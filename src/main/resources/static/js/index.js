@@ -1,3 +1,5 @@
+
+
 var log_editor;
 var diff_editor;
 var stompClient;
@@ -23,7 +25,14 @@ function connect(){
 }
 
 function get_log(){
-    stompClient.send("/search/log", {}, {});
+    //stompClient.send("/search/log", {}, {});
+    const swal = require('sweetalert2')
+    swal({
+        title: 'Error!',
+        text: 'Do you want to continue',
+        type: 'error',
+        confirmButtonText: 'Cool'
+    })
 }
 
 function get_log_modify_specific_file(){

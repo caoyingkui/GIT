@@ -13,6 +13,9 @@ import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +33,8 @@ public class WebController {
 
     @Autowired
     private SimpMessagingTemplate template;
+
+
 
     @MessageMapping("/log")
     public void codeSearch() throws Exception{
@@ -86,6 +91,26 @@ public class WebController {
         }
 
         this.template.convertAndSend("/message/commit", array);
+    }
+
+    @CrossOrigin
+    @GetMapping(value = "/sections/{commitid:.+}/questions/{file:.+}")
+    public void search(@PathVariable String commitid, @PathVariable String file){
+        ObjectId curId= analyzer.getId(commitid);
+        String curFile = analyzer.getFileFromCommit(curId, file);
+
+        ObjectId formerId = analyzer.getId(commitid + "^");
+        String formerFileName = analyzer.getFormerName(curId, file);
+        String formerFile = "";
+        if (formerFileName != null)
+            formerFile = analyzer.getFileFromCommit(formerId, formerFileName);
+
+        JSONObject object = new JSONObject();
+        object.put("formerFile", formerFile);
+        object.put("curFile", curFile);
+
+        this.template.convertAndSend("/message/diff", object.toString());
+
     }
 
     public void returnResultMessage(){

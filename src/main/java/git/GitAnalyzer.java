@@ -310,6 +310,14 @@ public class GitAnalyzer {
         //poi_analyzer.start();
 
         GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+        List<String> logs = lucene_analyzer.getLog();
+        for (String log: logs) {
+            String msg = lucene_analyzer.getCommitMessage(log);
+            if(msg.contains("SOLR-12759")){
+                System.out.println(log);
+            }
+        }
+        /*GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
         ClassFile classFile = new ClassFile(lucene_analyzer);
         List<String> files = lucene_analyzer.getAllFiles("HEAD", ".java");
         for (String file: files) {
@@ -325,7 +333,7 @@ public class GitAnalyzer {
                     WriterTool.append("oneLine.txt",msg);
                 }
             }
-        }
+        }*/
 
         //file.retrieveHistory("lucene/core/src/java/org/apache/lucene/store/ByteBuffersDirectory.java");
 
