@@ -96,7 +96,7 @@ public class CommitDependencyAnalyzer {
                 if (changed)
                     methods = classParser.getChangedMethod(gitAnalyzer.getPatch(commitId, null, file), true);
                 else
-                    methods = classParser.getAllMethods();
+                    methods = classParser.getAllMethodNames();
                 result.addAll(methods);
             }
         }catch (Exception e){

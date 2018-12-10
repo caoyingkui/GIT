@@ -8,10 +8,6 @@ function initailaize(){
     log_editor_initialize();
     diff_editor_initialize();
     connect();
-
-
-
-
 }
 
 function connect(){
@@ -25,14 +21,7 @@ function connect(){
 }
 
 function get_log(){
-    //stompClient.send("/search/log", {}, {});
-    const swal = require('sweetalert2')
-    swal({
-        title: 'Error!',
-        text: 'Do you want to continue',
-        type: 'error',
-        confirmButtonText: 'Cool'
-    })
+    stompClient.send("/search/log", {}, {});
 }
 
 function get_log_modify_specific_file(){

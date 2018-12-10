@@ -46,10 +46,10 @@ public class FileAnalyzer {
                 String newFile = analyzer.getFileFromCommit(commit, filePair.getValue().toString());
                 String oldFile = analyzer.getFileFromCommit(analyzer.getId(commit.getName() + "^"), filePair.getKey().toString());
                 ClassParser newParser = new ClassParser(newFile);
-                Set<String> methodNames = newParser.getAllMethods();
+                Set<String> methodNames = newParser.getAllMethodNames();
 
                 ClassParser oldParser = new ClassParser(oldFile);
-                methodNames.addAll(oldParser.getAllMethods());
+                methodNames.addAll(oldParser.getAllMethodNames());
 
                 for(String methodName: methodNames){
                     if(!changeTimes.containsKey(methodName)){

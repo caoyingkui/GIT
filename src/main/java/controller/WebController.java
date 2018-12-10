@@ -3,6 +3,7 @@ package controller;
 /**
  * Created by oliver on 2018/11/5.
  */
+import analyzer.histories.HistoryAnalyzer;
 import git.GitAnalyzer;
 import javafx.util.Pair;
 import org.eclipse.jgit.lib.ObjectId;
@@ -112,6 +113,16 @@ public class WebController {
         this.template.convertAndSend("/message/diff", object.toString());
 
     }
+
+
+    @CrossOrigin
+    @MessageMapping("/histories")
+    public void searchHistory(String fileName) {
+        HistoryAnalyzer historyAnalyzer = new HistoryAnalyzer();
+        String histories = historyAnalyzer.getHistories(fileName);
+        this.template.convertAndSend("/message/histories", histories);
+    }
+
 
     public void returnResultMessage(){
         this.template.convertAndSend("/message/result", "");
