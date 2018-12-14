@@ -1,0 +1,213 @@
+{
+    "id": "LUCENE-2380",
+    "title": "Add FieldCache.getTermBytes, to load term data as byte[]",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "With flex, a term is now an opaque byte[] (typically, utf8 encoded unicode string, but not necessarily), so we need to push this up the search stack.\n\nFieldCache now has getStrings and getStringIndex; we need corresponding methods to load terms as native byte[], since in general they may not be representable as String.  This should be quite a bit more RAM efficient too, for US ascii content since each character would then use 1 byte not 2.",
+    "attachments": {
+        "LUCENE-2380.patch": "https://issues.apache.org/jira/secure/attachment/12444816/LUCENE-2380.patch",
+        "LUCENE-2380_enum.patch": "https://issues.apache.org/jira/secure/attachment/12446413/LUCENE-2380_enum.patch",
+        "LUCENE-2380_direct_arr_access.patch": "https://issues.apache.org/jira/secure/attachment/12447532/LUCENE-2380_direct_arr_access.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-04-07T16:50:19+0000",
+            "content": "The structure should look like String and StringIndex, but I am not sure, if we need real BytesRefs. In my opinion, it should be an array of byte[], where each byte[] is allocated with the termsize from the enums BytesRef and copied over - this is. This is no problem, as the terms need to be replicated either way, as the BytesRef from the enum is reused. The only problem is that byte[] is mising the cool bytesref methods like utf8ToString() that may be needed by consumers.\n\ngetStrings and getStringIndex should be deprecated. We cannot emulate them using BytesRef.utf8ToString, as the String[] arrays are raw and allow no wrapping. If FieldCache would use accessor methods and not raw arrays, we would not have that problem... ",
+            "author": "Uwe Schindler",
+            "id": "comment-12854594"
+        },
+        {
+            "date": "2010-04-07T17:39:55+0000",
+            "content": "We could also do shared byte[] blocks (private), with a public method to retrieve the BytesRef for a given doc?  Standard codec's terms index does this \u2013 we could share it I think.\n\nA new byte[] per doc adds alot of RAM overhead and GC load.  (Of course, so does the String solution we use today, so it'd at least be no worse...). ",
+            "author": "Michael McCandless",
+            "id": "comment-12854615"
+        },
+        {
+            "date": "2010-04-07T18:00:11+0000",
+            "content": "We could also do shared byte[] blocks (private), with a public method to retrieve the BytesRef for a given doc?\n\nAbsolutely!  Now that we are in control, it would be a crime not not share the byte[]\nSeems like one should pass in a BytesRef to be filled in... that would be most efficient for people doing simple stuff like compare docid1 to docid2.  Returning a reused BytesRef could also work (as TermsEnum does) but it's less efficient for anything needing a state of more than 1 BytesRef since it then requires copying.\n\nWe can further save space by putting the length as a vInt in the byte[] - most would be a single byte.\nThen we just need an int[] as an index into the byte[]... or potentially packed ints.\n\nWe'll also need an implementation that can span multiple byte[]s for larger than 2GB support.  The correct byte[] to look into is then simply a function of the docid (as is done in Solr's UnInvertedField).\n\nWe could possibly play games with the offsets into the byte[] too - encode as a delta against the average instead of an absolute offset.  So offset = average_size * ord + get_delta(ord) ",
+            "author": "Yonik Seeley",
+            "id": "comment-12854621"
+        },
+        {
+            "date": "2010-04-07T18:31:55+0000",
+            "content": "This goes again in the direction of not having arrays in FieldCache anymore, but instead have accessor methods taking a docid and giving back the data (possibly as a reference). So getBytes(docid) returns a reused BytesRef with offset and length of the requested term. For native types we should also go away from arrays and only provide accessor methods. Java is so fast and possiby inlines the method call. So for native types we could also use a FloatBuffer or ByteBuffer or whatever from java.nio. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12854639"
+        },
+        {
+            "date": "2010-04-08T07:49:40+0000",
+            "content": "Working on LUCENE-2369 I essentially had to re-implement the FieldCache because of the hardwiring of arrays. Switching to accessor methods seems like the right direction to go. ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12854853"
+        },
+        {
+            "date": "2010-05-14T15:41:53+0000",
+            "content": "One thing to keep in mind is that the current way of returning shared BytesRef objects often forces one to make a copy.  We should perhaps consider allowing a BytesRef to be passed in.\n\n\n// returning shared BytesRef forces a copy\nfor(;;) {\n  BytesRef val1 = new BytesRef(getValue(doc1))  // make a copy\n  BytesRef val2 = getValue(doc2)\n  int cmp = val1.compareTo(val2)\n\n// allowing BytesRef to be passed in means no copy\nBytesRef val1 = new BytesRef();\nBytesRef val2 = new BytesRef();\nfor(;;) {\n  getValue(doc1, val1)\n  getValue(doc2, val2)\n  int cmp = val1.compareTo(val2)\n}\n\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-12867534"
+        },
+        {
+            "date": "2010-05-14T15:45:44+0000",
+            "content": "I agree, let's pass the reused BytesRef in. ",
+            "author": "Michael McCandless",
+            "id": "comment-12867535"
+        },
+        {
+            "date": "2010-05-18T17:21:31+0000",
+            "content": "Very rough first cut patch attached.\n\nI removed getStrings and replaced it with getTerms (returns a BytesRef oriented getter API for looking up the String from a doc).\n\nAnd I removed getStringsIndex and replaced it with getTermsIndex.\n\nAll lucene tests pass with this hard cutover, but I still need to measure perf hit: I'm using packed ints currently to hold the offsets, and 1 or 2 byte vInt prefix (Yonik's idea) to encode the term's length.\n\nI started to cutover Solr as well, and got some things cutover, but decided I should stop and check if these changes make sense   So the Solr side of the patch does not yet compile.  I specifically stopped when I got to StringIndexDocValues (abstract base class for lots of others) \u2013 I'd like to do a hard cutover of this class to use BytesRef, but does anyone see a problem w/ that?  I'm at little nervous about how far \"down\" I'll end up having to push the BytesRef... It is marked as \"Internal class, subject to change\"   I also dropped lots of nocommits along the way on the Solr side... so if someone could have a look and make suggestions that'd help  ",
+            "author": "Michael McCandless",
+            "id": "comment-12868747"
+        },
+        {
+            "date": "2010-05-18T17:57:38+0000",
+            "content": "Ahhh, fun stuff!  I'm packing for Prague though - prob won't be able to look at this for a week.\n\n1 or 2 byte vInt prefix\n\n1 or 2? a max len of 2**15?  (I know... a term bigger than 32K would be horrible, but so are limits that aren't necessary).  We could also do 1 or 4 (or 1 or 5), but as long as we make sure the single-byte case is optimized, it shouldn't matter.\n\nre: returning null if an ord of 0 is passed to get(int ord, BytesRef ret): do we need to do this?  We could record 0 as zero length in the FieldCache and hence avoid the special-case code.  We could require the user to check for 0 if they care to know the difference between zero length and missing. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12868762"
+        },
+        {
+            "date": "2010-05-18T18:05:32+0000",
+            "content": "Ahhh, fun stuff! I'm packing for Prague though - prob won't be able to look at this for a week.\n\nOK no prob... have fun!\n\n1 or 2? a max len of 2**15? (I know... a term bigger than 32K would be horrible, but so are limits that aren't necessary)\n\nIndexer already has this limit, during indexing (these large terms are skipped).\n\nre: returning null if an ord of 0 is passed to get(int ord, BytesRef ret): do we need to do this? We could record 0 as zero length in the FieldCache and hence avoid the special-case code. We could require the user to check for 0 if they care to know the difference between zero length and missing.\n\nI would love to return empty string (not null) if ord 0 comes in, and require caller to specifically handle ord 0 if they need to differentiate... I had started down that path but got spooked by it   I think we can revisit it, but maybe separately. ",
+            "author": "Michael McCandless",
+            "id": "comment-12868767"
+        },
+        {
+            "date": "2010-05-18T18:25:02+0000",
+            "content": "would love to return empty string (not null) if ord 0 comes in, and require caller to specifically handle ord 0 if they need to differentiate... I had started down that path but got spooked by it\n\nYeah... I guess I could see how it could cause a loss of info if you go though a few layers and you only have a BytesRef w/o an ord to tell you the value was missing. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12868776"
+        },
+        {
+            "date": "2010-05-24T22:42:25+0000",
+            "content": "New iteration attached.\n\nI got Solr mostly cutover, at least for the immediate usage of FieldCache.getStrings/getStringIndex.\n\nHowever one Solr test (TestDistributedSearch) is still failing... ",
+            "author": "Michael McCandless",
+            "id": "comment-12870888"
+        },
+        {
+            "date": "2010-05-25T10:49:01+0000",
+            "content": "New patch \u2013 now all tests pass.  Getting closer... but I still have to perf tes... ",
+            "author": "Michael McCandless",
+            "id": "comment-12871089"
+        },
+        {
+            "date": "2010-05-25T19:24:41+0000",
+            "content": "OK I ran some sort perf tests.  I picked the worst case \u2013 trivial\nquery (TermQuery) matching all docs, sorting by either a highly unique\nstring field (random string) or enumerated field (country ~ a couple\nhundred values), from benchmark's SortableSingleDocSource.\n\nIndex has 5M docs.  Each run is best of 3.\n\nResults:\n\n\n\n\nSort\nTrunk QPS\nPatch QPS\nChange %\n\n\nrandom\n7.75\n5.64\n-27.2%\n\n\ncountry\n8.05\n7.62\n-5.3%\n\n\n\n\n\nSo.... the packed ints lookups are more costly than trunk today (but,\nat a large reduction in RAM used).\n\nThen I tried another test, asking packed ints to upgrade to an array\nof the nearest native type (ie byte[], short[], int[], long[]) for the\ndoc -> ord map.  This is faster since lookups don't require\nshift/mask, but, wastes some space since you have unused bits:\n\n\n\n\nSort\nTrunk QPS\nPatch QPS\nChange %\n\n\nrandom\n7.75\n7.89\n1.8%\n\n\ncountry\n8.05\n7.64\n-5.1%\n\n\n\n\n\nThe country case didn't get any better (noise) because it happened to\nalready be using 8 bits (byte[]) for doc->ord map.\n\nRemember this is a worst case test \u2013 if you query matches fewer\nresults than your entire index, or your query is more costly to\nevaluate than the simple single TermQuery, this FieldCache lookup cost\nwill be relatively smaller.\n\nSo... I think we should expose in the new FieldCache methods an\noptional param to control time/space tradeoff; I'll add this,\ndefaulting to upgrading to nearest native type.  I think the 5.3%\nslowdown on the country field is acceptable given the large reduction\nin RAM used... ",
+            "author": "Michael McCandless",
+            "id": "comment-12871308"
+        },
+        {
+            "date": "2010-05-25T20:34:28+0000",
+            "content": "I did some rough estimates of RAM usage for StringIndex (trunk) vs\nTermIndex (patch).\n\nJava String is an object, so estimate 8 byte object header in the JRE.\nIt seems to have 3 int fields (offset, count, hashCode), from\nOpenJDK's sources, plus ref to char[].\n\nThe char[] has 8 byte object header, int length, and actual array\ndata.\n\nSo in trunk's StringIndex:\n\n  per-unique-term: 40 bytes (48 on 64bit jre) + 2*length-of-string-in-UTF16\n  per-doc: 4 bytes (8 bytes on 64 bit)\n\nIn the patch:\n\n  per-unique-term: ceil(log2(totalUTF8BytesTermData)) + utf8 bytes + 1 or 2 bytes (vInt, for term length)\n  per-doc: ceil(log2(numUniqueTerm)) bits\n\nSo eg say you have an English title field, avg length 40 chars, and\nassume always unique.  On a 5M doc index, trunk would take ~591MB and\npatch would take ~226 MB (32bit JRE) = 62% less.\n\nBut if you have a CJK title field, avg 10 chars (may be highish), it's\nless savings because UTF8 takes 50% more RAM than UTF16 does for CJK\n(and others).  Trunk would take ~305MB and patch ~178MB (32bit JRE) =\n42% less.\n\nAlso don't forget the GC load of having 5M String & char[] objects... ",
+            "author": "Michael McCandless",
+            "id": "comment-12871342"
+        },
+        {
+            "date": "2010-05-28T20:05:57+0000",
+            "content": "OK I fixed up the patch.  I think it's ready to commit, though it'd be\ngreat if someone could double check my Solr changes...:\n\n\n\tUpdated to trunk\n\n\n\n\n\tFixed bug in Solr's ByteUtils.java (it was not respecting the\n    offset in the incoming BytesRef)\n\n\n\n\n\tAdded optional boolean \"fasterButMoreRAM\" option when loading\n    field cache, defaults to true\n\n\n\n\n\tFor DocTermsIndex, I defined ord=0 to mean \"unset\"; and made it\n    the caller's responsibility to do something with the ord=0 case if\n    empty (length=0) BytesRef isn't acceptable.  Likewise, for\n    DocTerms, I now directly return empty BytesRef if doc didn't have\n    this field, but I also added an exists method to explicitly check\n    if you need to.\n\n\n\n\n\tAdded a getTerm convenience method (calls getOrd then lookup, by\n    default) to the terms index; renamed DocTerms.get -> getTerm for\n    consistency\n\n\n\n\n\tFixed the nocommits and/or changed to TODOs\n\n\n\n\n\tSmall cleanups\n\n\n\nI've also added a MIGRATE.txt that spells out more details on how an\napp can cutover to the new APIs.\n\nI think there are some other good things to do here, but as a future\nissue (this one's big enough!) \u2013 I'll open it:\n\n\n\tFor DocTermsIndex, make it optional whether the bytes data is\n    loaded.  EG for a single segment index (LUCENE-2335), or for sort\n    comparators apps that do not need the bytes data (eg because they\n    use terms dict to resolve ord -> term, and v/v).\n\n\n\n\n\tPossibly merge DocTerms & DocTermsIndex.  EG it's dangerous today\n    if you load terms and then termsIndex because you're wasting tons\n    of RAM; it'd be nicer if we could have a single cache entry that'd\n    \"upgrade\" itself to be an index (have the ords).\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12873131"
+        },
+        {
+            "date": "2010-06-03T18:39:43+0000",
+            "content": "I opened LUCENE-2483 for the future improvements. ",
+            "author": "Michael McCandless",
+            "id": "comment-12875233"
+        },
+        {
+            "date": "2010-06-03T19:16:07+0000",
+            "content": "Whew, that's one involved patch!\nI didn't get to it before, but I'll start looking over the Solr changes now. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12875256"
+        },
+        {
+            "date": "2010-06-03T20:53:29+0000",
+            "content": "I did some performance testing on faceting using the field cache (single valued field with facet.method fc and fcs).\n\nfield=100000 unique values\nfc: 5% slower\nfcs: 55% slower\n\nfield=100 unique values\nfc: 2.5% slower\nfcs: 26% slower\n\nI'll look into it to see how we can regain some of that lost performance. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12875287"
+        },
+        {
+            "date": "2010-06-03T21:02:44+0000",
+            "content": "What do the numbers mean? Time to build cache or time for sorting something? Thats unclear to me. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12875291"
+        },
+        {
+            "date": "2010-06-03T21:27:10+0000",
+            "content": "Hmmmm.\n\nCan you try adding \", true\" to FieldCache.DEFAULT.getTermsIndex?  That'll use more RAM but should be faster.\n\nAlso, could the fix for executor have changed the performance? ",
+            "author": "Michael McCandless",
+            "id": "comment-12875302"
+        },
+        {
+            "date": "2010-06-03T23:37:26+0000",
+            "content": "What do the numbers mean?\n\nTime to do the faceting (roughly).  FieldCache build time is not included.  Given that the degradation is much worse for a higher number of unique values, this points to the increased cost of going from ord->value. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12875360"
+        },
+        {
+            "date": "2010-06-03T23:47:44+0000",
+            "content": "I just committed a patch that helps... when merging the fieldcaches,  instead of looking up the term for each comparison, it's now stored in the segment data structure.\n\nPer-segment faceting is now 26% slower for the 100,000 term field, and 17% slower for the 100 term field.\n\nOne way to regain more performance is to implement some kind of stateful iterator over the values in the field cache entry instead of looking up by ord each time. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12875368"
+        },
+        {
+            "date": "2010-06-05T16:06:29+0000",
+            "content": "FYI, while trying to implement an iterator over the fieldcache terms, I ran into a bug where each term is written twice. This causes double the memory usage for the bytes (but no functionality bugs). I'll fix shortly, and anyone who has done performance tests might want to redo them again (cache effects, GC differences, and bigger entry build times).  ",
+            "author": "Yonik Seeley",
+            "id": "comment-12875913"
+        },
+        {
+            "date": "2010-06-05T16:52:06+0000",
+            "content": "Here's a draft patch (it currently fails) of an enumerator over the field cache entry. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12875919"
+        },
+        {
+            "date": "2010-06-14T22:51:34+0000",
+            "content": "Here's an updated \"terms enum over fieldcache\" patch.\nPagedBytes now keeps track of how much space was used in each byte array and allows access to the raw blocks and end info.  Slightly less elegant, but it works.\n\nI still need to do performance testing with this. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12878785"
+        },
+        {
+            "date": "2010-06-15T09:29:06+0000",
+            "content": "Patch looks good Yonik! ",
+            "author": "Michael McCandless",
+            "id": "comment-12878907"
+        },
+        {
+            "date": "2010-06-15T13:34:22+0000",
+            "content": "\n\n\n\nterms in field\nfacet method\npre-bytes ms\ntrunk+patch ms\nnew/old\n\n\n100000\nfc\n27\n36\n1.33\n\n\n100000\nfcs\n333\n325\n0.98\n\n\n100\nfc\n20\n22\n1.10\n\n\n100\nfcs\n24\n25\n1.04\n\n\n\n\n\nOK - so the biggest problem area initially (bottlenecked by field cache merging) that was 55% slower is now 2% faster. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12878974"
+        },
+        {
+            "date": "2010-06-17T09:09:47+0000",
+            "content": "The above commit was actually for LUCENE-2378. ",
+            "author": "Michael McCandless",
+            "id": "comment-12879712"
+        },
+        {
+            "date": "2010-06-19T13:30:02+0000",
+            "content": "This patch adds the ability to get at the raw arrays from the Direct* classes, and using those fixes the performance regressions in the \"fc\" faceting I was seeing.\n\nTo do this, it adds this to DocTermsIndex.  Anyone have a better solution?\n\n    /** @lucene.internal */\n    public abstract PackedInts.Reader getDocToOrd();\n\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-12880481"
+        },
+        {
+            "date": "2010-06-19T13:52:03+0000",
+            "content": "It was really tricky performance testing this.\n\nIf I started solr and tested one type of faceting exclusively, the performance impact of going through the new FieldCache interfaces (PackedInts for ord lookup) was relatively minimal.\n\nHowever, I had a simple script that tested the different variants (the 4 in the table above)... and using that resulted in the bigger slowdowns.\n\nThe script would do the following:\n\n1) test 100 iterations of facet.method=fc on the 100,000 term field\n2) test 10 iterations of facet.method=fcs on the 100,000 term field\n3) test 100 iterations of facet.method=fc on the 100 term field\n4) test 10 iterations of facet.method=fcs on the 100 term field\n\n\n\nI would run the script a few times, making sure the numbers stabilized and were repeatable.\n\nTesting #1 alone resulted in trunk slowing down ~ 4%\nTesting #1 along with any single other test: same small slowdown of ~4%\nRunning the complete script: slowdown of 33-38% for #1 (as well as others)\nWhen running the complete script, the first run of Test #1 was always the best... as if the JVM correctly specialized it, but then discarded it later, never to return.\nI saw the same affect on both an AMD Phenom II w/ ubuntu, Java 1.6_14 and Win7 with a Core2, Java 1.6_17, both 64 bit.  The drop on Win7 was only 20% though.\n\nSo: you can't always depend on the JVM being able to inline stuff for you, and it seems very hard to determine when it can.\nThis obviously has implications for the lucene benchmarker too. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12880483"
+        }
+    ]
+}

@@ -1,0 +1,200 @@
+{
+    "id": "LUCENE-4740",
+    "title": "Weak references cause extreme GC churn",
+    "details": {
+        "components": [
+            "core/store"
+        ],
+        "fix_versions": [
+            "4.4",
+            "6.0"
+        ],
+        "affect_versions": "3.6.1",
+        "priority": "Major",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "We are running a set of independent search machines, running our custom software using lucene as a search library. We recently upgraded from lucene 3.0.3 to 3.6.1 and noticed a severe degradation of performance.\n\nAfter doing some heap dump digging, it turns out the process is stalling because it's spending so much time in GC. We noticed about 212 million WeakReference, originating from WeakIdentityMap, originating from MMapIndexInput.\n\nOur problem completely went away after removing the clones weakhashmap from MMapIndexInput, and as a side-effect, disabling support for explictly unmapping the mmapped data.",
+    "attachments": {
+        "LUCENE-4740.patch": "https://issues.apache.org/jira/secure/attachment/12567551/LUCENE-4740.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-01-31T15:54:05+0000",
+            "content": "I am not sure if this is a problem in practice, but there are also WeakIdentityMaps used in AttributeImpl, AttributeSource, VirtualMethod where the keys of the map are classes, which I don't imagine get allocated or collected a lot at all.\n\nI replaced those maps with regular ConcurrentHashMap<Class, X> without any negative impact. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13567734"
+        },
+        {
+            "date": "2013-01-31T16:01:15+0000",
+            "content": "This seems to be somewhat addressed in trunk, with the inputs in http://svn.apache.org/repos/asf/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/store/ByteBufferIndexInput.java removing themselves from the clones list on close(). Should that be backported to 3.x? ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13567744"
+        },
+        {
+            "date": "2013-01-31T16:09:21+0000",
+            "content": "I replaced those maps with regular ConcurrentHashMap<Class, X> without any negative impact.\n\nThis kills the possibility of unloading web applications in application servers. Those maps don't produce many references.\n\nWhich OS are you using? Somebody had a similar problem on Windows - but on Linux all was fine. Maybe some JVM version has a bug in reference queues... Can you give your exact version number? ",
+            "author": "Uwe Schindler",
+            "id": "comment-13567751"
+        },
+        {
+            "date": "2013-01-31T18:10:00+0000",
+            "content": "Yes, that change is probably not a good general solution, but it worked well for our usecase. It might be nice to have support for unloadable classes optional.\n\nI am using debian squeeze, 64 bit, Oracle JDK 6 with a 16 GB heap and four indexes, totalling 9 GB\n\njava version \"1.6.0_26\"\nJava(TM) SE Runtime Environment (build 1.6.0_26-b03)\nJava HotSpot(TM) 64-Bit Server VM (build 20.1-b02, mixed mode)\n\n\n\nThe 212M WeakReferences on the heap indicates that the referencequeues weren't functioning correctly.\n\nIn any case, if the useUnmap is false, then it seems unnecessary to even add references to the clones to the map. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13567887"
+        },
+        {
+            "date": "2013-01-31T18:36:34+0000",
+            "content": "\nIn any case, if the useUnmap is false, then it seems unnecessary to even add references to the clones to the map.\n\n+1, I think make it null in this case. it just gives the user options (with different tradeoffs). ",
+            "author": "Robert Muir",
+            "id": "comment-13567914"
+        },
+        {
+            "date": "2013-01-31T18:45:27+0000",
+            "content": "Yes, that change is probably not a good general solution, but it worked well for our usecase. It might be nice to have support for unloadable classes optional.\n\nAs I said, a change in AttributeSource or VirtualMethod is not needed, the number of total per-JVM references there are in the number of 10s. This is perfectly fine code and nobody needs to change anything. No need for \"optional\" class unloading. Not using weak references here would be a major design issue and a large leak.\n\nIn any case, if the useUnmap is false, then it seems unnecessary to even add references to the clones to the map.\n\nRobert and me were discussing about that already, we can do that, this patch is easy. We can offer that as an option (the no-unmap option), with the backside of e.g. windows can no longer delete index files unless they are garbage collected and especially higher disk usage while indexing.\n\nI did some testing with various JDKs on windows 64 bit, using a loop that clones one indexinput over and over. This loop runs successful for hours without OOM, so there is no cleanup problem, ReferenceQueues are working correctly. With a heap size of 512 MB and this simple loop, the number of Weak references is between 5000 and 600,000. But indeed, there are some GC pauses (in JDK 6 and 7). The reason for this is: Weak referees are a little bit more \"reachable\" than unreachable objects, so GC let them survive for a longer time than unreachable ones. There is nothing we can do against that. The main problem in your case maybe the really large heap size: why do you need it?\n\nMy second test was to close every cloned index input (trunk/4.x only, where the commit you mentioned was added by me one week ago), in that case the number of references was of course a static \"1\"  In this test, no GC pauses occurred and the test ran faster.\n\nIn my final test I disabled the put() to the WeakIdentityMap completely, in that case it was again faster, but this was caused more by the complete non-existence of any locking or maintenance of the ConcurrentHashMap.\n\nThe times for 300 million clones:\n\n\tWith default Lucene 4.x/trunk, no close of clones (Lucene never closes clones and thats almost impossible to add): 200 secs, GC pauses\n\tWith closing clones: 65 secs\n\tWithout any map: 40 secs\n\n\n\n(JDK 6u32, windows, 64 bit, server vm, default garbage collector)\n\n\n  // for this test, make the clones map in ByteBufferIndexInput public/package-private/...\n  public void testGC() throws Exception {\n    MMapDirectory mmapDir = new MMapDirectory(_TestUtil.getTempDir(\"testGC\"));\n    IndexOutput io = mmapDir.createOutput(\"bytes\", newIOContext(random()));\n    io.writeVInt(5);\n    io.close();\n    IndexInput ii = mmapDir.openInput(\"bytes\", IOContext.DEFAULT);\n    int hash = 0;\n    for (int i = 0; i < 300*1024*1024; i++) {\n      final IndexInput clone = ii.clone();\n      hash += System.identityHashCode(clone);\n      if (i % (10*1024) == 0) {\n        System.out.println(\"Number of clones: \" + ((ByteBufferIndexInput) ii).clones.size());\n      }\n      //clone.close();\n    }\n    ii.close();\n    mmapDir.close();\n  }\n\n\n\nIn any case, we can allow user to disable unmap, but we then have to keep the weak references to the clones when unmapping is enabled, unless we add close() of clones to Lucene everywhere...\n\nSome other ideas are: Reuse the ByteBufferIndexInput instances, so we dont need to recreate them all the time. I have no idea how to do that, because we have no close() to release those, which brings us back to that problem again. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13567924"
+        },
+        {
+            "date": "2013-01-31T19:32:41+0000",
+            "content": "Agree that the weakreferences for classes is probably a very minor part of it, and very unlikely part of the problem here.\n\nThe unmap option is nice, and you could make it less complicated by simply disallowing the option to be changed after the mmapdirectory has ever been cloned. In practice it will always be set immediately after construction. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568007"
+        },
+        {
+            "date": "2013-01-31T20:31:18+0000",
+            "content": "After doing some more thinking and micro-benchmarking, I think the problem occurs when you create clones at a faster rate than the GC can cope with.\n\npublic class WeakTest extends TestCase {\n    private static final int CPUS = Runtime.getRuntime().availableProcessors();\n\n    public void testFoo() throws Exception {\n        final WeakIdentityMap<Object, Boolean> map = WeakIdentityMap.newConcurrentHashMap();\n        ExecutorService executorService = Executors.newCachedThreadPool();\n\n        for (int k = 0; k < CPUS; k++) {\n            executorService.submit(new Runnable() {\n                public void run() {\n                    while (true) {\n                        map.put(new Object(), Boolean.TRUE);\n                    }\n                }\n            });\n            executorService.submit(new Runnable() {\n                public void run() {\n                    while (true) {\n                        System.gc();\n                    }\n                }\n            });\n        }\n        while (true) {\n            System.out.println(\"Map size: \" + map.size());\n            Thread.sleep(1000);\n        }\n    }\n\n}\n\n\nI tried running this with -Xmx100m. This makes the map grow indefinitely.\nI know this is not a very reliable test, since the JVM only considers System.gc() a hint, but it definitely seems like it's not very good at freeing weak references during high load.\n\nIf I add Thread.sleep(1) in the put-worker, I can make it grow slower, but it still seems to grow over time.\n\n(Running java 7 on my home computer)\n\njava version \"1.7.0_07\"\nJava(TM) SE Runtime Environment (build 1.7.0_07-b10)\nJava HotSpot(TM) 64-Bit Server VM (build 23.3-b01, mixed mode)\n\n ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568074"
+        },
+        {
+            "date": "2013-02-01T09:44:15+0000",
+            "content": "Attached you will find the patch, that disables tracking of clones if the unmapping is disabled. We dont need to make the setting in MMapDirectory unmodifiable, after changing it all IndexInputs created afterwards, the new setting is used. This does not differ from the previous behaviour or unmapping at all.\n\nIn general, people should in any case set this setting after constrcution (we may add a ctor param, too). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568605"
+        },
+        {
+            "date": "2013-02-01T09:52:49+0000",
+            "content": "After doing some more thinking and micro-benchmarking, I think the problem occurs when you create clones at a faster rate than the GC can cope with.\n\nI agree that might be aproblem and you may be facing it. How mayn requests per second do you have on your server?\n\nThis behaviour is Java's weak reference GC behaviour, it has nothing to do with WeakIdentityMap. The default WeakHashMap from JDK has the same problems.\n\nAgree that the weakreferences for classes is probably a very minor part of it, and very unlikely part of the problem here.\n\nThat is very common, the JDK uses the same mechanism like in AttributeSource at several places. It is definitely not part of the problem.\n\nThe problem here is the weak map that has a very high throughput of puts (every query produces at least one IndexInput clone, possibly more). The high throughput already lead to the change to WeakIdentityMap recently, because a synchronized WeakHashMap was not able to handle the large number of concurrent puts (Lucene 3.6.0 regression).\n\nI am currently thinking of making the whole thing work without weak references and instead have some \"hard reference\" from the clone to master (it is already there, MappedByteBuffer.duplicate() returns a duplicate buffer that has a reference to the master). The problem with this is, that you need a check on every access of the IndexInput if the buffer is still valid. If it is only some null check, we may add it, but its risky for performance too.\n\nMy ide was that the master creates some boolean[1] and passes this boolen[1] array to all childs. When the master closes, it does set the b[0] to false. All childs would do a check on b[0]... Not sure how this affects performance. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568611"
+        },
+        {
+            "date": "2013-02-01T09:58:47+0000",
+            "content": "Looks good, but what happens if you start with having useUnmap = false, then creating a bunch of clones, and then setting it back to useUnmap = true?\n\nIf I read the code correctly (which I am not certain of), closing the original input will then unmap the data and break all the existing clones. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568615"
+        },
+        {
+            "date": "2013-02-01T10:17:02+0000",
+            "content": "I agree that might be aproblem and you may be facing it. How mayn requests per second do you have on your server?\n\nNot that many - about 8000 per minute on yesterdays peak, which is about 133 per second. However, each requests leads to several complex lucene queries, though I don't have any numbers on the actual lucene query throughput.\n\nThis behaviour is Java's weak reference GC behaviour, it has nothing to do with WeakIdentityMap. The default WeakHashMap from JDK has the same problems.\n\nAgreed.\n\nMy ide was that the master creates some boolean[1] and passes this boolen[1] array to all childs. When the master closes, it does set the b[0] to false. All childs would do a check on b[0]... Not sure how this affects performance.\n\nYes, I thought about this too, and I am not sure the performance penalty would be that problematic (but it would need to be measured). And if possibly, users of the inputs should avoid doing small individual byte gets, and instead try to consume chunks of bytes to avoid the overhead.\n\nI would prefer an AtomicBoolean since it uses a volatile field. As far as I know, you can't make contents of arrays volatile.\nIn any case, wouldn't it would possible to skip the whole master/slave relationship and make everyone equal, just sharing the closed state flag? Though then running close() on a clone would close everything, which is possibly not what you want to happen. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568634"
+        },
+        {
+            "date": "2013-02-01T10:20:13+0000",
+            "content": "but what happens if you start with having useUnmap = false, then creating a bunch of clones, and then setting it back to useUnmap = true? If I read the code correctly (which I am not certain of), closing the original input will then unmap the data and break all the existing clones.\n\nThe settings are decoupled:\nIf you start with useUnmap = false, all IndexInputs created will have no weak map, so when they are closed, the clones are not touched.\n\nIf you change the setting to true, the already existing indexinputs will not be tracked (as before), but new indexinputs will get a map and all of their clones will be freed correctly.\n\nThe other special case: If you change the setting from true -> false, all existing IndexInputs will keep their maps and will be cleaned up on close (buffers set to null). But the cleanMapping() method will get a no-op, so they are correctly nulled, but no longer unmapped.\n\nIn any case a SIGSEGV is prevented (as good as we can without locking).\n\nIn general, nothing breaks if you change the setting later, but you should really do it only after construction. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568635"
+        },
+        {
+            "date": "2013-02-01T10:23:39+0000",
+            "content": "I would prefer an AtomicBoolean since it uses a volatile field. As far as I know, you can't make contents of arrays volatile.\n\nThis kills performance. MMapIndexInput would be slower than SimpleFSIndexInput! This is why the array is used as a fake \"reference\" to a boolean.\n\nThe current approach of unmapping the byte buffers and protecting for sigsegv by nulling them is not 100% safe. The JVM may still crash if another thread does not yet see the nulled buffer. But in most cases the use will get a AlreadyClosedException and can fix his code before he goes into production and his JVM crashes suddenly. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568637"
+        },
+        {
+            "date": "2013-02-01T10:53:17+0000",
+            "content": "If you change the setting to true, the already existing indexinputs will not be tracked (as before), but new indexinputs will get a map and all of their clones will be freed correctly.\n\nRight, but the already existing indexinputs will have buffers pointing to the same bytebuffer, so if you close the master, you would get SIGSEGV in the clones, since the master can not forcibly close the clones. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568657"
+        },
+        {
+            "date": "2013-02-01T10:58:00+0000",
+            "content": "freeBuffers in MMapIndexInput only looks at MMapDirectory.useUnmap, which is the thing that may change, unlike the trackClones / clones which is fixed once the master has been created.\n\nI propose adding this to close():\n\nif (clones != null) { freeBuffers(); }\n\n ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568659"
+        },
+        {
+            "date": "2013-02-01T11:01:11+0000",
+            "content": "Right, but the already existing indexinputs will have buffers pointing to the same bytebuffer, so if you close the master, you would get SIGSEGV in the clones, since the master can not forcibly close the clones.\n\nRight that can happen, the fix is to make the freeBuffer method use the setting of the actual IndexInput, not the global one of MMapDirectory. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568665"
+        },
+        {
+            "date": "2013-02-01T11:02:39+0000",
+            "content": "I propose adding this to close():\n\nthats not good and makes reuse of ByteBufferIndexInput complicated. MMapDirectory have to take care in its overridden abstract method (by using the IndexInput's instance setting. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568666"
+        },
+        {
+            "date": "2013-02-01T11:13:38+0000",
+            "content": "Patch that makes the unmapping behaviour consistent. The \"unmap\" setting is now maintained by each MMapIndexInput. The unmap method was also moved into the impl class (the previous implementation was a relict from older times) ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568671"
+        },
+        {
+            "date": "2013-02-01T11:21:52+0000",
+            "content": "Better patch using the getter method instead stupid MMapDirectory.this.useUnmap. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13568673"
+        },
+        {
+            "date": "2013-02-01T12:50:19+0000",
+            "content": "That looks good to me. Will this only be applied to latest 4.x or also be backported to 3.x? ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13568716"
+        },
+        {
+            "date": "2013-02-02T10:38:19+0000",
+            "content": "[trunk commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1441726\n\nLUCENE-4740: Don't track clones of MMapIndexInput if unmapping is disabled. This reduces GC overhead. ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13569496"
+        },
+        {
+            "date": "2013-02-02T10:44:43+0000",
+            "content": "I committed this to trunk and 4.x branch.\n\nIt is not yet planned to release another 3.6.x version. Users should upgrade to Lucene 4.x (4.2 will contain this patch). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13569498"
+        },
+        {
+            "date": "2013-02-02T10:46:00+0000",
+            "content": "[branch_4x commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1441727\n\nMerged revision(s) 1441726 from lucene/dev/trunk:\nLUCENE-4740: Don't track clones of MMapIndexInput if unmapping is disabled. This reduces GC overhead. ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13569499"
+        },
+        {
+            "date": "2013-02-02T10:46:11+0000",
+            "content": "I keep this issue open:\n\n\n\tIf there will be a 3.6.3 release, we can backport.\n\tWe should try/benchmark other solutions to tracking clones, as there is indeed an overhead in GC.\n\n ",
+            "author": "Uwe Schindler",
+            "id": "comment-13569500"
+        },
+        {
+            "date": "2013-02-02T20:29:08+0000",
+            "content": "I've been watching the activity on this issue because I have occasional extreme GC pauses in Solr with an 8GB heap.  GC tuning has reduced them somewhat so that my load balancer hasn't marked the service offline in a few days, but I think that things still aren't ideal.\n\nI will admit that I find most of the comments baffling.  Therefore I have a simple question.  If I run Solr branch_4x with this patch applied, will I benefit?  I can see from the commit log that unmmapping must disabled to benefit, but I don't know if this is how Solr operates. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13569636"
+        },
+        {
+            "date": "2013-02-02T22:09:48+0000",
+            "content": "I just had an idea for a potential optimization:\nUse a timerthread/executor/whatever to delay the unmap operation for X seconds after marking it as closed.\nThis should give the clones enough time to figure out that it should fail nicely instead of crash the jvm.\n\nYou could even have the clones make sure to check the state of the master every X/2 seconds before performing any operation:\n\nbyte readByte() {\n  if (this.closed) {\n    throw ...;\n  }\n  long currentTime = System.currentTimeMillis();\n  if (currentTime - lastCheck >= X/2) {\n    lastCheck = currentTime;\n    if (master.isClosed() {\n      this.close();\n      throw ...;\n    }\n   }\n  return curBuf.readByte();\n}\n\n\n\nNot sure how much overhead this would mean in practice, but it would at least avoid synchronization most of the time.\nAn alternative is to schedule a periodic job for each clone, checking the master state and updating the clone state. That might lead to memory leaks unless weakreferences are used, so maybe that's not actually an improvement. ",
+            "author": "Kristofer Karlsson",
+            "id": "comment-13569652"
+        },
+        {
+            "date": "2013-06-14T17:47:41+0000",
+            "content": "Therefore I have a simple question. If I run Solr branch_4x with this patch applied, will I benefit? I can see from the commit log that unmmapping must disabled to benefit, but I don't know if this is how Solr operates.\n\nIf you have a version with this patch enabled and you are using an index that changes not too often, it is better to not unmap. In that case you can pass unmap=\"false\" as parameter to your MMapDirectoryFactory in Solr. If the index does not change too often, the overhead by a delay in unmapping the files at a lter stage does not matter. GC has less to do then. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13683594"
+        },
+        {
+            "date": "2013-07-23T18:37:05+0000",
+            "content": "Bulk close resolved 4.4 issues ",
+            "author": "Steve Rowe",
+            "id": "comment-13716741"
+        }
+    ]
+}

@@ -1,0 +1,177 @@
+{
+    "id": "SOLR-6820",
+    "title": "The sync on the VersionInfo bucket in DistributedUpdateProcesser#addDocument appears to be a large bottleneck when using replication.",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Sub-task",
+        "labels": "",
+        "fix_versions": [
+            "5.2",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "",
+    "attachments": {
+        "SOLR-6820.patch": "https://issues.apache.org/jira/secure/attachment/12707358/SOLR-6820.patch",
+        "threads.png": "https://issues.apache.org/jira/secure/attachment/12686412/threads.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-12-04T13:15:30+0000",
+            "author": "Mark Miller",
+            "content": "In my simple testing for SOLR-6816, I can see that raising the number of buckets to 1024 from 256 seems to do nothing, but raising it to 65536 seem to give performance similar to removing the sync entirely.\n\nWe should probably make the number of buckets configurable, consider our default, and review the hashing that is going on.  ",
+            "id": "comment-14234189"
+        },
+        {
+            "date": "2014-12-04T16:28:21+0000",
+            "author": "Yonik Seeley",
+            "content": "That's pretty surprising... with a 6 core CPU, it's unclear how 256 buckets could cause that much contention.  The id's are UUIDs, and they are hashed with murmur3... it should be well distributed.  Is the occasional block causing something else bad to happen in the whole stack (sending clients, etc)? ",
+            "id": "comment-14234328"
+        },
+        {
+            "date": "2014-12-10T00:19:18+0000",
+            "author": "Mark Miller",
+            "content": "I'll collect the hot spots for each case shortly. Might be interesting to add some quick debug stats as well. ",
+            "id": "comment-14240368"
+        },
+        {
+            "date": "2014-12-11T01:16:43+0000",
+            "author": "Mark Miller",
+            "content": "In the instance I'm seeing, the hashing looks okay, but it seems that this can be hit and block for up almost a minute in this test. It will hold the bucket sync and the other threads appear to lock up as well, I assume as each quickly hits a doc that needs the lock held by the thread blocked below:\n\n\n qtp1204167249-19 [BLOCKED]\norg.apache.lucene.index.IndexWriter.publishFlushedSegment(SegmentCommitInfo, FrozenBufferedUpdates, FrozenBufferedUpdates) IndexWriter.java:2273\norg.apache.lucene.index.DocumentsWriterFlushQueue$FlushTicket.publishFlushedSegment(IndexWriter, DocumentsWriterPerThread$FlushedSegment, FrozenBufferedUpdates) DocumentsWriterFlushQueue.java:198\norg.apache.lucene.index.DocumentsWriterFlushQueue$FlushTicket.finishFlush(IndexWriter, DocumentsWriterPerThread$FlushedSegment, FrozenBufferedUpdates) DocumentsWriterFlushQueue.java:213\norg.apache.lucene.index.DocumentsWriterFlushQueue$SegmentFlushTicket.publish(IndexWriter) DocumentsWriterFlushQueue.java:249\norg.apache.lucene.index.DocumentsWriterFlushQueue.innerPurge(IndexWriter) DocumentsWriterFlushQueue.java:116\norg.apache.lucene.index.DocumentsWriterFlushQueue.tryPurge(IndexWriter) DocumentsWriterFlushQueue.java:149\norg.apache.lucene.index.DocumentsWriter.purgeBuffer(IndexWriter, boolean) DocumentsWriter.java:183\norg.apache.lucene.index.IndexWriter.purge(boolean) IndexWriter.java:4536\norg.apache.lucene.index.IndexWriter.doAfterSegmentFlushed(boolean, boolean) IndexWriter.java:4550\norg.apache.lucene.index.DocumentsWriter$MergePendingEvent.process(IndexWriter, boolean, boolean) DocumentsWriter.java:700\norg.apache.lucene.index.IndexWriter.processEvents(Queue, boolean, boolean) IndexWriter.java:4578\norg.apache.lucene.index.IndexWriter.processEvents(boolean, boolean) IndexWriter.java:4570\norg.apache.lucene.index.IndexWriter.updateDocument(Term, IndexDocument, Analyzer) IndexWriter.java:1394\norg.apache.solr.update.DirectUpdateHandler2.addDoc0(AddUpdateCommand) DirectUpdateHandler2.java:240\norg.apache.solr.update.DirectUpdateHandler2.addDoc(AddUpdateCommand) DirectUpdateHandler2.java:164\norg.apache.solr.update.processor.RunUpdateProcessor.processAdd(AddUpdateCommand) RunUpdateProcessorFactory.java:69\norg.apache.solr.update.processor.UpdateRequestProcessor.processAdd(AddUpdateCommand) UpdateRequestProcessor.java:51\norg.apache.solr.update.processor.DistributedUpdateProcessor.doLocalAdd(AddUpdateCommand) DistributedUpdateProcessor.java:931\norg.apache.solr.update.processor.DistributedUpdateProcessor.versionAdd(AddUpdateCommand) DistributedUpdateProcessor.java:1085\norg.apache.solr.update.processor.DistributedUpdateProcessor.processAdd(AddUpdateCommand) DistributedUpdateProcessor.java:697\norg.apache.solr.update.processor.LogUpdateProcessor.processAdd(AddUpdateCommand) LogUpdateProcessorFactory.java:104\n\nOther intermittent times seem to lock up very briefly as all the threads hit the same bucket and one takes a moment to add the doc. ",
+            "id": "comment-14241957"
+        },
+        {
+            "date": "2014-12-11T02:25:22+0000",
+            "author": "Yonik Seeley",
+            "content": "In the instance I'm seeing, the hashing looks okay, but it seems that this can be hit and block for up almost a minute in this test.\n\nHmmm, this looks like a lucene limitation, and perhaps should be considered a bug.  It looks like the IndexWriter is \"stealing\" the thread used to add a document in order flush a complete segment (and hence a single add can sometimes take orders of magnitude longer?) ",
+            "id": "comment-14242024"
+        },
+        {
+            "date": "2014-12-11T23:03:33+0000",
+            "author": "Mark Miller",
+            "content": "This may be related to SOLR-6838. I have to do some investigation with Overwrite = false. ",
+            "id": "comment-14243313"
+        },
+        {
+            "date": "2015-03-25T23:21:46+0000",
+            "author": "Timothy Potter",
+            "content": "First pass ... raising this to 65536 as Mark indicated made a significant impact in overall indexing performance in my testing. \n\nSpecifically, with branch_5x my baseline got:\n\nnum docs         secs         docs/sec\n9992262          427\t      23401.08 (no replication, leader only)\n9992262          758\t      13182.40 (leader + 1 replica)\n\n\n\nwith this patch applied and using 65536:\n\n\n9992262          382          26157.75\n9992262          710          14073.61\n\n\n\nthat's a pretty significant bump in overall performance for an additional 0.5M of memory per collection IMO ",
+            "id": "comment-14381011"
+        },
+        {
+            "date": "2015-03-31T23:08:59+0000",
+            "author": "Timothy Potter",
+            "content": "jfyi - my patch for SOLR-7332 includes the fix for this as well, but I'll probably separate the two before committing ",
+            "id": "comment-14389615"
+        },
+        {
+            "date": "2015-04-09T19:49:23+0000",
+            "author": "Yonik Seeley",
+            "content": "At first I couldn't understand why such a large number of buckets was needed... the math for two documents wanting to use the same bucket at the same time should be similar to the birthday problem: http://en.wikipedia.org/wiki/Birthday_problem , with \"n\" being the number of indexing threads, and \"d\" being the number of buckets.\n\nBut then I realized... if one add takes a long time because lucene used the thread to flush a segment, then other indexing threads will quickly pile up on the same bucket.  Basically, and indexing thread quickly indexes documents into random slots until it accidentally hits the same bucket as the blocked thread, and then it stops.\nI guess having lots of buckets is the best work-around we can do for now (but it still doesn't cure the problem).  The root cure would be a way for Lucene to not use client threads for long running index operations.\n ",
+            "id": "comment-14488125"
+        },
+        {
+            "date": "2015-04-10T20:26:34+0000",
+            "author": "Timothy Potter",
+            "content": "Thanks for the nice description of this Yonik! I think this thread dump shows the problem nicely:\n\n\n\"recoveryExecutor-7-thread-1\" prio=10 tid=0x00007f0fe821e800 nid=0xbafc runnable [0x00007f1003c30000]\n   java.lang.Thread.State: RUNNABLE\n        at org.apache.lucene.codecs.lucene41.Lucene41PostingsReader$BlockDocsEnum.nextDoc(Lucene41PostingsReader.java:440)\n        at org.apache.lucene.search.MultiTermQueryWrapperFilter.getDocIdSet(MultiTermQueryWrapperFilter.java:111)\n        at org.apache.lucene.search.ConstantScoreQuery$ConstantWeight.scorer(ConstantScoreQuery.java:157)\n        at org.apache.lucene.search.BooleanQuery$BooleanWeight.scorer(BooleanQuery.java:351)\n        at org.apache.lucene.search.QueryWrapperFilter$1.iterator(QueryWrapperFilter.java:59)\n        at org.apache.lucene.index.BufferedUpdatesStream.applyQueryDeletes(BufferedUpdatesStream.java:545)\n        at org.apache.lucene.index.BufferedUpdatesStream.applyDeletesAndUpdates(BufferedUpdatesStream.java:284)\n        - locked <0x00000005d9e96768> (a org.apache.lucene.index.BufferedUpdatesStream)\n        at org.apache.lucene.index.IndexWriter.applyAllDeletesAndUpdates(IndexWriter.java:3238)\n        - locked <0x00000005d9a4f2a8> (a org.apache.solr.update.SolrIndexWriter)\n        at org.apache.lucene.index.IndexWriter.maybeApplyDeletes(IndexWriter.java:3229)\n        - locked <0x00000005d9a4f2a8> (a org.apache.solr.update.SolrIndexWriter)\n        at org.apache.lucene.index.IndexWriter.getReader(IndexWriter.java:384)\n        - locked <0x00000005d9a4f2a8> (a org.apache.solr.update.SolrIndexWriter)\n        - locked <0x00000005dc1943a8> (a java.lang.Object)\n        at org.apache.lucene.index.StandardDirectoryReader.doOpenFromWriter(StandardDirectoryReader.java:289)\n        at org.apache.lucene.index.StandardDirectoryReader.doOpenIfChanged(StandardDirectoryReader.java:274)\n        at org.apache.lucene.index.DirectoryReader.openIfChanged(DirectoryReader.java:251)\n        at org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:1465)\n        at org.apache.solr.update.UpdateLog.add(UpdateLog.java:424)\n        - locked <0x00000005dd011ab8> (a org.apache.solr.update.UpdateLog)\n        at org.apache.solr.update.DirectUpdateHandler2.addAndDelete(DirectUpdateHandler2.java:449)\n        - locked <0x00000005dc1943d8> (a java.lang.Object)\n        at org.apache.solr.update.DirectUpdateHandler2.addDoc0(DirectUpdateHandler2.java:216)\n        at org.apache.solr.update.DirectUpdateHandler2.addDoc(DirectUpdateHandler2.java:160)\n        at org.apache.solr.update.processor.RunUpdateProcessor.processAdd(RunUpdateProcessorFactory.java:69)\n        at org.apache.solr.update.processor.UpdateRequestProcessor.processAdd(UpdateRequestProcessor.java:51)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.doLocalAdd(DistributedUpdateProcessor.java:928)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.versionAdd(DistributedUpdateProcessor.java:1082)\n        - locked <0x00000005c2b560d0> (a org.apache.solr.update.VersionBucket)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.processAdd(DistributedUpdateProcessor.java:695)\n        at org.apache.solr.update.processor.LogUpdateProcessor.processAdd(LogUpdateProcessorFactory.java:104)\n        at org.apache.solr.update.UpdateLog$LogReplayer.doReplay(UpdateLog.java:1343)\n        at org.apache.solr.update.UpdateLog$LogReplayer.run(UpdateLog.java:1217)\n        ...\n\n\n\nand\n\n\n\"recoveryExecutor-7-thread-2\" prio=10 tid=0x00007ec5b4003000 nid=0xc131 waiting for monitor entry [0x00007f1003aab000]\n   java.lang.Thread.State: BLOCKED (on object monitor)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.versionAdd(DistributedUpdateProcessor.java:999)\n        - waiting to lock <0x00000005c2b560d0> (a org.apache.solr.update.VersionBucket)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.processAdd(DistributedUpdateProcessor.java:695)\n        at org.apache.solr.update.processor.LogUpdateProcessor.processAdd(LogUpdateProcessorFactory.java:104)\n        at org.apache.solr.update.UpdateLog$LogReplayer.doReplay(UpdateLog.java:1343)\n        at org.apache.solr.update.UpdateLog$LogReplayer.run(UpdateLog.java:1217)\n        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:471)\n       ...\n\n ",
+            "id": "comment-14490307"
+        },
+        {
+            "date": "2015-05-20T14:51:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1680586 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1680586 ]\n\nSOLR-6820: Make the number of version buckets used by the UpdateLog configurable as increasing beyond the default 256 has been shown to help with high volume indexing performance in SolrCloud ",
+            "id": "comment-14552421"
+        },
+        {
+            "date": "2015-05-20T15:04:49+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1680593 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1680593 ]\n\nSOLR-6820: Make the number of version buckets used by the UpdateLog configurable as increasing beyond the default 256 has been shown to help with high volume indexing performance in SolrCloud ",
+            "id": "comment-14552456"
+        },
+        {
+            "date": "2015-05-20T15:39:05+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Shouldn't we increase the default numBuckets to 65536? It doesn't look very expensive to do so \u2013 the numBuckets are used to create an array of VersionBucket objects each of which contains a single long value. The benefit is quite significant for such a small cost. ",
+            "id": "comment-14552506"
+        },
+        {
+            "date": "2015-05-20T16:09:06+0000",
+            "author": "Timothy Potter",
+            "content": "Shalin Shekhar Mangar good point! I'm happy to make the default 65536 ... Yonik Seeley Mark Miller any objections to changing the default setting from 256 to 65536? Thanks. ",
+            "id": "comment-14552566"
+        },
+        {
+            "date": "2015-05-22T16:36:51+0000",
+            "author": "Erick Erickson",
+            "content": "Should we put the 65K bucket default into 5.2? I don't see a good reason not to. ",
+            "id": "comment-14556412"
+        },
+        {
+            "date": "2015-05-22T16:43:38+0000",
+            "author": "Yonik Seeley",
+            "content": "I don't like that it's a band-aid around the real problem, but it's the best pseudo-workaround we currently have I guess (it's based on luck... we're just lowering the likelihood of a different thread hitting the blocked bucket).\n\n+1 for raising to 65536 for 5.2 ",
+            "id": "comment-14556417"
+        },
+        {
+            "date": "2015-05-22T17:44:58+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1681169 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1681169 ]\n\nSOLR-6820: Increase the default number of buckets to 65536 instead of 256 ",
+            "id": "comment-14556497"
+        },
+        {
+            "date": "2015-05-22T17:56:22+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1681171 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1681171 ]\n\nSOLR-6820: Increase the default number of buckets to 65536 instead of 256 ",
+            "id": "comment-14556512"
+        },
+        {
+            "date": "2015-05-22T20:19:17+0000",
+            "author": "Timothy Potter",
+            "content": "This has been committed to 5.2 but I forgot to include the ticket # in the commit message for the 5.2 branch \n\nCommit on 5.2 branch was: revision 1681229. ",
+            "id": "comment-14556774"
+        },
+        {
+            "date": "2015-05-27T18:39:02+0000",
+            "author": "Timothy Potter",
+            "content": "Copy-and-paste error in the configset solrconfig.xml files, the int parameter is missing the name!\n\n\n    <updateLog>\n      <str name=\"dir\">${solr.ulog.dir:}</str>\n      <int name=\"\">${solr.ulog.numVersionBuckets:65536}</int>\n    </updateLog>\n\n\n\nbut should be:\n\n\n    <updateLog>\n      <str name=\"dir\">${solr.ulog.dir:}</str>\n      <int name=\"numVersionBuckets\">${solr.ulog.numVersionBuckets:65536}</int>\n    </updateLog>\n\n\n\nIt doesn't look like this causes any failures but looks bad. ",
+            "id": "comment-14561460"
+        },
+        {
+            "date": "2015-05-28T17:43:11+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682288 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1682288 ]\n\nSOLR-6820: fix numVersionBuckets name attribute in configsets ",
+            "id": "comment-14563320"
+        },
+        {
+            "date": "2015-05-28T17:47:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682291 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1682291 ]\n\nSOLR-6820: fix numVersionBuckets name attribute in configsets ",
+            "id": "comment-14563336"
+        },
+        {
+            "date": "2015-05-28T18:00:09+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682293 from Timothy Potter in branch 'dev/branches/lucene_solr_5_2'\n[ https://svn.apache.org/r1682293 ]\n\nSOLR-6820: fix numVersionBuckets name attribute in configsets ",
+            "id": "comment-14563361"
+        },
+        {
+            "date": "2015-05-28T18:00:36+0000",
+            "author": "Timothy Potter",
+            "content": "Fixed solrconfig.xmls - ready to go for 5.2 ",
+            "id": "comment-14563362"
+        },
+        {
+            "date": "2015-06-15T21:42:39+0000",
+            "author": "Anshum Gupta",
+            "content": "Bulk close for 5.2.0. ",
+            "id": "comment-14586796"
+        }
+    ]
+}

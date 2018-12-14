@@ -1,0 +1,156 @@
+{
+    "id": "LUCENE-3030",
+    "title": "Block tree terms dict & index",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Our default terms index today breaks terms into blocks of fixed size\n(ie, every 32 terms is a new block), and then we build an index on top\nof that (holding the start term for each block).\n\nBut, it should be better to instead break terms according to how they\nshare prefixes.  This results in variable sized blocks, but means\nwithin each block we maximize the shared prefix and minimize the\nresulting terms index.  It should also be a speedup for terms dict\nintensive queries because the terms index becomes a \"true\" prefix\ntrie, and can be used to fast-fail on term lookup (ie returning\nNOT_FOUND without having to seek/scan a terms block).\n\nHaving a true prefix trie should also enable much faster intersection\nwith automaton (but this will be a new issue).\n\nI've made an initial impl for this (called\nBlockTreeTermsWriter/Reader).  It's still a work in progress... lots\nof nocommits, and hairy code, but tests pass (at least once!).\n\nI made two new codecs, temporarily called StandardTree, PulsingTree,\nthat are just like their counterparts but use this new terms dict.\n\nI added a new \"exactOnly\" boolean to TermsEnum.seek.  If that's true\nand the term is NOT_FOUND, we will (quickly) return NOT_FOUND and the\nenum is unpositioned (ie you should not call next(), docs(), etc.).\n\nIn this approach the index and dict are tightly connected, so it does\nnot support a pluggable index impl like BlockTermsWriter/Reader.\nBlocks are stored on certain nodes of the prefix trie, and can contain\nboth terms and pointers to sub-blocks (ie, if the block is not a leaf\nblock).  So there are two trees, tied to one another \u2013 the index\ntrie, and the blocks.  Only certain nodes in the trie map to a block\nin the block tree.\n\nI think this algorithm is similar to burst tries\n(http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.18.3499),\nexcept it allows terms to be stored on inner blocks (not just leaf\nblocks).  This is important for Lucene because an [accidental]\n\"adversary\" could produce a terms dict with way too many blocks (way\ntoo much RAM used by the terms index).  Still, with my current patch,\nan adversary can produce too-big blocks... which we may need to fix,\nby letting the terms index not be a true prefix trie on it's leaf\nedges.\n\nExactly how the blocks are picked can be factored out as its own\npolicy (but I haven't done that yet).  Then, burst trie is one policy,\nmy current approach is another, etc.  The policy can be tuned to\nthe terms' expected distribution, eg if it's a primary key field and\nyou only use base 10 for each character then you want block sizes of\nsize 10.  This can make a sizable difference on lookup cost.\n\nI modified the FST Builder to allow for a \"plugin\" that freezes the\n\"tail\" (changed suffix) of each added term, because I use this to find\nthe blocks.",
+    "attachments": {
+        "BlockTree.png": "https://issues.apache.org/jira/secure/attachment/12489095/BlockTree.png",
+        "LUCENE-3030.patch": "https://issues.apache.org/jira/secure/attachment/12476382/LUCENE-3030.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2011-04-14T22:48:11+0000",
+            "content": "Patch. ",
+            "author": "Michael McCandless",
+            "id": "comment-13020076"
+        },
+        {
+            "date": "2011-04-24T18:35:58+0000",
+            "content": "Current patch... ",
+            "author": "Michael McCandless",
+            "id": "comment-13024661"
+        },
+        {
+            "date": "2011-07-22T16:01:28+0000",
+            "content": "Another rev of the patch... tons of nocommits, but I think it's close (though some tests still fail w/ StandardTree codec). ",
+            "author": "Michael McCandless",
+            "id": "comment-13069594"
+        },
+        {
+            "date": "2011-08-01T16:11:25+0000",
+            "content": "Checkpointing my current state here \u2013 the big change is I added a Terms.intersect(CompiledAutomaton) method, which returns a TermsEnum, but there's something wrong it still \u2013 seems to give the right results but makes LEV2 FuzzyQ slower. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073589"
+        },
+        {
+            "date": "2011-08-01T21:39:09+0000",
+            "content": "I created a branch https://svn.apache.org/repos/asf/lucene/dev/branches/blocktree_3030 for iterating on this. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073800"
+        },
+        {
+            "date": "2011-08-02T12:54:14+0000",
+            "content": "This is awesome, i really like adding the intersect() hook!\n\nThanks for making a branch, I will check it out and try to dive in to help with some of this  \n\nOne trivial thing we might want to do is to add the logic currently in AQ's ctor to CA, so that you ask CA for its termsenum.\nthis way, if it can be accomplished with a simpler enum like just terms.iterator() or prefixtermsenum etc etc we get that optimization always. ",
+            "author": "Robert Muir",
+            "id": "comment-13076177"
+        },
+        {
+            "date": "2011-08-02T12:57:39+0000",
+            "content": "Also, we should measure if a \"prefix automaton\" with intersect() is faster than PrefixTermsEnum (I suspect it could be!)\n\nIf this is true, we might want to not rewrite to prefixtermsenum anymore, instead changing PrefixQuery to extend AutomatonQuery too. ",
+            "author": "Robert Muir",
+            "id": "comment-13076178"
+        },
+        {
+            "date": "2011-08-02T13:34:12+0000",
+            "content": "One trivial thing we might want to do is to add the logic currently in AQ's ctor to CA, so that you ask CA for its termsenum.\n\n+1 \u2013 I think CA should serve up a TermsEnum when provided a Terms? ",
+            "author": "Michael McCandless",
+            "id": "comment-13076199"
+        },
+        {
+            "date": "2011-08-02T18:16:23+0000",
+            "content": "The block tree terms dict seems to be working... all tests pass w/\nStandardTree codec.  There's still more to do (many nocommits), but, I\nthink the perf results should be close to what I finally commit:\n\n\n\n\nTask\nQPS base\nStdDev base\nQPS blocktree\nStdDev blocktree\nPct diff\n\n\nIntNRQ\n11.58\n1.37\n10.11\n1.77\n35%-16%\n\n\nTerm\n106.65\n3.24\n98.84\n4.97\n14%-0%\n\n\nPrefix3\n30.83\n1.36\n28.64\n2.42\n18%-5%\n\n\nOrHighHigh\n5.85\n0.15\n5.44\n0.28\n14%-0%\n\n\nOrHighMed\n19.25\n0.62\n17.91\n0.86\n14%-0%\n\n\nPhrase\n9.37\n0.42\n8.87\n0.10\n10%-0%\n\n\nTermBGroup1M\n44.02\n0.90\n42.76\n1.08\n7%-1%\n\n\nTermGroup1M\n37.68\n0.65\n36.95\n0.74\n5%-1%\n\n\nTermBGroup1M1P\n47.16\n2.94\n46.36\n0.16\n7%-5%\n\n\nSpanNear\n5.60\n0.35\n5.55\n0.29\n11%-11%\n\n\nSloppyPhrase\n3.36\n0.16\n3.34\n0.04\n6%-5%\n\n\nWildcard\n35.15\n1.30\n35.05\n2.42\n10%-10%\n\n\nAndHighHigh\n10.71\n0.22\n10.99\n0.22\n1%-6%\n\n\nAndHighMed\n51.15\n1.44\n54.31\n1.84\n0%-12%\n\n\nFuzzy1\n31.63\n0.55\n66.15\n1.35\n101%-117%\n\n\nPKLookup\n40.00\n0.75\n84.93\n5.49\n94%-130%\n\n\nFuzzy2\n33.78\n0.82\n89.59\n2.46\n151%-179%\n\n\nRespell\n23.56\n1.15\n70.89\n1.77\n179%-224%\n\n\n\n\n\nThis is for a multi-segment index, 10 M wikipedia docs, using luceneutil.\n\nThese are huge speedups for the terms-dict intensive queries!\n\nThe two FuzzyQuerys and Respell get the speedup from the directly\nimplemented intersect method, and the PKLookup gets gains because it\ncan often avoid seeking since block tree's terms index can sometimes\nrule out terms by their prefix (though, this relies on the PK terms\nbeing \"predictable\" \u2013 I use \"%09d\" w/ a counter, now; if you instead\nused something more random looking (GUIDs )I don't think we'd see\ngains). ",
+            "author": "Michael McCandless",
+            "id": "comment-13078332"
+        },
+        {
+            "date": "2011-08-02T18:18:54+0000",
+            "content": "Here's the graph of the results:\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-13078337"
+        },
+        {
+            "date": "2011-08-02T20:01:02+0000",
+            "content": "These are huge speedups for the terms-dict intensive queries!\noh boy! This is awesome! ",
+            "author": "Simon Willnauer",
+            "id": "comment-13078400"
+        },
+        {
+            "date": "2011-08-16T15:51:07+0000",
+            "content": "Patch, removing all nocommits! ",
+            "author": "Michael McCandless",
+            "id": "comment-13085791"
+        },
+        {
+            "date": "2011-08-16T17:49:59+0000",
+            "content": "Some small cleanups over the last patch.  I'll commit shortly. ",
+            "author": "Michael McCandless",
+            "id": "comment-13085868"
+        },
+        {
+            "date": "2011-08-19T16:59:21+0000",
+            "content": "There is a small hit to indexing perf here, somewhere between 0 - 5% or so depending on the run.  Given the gains for MTQs I think this is an OK tradeoff.  We can further optimize the BlockTreeTermsWriter later.... ",
+            "author": "Michael McCandless",
+            "id": "comment-13087797"
+        },
+        {
+            "date": "2011-08-19T17:02:04+0000",
+            "content": "Final patch, against current trunk.  I think it's ready to commit!  I'll wait a day or so... ",
+            "author": "Michael McCandless",
+            "id": "comment-13087799"
+        },
+        {
+            "date": "2011-08-19T20:25:48+0000",
+            "content": "There is a small hit to indexing perf here, somewhere between 0 - 5% or so depending on the run. Given the gains for MTQs I think this is an OK tradeoff. We can further optimize the BlockTreeTermsWriter later....\n\nI think 0 - 5 % is totally fine. if somebody is totally obsessed by indexing throughput they should overclock \n\nawesome work mike! ",
+            "author": "Simon Willnauer",
+            "id": "comment-13087943"
+        },
+        {
+            "date": "2011-08-19T20:54:16+0000",
+            "content": "awesome work mike!\n\nI couldn't agree more, this is great stuff. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13087962"
+        },
+        {
+            "date": "2011-08-20T00:00:13+0000",
+            "content": "New patch, just cleaning up small stuff, commenting out the DEBUGs, adding some TODOs. ",
+            "author": "Michael McCandless",
+            "id": "comment-13088080"
+        },
+        {
+            "date": "2011-08-20T18:26:16+0000",
+            "content": "Just some trivial cleanups! ",
+            "author": "Robert Muir",
+            "id": "comment-13088242"
+        },
+        {
+            "date": "2011-08-20T19:08:05+0000",
+            "content": "Thanks Robert \u2013 looks good!  I'll commit shortly. ",
+            "author": "Michael McCandless",
+            "id": "comment-13088248"
+        },
+        {
+            "date": "2011-08-20T20:49:55+0000",
+            "content": "Awesome! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13088268"
+        },
+        {
+            "date": "2013-03-22T16:43:00+0000",
+            "content": "[branch_4x commit] Michael McCandless\nhttp://svn.apache.org/viewvc?view=revision&revision=1382141\n\nLUCENE-3030: add missing CHANGES entry ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610898"
+        }
+    ]
+}

@@ -1,0 +1,59 @@
+{
+    "id": "SOLR-11815",
+    "title": "TLOG leaders going down and rejoining as a replica do fullCopy when not needed",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "replication (java)"
+        ],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "7.2",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I am running a collection with a persistent high volume of writes. When the leader goes down and recovers, it joins as a replica and asks the new leader for the files to Sync. The isIndexStale check is finding that some files differ in size and checksum which forces a fullCopy. Since our indexes are rather large, a rolling restart is resulting in large amounts of data transfer, and in some cases disk space contention issues.\n\nI do not believe the fullCopy is necessary given the circumstances. \n\nRepro Steps:\n\n1. collection/shard with 1 leader and 1 replica are accepting writes\n\n\tPull interval is 30 seconds\n\tHard Commit interval is 60 seconds\n2. Replica executes an index pull and completes. \n3. Leader process Hard Commits (replica index is delayed)\n4. leader process is killed (SIGTERM)\n5. Replica takes over as new leader\n6. New leader applies TLOG since last pull (cores are binary-divergent now)\n7. Former leader comes back as New Replica\n8. New replica initiates recovery\n\tRecovery detects that the generation and version are behind and a check is necessary\n9. isIndexStale() detects that a segment exists on both the New Replica and New Leader but that the size and checksum differ. \n\tThis triggers fullCopy to be flagged on\n10. Entirety of index is pulled regardless of changes\n\n\n\nThe majority of files should not have changes, but everything gets pulled because of the first file it finds with a mismatched checksum. \n\nRelevant Code:\nhttps://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java#L516-L518\n\nhttps://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java#L1105-L1126",
+    "attachments": {
+        "SOLR-11815.patch": "https://issues.apache.org/jira/secure/attachment/12905557/SOLR-11815.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-01-03T22:06:12+0000",
+            "content": "I tried to reproduce the scenario by modifying TestTlogReplicas#testKillLeader(). I was unable to do so, since ChaosMonkey#stop() and ChaosMonkey#kill() both seem to kill the leader (instead of a graceful shutdown).\n\nI could reproduce it the hard way, using Docker:\nhttps://github.com/chatman/solr-grafana-docker/tree/master/tlog-restart\n\nIn short, here's my test scenario (https://github.com/chatman/solr-grafana-docker/blob/master/tlog-restart/indexing.sh):\n\n\tcreate collection with two TLOG replicas\n\tadd few docs\n\tcommit\n\tadd few docs\n\tcommit\n\tadd few docs\n\tstop leader\n\tadd few docs (to new leader)\n\tcommit (optional step; \"binary divergence\", as Shaun puts it, has already happened by now)\n\tbring back old leader\n\tobserve old leader's logs (it tries a fullCopy=true)\n\n\n\nFull copy happens due to mismatch; But, this is wasteful, since all but the recent segments are the same. ",
+            "author": "Ishan Chattopadhyaya",
+            "id": "comment-16310351"
+        },
+        {
+            "date": "2018-01-03T22:32:48+0000",
+            "content": "Good catch! \n\nDid this log line help debug this issue?\n\n\n          LOG.warn(\"File {} did not match. expected checksum is {} and actual is checksum {}. \" +\n              \"expected length is {} and actual length is {}\", filename, backupIndexFileChecksum, indexFileChecksum,\n              backupIndexFileLen, indexFileLen);\n\n\n\nMaybe filesToAlwaysDownloadIfNoChecksums should always download these files and isIndexStale should not report stale if these files don't have matching checksums \n\nOn a side note : All segment files now have checksums . The segment length checks were there for back-compat but from 6.0 techincally we could have removed it. This might make the code easier to read  ",
+            "author": "Varun Thacker",
+            "id": "comment-16310389"
+        },
+        {
+            "date": "2018-01-03T22:49:18+0000",
+            "content": "Yup, that log line was what sent us looking at this path. \n\nIf isIndexStale stops reporting checksum differences or file size mismatches, then it doesn't really do anything anymore and appears to be entirely removable.  ",
+            "author": "Shaun Sabo",
+            "id": "comment-16310421"
+        },
+        {
+            "date": "2018-01-03T23:35:36+0000",
+            "content": "From my uninformed view, it doesn't seem like the `isIndexStale` check is necessary. \n\nIf remove the check:\nhttps://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java#L516-L518 \n\nLater on in downloadIndexFiles:\nhttps://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java#L992\n\nIt will download any of those files if\n1) checksum/size mismatch\n2) fullCopyNeeded (called downloadCompleteIndex here)\n3) alwaysDownload\n\nSo it seems like the isIndexStale check was forcing condition (2) to be true, but actually just having condition (1) is probably sufficient, and operates on a file-by-file basis.\n\nIt doesn't seem like removing that check alters the filesToDownload set in any way, and it seems like downloadIndexFiles and isIndexStale use the same compareFile check.\n\n\nI was able to repro using ishan's script, though I had to make a minor adjustment to the collection create: https://gist.github.com/slackhappy/53f5674f2fcba434145b5db5adb07810 ",
+            "author": "John Gallagher",
+            "id": "comment-16310479"
+        },
+        {
+            "date": "2018-01-04T17:28:31+0000",
+            "content": "We spun a test up with isIndexStale commented out and found that the following block was causing us to still trigger a full re-replication as well when the checksum mismatch is discovered. We don't think that this check is necessary anymore either. \n\nhttps://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java#L1136-L1141 ",
+            "author": "Shaun Sabo",
+            "id": "comment-16311716"
+        },
+        {
+            "date": "2018-01-10T22:27:18+0000",
+            "content": "Adding a WIP patch that mitigates this issue. In the event of a full copy, I'm doing a differential copy: download whatever is new/different, but re-use the files that are same. It doesn't have tests, and brittle right now (naive class cast).\nEDIT: Moving this to its own issue, SOLR-11920.\n\nThis issue is to find a way to avoid fullCopy=true, since it seems wasteful. However, if the process of doing the fullCopy itself is optimized (SOLR-11920), then fixing this might not be necessary. ",
+            "author": "Ishan Chattopadhyaya",
+            "id": "comment-16321251"
+        }
+    ]
+}

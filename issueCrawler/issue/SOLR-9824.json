@@ -1,0 +1,266 @@
+{
+    "id": "SOLR-9824",
+    "title": "Documents indexed in bulk are replicated using too many HTTP requests",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "7.0"
+        ],
+        "affect_versions": "6.3",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "This takes awhile to explain; bear with me. While working on bulk indexing small documents, I looked at the logs of my SolrCloud nodes.  I noticed that shards would see an /update log message every ~6ms which is way too much.  These are requests from one shard (that isn't a leader/replica for these docs but the recipient from my client) to the target shard leader (no additional replicas).  One might ask why I'm not sending docs to the right shard in the first place; I have a reason but it's besides the point \u2013 there's a real Solr perf problem here and this probably applies equally to replicationFactor>1 situations too.  I could turn off the logs but that would hide useful stuff, and it's disconcerting to me that so many short-lived HTTP requests are happening, somehow at the bequest of DistributedUpdateProcessor.  After lots of analysis and debugging and hair pulling, I finally figured it out.  \n\nIn SOLR-7333 (Tim Potter) introduced an optimization called UpdateRequest.isLastDocInBatch() in which ConcurrentUpdateSolrClient will poll with a '0' timeout to the internal queue, so that it can close the connection without it hanging around any longer than needed.  This part makes sense to me.  Currently the only spot that has the smarts to set this flag is JavaBinUpdateRequestCodec.unmarshal.readOuterMostDocIterator() at the last document.  So if a shard received docs in a javabin stream (but not other formats) one would expect the last document to have this flag.  There's even a test.  Docs without this flag get the default poll time; for javabin it's 25ms.  Okay.\n\nI suspect that if someone used CloudSolrClient or HttpSolrClient to send javabin data in a batch, the intended efficiencies of SOLR-7333 would apply.  I didn't try. In my case, I'm using ConcurrentUpdateSolrClient (and BTW DistributedUpdateProcessor uses CUSC too).  CUSC uses the RequestWriter (defaulting to javabin) to send each document separately without any leading marker or trailing marker.  For the XML format by comparison, there is a leading and trailing marker (<stream> ... </stream>).  Since there's no outer container for the javabin unmarshalling to detect the last document, it marks every document as req.lastDocInBatch()!  Ouch!",
+    "attachments": {
+        "SOLR-9824-tflobbe.patch": "https://issues.apache.org/jira/secure/attachment/12868390/SOLR-9824-tflobbe.patch",
+        "SOLR-9824.patch": "https://issues.apache.org/jira/secure/attachment/12842460/SOLR-9824.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-12-03T00:54:55+0000",
+            "author": "David Smiley",
+            "content": "Work-around: Thanks to some additional conditions of when the lastDocInBatch condition happens, it's possible to work-around this performance bug by setting -Dsolr.cloud.replication.runners=2 (not 1).  I don't really like it at 2 but since it fixes the bug, I'm going with it.  In addition, in my environment I've set -Dsolr.cloud.replication.poll-queue-time-ms=1000; the default is 25.\n\nsolr.cloud.replication.poll-queue-time-ms:  The fact that this defaults to a measly 25ms is too low IMO.  I think it should be at least 250 \u2013 which happens to be the default in ConcurrentUpdateSolrClient.  The lower it is, the greater likelihood of more indexing overhead including log messages.  The greater it is, it could delay a /update connection from completing up to this amount of time.\n\nAddUpdateCommand.pollQueueTime defaults to 0, which is only modified to -Dsolr.cloud.replication.poll-queue-time-ms=25 by javabin.  So if you send data to Solr in anything other than javabin, boy are you in for some HTTP connection frenzy (I've tried).  I insist we set this to a reasonable number.  Perhaps 250 as per my other suggestion, and overridable using the same system property. ",
+            "id": "comment-15717028"
+        },
+        {
+            "date": "2016-12-07T06:39:37+0000",
+            "author": "Mark Miller",
+            "content": "Nice find. ",
+            "id": "comment-15727897"
+        },
+        {
+            "date": "2016-12-07T06:57:30+0000",
+            "author": "Mark Miller",
+            "content": "Hanging around for 250 ms after an update is pretty ugly. I'd like to think we can continue to find a better path. It's not that reasonable in the other direction. A single 10ms update shouldn't take 250ms. I refuse to believe this is what we have to do to fix this \n\nThere is normally a default of 250 because using that class means you want to blast documents in big batches. We are using it for large batches, small batches, and single updates though - the same default is not appropriate and  ",
+            "id": "comment-15727933"
+        },
+        {
+            "date": "2016-12-07T13:36:39+0000",
+            "author": "David Smiley",
+            "content": "Fair points Mark.\n\nI think the root fix of the problem I experienced is to modify ConcurrentUpdateSolrClient so that there is a leading and trailing marker.  Arguably this should be the job of the RequestWriter so that CUSC doesn't have to make format assumptions. Hopefully no changes to javabin encoding are needed; but until I next look closer at this, I'm not sure if it's avoidable. Perhaps JavaBinUpdateRequestCodec may need tweaks too.\n\nTo address this more generally for formats other than Javabin, I think the other formats could be improved to set lastDocInBatch.  This should of course apply even if the document isn't a \"batch\". Those formats could initially trigger the poll time to be 250ms (configurable via -Dsolr.cloud.replication.poll-queue-time-ms  knowing that it likely won't get hit.  For formats that have yet to be updated, I tend to think a non-zero value should be the default; perhaps 25ms? ",
+            "id": "comment-15728786"
+        },
+        {
+            "date": "2016-12-08T17:18:33+0000",
+            "author": "Mark Miller",
+            "content": "The lastDocInBatch trick may not be the right solution - it's not even really compatible with streaming in updates.\n\nI think we should be able to tackle this better somehow.\n\nThe client really should know what is up and communicate that to the server.\n\nAre we sending a single doc? Let the server know and it can avoid waiting. Are we sending a batch of documents in a single request? Let the server know and it can use a wait. Are we streaming in documents? We wait.\n\nThe lasDocInBatch could be an optimization on that that avoids waiting on the last doc in a batch, but it feels like we should be able to address this in a way that is not format specific as well. ",
+            "id": "comment-15732805"
+        },
+        {
+            "date": "2016-12-08T17:22:54+0000",
+            "author": "Mark Miller",
+            "content": "At least for the solrj clients - harder to do the same with raw http. ",
+            "id": "comment-15732817"
+        },
+        {
+            "date": "2016-12-08T17:43:51+0000",
+            "author": "Mark Miller",
+            "content": "Another idea is to look at the request size and use the wait when the size is large enough - streaming and chunked encoding would have no size and wait, small docs or a few docs would not wait, and lots of docs or a really large doc would wait. Given a really large doc will take a while anyway, the additional wait should not be that bad.\n\nJust another idea, will keep poking around this. ",
+            "id": "comment-15732865"
+        },
+        {
+            "date": "2016-12-08T17:55:36+0000",
+            "author": "David Smiley",
+            "content": "streaming and chunked encoding would have no size and wait\n\nThis sounds really clever if we can verify that most clients do send the size for small single docs. ",
+            "id": "comment-15732899"
+        },
+        {
+            "date": "2016-12-08T18:19:08+0000",
+            "author": "Mark Miller",
+            "content": "This sounds really clever if we can verify that most clients do send the size for small single docs.\n\nI fixed clients to send the size like they are supposed and avoid chunked encoding in the last year or two. Clients like curl and such are also smart enough to do this when you are not trying to stream something in (if you don't send it, you have to use chunked encoding).\n\nSo a very quick and simple win would be to always wait when there is no size as we know the client is trying to stream in multiple documents unless it's broken. ",
+            "id": "comment-15732967"
+        },
+        {
+            "date": "2016-12-08T18:54:30+0000",
+            "author": "Mark Miller",
+            "content": "\n                  if (pollQueueTime > 0 && threadCount == 1 && req.isLastDocInBatch()) {\n                    // no need to wait to see another doc in the queue if we've hit the last doc in a batch\n                    System.out.println(\"set poll time to 0\");\n                    upd = queue.poll(0, TimeUnit.MILLISECONDS);\n                  } else {\n                    upd = queue.poll(pollQueueTime, TimeUnit.MILLISECONDS);\n                  }\n\n\n\nThis extra optimization is the problem you describe in the description. ",
+            "id": "comment-15733062"
+        },
+        {
+            "date": "2016-12-08T19:52:20+0000",
+            "author": "Mark Miller",
+            "content": "Another possible optimization that could make clients always work is to start writing a start and end marker for the whole request. This would allow all of the Solr clients to handle this perfectly for every case. We could use a PushbackInputStream to work with or without these special markers.\n\nAnd we could still do the best guess approach based on size for HTTP clients.\n\n\n\tLooks pretty difficult to incorporate the last doc detection with that idea though \n\n ",
+            "id": "comment-15733236"
+        },
+        {
+            "date": "2016-12-08T22:58:54+0000",
+            "author": "Mark Miller",
+            "content": "No that marker trick type thing can't work. Bummer. ",
+            "id": "comment-15733653"
+        },
+        {
+            "date": "2016-12-09T00:58:42+0000",
+            "author": "Mark Miller",
+            "content": "Here is an idea that would work for all formats in all cases. ",
+            "id": "comment-15733894"
+        },
+        {
+            "date": "2016-12-09T01:06:21+0000",
+            "author": "Mark Miller",
+            "content": "So what I do is use a max int poll time and take advantage of that fact that we know internally we use CUSS like:\n\n\n\tCreate CUSS\n\tAddDocs\n\tBlockUntilFinished\n\tDone\n\n\n\nThis is not the general case where we may then add more docs or something, when we call blockUntilFinished we know all the docs we are going to add are in the queue.\nSo we use a max int queue poll time - we want a single connection and we know how long we want to keep the connection up. That means we have to bail on those queue waits though - so in blockUntilFinished, we just wait until the queue has been emptied and then we interrupt the waits on the queue polling so that all the runners shutdown.\n\nThe idea is, rather than this lastDoc flag that has so many issues, we just try to keep polling through the length of the request. ",
+            "id": "comment-15733911"
+        },
+        {
+            "date": "2016-12-09T06:01:12+0000",
+            "author": "David Smiley",
+            "content": "I like the idea of removing lastDoc; it's hard to work with.\n\nI'm not sure why we even need a longLastingThreads flag.  Can't we just ensure that blockUntilFinished() triggers the runners to interrupt their poll's always?  You're doing this now in the patch (albeit only when longLastingThreads==true) but why not simply always?  And why are Future's needed to do the cancel() when we can interrupt the Threads directly? We could expose them easily by having the Runner store it's current thread when run() is called.  If we didn't need a \"longLastingThreads\" boolean then the client could set the poll time independently, perhaps defaulting to '0' but might set it to be very long if it intends to call blockUntilFinished().  Arguably, blockUntilFinished() might log a warning if the poll time is zero because it would amount to misconfiguration.\n\nIt may be safer to ensure that interrupt() only affects the queue.poll calls and not anything else; but I'm unsure if anything else internal to writing the document to the stream would interrupt/cancel part way to warrant caring.  Do you know?  It's do-able but would require some extra boolean volatile state variables like doStop and currentlyPolling.\n\nI'm confused about something: the first line of sendUpdateStream() is while(!queue.isEmpty) but why even do that given that given we poll the queue?  i.e. why not while(true)?  Or perhaps why even loop at all given the caller has a similar loop. ",
+            "id": "comment-15734440"
+        },
+        {
+            "date": "2016-12-09T06:19:41+0000",
+            "author": "Mark Miller",
+            "content": "I'd rather not break the current client behavior. As it is now, you can keep a CUSS around and it will spin up and down threads as activity comes and goes. We are using CUSS in a very specific way though - we don't want threads to spin up and down, really we want one thread and we want it to stick around, whether we have a long GC pause, too much load, or whatever. A lot of load is not when you want to start tearing down and building more connections. I don't think we ever want to use 0 for this distrib update use case. Only if you could fix that lastDoc marker issue, and given how things work you really can't.\n\nThere are also back compat breaks I don't want to introduce. Interruption behavior being one of them.\n\nConsidering we are dealing with Runnable, I see no problem with using futures to cancel tasks, seems odder to try and break threads out of the executor. Futures are how you are supposed to wait for or cancel executor tasks. ",
+            "id": "comment-15734466"
+        },
+        {
+            "date": "2016-12-09T06:41:38+0000",
+            "author": "Mark Miller",
+            "content": "It may be safer to ensure that interrupt() only affects the queue.poll calls and not anything else;\n\nIt's fine - in our case we know all the outstanding documents have been added to the queue by the time we are in the blockuntilfinished block. We don't access CUSS in a multi threaded manner. Once we are in blockUntilFinished and the queue is empty, we know we are just interrupting poll.\n\nWe want to use CUSS internally because I don't want to dupe a bunch of this logic. But our use case and it's general use case are very different. We shouldn't try to fit both use cases in the same box.\n\nThis option will be for use cases like ours. You are not just keeping a server around to pull and use to add docs as needed over time. You are creating a instance for a known load of docs, it's going away after that load, and you don't want to spin up or down connections or threads, and we access the CUSS instance single threaded. That is the case we need to optimize for. I'm much less interested in improving CUSS for non internal use anyway, I'd rather spin any changes for that use case into another issue. It's really not a great client for SolrCloud for a lot of other reasons. And it's very easy to introduce bugs with changes that look like they don't hurt. We have seen those same types of changes hurt before.\n ",
+            "id": "comment-15734499"
+        },
+        {
+            "date": "2016-12-09T13:14:34+0000",
+            "author": "David Smiley",
+            "content": "Ok I get we want a flag to articulate that we want long-running threads.  It's really long-running connections specifically what we want; it sounds clearer to say it that way IMO.  Maybe longLastingThreads/Connections could be synonymous with a poll time of MAX_VALUE?\nSome other review comments:\n\n\tlongLastingThreads (perhaps better renamed longLastingConnections) should be final.\n\tBoth places where poll() is invoked, has the same surrounding try-catch InterruptedException logic; it could be extracted to a method that returns the Update (possibly null).\n\t\n\t\tsay what's the harm in removing the if !longLastingThreads so that it doesn't propagate; it just finishes the connection. That sounds like the right behavior to do always.\n\t\n\t\n\tI presume you're going to effectively revert SOLR-7333 and all related changes?\n\n\n\nRE Futures: I get what you're saying but I think it introduces needless complexity.  We're conditionally creating a Map, which needs to be populated and get items removed under the safety synchronized.  Runners need to be submitted differently to get Futures.  I think that's much more complex than saving the current Thread to a field on the Runner.\n\n(RE interruption) It's fine - in our case we know all the outstanding documents have been added to the queue by the time we are in the blockuntilfinished block. We don't access CUSS in a multi threaded manner. Once we are in blockUntilFinished and the queue is empty, we know we are just interrupting poll.\n\nThe spot where blockUntilFinished triggers interruption (via Future.cancel) indeed only occurs when the queue is empty (and we can be sure of that, and that no new docs will get added.  But the Runner could be in the middle of sending the last document it got.  I have no idea if somewhere internal to doing that, it might cause the sending of that document to not send and/or throw. ",
+            "id": "comment-15735278"
+        },
+        {
+            "date": "2016-12-11T00:32:52+0000",
+            "author": "Mark Miller",
+            "content": "So we do have to extract those threads. Future won't end up working because you can interrupt only once.\n\nAlso seems I can't easily get part of what I want, which is to not need a new request for when you hit a commit or delete by query, but seems that won't happen, very hard with the current overall logic. In that case we may be able to just have this the default behavior after all.\n\nThose were early exploratory patches, I wouldn't start nitpicking yet. They are just to show the approach.\n\nI presume you're going to effectively revert SOLR-7333 and all related changes?\n\nNah, wasn't planning on it. A request can hint that it's on the last doc, that's fine with me. If someone wants to pull that all out, that is fine, but I'm just not using the hint that is now available rather than pulling out code. ",
+            "id": "comment-15738751"
+        },
+        {
+            "date": "2016-12-11T00:36:52+0000",
+            "author": "Mark Miller",
+            "content": "Also, while I didn't want to change interrupt behavior, the current behavior is pretty useless - it only interrupts the current update and then just goes back into the loop. ",
+            "id": "comment-15738757"
+        },
+        {
+            "date": "2016-12-11T14:33:04+0000",
+            "author": "Mark Miller",
+            "content": "Here is where I am currently at. At the moment it builds on SOLR-9842.patch, which allows to be sure we shutdown the CUSS clients in all cases.\n\nNeeds more testing, but this path may work. ",
+            "id": "comment-15739828"
+        },
+        {
+            "date": "2016-12-11T20:06:59+0000",
+            "author": "Mark Miller",
+            "content": "This approach is testing out really well. I'll start cleaning up the patch. Still a bit more testing I'd like to do as well. ",
+            "id": "comment-15740261"
+        },
+        {
+            "date": "2016-12-12T01:09:40+0000",
+            "author": "Mark Miller",
+            "content": "More polish and lots more testing done.\n\nI did end up removing the polling setting on an updaterequest since it no longer takes effect.\n\nStill testing, but this is banging into shape. ",
+            "id": "comment-15740654"
+        },
+        {
+            "date": "2016-12-12T22:13:12+0000",
+            "author": "David Smiley",
+            "content": "I reviewed your patch.\n\n\tNice catch to remove that synchronized on HttpClientUtil.interceptors!  I like the use of CopyOnWriteArrayList there.\n\tI like that you managed to remove the proposed longLastingThreads flag for this behavior.  not having the flag also keeps things simpler, I think.\n\tCUSC.blockUntilFinished:\n\t\n\t\tI like the escalating timeout here starting at 10ms up to 250.\n\t\tI see that it may need to add a runner conditionally (non-empty queue size, empty runners)... but if that happens, I don't think we should invoke interruptRunnerThreadsPolling?  i.e. put that into an else branch.  Reason being... we if add a runner, don't go interrupting it immediately after.\n\t\tthere's a race due to inPoll just being a volatile variable and so it might be false and we might not interrupt when we actually wanted to, or vice versa... but I suppose it may not be a big issue since the queue is poll'ed with timeouts that don't take forever.  Adding comments to this effect would be good.\n\t\n\t\n\n\n\nThe obvious complexity of ConcurrentUpdateSolrClient worries me.  One small bit of evidence:  synchronized keyword on 3 different objects (this, queue, runners).  I was perhaps going to add more review comments but it takes awhile to digest what's going on and why we check for the things when we do.  I perhaps naively like to think it can be improved while retaining the features & performance it has now.  It's hard to review changes to CUSC as it is.  This isn't a slight against you or this patch.  Maybe we could think of ways to improve it?  I know any changes to CUSC are risky but if a refactor leads to more maintainable code then that is in and of itself less risk than continuing to add more complexity.  Perhaps one step might be refactoring out a specialized Queue + Executor which has the feature of scaling down to 0 runners when nothing's on the queue.  I dunno; just an idea. ",
+            "id": "comment-15743318"
+        },
+        {
+            "date": "2016-12-28T12:43:06+0000",
+            "author": "Mark Miller",
+            "content": "put that into an else branch. \n\nI'll do that.\n\nthere's a race due to inPoll just being a volatile variable and so it might be false and we might not interrupt when we actually wanted to, or vice versa... but I suppose it may not be a big issue since the queue is poll'ed with timeouts that don't take forever. Adding comments to this effect would be good.\n\nYeah, I don't think it's an issue. Distributed updates does use a very large timeout, but our use of blockUntilFinished will loop and interrupt again. We should not technically need this right now, but I like that it makes it safe for future code additions. For standard use it's really just a best effort to cut off any wait. I've done a lot of extensive testing with various update rates and update threads and such and have not seen an issue yet.\n\nCUSC\n\nYonik did almost a rewrite of it not too long ago to fix some bugs, and I don't have much appetite to rework it. There are tons of subtle things that can go wrong. It's complex, but I think they way it was written, it kind of is what it is. I think if we want a simpler model, we should probably create a new class with a different streaming design.\n\nI think the queue synchronize is really simple, and runners as well. That is fairly simple multithreaded code. I think the complication is in other parts of the design myself.\n\nThis class is a bit advanced for sure though. You have to be willing to spend some time to have confidence changing it. ",
+            "id": "comment-15782818"
+        },
+        {
+            "date": "2016-12-28T13:01:43+0000",
+            "author": "Mark Miller",
+            "content": "Here is my latest patch. Other then the couple changes from your comments, I think it has some other minor changes (I think I noticed tighter synchronization blocks), but I can't remember as I made those tweaks a while back. ",
+            "id": "comment-15782850"
+        },
+        {
+            "date": "2016-12-28T15:45:17+0000",
+            "author": "David Smiley",
+            "content": "Ok.  If you feel sufficiently comfortable with this patch to commit it then go for it.  I didn't review the details of this patch iteration because it's a PITA without a tool like GitHub.  It's an improvement... time will tell if there are bugs.\n\nBTW I noticed a minor typo... the test uses the word \"negligent\" when I think \"negligible\" is intended.\n\nThanks for working on this issue Mark.  The 6.4 release is going to be awesome. ",
+            "id": "comment-15783139"
+        },
+        {
+            "date": "2016-12-28T19:45:29+0000",
+            "author": "Mark Miller",
+            "content": "I'm getting pretty comfortable. I spent all the time on SOLR-2646 mostly for this issue, so that I could easily use CUSS against a SolrCloud cluster and check performance and results and logging under many different cases. Varied queue size, random pauses between updates, varied thread counts, etc, etc.\n\nGiven I have not touched this in a while, I'll probably do another battery of tests before committing it though. ",
+            "id": "comment-15783578"
+        },
+        {
+            "date": "2017-02-22T19:44:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d6337ac3e566c504766d69499ab470bd26744a29 in lucene-solr's branch refs/heads/master from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d6337ac ]\n\nSOLR-9824: Some bulk update paths could be very slow due to CUSC polling. ",
+            "id": "comment-15879075"
+        },
+        {
+            "date": "2017-04-19T03:58:36+0000",
+            "author": "David Smiley",
+            "content": "How about this gets committed for Solr 6.6? ",
+            "id": "comment-15974025"
+        },
+        {
+            "date": "2017-04-19T13:50:41+0000",
+            "author": "Mark Miller",
+            "content": "Once I get back to some beasting test runs on master. There were still a test or two hanging last time I tried to do a report and I want to rule this out first. ",
+            "id": "comment-15974697"
+        },
+        {
+            "date": "2017-05-16T20:18:49+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "I've seen tests hang too, mostly in waitForEmptyQueue(). Solr gets to a situation where the queue has one element, there is one runner and the scheduler is shutdown. I have only seen this when the test is shutting down.\nI added this change inside that loop:\n\nif (scheduler.isTerminated()) {\n  log.warn(\"The task queue still has elements but the update scheduler {} is terminated. Can't process any more tasks. \"\n            + \"Queue size: {}, Runners: {}. Current thread Interrupted? {}\", scheduler, queue.size(), runners.size(), threadInterrupted);\n  break;\n}\n\n\n\nand I have seen no more hungs in my tests (after 300+ runs). I checked the Thread dumps when this happens and there are no CUSC.Runner running. I believe the problem is that in addRunner we should remove the Runner from the runners list if scheduler.execute(r) fails. Something like:\n\nRunner r = new Runner();\nrunners.add(r);\ntry {\n  scheduler.execute(r);  // this can throw an exception if the scheduler has been shutdown, but that should be fine.\n} catch (RuntimeException e) {\n  runners.remove(r);\n  throw e;\n}\n\n\n ",
+            "id": "comment-16013047"
+        },
+        {
+            "date": "2017-05-16T20:27:53+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Patch with the changes proposed. Running tests with this now. Let me know what you think. ",
+            "id": "comment-16013056"
+        },
+        {
+            "date": "2017-05-23T03:05:14+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "I just committed the changes of my patch together with SOLR-10233 commit ",
+            "id": "comment-16020597"
+        },
+        {
+            "date": "2017-06-08T15:44:26+0000",
+            "author": "Mark Miller",
+            "content": "Thanks! Hadn't been paying attention closely here for a bit. I'll review this soon when I look at resolving this issue. ",
+            "id": "comment-16042889"
+        },
+        {
+            "date": "2017-06-08T15:47:27+0000",
+            "author": "David Smiley",
+            "content": "I guess this can be marked as Resolved for 7.0?  It's been committed there for awhile. ",
+            "id": "comment-16042894"
+        },
+        {
+            "date": "2017-06-12T14:05:54+0000",
+            "author": "Yago Riveiro",
+            "content": "Will this backported to 6.x branch? ",
+            "id": "comment-16046593"
+        },
+        {
+            "date": "2017-06-14T12:35:43+0000",
+            "author": "David Smiley",
+            "content": "+1 I will. ",
+            "id": "comment-16049124"
+        },
+        {
+            "date": "2017-06-16T15:48:34+0000",
+            "author": "Mark Miller",
+            "content": "Yeah, it's meant to go to 6.x. It was baking on 7. Tomas has likely fixed the main issue I was concerned about before backporting.\n\nThis is not resolved because it's still intended to be backported, just a complicated change that needed some baking time to make sure no major bugs were introduced. ",
+            "id": "comment-16052059"
+        },
+        {
+            "date": "2017-08-08T03:06:11+0000",
+            "author": "David Smiley",
+            "content": "I'm changing the issue status now to ensure it's clear that this problem is resolved in at least one version (to be released soon).  If someone has time, it can be back-ported later with fix-versions edited. ",
+            "id": "comment-16117778"
+        }
+    ]
+}

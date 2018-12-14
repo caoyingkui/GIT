@@ -1,0 +1,284 @@
+{
+    "id": "LUCENE-4599",
+    "title": "Compressed term vectors",
+    "details": {
+        "components": [
+            "core/codecs",
+            "core/termvectors"
+        ],
+        "fix_versions": [
+            "4.2"
+        ],
+        "affect_versions": "None",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Task",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "We should have codec-compressed term vectors similarly to what we have with stored fields.",
+    "attachments": {
+        "CompressingTVF_ingest_rate.png": "https://issues.apache.org/jira/secure/attachment/12565685/CompressingTVF_ingest_rate.png",
+        "4599-zookeer-fail.log": "https://issues.apache.org/jira/secure/attachment/12565650/4599-zookeer-fail.log",
+        "Lucene40TVF_ingest_rate.png": "https://issues.apache.org/jira/secure/attachment/12565686/Lucene40TVF_ingest_rate.png",
+        "solr.patch": "https://issues.apache.org/jira/secure/attachment/12565633/solr.patch",
+        "highlightNoStop.tasks": "https://issues.apache.org/jira/secure/attachment/12565703/highlightNoStop.tasks",
+        "4599-dataimport-fail.log": "https://issues.apache.org/jira/secure/attachment/12565651/4599-dataimport-fail.log",
+        "LUCENE-4599.patch": "https://issues.apache.org/jira/secure/attachment/12559891/LUCENE-4599.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-12-07T16:26:12+0000",
+            "content": "Initial patch. It makes term vectors behave like Lucene 4.1 stored fields: one index file which is loaded into memory in a memory-efficient way and one data file that stores the actual term vectors (so 2 files instead of 3 with the current term vectors impl).\n\nAll core tests except TestIndexWriter.testEmptyDirRollback pass (because this test expects that there are 3 files for term vectors).\n\nThis is only work in progress, I still need to:\n\n\tadd tests to try to visit all branches,\n\toverride the default merge(MergeState) impl\n\n\n\nI've tested this patch against 100000 docs from the 1K wikipedia dump, and term vectors were ~20% smaller (I should try against a corpus with bigger docs to get more relevant results).\n\nIf you have ideas to efficiently compress term vectors, you're welcome! Currently this patch does nothing crazy and stores terms and positions sequentially:\n\nterm1 - positions for term1 - offsets for term1 - payloads for term1 - term2 - ...\n\n\nGiven that many terms are likely to have a frequency of 1, it might be more efficient to pack the positions/offsets for several terms alltogether ",
+            "author": "Adrien Grand",
+            "id": "comment-13526505"
+        },
+        {
+            "date": "2012-12-07T16:52:07+0000",
+            "content": "\nIf you have ideas to efficiently compress term vectors, you're welcome!\n\nI think we waste space with the terms, especially prefix/suffix lengths (even so much so, the prefix encoding probably hurts in general for many people). these should likely be bulk-compressed. as you already noticed in the patch, frequencies are a waste too. \n\nflags are wasteful and stupid, but it seems like you already tried to address that to some extent. if we compress chunks of docs we should optimize the case where flags are the same. Its crazy that someone would have just positions for \"body field\" of document 2, but positions and offsets for \"body field\" of document 3.  ",
+            "author": "Robert Muir",
+            "id": "comment-13526535"
+        },
+        {
+            "date": "2012-12-07T17:19:56+0000",
+            "content": "I think we waste space with the terms, especially prefix/suffix lengths [..] these should likely be bulk-compressed\n\nGood point.\n\nflags are wasteful and stupid, but it seems like you already tried to address that to some extent\n\nI'm storing them in a packed ints array where each entry is 3 bits per value. I'll try to optimize when a field always has the same flags.\n ",
+            "author": "Adrien Grand",
+            "id": "comment-13526557"
+        },
+        {
+            "date": "2012-12-08T05:47:35+0000",
+            "content": "Does it make sense to put this in an FST where the key is the term bytes and the value is what you're doing now for the positions, offsets, and payloads in a byte array?  The point to this is that a term dictionary is going to use much less space with sharing of prefixes and suffixes of words.\n\nOr... can we simply reference the terms by ord (an int) instead of writing each term bytes? ",
+            "author": "David Smiley",
+            "id": "comment-13527075"
+        },
+        {
+            "date": "2012-12-08T15:27:04+0000",
+            "content": "I think a FST would not compress as much as what LZ4 or Deflate can do? But maybe it could speed up TermsEnum.seekCeil on large documents so it might be an interesting idea regarding random access speed?\n\ncan we simply reference the terms by ord (an int) instead of writing each term bytes?\n\nDo you mean their ords in the terms dictionary? Is that information available somewhere when writing/merging term vectors? ",
+            "author": "Adrien Grand",
+            "id": "comment-13527167"
+        },
+        {
+            "date": "2012-12-08T16:09:08+0000",
+            "content": "Does it make sense to put this in an FST where the key is the term bytes and the value is what you're doing now for the positions, offsets, and payloads in a byte array? \n\nThat's a neat idea   We should [almost] just be able to use MemoryPostingsFormat, since it already stores all postings in an FST.\n\nI think a FST would not compress as much as what LZ4 or Deflate can do? But maybe it could speed up TermsEnum.seekCeil on large documents so it might be an interesting idea regarding random access speed?\n\nLikely it would not compress as well, since LZ4/Deflate are able to share common infix fragments too, but FST only shares prefix/suffix.  It'd be interesting to test ... but we should explore this (FST-backed TermVectorsFormat) in a new issue I think ... this issue seems awesome enough already \n\nOr... can we simply reference the terms by ord (an int) instead of writing each term bytes?\n\nUsing ords matching the main terms dict is a neat idea too!  It would be much more compact ... but, when reading the term vectors we'd need to resolve-by-ord against the main terms dictionary (not all postings formats support that: it's optional, and eg our default PF doesn't), which would likely be slower than today.\n\nIs that information available somewhere when writing/merging term vectors?\n\nUnfortunately, no.  We only assign ords when it's time to flush the segment ... but we write term vectors \"live\" as we index each document.  If we changed that, eg buffered up term vectors, then we could get the ords when we wrote them. ",
+            "author": "Michael McCandless",
+            "id": "comment-13527180"
+        },
+        {
+            "date": "2012-12-08T17:25:02+0000",
+            "content": "The ord reference approach seems most interesting to me, even if it's not workable at the moment (based on Mike's comment).  If things were changed to make ord's possible then there wouldn't even need to be any term information in term-vectors whatsoever; right?  Not even the ord (integer) itself because the array of each term vector is intrinsically in ord-order and aligned exactly to each ord; right?\n\nDoes anyone know roughly what % of term-vector storage is currently for the term? ",
+            "author": "David Smiley",
+            "id": "comment-13527203"
+        },
+        {
+            "date": "2012-12-08T17:58:11+0000",
+            "content": "I'm not sure how much more compact ords would really be? start thinking about average word length, shared prefixes and so on, and long references (even though they could be delta-encoded since they are in order, i still imagine 3 or 4 bytes on average if you assume a large terms dict) don't seem to save a lot.\n\nI think its way more important to bulk encode the prefix/suffix lengths. ",
+            "author": "Robert Muir",
+            "id": "comment-13527215"
+        },
+        {
+            "date": "2012-12-18T16:39:27+0000",
+            "content": "With the 4.1 release triage likely coming soon, I am wondering if this is ready to make the cut or if it needs more work. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13535030"
+        },
+        {
+            "date": "2012-12-18T17:27:50+0000",
+            "content": "Hey Shawn, I'm still working actively on this issue. I made good progress regarding compression ratio but term vectors are more complicated than stored fields (with lots of corner cases like negative start offsets, negative lengths, fields that don't always have the same options, etc.) so I will need time and lots of Jenkins builds to feel comfortable making it the default term vectors impl. It will depend on the 4.1 release schedule but given that it's likely to comme rather soon and that I will have very little time to work on this issue until next month it will probably only make it to 4.2. ",
+            "author": "Adrien Grand",
+            "id": "comment-13535079"
+        },
+        {
+            "date": "2012-12-18T18:28:19+0000",
+            "content": "it will probably only make it to 4.2.\n\nI'm not surprised.  I had hoped it would make it, but there will be enough to do for release without working on half-baked features.  I might need to continue to use Solr from branch_4x even after 4.1 gets released.\n\nThank you for everything you've done for me personally and the entire project. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13535126"
+        },
+        {
+            "date": "2012-12-18T20:49:49+0000",
+            "content": "\nbut term vectors are more complicated than stored fields (with lots of corner cases like negative start offsets, negative lengths, fields that don't always have the same options, etc.)\n\nAnd all of these corner cases are completely bogus with no real use cases. We definitely need to make the long-term investment to fix this. Its so sad this kinda nonsense bullshit is slowing down Adrien here. Its hard to fix... I know ive wasted a lot of brain cycles on trying to come up with perfect solutions. But we have to make some progress somehow. ",
+            "author": "Robert Muir",
+            "id": "comment-13535295"
+        },
+        {
+            "date": "2012-12-19T17:24:28+0000",
+            "content": "New patch (still not committable yet) with better compression ratio thanks to the following optimizations:\n\n\tthe block of data compressed by LZ4 only contains term and payload bytes (without their lengths), everything else (positions, flags, term lengths, etc.) is stored using packed ints,\n\tterm freqs are encoded in a pfor-like way to save space (this was a 3x/4x decrease of the space needed to store freqs),\n\twhen all fields have the same flags (a 3-bits int that says whether positions/offsets/payloads are enabled), the flag is stored only once per distinct field,\n\twhen both positions and offsets are enabled, I compute average term lengths and only store the difference between the start offset and the expected start offset computed from the average term length and the position,\n\tfor lengths, this impl stores the difference between the indexed term length and the actual length (endOffset - startOffset), with an optimization when they are always equal to 0 (can happen with ASCII and an analyzer that does not perform stemming).\n\n\n\nDepending on the size of docs, not the same data takes most space in a single chunk:\n\n\n\n\u00a0\n Small docs (28 * 1K) \n Large doc (1 * 750K) \n\n\n Total chunk size (positions and offsets enabled) \n 21K \n 450K \n\n\n Term bytes \n 11K (16K before compression) \n 64K (84K before compression) \n\n\n Term lengths \n 2K \n 8K \n\n\n Positions \n 3K \n 215K \n\n\n Offsets \n 3K (4K if positions are disabled) \n 150K (240K if positions are disabled) \n\n\n Term freqs \n 500 \n 7K \n\n\n\n\nthe rest is negligible\n\n\n\tSo with small docs, most of space is occupied by term bytes whereas with large docs positions and offsets can easily take 80% of the chunk size.\n\tCompression might not be as good as with stored fields, especially when docs are large because terms have already been deduplicated.\n\n\n\nOverall, the on-disk format is more compact than the Lucene40 term vectors format (positions and offsets enabled, the number of documents indexed is not the same for small and large docs):\n\n\n\n\u00a0\n Small docs \n Large docs \n\n\n Lucene40 tvx \n 160033 \n 1633 \n\n\n Lucene40 tvd \n 49971 \n 232 \n\n\n Lucene40 tvf \n 11279483 \n 56640734 \n\n\n Compressing tvx \n 1116 \n 78 \n\n\n Compressing tvd \n 7589550 \n 44633841 \n\n\n\n\n\nThis impl is 34% smaller than the Lucene40 one on small docs (mainly thanks to compression) and 21% on large docs (mainly thanks to packed ints). If you have other ideas to improve this ratio, let me know!\n\nI still have to write more tests, clean up the patch, make reading term vectors more memory-efficient, and implement efficient merging... ",
+            "author": "Adrien Grand",
+            "id": "comment-13536166"
+        },
+        {
+            "date": "2013-01-19T00:51:34+0000",
+            "content": "New patch with tests, addProx and specialized merging. I think it is ready. This patch is similar to the previous ones except that it uses LZ4 compression on top of \"prefix compression\" (similarly to Lucene40TermVectorsFormat which writes the common prefix length with the previous term as a VInt before each term) instead of the raw term bytes to improve the compression ratio and relies on LUCENE-4643 for most integer encoding instead of raw packed ints. Otherwise:\n\n\tvectors are still compressed into blocks of 16 KB,\n\tlooking up term vectors requires at most 1 disk seek.\n\n\n\nHere are the size reductions of the term vector files depending on the size of the input docs:\n\n\n\n\n Field options / Document size \n 1 KB (a few tens of docs per chunk) \n 750 KB (one doc per chunk) \n\n\n none \n 37% \n 32% \n\n\n positions \n 32% \n 10% \n\n\n offsets \n 41% \n 31% \n\n\n positions+offsets \n 40% \n 35% \n\n\n\n\n\nRegarding speed, indexing seems to be slightly slower but maybe the diminution of the size of the vector files would make merging faster when not everything fits in the I/O cache. I also ran a simple benchmark that loads term vectors for every doc of the index and iterates over all terms and positions. This new format was ~5x slower for small docs (likely because it has to decode the whole chunk even to read a single doc) and between 1.5x and 2x faster for large docs that are alone in their chunk (again, results would very likely be better on a large index which wouldn't fully fit in the O/S cache).\n\nIf someone with very large term vector files wanted to test this new format, this would be great! I'll try on my side to perform more indexing/highlighting benchmarks.. ",
+            "author": "Adrien Grand",
+            "id": "comment-13557808"
+        },
+        {
+            "date": "2013-01-19T01:39:51+0000",
+            "content": "If someone with very large term vector files wanted to test this new format, this would be great! I'll try on my side to perform more indexing/highlighting benchmarks..\n\nMy indexes are pretty big, with termvectors taking up a lot of that. The 3.5.0 version of each of my shards is about 21GB. The same index in 4.1 with compressed stored fields is a little lres than 17 GB. I will give this patch a try on branch_4x. The full import will take 7-8 hours. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13557849"
+        },
+        {
+            "date": "2013-01-19T02:32:13+0000",
+            "content": "I should ask - will this be on by default in Solr with the patch?  I just got the patch applied to 4.1 because I already had it, decided to try it before branch_4x.  It has occurred to me that as a LUCENE issue, it might not be turned on for Solr. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13557889"
+        },
+        {
+            "date": "2013-01-19T11:30:22+0000",
+            "content": "The 3.5.0 version of each of my shards is about 21GB. The same index in 4.1 with compressed stored fields is a little less than 17 GB.\n\nGreat! I'm very curious to know how smaller your index will be with this new TV format!\n\nwill this be on by default in Solr with the patch?\n\nUnfortunately no. You need to define a custom codec, codec factory and declare it in your solrconfig.xml. I just attached a (quick and dirty) patch, I hope it helps! ",
+            "author": "Adrien Grand",
+            "id": "comment-13557970"
+        },
+        {
+            "date": "2013-01-19T17:41:49+0000",
+            "content": "in the Compressing41Codec class from the solr patch, there is a protected member.  I had to make that public or hundreds of tests were failing.  I don't know if that was the right thing to do, but it allowed the tests to proceed without immediate failures.  If they all pass after that change, I'll do another full-import.\n\n\n[junit4:junit4]    > Throwable #1: java.util.ServiceConfigurationError: Cannot instantiate SPI class: org.apache.solr.core.Compressing41Codec\n[junit4:junit4]    > Caused by: java.lang.IllegalAccessException: Class org.apache.lucene.util.NamedSPILoader can not access a member of class org.apache.solr.core.Compressing41Codec with modifiers \"protected\"\n\n[junit4:junit4]    > Throwable #1: java.lang.NoClassDefFoundError: Could not initialize class org.apache.lucene.codecs.Codec\n[junit4:junit4]    >    at org.apache.lucene.util.TestRuleSetupAndRestoreClassEnv.before(TestRuleSetupAndRestoreClassEnv.java:137)\n\n ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558057"
+        },
+        {
+            "date": "2013-01-19T18:01:41+0000",
+            "content": "Yes, the constructor must be public  ",
+            "author": "Uwe Schindler",
+            "id": "comment-13558063"
+        },
+        {
+            "date": "2013-01-19T18:53:55+0000",
+            "content": "Attaching test failure logs.  The zookeeper failure happened during heavy CPU and I/O utilization - I was optimizing a 17GB index on the same machine at the time.  The dataimport failure has happened twice so far.  I'm running the tests again ... after that I may go ahead and try this version anyway, even if there are still failures, just to see what it does to the index size.  If I run into actual operational failures during that trial, I'll let you know.\n\nThis is the lucene_solr_4_1 branch.  Applying the lucene patch required some fairly trivial manual work on one hunk.  The solr patch required protected->public tweaking as already described. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558071"
+        },
+        {
+            "date": "2013-01-19T19:42:05+0000",
+            "content": "Another test run produced another dataimport failure.  I went ahead and put the new version into place and updated my solrconfig.xml in the same way that the patch updated the example, now I have begun a full-import.  I'm not sure the new format took - Solr didn't complain about the format of my existing indexes like I expected. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558079"
+        },
+        {
+            "date": "2013-01-19T20:29:04+0000",
+            "content": "Another test run produced another dataimport failure.\n\nCould be the DST change in Fidji today, see mailing list. I disabled the test.\n\nI'm not sure the new format took - Solr didn't complain about the format of my existing indexes like I expected.\n\nThe CodecFactory in the patch produces a new index format, which is marked by another header (\"Compressing41\"). An existing index has the codec id \"Lucene41\" and is still readable (Lucene will use the default codec to read it). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13558089"
+        },
+        {
+            "date": "2013-01-20T00:55:06+0000",
+            "content": "I tried to reproduce the SOlr cloud error (ant test  -Dtestcase=ClusterStateUpdateTest -Dtests.method=testCoreRegistration -Dtests.seed=F72E8E946F6EBEAF -Dtests.nightly=true -Dtests.weekly=true -Dtests.slow=true -Dtests.locale=sr_RS -Dtests.timezone=Africa/Bamako -Dtests.file.encoding=UTF-8) but it succceeded, so I assume it's a random Solr cloud failure due to the fact that your machine was very busy? ",
+            "author": "Adrien Grand",
+            "id": "comment-13558140"
+        },
+        {
+            "date": "2013-01-20T02:25:42+0000",
+            "content": "so I assume it's a random Solr cloud failure due to the fact that your machine was very busy?\n\nThat's my assumption too.  My worry is that a real SolrCloud might fail in a similar way if the machines involved become really busy.  If the test is designed to have much tighter constraints than a typical production cloud, then it might not be something I have to worry about. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558148"
+        },
+        {
+            "date": "2013-01-20T04:06:42+0000",
+            "content": "My full import just finished.  The indexes built with a patched Solr from lucene_solr_4_1 are pretty much the same size as they were before.    The indexes below that end in 0 are the recently built cores that are now live.  The ones that end in 1 are the ones built with an unmodified 4.1.\n\n\nncindex@bigindy5 /index/solr4/data $ du -sc *\n762820  inc_0\n742984  inc_1\n24      ncmain\n17210772        s0_0\n17214504        s0_1\n17211784        s1_0\n17143900        s1_1\n17191632        s2_0\n17190108        s2_1\n17192292        s3_0\n17188164        s3_1\n17198920        s4_0\n17200008        s4_1\n17205092        s5_0\n17205800        s5_1\n207858804       total\n\n ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558157"
+        },
+        {
+            "date": "2013-01-20T04:42:29+0000",
+            "content": "You can ignore the previous comment.  I thought I had added the codec line to solrconfig.xml \u2013 turns out that I edited the solrconfig from the 3.5.0 directory, not the 4.1 directory.  On my dev server, the 3.5 solr isn't even running.  Now that I've got the right config changed, a new full-import looks like it's probably working - there are now two termvector files per segment instead of three. ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558164"
+        },
+        {
+            "date": "2013-01-20T13:17:24+0000",
+            "content": "New files are 53.2% of the old size.\nNew TV files total 3890809739.\nOld TV files total 7311612548.\n\n\nUnmodified Solr 4.1:\ntotal 17154140\ndrwxr-xr-x 2 ncindex ncindex      45056 Jan 19 21:35 ./\ndrwxr-xr-x 4 ncindex ncindex       4096 Jan 18 20:15 ../\n-rw-r--r-- 1 ncindex ncindex         99 Jan 19 21:28 segments_dt\n-rw-r--r-- 1 ncindex ncindex         20 Jan 19 21:28 segments.gen\n-rw-r--r-- 1 ncindex ncindex 3220362314 Jan 19 21:11 _uk.fdt\n-rw-r--r-- 1 ncindex ncindex    1796091 Jan 19 21:11 _uk.fdx\n-rw-r--r-- 1 ncindex ncindex       3291 Jan 19 21:28 _uk.fnm\n-rw-r--r-- 1 ncindex ncindex 2712855241 Jan 19 21:23 _uk_Lucene41_0.doc\n-rw-r--r-- 1 ncindex ncindex 2641242950 Jan 19 21:23 _uk_Lucene41_0.pos\n-rw-r--r-- 1 ncindex ncindex 1605874308 Jan 19 21:23 _uk_Lucene41_0.tim\n-rw-r--r-- 1 ncindex ncindex   35091811 Jan 19 21:23 _uk_Lucene41_0.tip\n-rw-r--r-- 1 ncindex ncindex        115 Jan 19 21:28 _uk_nrm.cfe\n-rw-r--r-- 1 ncindex ncindex   36874222 Jan 19 21:28 _uk_nrm.cfs\n-rw-r--r-- 1 ncindex ncindex        473 Jan 19 21:28 _uk.si\n-rw-r--r-- 1 ncindex ncindex   24581897 Jan 19 21:28 _uk.tvd\n-rw-r--r-- 1 ncindex ncindex 7090368538 Jan 19 21:28 _uk.tvf\n-rw-r--r-- 1 ncindex ncindex  196662113 Jan 19 21:28 _uk.tvx\n\nSolr 4.1 with patch:\ntotal 13812100\ndrwxr-xr-x 2 ncindex ncindex      53248 Jan 20 06:10 ./\ndrwxr-xr-x 4 ncindex ncindex       4096 Jan 18 20:15 ../\n-rw-r--r-- 1 ncindex ncindex 3220492130 Jan 20 05:54 _1oy.fdt\n-rw-r--r-- 1 ncindex ncindex    1790533 Jan 20 05:54 _1oy.fdx\n-rw-r--r-- 1 ncindex ncindex       3291 Jan 20 06:10 _1oy.fnm\n-rw-r--r-- 1 ncindex ncindex 2713448546 Jan 20 06:08 _1oy_Lucene41_0.doc\n-rw-r--r-- 1 ncindex ncindex 2640844965 Jan 20 06:08 _1oy_Lucene41_0.pos\n-rw-r--r-- 1 ncindex ncindex 1604289094 Jan 20 06:08 _1oy_Lucene41_0.tim\n-rw-r--r-- 1 ncindex ncindex   34910618 Jan 20 06:08 _1oy_Lucene41_0.tip\n-rw-r--r-- 1 ncindex ncindex        115 Jan 20 06:10 _1oy_nrm.cfe\n-rw-r--r-- 1 ncindex ncindex   36874183 Jan 20 06:10 _1oy_nrm.cfs\n-rw-r--r-- 1 ncindex ncindex        477 Jan 20 06:10 _1oy.si\n-rw-r--r-- 1 ncindex ncindex 3889805695 Jan 20 06:10 _1oy.tvd\n-rw-r--r-- 1 ncindex ncindex    1004044 Jan 20 06:10 _1oy.tvx\n-rw-r--r-- 1 ncindex ncindex         20 Jan 20 06:10 segments.gen\n-rw-r--r-- 1 ncindex ncindex        105 Jan 20 06:10 segments_ul\n-rw-r--r-- 1 ncindex ncindex          0 Jan 19 21:39 write.lock\n\n\n\nFor this listing, the _0 and _1 indexes have been swapped - now the _1 indexes are live.\n\n\nncindex@bigindy5 /index/solr4/data $ du -sc *\n492     inc_0\n609212  inc_1\n24      ncmain\n17154980        s0_0\n13840212        s0_1\n17211000        s1_0\n13913260        s1_1\n17191660        s2_0\n13895536        s2_1\n17192320        s3_0\n13889920        s3_1\n17198940        s4_0\n13897380        s4_1\n17205112        s5_0\n13918936        s5_1\n187118984       total\n\n ",
+            "author": "Shawn Heisey",
+            "id": "comment-13558245"
+        },
+        {
+            "date": "2013-01-20T15:02:52+0000",
+            "content": "Thanks for testing Shawn, it's a nice size reduction!\n\nI performed an indexing benchmark with luceneutil on 1M docs from the wikibig collection. Indexing went 17% faster (I attached the ingest rates) and term vector files were 34% smaller (3.9G instead of 5.9G). ",
+            "author": "Adrien Grand",
+            "id": "comment-13558268"
+        },
+        {
+            "date": "2013-01-20T17:24:31+0000",
+            "content": "I ran the highlight tasks from luceneutil (I had to remove stop words first, see attached tasks file). The index contains 500k docs from wikibig and fully fits in the O/S cache.\n\n\n                    TaskQPS Lucene40      StdDevQPS Compressing      StdDev                Pct diff\n                 LowTerm      411.77      (3.8%)      268.23      (2.1%)  -34.9% ( -39% -  -30%)\n                 MedTerm      352.85      (5.2%)      242.88      (3.8%)  -31.2% ( -38% -  -23%)\n                HighTerm      231.72      (6.7%)      177.52      (5.8%)  -23.4% ( -33% -  -11%)\n               LowPhrase      226.94      (3.7%)      177.07      (1.9%)  -22.0% ( -26% -  -16%)\n              AndHighMed      136.94      (2.2%)      119.63      (1.8%)  -12.6% ( -16% -   -8%)\n               OrHighLow      124.73      (5.2%)      111.01      (3.6%)  -11.0% ( -18% -   -2%)\n               OrHighMed       82.16      (6.8%)       75.91      (4.7%)   -7.6% ( -17% -    4%)\n              OrHighHigh       73.41      (5.9%)       68.18      (6.1%)   -7.1% ( -18% -    5%)\n               MedPhrase       34.41      (5.5%)       32.28      (8.1%)   -6.2% ( -18% -    7%)\n              HighPhrase       44.10      (3.9%)       41.47      (4.9%)   -6.0% ( -14% -    2%)\n         LowSloppyPhrase       36.07      (4.8%)       33.93      (5.4%)   -5.9% ( -15% -    4%)\n             AndHighHigh       49.13      (2.6%)       46.27      (2.2%)   -5.8% ( -10% -   -1%)\n         MedSloppyPhrase       12.84      (3.8%)       12.20      (6.2%)   -5.0% ( -14% -    5%)\n        HighSloppyPhrase       13.20      (4.6%)       12.58      (6.5%)   -4.7% ( -15% -    6%)\n             LowSpanNear        7.94     (10.7%)        7.69      (8.2%)   -3.2% ( -19% -   17%)\n            HighSpanNear        5.32      (3.6%)        5.24      (4.4%)   -1.6% (  -9% -    6%)\n              AndHighLow     3780.85      (4.0%)     3756.77      (7.5%)   -0.6% ( -11% -   11%)\n                PKLookup      341.94      (2.2%)      340.85      (2.4%)   -0.3% (  -4% -    4%)\n                 Prefix3      122.64      (3.8%)      122.60      (4.3%)   -0.0% (  -7% -    8%)\n                Wildcard      188.27      (3.2%)      188.23      (3.2%)   -0.0% (  -6% -    6%)\n                  IntNRQ      136.55      (7.2%)      137.57      (7.4%)    0.7% ( -12% -   16%)\n             MedSpanNear       40.54      (6.0%)       40.94      (6.4%)    1.0% ( -10% -   14%)\n                 Respell       58.13      (4.0%)       59.35      (3.5%)    2.1% (  -5% -    9%)\n                  Fuzzy2       55.24      (5.7%)       57.72      (7.8%)    4.5% (  -8% -   19%)\n                  Fuzzy1       76.40      (5.9%)       83.67      (4.0%)    9.5% (   0% -   20%)\n\n\n\nResults are disappointing, and I'm surprised that some queries perform much worse while other ones perform better. I'll dig but if someone has an idea why (I'm not familiar at all with FastVectorHighlighter), I'm interested to know his/her theory! ",
+            "author": "Adrien Grand",
+            "id": "comment-13558320"
+        },
+        {
+            "date": "2013-01-20T21:56:09+0000",
+            "content": "OK, I think I understood: I had forgotten to turn debug off, and although documents in this collection are rather big, queries tend to favor small docs, whose chunks contain more documents (up to 30). I ran the benchmark again with a very small chunk size (128) so that chunks would likely contain a single doc and results got better :\n\n                  Fuzzy2       94.39      (7.8%)       88.33      (7.5%)   -6.4% ( -20% -    9%)\n                 MedTerm      292.09      (2.7%)      279.01      (2.6%)   -4.5% (  -9% -    0%)\n              OrHighHigh       76.84      (7.4%)       73.58      (5.8%)   -4.2% ( -16% -    9%)\n                  Fuzzy1       93.07      (4.8%)       89.59      (4.4%)   -3.7% ( -12% -    5%)\n               OrHighMed       69.23      (6.4%)       67.17      (4.9%)   -3.0% ( -13% -    8%)\n              HighPhrase        8.54      (9.4%)        8.36     (11.6%)   -2.1% ( -21% -   20%)\n               LowPhrase      125.02      (2.5%)      122.91      (3.4%)   -1.7% (  -7% -    4%)\n               MedPhrase       39.97      (5.3%)       39.58      (7.6%)   -1.0% ( -13% -   12%)\n                HighTerm      177.70      (2.4%)      176.21      (2.2%)   -0.8% (  -5% -    3%)\n                 LowTerm      370.26      (3.7%)      367.36      (2.8%)   -0.8% (  -7% -    5%)\n               OrHighLow      106.08      (5.2%)      105.41      (4.7%)   -0.6% ( -10% -    9%)\n         LowSloppyPhrase       71.29      (5.2%)       70.95      (5.3%)   -0.5% ( -10% -   10%)\n        HighSloppyPhrase       30.52      (5.6%)       30.39      (5.2%)   -0.4% ( -10% -   10%)\n                PKLookup      339.12      (3.0%)      338.09      (3.1%)   -0.3% (  -6% -    5%)\n         MedSloppyPhrase       71.13      (4.2%)       70.95      (4.4%)   -0.3% (  -8% -    8%)\n              AndHighLow      259.19      (3.8%)      258.54      (5.1%)   -0.2% (  -8% -    8%)\n                 Respell       69.04      (3.7%)       68.92      (3.2%)   -0.2% (  -6% -    6%)\n             AndHighHigh       74.49      (1.5%)       74.47      (1.8%)   -0.0% (  -3% -    3%)\n                Wildcard      157.16      (2.0%)      157.21      (1.9%)    0.0% (  -3% -    3%)\n              AndHighMed       79.81      (2.1%)       80.16      (1.6%)    0.4% (  -3% -    4%)\n             MedSpanNear       14.09      (3.6%)       14.16      (4.4%)    0.5% (  -7% -    8%)\n                 Prefix3      281.17      (2.7%)      282.85      (2.5%)    0.6% (  -4% -    5%)\n            HighSpanNear        7.73      (3.9%)        7.79      (2.8%)    0.8% (  -5% -    7%)\n                  IntNRQ      143.14      (3.0%)      144.45      (3.2%)    0.9% (  -5% -    7%)\n             LowSpanNear       23.85      (6.6%)       24.36      (6.0%)    2.2% (  -9% -   15%)\n\n\n\n(Decreasing the chunk size from 16KB to 128 made the compression ratio increase from 66% to 68%.) ",
+            "author": "Adrien Grand",
+            "id": "comment-13558401"
+        },
+        {
+            "date": "2013-01-20T22:54:09+0000",
+            "content": "I tried to compute the compression ratio of the term vector files compared to Lucene40TVF for small docs (the wikipedia 1K docs) based on the chunk size (the patch has 2^14 as a default chunk size):\n\n\n\n Chunk size \n no options \n positions + offsets \n\n\n 2^7 \n 0.79 \n 0.68 \n\n\n 2^8 \n 0.79 \n 0.68 \n\n\n 2^9 \n 0.75 \n 0.66 \n\n\n 2^10\n 0.73 \n 0.65 \n\n\n 2^11\n 0.70 \n 0.63 \n\n\n 2^12\n 0.68 \n 0.62 \n\n\n 2^13\n 0.65 \n 0.60 \n\n\n 2^14\n 0.63 \n 0.59 \n\n\n 2^15\n 0.62 \n 0.58 \n\n\n 2^16\n 0.62 \n 0.59 \n\n\n 2^17\n 0.62 \n 0.58 \n\n\n\n\n\nInterestingly, raising the chunk size above 2^14 doesn't bring much. 2^11 or 2^12 look like good candidates for the default size if we were to make this TVF the default one (making big documents likely to be alone in their chunks and preventing small docs from raising the compression ratio).\n ",
+            "author": "Adrien Grand",
+            "id": "comment-13558418"
+        },
+        {
+            "date": "2013-01-20T23:33:58+0000",
+            "content": "If there's no objection, I plan to commit soon. ",
+            "author": "Adrien Grand",
+            "id": "comment-13558435"
+        },
+        {
+            "date": "2013-01-21T20:18:15+0000",
+            "content": "[branch_4x commit] Adrien Grand\nhttp://svn.apache.org/viewvc?view=revision&revision=1436584\n\nLUCENE-4599: New compressed TVF impl: CompressingTermVectorsFormat (merged from r1436556).\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13559058"
+        },
+        {
+            "date": "2013-01-21T20:18:17+0000",
+            "content": "[trunk commit] Adrien Grand\nhttp://svn.apache.org/viewvc?view=revision&revision=1436556\n\nLUCENE-4599: New compressed TVF impl: CompressingTermVectorsFormat.\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13559059"
+        },
+        {
+            "date": "2013-01-22T06:52:12+0000",
+            "content": "[branch_4x commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1436764\n\nLUCENE-4599: fix Compressing vectors to not return a docsAndPositions when it has no prox ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13559432"
+        },
+        {
+            "date": "2013-01-22T06:54:13+0000",
+            "content": "[trunk commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1436765\n\nLUCENE-4599: fix Compressing vectors to not return a docsAndPositions when it has no prox ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13559435"
+        },
+        {
+            "date": "2013-01-22T09:56:42+0000",
+            "content": "Great reduction! Is this going to be enabled in the default Lucene 41 codec that already compresses stored fields? ",
+            "author": "Markus Jelsma",
+            "id": "comment-13559524"
+        },
+        {
+            "date": "2013-01-22T10:03:04+0000",
+            "content": "Unfortunately it is too late for Lucene 4.1 and anyway this new format still requires a lot of testing, but I plan to propose to make it the default term vectors format for Lucene 4.2, so yes Lucene 4.2 might compress both stored fields and term vectors. ",
+            "author": "Adrien Grand",
+            "id": "comment-13559527"
+        },
+        {
+            "date": "2013-01-22T10:08:46+0000",
+            "content": "Alright. Do you already have an issue filed for making it default in trunk so i can watch? We use recent Solr/Lucene trunk check outs and are interested in how this affects stuff. ",
+            "author": "Markus Jelsma",
+            "id": "comment-13559528"
+        },
+        {
+            "date": "2013-01-22T10:13:29+0000",
+            "content": "Not yet. I'm leaving some time for the Jenkins instances to find bugs (for example, one of them found a little bug last night that Robert had to fix) and for people to criticize/fix/improve the format. ",
+            "author": "Adrien Grand",
+            "id": "comment-13559530"
+        },
+        {
+            "date": "2013-01-22T10:46:41+0000",
+            "content": "Alright. Looking forward to that. Thanks Adrien! ",
+            "author": "Markus Jelsma",
+            "id": "comment-13559540"
+        },
+        {
+            "date": "2013-05-10T10:34:38+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13654279"
+        }
+    ]
+}

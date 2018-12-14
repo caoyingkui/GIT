@@ -1,0 +1,120 @@
+{
+    "id": "SOLR-10020",
+    "title": "CoreAdminHandler silently swallows some errors",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "With the setup on SOLR-10006, after removing some index files and starting that Solr instance I tried issuing a REQUESTRECOVERY command and it came back as a success even though nothing actually happened. When the core is accessed, a core init exception is returned by subsequent calls to getCore(). There is no catch block after the try so no error is returned.\n\nLooking through the code I see several other commands that have a similar pattern:\n FORCEPREPAREFORLEADERSHIP_OP\nLISTSNAPSHOTS_OP\ngetCoreStatus\n\nand perhaps others. getCore() can throw an exception, about the only explicit one it does throw is if the core has an initialization error.",
+    "attachments": {
+        "SOLR-10020.patch": "https://issues.apache.org/jira/secure/attachment/12848943/SOLR-10020.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-23T16:40:15+0000",
+            "content": "When trying this I see the following in the solr logs:\n\n\n7329 INFO  (qtp407457709-27) [n:127.0.0.1:40165_solr    ] o.a.s.h.a.CoreAdminOperation It has been requested that we recover: core=collection1_shard1_replica1\n7330 INFO  (qtp407457709-27) [n:127.0.0.1:40165_solr    ] o.a.s.s.HttpSolrCall [admin] webapp=null path=/admin/cores params={core=collection1_shard1_replica1&action=REQUESTRECOVERY&wt=javabin&version=2} status=0 QTime=1\n7331 ERROR (Thread-30) [n:127.0.0.1:40165_solr    ] o.a.s.h.a.CoreAdminOperation Could not find core to call recovery:collection1_shard1_replica1\n\n\n\nSo, two things to note here - there is an error logged somewhere that this operation failed, and the error logged is after the request has already completed. I think it is correct to process the recovery async, since it could presumably take a long time, but I guess we should also be treating it like every other async request and return an id for it.\n\nIn LISTSNAPSHOTS_OP there is an explicit null check and throw SolrException. Agree with you that FORCEPREPAREFORLEADERSHIP_OP should likely throw instead of log, that might be better as a separate issue though since I don't know what relies on current behaviour. getCoreStatus is probably fine, since it will be evident from the lack of info returned. I didn't see any other cases where we need to fix anything (REQUESTBUFFERUPDATES_OP throws an exception). ",
+            "author": "Mike Drob",
+            "id": "comment-15834856"
+        },
+        {
+            "date": "2017-01-23T16:44:49+0000",
+            "content": "I haven't run any tests yet, but this is what one approach could look like. What do you think, Erick Erickson? ",
+            "author": "Mike Drob",
+            "id": "comment-15834860"
+        },
+        {
+            "date": "2017-01-23T21:56:20+0000",
+            "content": "ant test came back clean for me. ",
+            "author": "Mike Drob",
+            "id": "comment-15835268"
+        },
+        {
+            "date": "2017-02-07T19:58:35+0000",
+            "content": "Erick Erickson - Do you have time to look at this patch? ",
+            "author": "Mike Drob",
+            "id": "comment-15856679"
+        },
+        {
+            "date": "2017-02-07T21:54:01+0000",
+            "content": "Sorry, this week is crazy, so I probably can't until at least the weekend. ",
+            "author": "Erick Erickson",
+            "id": "comment-15856873"
+        },
+        {
+            "date": "2017-02-08T19:10:51+0000",
+            "content": "Had a chance to look and this looks fine. We now get a response that shows the FileNotFound error for the three commands I'd eyeballed.....\n\n+1 and thanks! ",
+            "author": "Erick Erickson",
+            "id": "comment-15858409"
+        },
+        {
+            "date": "2017-02-09T17:13:30+0000",
+            "content": "Looked at this again and realized I had the core close in the wrong spot. New patch attached. ",
+            "author": "Mike Drob",
+            "id": "comment-15859833"
+        },
+        {
+            "date": "2017-02-09T17:52:48+0000",
+            "content": "Adding a test, and also unwrapping a layer of async because DefaultSolrCoreState.doRecovery already uses a separate thread/executor, so we don't need to do it directly in the CoreAdminOperation. ",
+            "author": "Mike Drob",
+            "id": "comment-15859901"
+        },
+        {
+            "date": "2017-02-21T18:04:47+0000",
+            "content": "Mike Drob Do you think this patch is ready to commit? If so I'll look it over again and commit it sometime Real Soon Now.\n\nErick ",
+            "author": "Erick Erickson",
+            "id": "comment-15876405"
+        },
+        {
+            "date": "2017-02-21T18:11:49+0000",
+            "content": "Yea, I think this one is ready. ",
+            "author": "Mike Drob",
+            "id": "comment-15876411"
+        },
+        {
+            "date": "2017-02-21T20:16:13+0000",
+            "content": "Mike:\n\nJust to check my understanding here. Essentially you took out a thread that had no other real purpose than to start a thread, right? We haven't changed the asynchronous nature of the call at all for RequestRecovery.\n\nLooking more closely at\nFORCEPREPAREFORLEADERSHIP_OP\nLISTSNAPSHOTS_OP\n\nI don't think the same problem occurs there since they don't spawn threads that can't really propagate the error back.\n\nTesting  & etc now. ",
+            "author": "Erick Erickson",
+            "id": "comment-15876626"
+        },
+        {
+            "date": "2017-02-21T20:40:30+0000",
+            "content": "Exactly. And because we don't start a new thread in the handler, we can throw an exception which eventually gets back to the caller instead of solely logging the problem.\n\nLISTSNAPSHOTS_OP also throws an exception, so does not have this problem.\n\nFORCEPREPAREFORLEADERSHIP_OP logs but does not throw, so a client will not see the problem with a non-existent core. This is easy to fix with something like \n\n        core.getCoreDescriptor().getCloudDescriptor().setLastPublished(Replica.State.ACTIVE);\n        log().info(\"Setting the last published state for this core, {}, to {}\", core.getName(), Replica.State.ACTIVE);\n      } else {\n-        SolrException.log(log(), \"Could not find core: \" + cname);\n+        throw new SolrException(ErrorCode.BAD_REQUEST, \"Unable to locate core \" + cname);\n      }\n    }\n  }),\n\n\nI didn't do that in this patch because I'm not sure who the callers of this API are and didn't want to rock too many boats at once. ",
+            "author": "Mike Drob",
+            "id": "comment-15876667"
+        },
+        {
+            "date": "2017-02-22T06:01:40+0000",
+            "content": "Same patch with CHANGES attribution. ",
+            "author": "Erick Erickson",
+            "id": "comment-15877537"
+        },
+        {
+            "date": "2017-02-22T06:01:58+0000",
+            "content": "Commit 14b3622608d3312eca32ba749132ce2f8531326a in lucene-solr's branch refs/heads/master from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=14b3622 ]\n\nSOLR-10020: CoreAdminHandler silently swallows some errors ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15877538"
+        },
+        {
+            "date": "2017-02-22T06:07:57+0000",
+            "content": "Commit f5ea2022097503df4ed62e59f7d1cb061c8266ee in lucene-solr's branch refs/heads/branch_6x from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f5ea202 ]\n\nSOLR-10020: CoreAdminHandler silently swallows some errors\n\n(cherry picked from commit 14b3622608d3312eca32ba749132ce2f8531326a) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15877544"
+        },
+        {
+            "date": "2017-02-22T06:23:50+0000",
+            "content": "Mark MillerYonik SeeleyIshan Chattopadhyaya I had some  merge issues when I merged CHANGES.txt from trunk to 6x for this JIRA. It seems like some entries were moved around in trunk (SOLR-10114) in CHANGES.txt but not merged into the 6x version.\n\nSo the changes from around SOLR-10114 through \"optimizations\" for the 6.5 version of solr/CHANGES.txt where I had the unexpected conflict looks OK to me, this is just a heads-up in case I messed up the merge and you wanted to take a look. ",
+            "author": "Erick Erickson",
+            "id": "comment-15877561"
+        }
+    ]
+}

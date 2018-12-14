@@ -1,0 +1,170 @@
+{
+    "id": "SOLR-7115",
+    "title": "UpdateLog can miss closing transaction log objects.",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.4",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "I've seen this happen on YourKit and in various tests - especially since adding resource release tracking to the log objects. Now I've got a test that catches it in SOLR-7113.\n\nIt seems that in precommit, if prevTlog is not null, we need to close it because we are going to overwrite prevTlog with a new log.",
+    "attachments": {
+        "SOLR-7115-LargeVolumeEmbeddedTest-fail.txt": "https://issues.apache.org/jira/secure/attachment/12832487/SOLR-7115-LargeVolumeEmbeddedTest-fail.txt",
+        "SOLR-7115.patch": "https://issues.apache.org/jira/secure/attachment/12832645/SOLR-7115.patch",
+        "tests-failures-7115.txt": "https://issues.apache.org/jira/secure/attachment/12833350/tests-failures-7115.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-02-14T23:31:47+0000",
+            "author": "Mark Miller",
+            "content": "I assume the log list is supposed to catch the close for this. Somehow that can be missed though. ",
+            "id": "comment-14321752"
+        },
+        {
+            "date": "2015-02-15T05:11:24+0000",
+            "author": "Mark Miller",
+            "content": "The follow gets through the tests, but I'd have to do some more studying to understand if it's right.\n\n\nIndex: solr/core/src/java/org/apache/solr/update/UpdateLog.java\n===================================================================\n--- solr/core/src/java/org/apache/solr/update/UpdateLog.java\t(revision 1659862)\n+++ solr/core/src/java/org/apache/solr/update/UpdateLog.java\t(working copy)\n@@ -608,8 +608,10 @@\n       // since we're changing the log, we must change the map.\n       newMap();\n \n+      TransactionLog logToDecRef = null;\n       if (prevTlog != null) {\n         globalStrings = prevTlog.getGlobalStrings();\n+        logToDecRef = prevTlog;\n       }\n \n       // since document additions can happen concurrently with commit, create\n@@ -618,6 +620,10 @@\n       prevTlog = tlog;\n       tlog = null;\n       id++;\n+      \n+      if (logToDecRef != null) {\n+        logToDecRef.decref();\n+      }\n     }\n   }\n \n\n ",
+            "id": "comment-14321814"
+        },
+        {
+            "date": "2015-03-02T17:55:03+0000",
+            "author": "Yonik Seeley",
+            "content": "It's weird that existing stress tests don't catch this... I want to see if I can get some of those to fail. ",
+            "id": "comment-14343464"
+        },
+        {
+            "date": "2015-03-02T21:54:03+0000",
+            "author": "Yonik Seeley",
+            "content": "OK... this is really strange.\n\nUpdateLog.preCommit() / postCommit() pair are protected by the commit lock.\nprevTlog is set in preCommit and cleared in postCommit.\nHmmm, is this happening in the presence of other errors (something that would prevent postCommit from being called?)\nThat would seem to be the only way to get into preCommit and have prevTlog still pointing at something.\nI just verified by throwing an exception inside the \"if (prevTlog != null) {\" block in preCommit() and the entire test suite passes. ",
+            "id": "comment-14343836"
+        },
+        {
+            "date": "2015-03-03T00:55:24+0000",
+            "author": "Yonik Seeley",
+            "content": "I've also run the test from SOLR-7113 a number of times after commenting out the suppression, and I can't get it to fail. ",
+            "id": "comment-14344187"
+        },
+        {
+            "date": "2015-03-03T16:58:03+0000",
+            "author": "Mark Miller",
+            "content": "I was still seeing it fail without that when I left last week. I'll try again soon. One of the 'doc time to live' distrib tests also occasionally fails on jenkins with it. It was failing consistently for me, but I'm sure there is some timing involved. ",
+            "id": "comment-14345335"
+        },
+        {
+            "date": "2015-03-13T12:24:08+0000",
+            "author": "Yonik Seeley",
+            "content": "One thing I want to investigate: can exceeding maxWarmingSearchers  (in the case where there is a lot of commits) cause a commit to fail and cause a postCommit() to not be called?\n\nRelated: when a replica makes a recovery request to the leader (and the leader commits), is it possible for that commit to fail due to maxWarmingSearchers?  My guess is \"no\" on this one because we shouldn't need to open a new searcher. ",
+            "id": "comment-14360270"
+        },
+        {
+            "date": "2015-05-27T16:40:16+0000",
+            "author": "Mark Miller",
+            "content": "It's possible this was caused by SOLR-7478. ",
+            "id": "comment-14561238"
+        },
+        {
+            "date": "2016-05-05T21:14:34+0000",
+            "author": "Mark Miller",
+            "content": "I see this consistently trying to update to hadoop 2.7.2.\n\nI traced in and it seems like the problem is that on close, the following call in commit can hang and keep the post commit updatelog code from being called. Oddly, this hang doesn't seem to last because the test does not complain about the thread remaining.\n\n\n              RefCounted<SolrIndexSearcher> searchHolder = core.openNewSearcher(true, true);\n              searchHolder.decref();\n\n\n\nChecking if the core is closed before calling that seems to help. ",
+            "id": "comment-15273103"
+        },
+        {
+            "date": "2016-05-09T14:39:54+0000",
+            "author": "Yonik Seeley",
+            "content": "Not opening a new searcher breaks our invariants after that point (breaks RTG, atomic updates, version checking for things like update reorder checks, etc).\nI wonder if we can we can guarantee that nothing is in-flight that would be affected? ",
+            "id": "comment-15276436"
+        },
+        {
+            "date": "2016-05-18T14:58:08+0000",
+            "author": "Yonik Seeley",
+            "content": "Thinking about this a little further, I guess we can assume that nothing could possibly be in flight concurrently since anything that was should prevent the core from closing (it's reference counted).  SOLR-9116 may fix this problem? ",
+            "id": "comment-15289110"
+        },
+        {
+            "date": "2016-10-10T14:42:46+0000",
+            "author": "Mikhail Khludnev",
+            "content": "https://jenkins.thetaphi.de/job/Lucene-Solr-master-Solaris/899/testReport/junit.framework/TestSuite/org_apache_solr_client_solrj_embedded_LargeVolumeEmbeddedTest/\nSOLR-7115-LargeVolumeEmbeddedTest-fail.txt ",
+            "id": "comment-15562474"
+        },
+        {
+            "date": "2016-10-11T11:27:27+0000",
+            "author": "Mikhail Khludnev",
+            "content": "SOLR-7115.patch straightforward test \n\njava.lang.AssertionError: ObjectTracker found 158 object(s) that were not released!!! [TransactionLog, TransactionLog, ....]\norg.apache.solr.common.util.ObjectReleaseTracker$ObjectTrackerException\n\tat org.apache.solr.common.util.ObjectReleaseTracker.track(ObjectReleaseTracker.java:43)\n\tat org.apache.solr.update.TransactionLog.<init>(TransactionLog.java:188)\n\tat org.apache.solr.update.UpdateLog.newTransactionLog(UpdateLog.java:344)\n\tat org.apache.solr.update.UpdateLog.ensureLog(UpdateLog.java:859)\n\tat org.apache.solr.update.UpdateLog.add(UpdateLog.java:428)\n\tat org.apache.solr.update.UpdateLog.add(UpdateLog.java:415)\n\tat org.apache.solr.update.DirectUpdateHandler2.doNormalUpdate(DirectUpdateHandler2.java:299)\n\tat org.apache.solr.update.DirectUpdateHandler2.addDoc0(DirectUpdateHandler2.java:211)\n\tat org.apache.solr.update.DirectUpdateHandler2.addDoc(DirectUpdateHandler2.java:166)\n\tat org.apache.solr.update.processor.RunUpdateProcessor.processAdd(RunUpdateProcessorFactory.java:67)\n\t...\n\tat org.apache.solr.SolrTestCaseJ4.assertU(SolrTestCaseJ4.java:740)\n\tat org.apache.solr.core.TestMaxOnDeckSearchersException$1.run(TestMaxOnDeckSearchersException.java:68)\n\n ",
+            "id": "comment-15565201"
+        },
+        {
+            "date": "2016-10-11T19:48:31+0000",
+            "author": "Mikhail Khludnev",
+            "content": "The fix is trivial, but I hardly want to commit in DUH2 without review. ",
+            "id": "comment-15566389"
+        },
+        {
+            "date": "2016-10-14T06:11:13+0000",
+            "author": "Mikhail Khludnev",
+            "content": "\n-        synchronized (solrCoreState.getUpdateLock()) {\n-          if (ulog != null) ulog.preSoftCommit(cmd);\n-          if (cmd.openSearcher) {\n-            core.getSearcher(true, false, waitSearcher);\n-          } else {\n-            // force open a new realtime searcher so realtime-get and versioning code can see the latest\n-            RefCounted<SolrIndexSearcher> searchHolder = core.openNewSearcher(true, true);\n-            searchHolder.decref();\n+        try{\n+          synchronized (solrCoreState.getUpdateLock()) {\n+            if (ulog != null) ulog.preSoftCommit(cmd);\n+            if (cmd.openSearcher) {\n+              core.getSearcher(true, false, waitSearcher);\n+            } else {\n+              // force open a new realtime searcher so realtime-get and versioning code can see the latest\n+              RefCounted<SolrIndexSearcher> searchHolder = core.openNewSearcher(true, true);\n+              searchHolder.decref();\n+            }\n+            if (ulog != null) {\n+              ulog.postSoftCommit(cmd);\n+            }\n           }\n-          if (ulog != null) ulog.postSoftCommit(cmd);\n         }\n-        if (ulog != null) ulog.postCommit(cmd); // postCommit currently means new searcher has\n-                              // also been opened\n+        finally{\n+          if (ulog != null) {\n+            ulog.postCommit(cmd); // postCommit currently means new searcher has\n+                                  // also been opened\n+          }\n+        }\n       }\n\n\nPlease have a look... ",
+            "id": "comment-15574375"
+        },
+        {
+            "date": "2016-10-27T20:03:04+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Patch is ready, but there is no review. Fix it next time.  ",
+            "id": "comment-15613042"
+        },
+        {
+            "date": "2016-12-16T17:37:42+0000",
+            "author": "Yonik Seeley",
+            "content": "I don't know if the patch to DUH2 is needed for other reasons, but now that SOLR-9712 is committed, I'll adapt and try out the patch from this issue. ",
+            "id": "comment-15755035"
+        },
+        {
+            "date": "2016-12-18T15:39:12+0000",
+            "author": "Yonik Seeley",
+            "content": "I tried out the modified test, and as expected it passes (since exceptions are no longer thrown on a commit).  I'm not going to commit it because the test is no longer really testing anything anymore (since it requires exceptions that are no longer thrown), and other tests cover concurrent commits. ",
+            "id": "comment-15758997"
+        },
+        {
+            "date": "2016-12-18T15:40:06+0000",
+            "author": "Yonik Seeley",
+            "content": "Resolving as part of SOLR-7912 ",
+            "id": "comment-15758999"
+        },
+        {
+            "date": "2016-12-18T17:03:10+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Makes sense ",
+            "id": "comment-15759108"
+        },
+        {
+            "date": "2016-12-20T12:24:43+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Yonik Seeley\nI don't know if the patch to DUH2 is needed for other reasons\n\nSOLR-9712 prevents max Warming Searcher exception. But any other exception might lead to skipping line https://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java#L646 and leaking transaction log. Isn't it's worth to be protected with finally?     ",
+            "id": "comment-15764087"
+        },
+        {
+            "date": "2016-12-20T12:43:06+0000",
+            "author": "Yonik Seeley",
+            "content": "I thought about that... but calling postCommit assumes a new searcher has been opened, so it doesn't seem right.\nIt seems like we should have explicit failure callbacks... commitFailed and openSearcherFailed (or add a boolean \"success\" flag to the post methods)? ",
+            "id": "comment-15764127"
+        },
+        {
+            "date": "2017-01-04T02:06:14+0000",
+            "author": "Hoss Man",
+            "content": "just to clarify: when refering to SOLR-7912, i think folks actually ment SOLR-9712 ... correct? ",
+            "id": "comment-15796887"
+        },
+        {
+            "date": "2017-01-04T15:10:34+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Indeed! ",
+            "id": "comment-15798476"
+        }
+    ]
+}

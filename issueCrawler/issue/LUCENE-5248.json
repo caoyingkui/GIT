@@ -1,0 +1,170 @@
+{
+    "id": "LUCENE-5248",
+    "title": "Improve the data structure used in ReaderAndLiveDocs to hold the updates",
+    "details": {
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [
+            "4.6",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "Currently ReaderAndLiveDocs holds the updates in two structures:\n\nMap<String,Map<Integer,Long>>\nHolds a mapping from each field, to all docs that were updated and their values. This structure is updated when applyDeletes is called, and needs to satisfy several requirements:\n\n\n\tUn-ordered writes: if a field \"f\" is updated by two terms, termA and termB, in that order, and termA affects doc=100 and termB doc=2, then the updates are applied in that order, meaning we cannot rely on updates coming in order.\n\tSame document may be updated multiple times, either by same term (e.g. several calls to IW.updateNDV) or by different terms. Last update wins.\n\tSequential read: when writing the updates to the Directory (fieldsConsumer), we iterate on the docs in-order and for each one check if it's updated and if not, pull its value from the current DV.\n\tA single update may affect several million documents, therefore need to be efficient w.r.t. memory consumption.\n\n\n\nMap<Integer,Map<String,Long>>\nHolds a mapping from a document, to all the fields that it was updated in and the updated value for each field. This is used by IW.commitMergedDeletes to apply the updates that came in while the segment was merging. The requirements this structure needs to satisfy are:\n\n\n\tAccess in doc order: this is how commitMergedDeletes works.\n\tOne-pass: we visit a document once (currently) and so if we can, it's better if we know all the fields in which it was updated. The updates are applied to the merged ReaderAndLiveDocs (where they are stored in the first structure mentioned above).\n\n\n\nComments with proposals will follow next.",
+    "attachments": {
+        "LUCENE-5248.patch": "https://issues.apache.org/jira/secure/attachment/12606052/LUCENE-5248.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-09-30T15:21:25+0000",
+            "content": "I discussed briefly the details of the first data structure with Adrien and Rob, and here's a proposal:\n\n\n\tConceptually hold an int[] and long[] arrays (for docs and values respectively), per field.\n\tWhen an update is applied to a document, we write an entry in the arrays, not bothering to update an existing array.\n\t\n\t\tE.g. if updates come to docs 1,2,1,2,3,1,2,3, then the arrays will hold:\n\t\t\n\t\t\tdocs: [1,2,1,2,3,1,2,3]\n\t\t\tvalues: [5,4,1,3,5,6,2,9]\n\t\t\n\t\t\n\t\tSo the result of the updates should be doc1=6, doc2=2 and doc3=9.\n\t\n\t\n\tIn writeLiveDocs we stable-sort the two arrays and take the last value of a document. The sort will yield:\n\t\n\t\tdocs: [1,1,1,2,2,2,3,3]\n\t\tvalues: [5,1,6,4,3,2,5,9]\n\t\tThe Iterator<Number> will take the last value of each document\n\t\n\t\n\tTo manage the data structure:\n\t\n\t\tFieldUpdates which holds the ints/longs, sorts and provides an iterator-like API, e.g. nextDoc()/nextValue() which takes the last value for each document.\n\t\tFor docs, use PackedInts.getMutable (with bitsPerValue=PackedInts.bitsRequired(maxDoc - 1))\n\t\tFor value, use GrowableWriter\n\t\tIn ReaderAndLiveDocs, hold a Map<String,FieldUpdates>: a per-field FieldUpdates instance.\n\t\n\t\n\n\n\nAs for the second structure, it's unrelated to the first (i.e. they can be improved separately), though still it suffers from same issues \u2013 a single update that comes in while the segment is merging can affect millions of documents and therefore can be inefficient too. One way to solve it is to use the same structure mentioned above and manage multiple iterators in IW.commitMergedDeletes (what's a bit more hair to this already hairy code? ), so that for every document we \"handle\", we also iterate in parallel on all the fields.\n\nI'll start with the first structure, and then if it works well, I'll try to apply it to the second. If you have comments/suggestions on how else to save the updates, feel free to propose. ",
+            "author": "Shai Erera",
+            "id": "comment-13781924"
+        },
+        {
+            "date": "2013-09-30T15:31:14+0000",
+            "content": "Another option, maybe even unrelated to this issue (but relevant to field updates in general), is to take ReaderAndLiveDocs into IW's RAM accounting. Today it's irrelevant since it holds 1-bit per document, but field updates could hold many more (several longs). We could add to RLD.sizeInBytes, taking only the field updates into account, and writeLiveDocs if it exceeds the buffer. Thing is, flush-by-RAM, as far as I understand, does not involve flushing RALD, so this change may not be that simple. But I'll let Mike/Rob, who knows this code better than me, comment on that. ",
+            "author": "Shai Erera",
+            "id": "comment-13781933"
+        },
+        {
+            "date": "2013-09-30T16:08:08+0000",
+            "content": "I thought about it some more ... perhaps there's a way to keep the updates without holding (almost) any RAM. Today, the code follows the delete path, by resolving the delete terms to the docIDs they affect. With deletes it's easy, there's a low RAM overhead.\n\nI don't see a reason why we need to resolve the updates when we register them with RALD (but perhaps I'm overlooking something) as they aren't used in-memory. If a Reader needs to see them, we flush them to disk, unlike liveDocs which are shared in-memory and not flushed to disk. So perhaps we could keep in RALD a Map<String,NumericUpdate[]>, a mapping from a field to all numeric updates. When applying them in writeLiveDocs, we will manage multiple DocsEnums (one per NumericUpdate.term) and iterate them in order, ensuring to apply the recent update to the document that is pointed in the current iteration. So if termA affects docs 1,3,6 and termB 2,3,5,6, we iterate on both and position termA on 1 and termB on 2. Since they don't match we return the update value for doc1. When both are position on doc3, we apply the update of termB (as it came last). doc4 is assumed as not updated and so forth.\n\nThis is definitely hairy, but consumes much less RAM. Also, in terms of performance I don't think that we lose anything, because it's not like we will resolve same updates multiple times (once per-segment, but that's done anyway?). It's just hairy code, but not sure how much more hairy than the changes to commitMergedDeletes would require with the proposal detailed above. For commitMergedDeletes, we won't need to resolve any updates, just record them in the merged RALD, they will be resolved (using the merged DocsEnum) when it's time to writeLiveDocs that segment? ",
+            "author": "Shai Erera",
+            "id": "comment-13781966"
+        },
+        {
+            "date": "2013-09-30T19:35:44+0000",
+            "content": "I think the lack of RAM tracking in RALD is an important thing to fix,\nseparately from optimizing how RALD uses its RAM.  Especially the\nspooky case where on update, consuming tiny amounts of RAM, can\nresolve to millions of documents, consuming tons of RAM in RALD.\n\nToday, there are three reasons why we\nBufferedDeletesStream.applyDeletes, which \"resolves\" the Term/Query\npassed to deleteDocuments/updateNumericDocValue:\n\n\n\tWe've hit IW's RAM buffer\n\n\n\n\n\tWe're opening a new NRT reader, and applyAllDeletes=true\n\n\n\n\n\tA merge is kicking off\n\n\n\nAs things stand now, the first case will resolve the updates and move\nthem into RALD but not write them to disk, while the other two cases\nwill write them to disk and clear RALD's maps I think?  Maybe a simple\nfix is to also write to disk in case 1?\n\nBut, if the segment is large, we can still have a big spike as we\npopulate those Maps with millions of docs worth of updates?\n\nI don't see a reason why we need to resolve the updates when we register them with RALD \n\nIf we \"resolve & move the updates to disk\" as a single operation (ie,\nfix the first case above), then I think we can just keep the logic in\nBD, but have it immediately move the updates to disk, rather than\nbuffer them up in RALD, except in the \"this segment is merging\" case?\n\nWhen applying them in writeLiveDocs, we will manage multiple DocsEnums (one per NumericUpdate.term) and iterate them in order\n\nI think this is a neat idea; though I would worry about the RAM\nrequired for N DocsEnums where N is possibly quite large... ",
+            "author": "Michael McCandless",
+            "id": "comment-13782136"
+        },
+        {
+            "date": "2013-09-30T20:52:28+0000",
+            "content": "I discussed that w/ Mike on chat and here's the plan we came to:\n\n\n\tDon't buffer updates in RALD anymore. It's silly, since as Mike wrote above, one of the reasons we applyDeletes is because IW's RAM buffer limit was reached. By buffering updates, we only move the RAM elsewhere, where it's not accounted for (RALD).\n\tInstead, BufferedDeleteStream will build the Map<String,FieldUpdates> structure as described above and hand them to RALD.writeFieldUpdates\n\tRALD.writeFieldUpdates will execute the portion of the code that is currently executed in writeLiveDocs.\n\t\n\t\tIf the segment isn't merging (isMerging=false), the map is discarded and can be GC'd.\n\t\tOtherwise, it will need to buffer the resolved updates, so they can later be applied to the merged segment (a note on that below).\n\t\tThat's not bad though, as this is done only temporarily, until the segment finishes merging, or merge is aborted/failed, then it's cleared away.\n\t\n\t\n\n\n\nThe reason why we need to buffer the resolved updates in the isMerging case is because the raw form keeps a docIDUpto, which after merging may make no sense. For example, if you have two segments to which an update is applied: for _0, docIDUpto=MAX_VAL (i.e. it's an already existing segment) and for _1 it's 17 (i.e. it's a newly flushed segment where updates should be applied up to doc 17), and if you use SortingMP .. docIDUpto=17 and MAX_VAL become irrelevant. The docs can be entirely shuffled and then you don't know which docs should receive the updates anymore. And if you have SortingMP and deletes, it only becomes more complicated.\n\nI think that for now we should buffer the resolved updates, improve the data structure used to buffer them, and handle that later. ",
+            "author": "Shai Erera",
+            "id": "comment-13782227"
+        },
+        {
+            "date": "2013-10-01T06:36:20+0000",
+            "content": "Patch with testTonsOfUpdates: it's a real nasty test with which I hit OOM when running w/ -Dtests.nightly=true and -Dtests.multiplier=3. It first adds many documents (few 10Ks, w/ these params 250K) with several update terms (so that each term affects many docs) and few NDV fields. It then applies many numeric updates (with these params 20K), but sets IW's ram buffer to 512 bytes, so we get many flushes.\n\nBecause currently the resolved updates are held in RALD, and since the test doesn't invoke any merge while applying the updates, they just keep accumulating there, until RAM is exhausted. I should say that even when running the test with less docs, update terms and updates, I saw memory keeps on growing, but it wasn't enough to hit the heap space limit. But perhaps it means we can use RamUsageEstimator to assert that IW RAM consumption doesn't continuously increase, so that we catch this even if an OOM isn't hit?\n\nI plan to handle it in two steps:\n\n\n\tStop buffering updates in RALD except the isMerging case, but still use the Map<String,Map<Integer,Long>>. Then we should see IW's sizeOf remains somewhat stable. Also, the test shouldn't OOM.\n\tOptimize the temporary spike in RAM (and buffering for isMerging) by trying Map<String,IntToLongMap> (a Map on primitives, no compression but no object allocations) and Map<String,FieldUpdates> (with compression, but more complicated code).\n\n ",
+            "author": "Shai Erera",
+            "id": "comment-13782666"
+        },
+        {
+            "date": "2013-10-01T09:51:52+0000",
+            "content": "One thing to note though, is if we never buffer updates, it means we always write them to disk, even if they are not needed by a Reader. That's the reason they are currently buffered, to save the write to disk until a Reader actually needs them. Since we rewrite the entire DV field(s) and not just the updated documents, we should take that into account in this optimization. For instance, the test I uploaded will cause 100s of gen'd files to be written to disk (DV fields and FieldInfos), without a Reader ever seeing them. ",
+            "author": "Shai Erera",
+            "id": "comment-13782768"
+        },
+        {
+            "date": "2013-10-01T12:03:44+0000",
+            "content": "One thing to note though, is if we never buffer updates, it means we always write them to disk, even if they are not needed by a Reader.\n\nThat's a good point, and I guess it means we are vulnerable to an adversary here ... but that adversary isn't really SO bad right?  It'd do one update, and index a bunch of docs, and then we flush and write a new NDV gen \"unnecessarily\".  But the adversary had to quite a bit of \"real\" work (indexing) so I'm not sure it's really an adversary ...\n\nWe could try to be smarter, and carry the buffer if it's \"smallish\".  This is how deletes work: if we are flushing because of too-much-RAM, but deletes are using less than 1/2 of the RAM buffer, we just carry them.  We only apply them once they are using >= 1/2. ",
+            "author": "Michael McCandless",
+            "id": "comment-13782853"
+        },
+        {
+            "date": "2013-10-02T06:01:16+0000",
+            "content": "Patch improves the test and also hacks a solution \u2013 in BufferedDeleteStream.applyDeletes I call RALD.writeLiveDocs to flush all the updates. Few comments:\n\n\n\tFirst, this is just a hack - I need to separate writeLiveDocs from writeFieldUpdates, so that we don't also always write liveDocs.\n\n\n\n\n\tStill need to improve the data structure used to hold the resolved updates. I think I will create a FieldUpdates interface/abstract class so we can experiment with different representations, including optimizations for e.g. only one NumericUpdate (where we don't need to materialize anything into memory since it's only one Term).\n\n\n\n\n\tThe test OOMs less, but sometimes it does (depends on test params). The reason is that even if we resolve the updates and flush to disk, as long as we resolve them in-memory, there could be a case of an innocent-looking update which affects millions of documents, and consumes a large amount of RAM, no matter the representation (a more efficient structure means more docs can be updated, but still...). I don't think there's a way around it \u2013 if you do very large updates (I think it's the edge case, not the common), you should allocate enough RAM. It's just like IW's RAM buffer doesn't help when you index a single very large document.\n\t\n\t\tWith the FieldUpdates abstraction, we could optimize for various cases including few very large updates, where we can iterate on their DocsEnum in parallel and consume less RAM than if we materialize them all into memory etc.\n\t\n\t\n\n\n\nNext I will work on the FieldUpdates abstraction, separate writeLiveDocs from writeFieldUpdates and implement the structure mentioned above (parallel compressed arrays for docs, updates and bits=docsWithField). ",
+            "author": "Shai Erera",
+            "id": "comment-13783685"
+        },
+        {
+            "date": "2013-10-02T06:08:57+0000",
+            "content": "Forgot to mention, I tried to use RamUsageEstimator to detect early when the size of IndexWriter.readerPool continuously grows. But this doesn't work, I think because of the circular reference from SegReader -> SegCoreReaders -> SegReader:\n\n\tEven though I see sizeOf(RALD) drops whenever writeLiveDocs is called (because the map is cleared), it still grows continuously because of its reader.\n\tI debugged this and I see SegReader only references the DVProducers it needs (new gen'd ones) and didn't spot any potential memory leak\n\tAlso the size of SegCoreReaders takes up the majority of SegReader but everything looks ok w/ SegCoreReaders.\n\tI think I read somewhere that RUE is not good at measuring circular referencing objects?\n\n\n\nIf you think that RUE can be used to detect this continuous growth, it means there's a potential memory leak between RALD, SegReader and SegCoreReaders and I will get to the bottom of it. ",
+            "author": "Shai Erera",
+            "id": "comment-13783691"
+        },
+        {
+            "date": "2013-10-02T06:23:55+0000",
+            "content": "Hmm, maybe the problem is not RUE, but the fact that we don't commit/reopen/merge means the unused gen'd fieldInfos and DVs files aren't deleted from the Directory (and it's a RAMDirectory)? This isn't a bug, but can explain the growth in RAM since RALD references SegInfo which references the Directory. I'll double-check that later.\n\nAbout FieldUpdates abstractions, few ideas for very large updates:\n\n\n\tDiskFieldUpdates \u2013 hold the resolved updates on disk, sort on disk and read from disk \u2013 for very large updates. Slower, more IO, but does not OOM.\n\tDerefedFieldUpdates \u2013 if there are only few large updates, we can hold PackedInt for docs (bitsRequired=maxDoc-1), PackedInt for indexes (bitsRequired=numValues-1) and long[] for values. The values array is much smaller than the docs array and we use an indexes array to mark for each document where it takes its value from (in the values array).\n\n\n\nI'm sure Adrien will have more (probably better) ideas . ",
+            "author": "Shai Erera",
+            "id": "comment-13783697"
+        },
+        {
+            "date": "2013-10-06T12:15:40+0000",
+            "content": "Patch adds following changes:\n\n\n\tNumericFieldUpdates abstraction for holding the field updates. For now, I've kept the Map representation because I wanted to get the rest of the changes in place.\n\tReaderAndLiveDocs no longer buffers any updates, unless it is merging\n\tSeparated writeFieldUpdates from writeLiveDocs:\n\t\n\t\tBufferedDeleteStream builds a Map<String,NumericFieldUpdates> from all NumericUpdates and calls RLD.writeFieldUpdates if any\n\t\tRLD.writeFieldUpdates writes the new gen'd DV files and buffers the updates if it is merging.\n\t\n\t\n\tIW.commitMergedDeletes applies the merging updates to the merged segment by traversing over updates to all fields in parallel and builds a new Map<String,NumericFieldUpdates> (because it re-maps documents), which it then hands over to the new segment's RLD.writeFieldUpdates().\n\n\n\nThis change basically reverted many of the previous changes to RLD and IW, since not buffering updates in RLD simplifies it a lot. Next I will implement a more RAM-efficient NumericFieldUpdates. ",
+            "author": "Shai Erera",
+            "id": "comment-13787580"
+        },
+        {
+            "date": "2013-10-09T18:23:58+0000",
+            "content": "Patch replaces MapNumericFieldUpdates with PackedNumericFieldUpdates which hold the docs/values data in PagedMutable and PagedGrowableWriter respectively. It also holds a FixedBitSet the size of maxDoc to mark which documents have a numeric value (e.g. for \"unsetting\" a value from a document). ",
+            "author": "Shai Erera",
+            "id": "comment-13790689"
+        },
+        {
+            "date": "2013-10-09T20:35:54+0000",
+            "content": "Hi Shai:\n\nshould UpdatesIterator implement DISI? It seems like it might be a good fit.\n\n\n+    private final FixedBitSet docsWithField;\n+    private PagedMutable docs;\n+    private PagedGrowableWriter values;\n\n\n\nWhen we have multiple related structures like this, maybe we can add a comment as to what each is?\nSomething like:\n\n// bit per docid: set if the value is \"real\"\n// TODO: is bitset(maxdoc) really needed since usually its sparse? why not an openbitset parallel with \"docs\"?\nprivate final FixedBitSet docsWithField;\n// holds a list of documents.\n// TODO: do these really need to be absolute-encoded?\nprivate PagedMutable docs;\n// holds a list of values, parallel with docs\nprivate PagedGrowableWriter values;\n\n\n\n\n+      docsWithField = new FixedBitSet(maxDoc);\n+      docsWithField.clear(0, maxDoc)\n\n\n\nThe clear should be unnecessary!\n\n\n+    public void add(int doc, Long value) {\n+      assert value != null;\n+      if (size == Integer.MAX_VALUE) {\n+        throw new IllegalStateException(\"cannot support more than Integer.MAX_VALUE doc/value entries\");\n+      }\n\n\n\nIs this really a limitation?\n\n\n+        @Override\n+        protected int compare(int i, int j) {\n+          return (int) (docs.get(i) - docs.get(j));\n+        }\n\n\n\nCan we just use Long.compare? this subtraction may be safe... but it would smell better. ",
+            "author": "Robert Muir",
+            "id": "comment-13790834"
+        },
+        {
+            "date": "2013-10-10T03:26:43+0000",
+            "content": "should UpdatesIterator implement DISI? It seems like it might be a good fit.\n\nI thought about it but decided not to since e.g. advance() is never going to be called. Because we need to pass a value for all documents (to FieldsConsumer), we will always call nextDoc(). Do you have a usecase in mind?\n\nWhen we have multiple related structures like this, maybe we can add a comment as to what each is?\n\nI will.\n\nis bitset(maxdoc) really needed since usually its sparse? why not an openbitset parallel with \"docs\"?\n\nI like the idea. So instead of calling docsWithField.set(doc), I will call docsWithField.set(size), and then sort this one too. It will definitely save memory for small updates and waste some bits for large updates, but since the docs/values structures are bigger than it in these cases, I think that's fine.\n\ndo these really need to be absolute-encoded?\n\nThe docs are only positive integers, but we're not guaranteed on the order they arrive. So if we'll encode the delta we may end up w/ negative numbers, and won't be able to set BPV to bitsRequired(maxDoc-1). After we sort the arrays (when getUpdates() is called), we can re-encode deltas only, but I don't know if it's worth it since the arrays will be GC'd if the segment is merging...\n\nThe clear should be unnecessary!\n\nYou're right! It's a leftover from a debugging session that I forgot to remove.\n\nIs this really a limitation?\n\nThe arrays aren't limited, so not. But because we sort the arrays and the Sorter interfaces currently only take integer indexes, it is. Maybe we should one day change the Sorter interface to take long indexes?\n\nBTW, if we do that and intend to support more than 2B entries, we should either use FixedBitSet for docsWithField, or move to another parallel PagedMutable so that it too can hold as many entries as the docs and values can.\n\nCan we just use Long.compare?\n\nWe don't have Long.compare in Java 1.6 as far as I checked. I will change it to a ternary <>check. ",
+            "author": "Shai Erera",
+            "id": "comment-13791146"
+        },
+        {
+            "date": "2013-10-10T19:39:03+0000",
+            "content": "Do we have test coverage of updating with null (deleting the update\nfrom the document)?  E.g., having to handle such updates applied\nduring merging, and e.g. the case of deleting all such fields for all\ndocs in one segment?\n\nIn BDS.applyNumericDocValuesUpdates, you set termsEnum=null and\ncontinue, but only when field != currentField.  So if there are two\nterms in a row with the same field (which does not exist) won't we hit\nNPE? ",
+            "author": "Michael McCandless",
+            "id": "comment-13791905"
+        },
+        {
+            "date": "2013-10-12T03:12:12+0000",
+            "content": "Do we have test coverage of updating with null (deleting the update from the document)?\n\nWe have TestNDVUpdates.testUnsetValue and testUnsetAllValues, though we don't have a test which unsets a value while a document is merging. We have tests that cover updating a value (no unsetting) while it is merging, I guess I can modify them to unset as well, but will then need to improve the test to use docsWithField. I'll look into it.\n\nSo if there are two terms in a row with the same field (which does not exist) won't we hit NPE?\n\nGood catch! You're right, I had another if (termsEnum == null) continue but I removed it since I thought the above if takes care of that. I added a unit test which reproduces and the fix. Will commit on LUCENE-5189. ",
+            "author": "Shai Erera",
+            "id": "comment-13793221"
+        },
+        {
+            "date": "2013-10-12T03:15:17+0000",
+            "content": "I added a unit test which reproduces and the fix. Will commit on LUCENE-5189.\n\nSorry, it's a bug introduced in this patch so I'll fix here. ",
+            "author": "Shai Erera",
+            "id": "comment-13793224"
+        },
+        {
+            "date": "2013-10-14T12:22:29+0000",
+            "content": "Patch tracks docsWithFields in a parallel bitset to the docs/values arrays. Also modifies TestIndexWriterDelete.testNoLostDeletesOrUpdatesOnIOException to fail on either \"writeLiveDocs\" or \"writeFieldUpdates\".\n\nI think it's ready - no nocommits left. ",
+            "author": "Shai Erera",
+            "id": "comment-13794077"
+        },
+        {
+            "date": "2013-10-14T15:20:27+0000",
+            "content": "\nAlso modifies TestIndexWriterDelete.testNoLostDeletesOrUpdatesOnIOException to fail on either \"writeLiveDocs\" or \"writeFieldUpdates\".\n\nMaybe this could be named more succinctly: like 'testExceptions' ? ",
+            "author": "Robert Muir",
+            "id": "comment-13794185"
+        },
+        {
+            "date": "2013-10-14T15:25:03+0000",
+            "content": "We can even move the test to TestIWExceptions, but I think it has to be named properly .. maybe testNoLostDeletesOrUpdates, or just testNoLostUpdates? ",
+            "author": "Shai Erera",
+            "id": "comment-13794195"
+        },
+        {
+            "date": "2013-10-16T07:43:19+0000",
+            "content": "Commit 1532670 from Shai Erera in branch 'dev/trunk'\n[ https://svn.apache.org/r1532670 ]\n\nLUCENE-5248: improve the data structure used to hold field updates ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13796510"
+        },
+        {
+            "date": "2013-10-16T07:44:28+0000",
+            "content": "Committed this to trunk after a night's of successful beasting (11K iterations). Handing over to Jenkins. ",
+            "author": "Shai Erera",
+            "id": "comment-13796511"
+        },
+        {
+            "date": "2013-11-14T16:03:44+0000",
+            "content": "Committed to 4x under LUCENE-5189. ",
+            "author": "Shai Erera",
+            "id": "comment-13822543"
+        }
+    ]
+}

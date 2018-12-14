@@ -1,0 +1,98 @@
+{
+    "id": "SOLR-11291",
+    "title": "Adding Solr Core Reporter",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "metrics"
+        ],
+        "type": "New Feature",
+        "fix_versions": [
+            "7.2",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Adds a new reporter, SolrCoreReporter, which allows metrics to be reported on per-core basis.\nAlso modifies the SolrMetricManager and SolrCoreMetricManager to take advantage of this new reporter.\n\nAdds a test/example that uses the  SolrCoreReporter. Also adds randomization to SolrCloudReportersTest.",
+    "attachments": {
+        "SOLR-11291.patch": "https://issues.apache.org/jira/secure/attachment/12883753/SOLR-11291.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-08-25T15:18:30+0000",
+            "content": "Here is the implementation. ",
+            "author": "Omar Abdelnabi",
+            "id": "comment-16141751"
+        },
+        {
+            "date": "2017-09-04T13:07:32+0000",
+            "content": "\n\n(Disclosure: Omar and I are in the same team and I've already internally seen and had input into the attached patch.)\n\nThe motivation for the proposed changes is, as Omar mentioned, to support new reporters that allow metrics to be reported on a per-core basis. I.e. the reporter itself directly 'knows' which core it is reporting metrics for; this is similar to but slightly different from the Core Metric Registry functionality.\n\nSince SOLR-9858 in Solr 7.0 the SolrShardReporter reports selected metrics from replicas to the shard leader. If the group=\"shard\" attribute is configured then SolrCoreMetricManager calls SolrMetricManager.loadShardReporters which eventually calls\n\n((SolrShardReporter)reporter).setCore(core);\n\n\nso that the SolrShardReporter 'knows' which core it is reporting metrics for.\n\nThis ticket proposes the creation of an abstract class:\n\nabstract public class SolrCoreReporter extends FilteringSolrMetricReporter {\n  protected SolrCore core;\n  ... constructor here ...\n  public void setCore(SolrCore core) { this.core = core; }\n  public SolrCore getCore() { return core; }\n}\n\n\nSolrCoreReporter is a tentative name e.g. it could be renamed to (say) SolrReplicaReporter or similar if SolrCoreReporter is too close to the Core Metric Registry concept. The existing SolrShardReporter would extend the new abstract class.\n\nOmar's patch includes a test example reporter SolrConsoleReporter which extends the new abstract class and via\n\nant test -Dtestcase=SolrConsoleReporterTest\n\n\nalways and\n\nant test -Dtestcase=SolrCloudReportersTest \n\n\npart of the time via randomization the SolrConsoleReporter class is used.\n\n(Slightly longer than anticipated preamble, oops, now here's a question.)\n\nIn its current form the patch includes the addition of a new SolrInfoBean.Group.replica enum choice and SolrMetricManager changes like this:\n\n   ...\n+  public void loadReplicaReporters(PluginInfo[] pluginInfos, SolrCore core) {\n+    doLoadSolrCoreReporters(pluginInfos, core, SolrInfoBean.Group.replica);\n+  }\n+\n   public void loadShardReporters(PluginInfo[] pluginInfos, SolrCore core) {\n+    doLoadSolrCoreReporters(pluginInfos, core, SolrInfoBean.Group.shard);\n+  }\n+\n+  private void doLoadSolrCoreReporters(PluginInfo[] pluginInfos, SolrCore core, SolrInfoBean.Group group) {\n     ...\n\n\ni.e. there is overlap between the existing SolrInfoBean.Group.shard code and the new SolrInfoBean.Group.replica code.\n\nMight such overlap be confusing from a user's point of view?\n\nIf it would be confusing and if the new abstract class was called SolrReplicaReporter then might a solution be to deprecate SolrInfoBean.Group.shard in favour of SolrInfoBean.Group.replica?\n\nAndrzej Bialecki  - would you have any thoughts on this? ",
+            "author": "Christine Poerschke",
+            "id": "comment-16152591"
+        },
+        {
+            "date": "2017-09-18T10:50:38+0000",
+            "content": "Andrzej Bialecki  and I spoke about this offline. At present there's the SolrInfoBean.Group.shard enum choice associated with the SolrShardReporter class for which setCore(core) is called. Instead of having the SolrInfoBean.Group.shard enum choice (and a potential additional SolrInfoBean.Group.replica enum choice) we should be able to inspect the class and based on that call the setCore(core) method e.g. something along the lines of\n\nif (SolrCoreReporter.class.isAssignableFrom(reporter.getClass())) {\n  ((SolrCoreReporter)reporter).setCore(core);        \n}\n\n\nwhich then likely also should permit the removal altogether of the SolrInfoBean.Group.shard enum choice. ",
+            "author": "Christine Poerschke",
+            "id": "comment-16169864"
+        },
+        {
+            "date": "2017-09-22T16:09:21+0000",
+            "content": "... Instead of having the SolrInfoBean.Group.shard enum choice (and a potential additional SolrInfoBean.Group.replica enum choice) we should be able to ... which then likely also should permit the removal altogether of the SolrInfoBean.Group.shard enum choice.\n\nOmar Abdelnabi and I looked into this further and it seems that removing of the SolrInfoBean.Group.shard enum choice is not a possibility since SolrMetricManager.prepareCloudPlugins uses the enum to decide about creating or not creating of a reporter object. In other words, with the removal of that enum and that logic we would unintentionally create extra SolrMetricReporter objects.\n\nSo, how could we proceed here then?\n\n\n\tIn SOLR-11389 I delved into the code paths leading to the Solr(Shard|Cluster)Reporter.setCore[Container] method calls.\n\tI propose to merge the two classes' setCore[Container] method logic into init(PluginInfo,[Solr]Core[Container]) method variants of the existing init(PluginInfo) method.\n\tThe SOLR-11389 change would subtly change existing behaviour, hence the separation from the changes on this ticket here.\n\tAfter SOLR-11389 this ticket here would then add an abstract SolrCoreReporter class and an abstract SolrCoreContainerReporter class; the SolrMetricManager.java change required would be very small:\n\n-      if (reporter instanceof SolrShardReporter) {\n-        ((SolrShardReporter)reporter).init(pluginInfo, solrCore);\n\n+      if (reporter instanceof SolrCoreReporter) {\n+        ((SolrCoreReporter)reporter).init(pluginInfo, solrCore);\n\n-      } else if (reporter instanceof SolrClusterReporter) {\n-        ((SolrClusterReporter)reporter).init(pluginInfo, coreContainer);\n\n+      } else if (reporter instanceof SolrCoreContainerReporter) {\n+        ((SolrCoreContainerReporter)reporter).init(pluginInfo, coreContainer);\n\n       } else {\n         reporter.init(pluginInfo);\n       }\n\n\n\n\n\nHow does that sound? ",
+            "author": "Christine Poerschke",
+            "id": "comment-16176644"
+        },
+        {
+            "date": "2017-10-30T17:37:56+0000",
+            "content": "This is the updated patch ",
+            "author": "Omar Abdelnabi",
+            "id": "comment-16225392"
+        },
+        {
+            "date": "2017-10-31T18:34:07+0000",
+            "content": "Commit d58ec8728cefe803925fc7497c5a722b7b98700f in lucene-solr's branch refs/heads/master from Christine Poerschke\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d58ec87 ]\n\nRemove unnecessary casts in SolrCloudReportersTest. Split out from the SOLR-11291 changes. (Omar Abdelnabi via Christine Poerschke) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16227290"
+        },
+        {
+            "date": "2017-10-31T18:35:22+0000",
+            "content": "Commit 4d638faa46ceafb0c57d9faf753a932043dbda9c in lucene-solr's branch refs/heads/branch_7x from Christine Poerschke\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4d638fa ]\n\nRemove unnecessary casts in SolrCloudReportersTest. Split out from the SOLR-11291 changes. (Omar Abdelnabi via Christine Poerschke) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16227293"
+        },
+        {
+            "date": "2017-11-01T17:46:01+0000",
+            "content": "Attaching a new patch that fixes a small printing issue in SolrConsoleReporter.java ",
+            "author": "Omar Abdelnabi",
+            "id": "comment-16234463"
+        },
+        {
+            "date": "2017-11-28T13:05:44+0000",
+            "content": "Thanks Omar for updating the patch!\n\nAttached patch is for the SolrCore[Container]Reporter related changes only, with small tweaks e.g.\n\n\trelocation of the new abstract SolrCore[Container]Reporter classes from metrics.reporters.solr to metrics package\n\taddition of class-level javadocs\n\tremoval of unused imports to make 'ant precommit' pass\n\n\n\n(I've removed the test/SolrConsoleReporter changes from scope since it contains many code portions from com.codahale.metrics.ConsoleReporter and both having and maintaining that duplication could be a little tricky. Having said that, the test/SolrConsoleReporter classes remain available here on this ticket via the attached patches i.e. developers building their own custom metric reporters can still locally apply and use them to explore the workings of the Solr metrics reporters.) ",
+            "author": "Christine Poerschke",
+            "id": "comment-16268693"
+        },
+        {
+            "date": "2017-11-28T15:54:38+0000",
+            "content": "Commit 812db14f278ce8fe03de94d18e0c662d104f62e3 in lucene-solr's branch refs/heads/master from Christine Poerschke\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=812db14 ]\n\nSOLR-11291: Factor out abstract metrics/SolrCore[Container]Reporter classes. (Omar Abdelnabi, Christine Poerschke) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16268955"
+        },
+        {
+            "date": "2017-12-01T15:43:41+0000",
+            "content": "Commit a8fbff4d1b8aef343b87a78d0be0fb711a46e53b in lucene-solr's branch refs/heads/branch_7x from Christine Poerschke\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a8fbff4 ]\n\nSOLR-11291: Factor out abstract metrics/SolrCore[Container]Reporter classes. (Omar Abdelnabi, Christine Poerschke) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16274536"
+        },
+        {
+            "date": "2017-12-01T15:45:06+0000",
+            "content": "Thanks Omar! ",
+            "author": "Christine Poerschke",
+            "id": "comment-16274537"
+        }
+    ]
+}

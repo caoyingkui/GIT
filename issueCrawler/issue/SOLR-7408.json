@@ -1,0 +1,224 @@
+{
+    "id": "SOLR-7408",
+    "title": "Let SolrCore be the only thing which registers/unregisters a config directory listener",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.2",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "As reported here: http://markmail.org/message/ynkm2axkdprppgef, there is a race condition which results in an exception when creating multiple collections over the same config set. I was able to reproduce it in a test, although I am only able to reproduce if I put break points and manually simulate the problematic context switches.",
+    "attachments": {
+        "SOLR-7408.patch": "https://issues.apache.org/jira/secure/attachment/12725827/SOLR-7408.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-04-16T10:14:23+0000",
+            "author": "Shai Erera",
+            "content": "The patch adds a test which reproduces the bug, however only if you place breakpoints and simulate the context switches manually. Therefore I'll explain the steps to reproduce here, and we can decide if we want to keep the test or remove it:\n\n\n\tPut a breakpoint in ZkController.registerConfListenerForCore on synchronized (confDirectoryListeners) {.\n\n\n\n\n\tPut another breakpoint in ZkController.unregister on synchronized (confDirectoryListeners) {.\n\n\n\n\n\tRun the test in Debug and wait for the two threads to get to registerConfListenerForCore\n\t\n\t\tAdvance one of them until it reaches the other breakpoint in unregister.\n\t\tLet it remove the entry from the map.\n\t\tNow advance the second thread that's in registerConfigListenerForCore, it doesn't find the confDir in the map and throws the \"conf directory is not valid\" exception.\n\t\n\t\n\n\n\nWhat happens is that the last core which references a configDir is removed, at the same time a new core is created. Note that even if both threads call .watchZKConfDir, we still remove the entry from the map, and the current code fails w/ the exception.\n\nThis patch partially fixes the problem, by moving the removal of the entry from the map into a sync'd block as well, guards the map in watchZKConfDir and re-registers a watch inside registerConfListenerForCore if one doesn't exist.\n\nHowever, this doesn't solve the entire problem. While now the application won't hit an exception, the above chain of events can cause the listener to be removed, after it has been registered. The reason is that SolrCore registers the listener in its constructor, however CoreContainer.getCores() (which is used by ZkController.getCores()) does not return that SolrCore until it has been registered in SolrCores.cores. That happens in CoreContainer.registerCore, line 460, after the SolrCore was already created and registered its listener.\n\nI think that the solution is to register the core listener only when we are ready to advertise that core, i.e. not until its put in SolrCore.cores. That is the only way to guarantee that ZkController.unregister will remove the confDir listener when all known/advertised cores don't reference it. And since registerConfListenerForCore re-adds the watch if one doesn't exist, we should be safe.\n\nHowever, this area of the code is completely new to me, so would appreciate a review. You don't really have to run the test, it only helped me understand what's going on. ",
+            "id": "comment-14497869"
+        },
+        {
+            "date": "2015-04-16T12:08:05+0000",
+            "author": "Shai Erera",
+            "content": "Patch implements what I proposed: SorlCore.registerConfListener() is made public, no longer called by SolrCore() and now called by SolrCores.putCore after it is put in the map. This now prevents removing any listeners of known/advertised cores.\n\nIdeally, we would not create an entry in the map unless there is at least one listener for this confDir, and we would also remove the entry from the map when the last listener has been removed (when the last SolrCore is closed). However, it seems like we call unregister even in the event of errors (CoreAdminHandler.handleCreateAction), forcing the removal of the configDir listener, and it's not clear if we also call SolrCore.close(). So we may start leaking listeners that will never be removed ...\n\nIf anyone has a better idea how to address that issue, please chime in. ",
+            "id": "comment-14497980"
+        },
+        {
+            "date": "2015-04-16T23:02:27+0000",
+            "author": "Anshum Gupta",
+            "content": "Thanks Shai. The patch looks good to me in what it does. \n\nThough I think I understand what you're saying here, can you elaborate more on this?\nHowever, it seems like we call unregister even in the event of errors (CoreAdminHandler.handleCreateAction), forcing the removal of the configDir listener, and it's not clear if we also call SolrCore.close(). So we may start leaking listeners that will never be removed .. ",
+            "id": "comment-14498933"
+        },
+        {
+            "date": "2015-04-17T04:24:08+0000",
+            "author": "Shai Erera",
+            "content": "Though I think I understand what you're saying here, can you elaborate more on this?\n\nIf we wanted to change the code such that we put a listener in the map on a SolrCore creation, and remove it from the map on a SolrCore close, I believe we wouldn't be running into such concurrency issues. In a sense, this is what is done when all is good: a SolrCore puts a listener in its ctor, and removes it in its close().\n\nBut if something goes wrong, we may leave dangling listeners, of SolrCore instances that no longer exist. This is what I believe (CoreAdminHandler.handleCreateAction attempts to do \u2013 if a core creation failed, it attempts to unregister all listeners of a configDir from the map, and lets unregister decide if the entry itself can be removed or not. This ensures that we won't be left w/ dangling listeners that will never be released - what I referred to as leaking listeners.\n\nThe code in unregister relies on the same logic that introduces the bug \u2013 if there is core in SolrCores which references this configDir, remove all listeners. The problem is that a core registers a listener, before it is put in SolrCores, and hence the race condition.\n\nI would personally prefer that we stop removing all listeners, and let a core take care of itself, but I don't know how safe is Solr code in that regard. I.e. are all places that create a SolrCore clean up after it in the event of a failure? Clearly CoreAdminHandler.handleCreateAction doesn't, which got me thinking what other places don't do that as well.\n\nBut, if we want to change the logic like that, we can certainly look at all the places that do new SolrCore(...) and make sure they call SolrCore.close() in the event of any failure. ",
+            "id": "comment-14499217"
+        },
+        {
+            "date": "2015-04-17T06:48:56+0000",
+            "author": "Noble Paul",
+            "content": "looks good to me ",
+            "id": "comment-14499354"
+        },
+        {
+            "date": "2015-04-17T07:28:07+0000",
+            "author": "Anshum Gupta",
+            "content": "I like the idea of calling SolrCore.close() and letting that handle the responsibility of unregistering (already happens).\nDoes it make more sense to have this in a different JIRA or at least change the title/summary of this one to highlight the new/updated intention? ",
+            "id": "comment-14499394"
+        },
+        {
+            "date": "2015-04-17T11:00:47+0000",
+            "author": "Shai Erera",
+            "content": "I will update the title of this JIRA and handle it here. I like this better than doing what I consider more of a hack to the code and later change it. SolrCore is initialized in two places, so shouldn't be complicated to ensure it is closed in case of errors.\n\nWhile I'm at it, I'll try to simplify the ctor by breaking it out to some auxiliary methods, instead of having a 250 lines method! ",
+            "id": "comment-14499636"
+        },
+        {
+            "date": "2015-04-17T14:57:39+0000",
+            "author": "Anshum Gupta",
+            "content": "+1 to both of those! ",
+            "id": "comment-14499956"
+        },
+        {
+            "date": "2015-04-18T07:01:49+0000",
+            "author": "Shai Erera",
+            "content": "There are two ctors which aren't called by Solr code. Is SolrCore considered public API, and so we should keep these ctors, or can I remove them? ",
+            "id": "comment-14501152"
+        },
+        {
+            "date": "2015-04-18T07:29:41+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "There are two ctors which aren't called by Solr code. Is SolrCore considered public API, and so we should keep these ctors, or can I remove them?\n\nYes, it is public API because of EmbeddedSolrServer use-cases. We can deprecate them but we can't remove them. I will be on board if you want to remove the deprecated APIs after 1 minor release though. ",
+            "id": "comment-14501168"
+        },
+        {
+            "date": "2015-04-18T07:33:09+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I would personally prefer that we stop removing all listeners, and let a core take care of itself, but I don't know how safe is Solr code in that regard. I.e. are all places that create a SolrCore clean up after it in the event of a failure? Clearly CoreAdminHandler.handleCreateAction doesn't, which got me thinking what other places don't do that as well.\n\nShould we start ref counting the ZK watches? ",
+            "id": "comment-14501174"
+        },
+        {
+            "date": "2015-04-19T08:04:09+0000",
+            "author": "Shai Erera",
+            "content": "Should we start ref counting the ZK watches?\n\nThe confDir listeners are per SolrCore instance, so I don't think we should ref-count them. Each SolrCore will add/remove its own listener. ",
+            "id": "comment-14501737"
+        },
+        {
+            "date": "2015-04-19T11:09:26+0000",
+            "author": "Shai Erera",
+            "content": "\n\tRemove ZkController.watchZkDir\n\tRemove code which cleaned the map in .unregister()\n\tEnsures SolrCore is closed on any errors\n\tSimplifies SolrCore ctor a bit by extracting logic to separate methods. More can be done I'm sure, by breaking out this class into several auxiliary classes, but not in the context of this issue.\n\n\n\nTests pass. ",
+            "id": "comment-14501802"
+        },
+        {
+            "date": "2015-04-21T13:37:43+0000",
+            "author": "Shai Erera",
+            "content": "If there are no objections, I will commit this tomorrow. ",
+            "id": "comment-14504955"
+        },
+        {
+            "date": "2015-04-22T03:32:34+0000",
+            "author": "Anshum Gupta",
+            "content": "Shai, can you give me a just a few hours? I'd want to look at this change. I wanted to get to it earlier today but didn't get any time. ",
+            "id": "comment-14506340"
+        },
+        {
+            "date": "2015-04-22T05:19:15+0000",
+            "author": "Shai Erera",
+            "content": "Sure! ",
+            "id": "comment-14506443"
+        },
+        {
+            "date": "2015-04-22T06:10:07+0000",
+            "author": "Anshum Gupta",
+            "content": "Thanks for doing all of the cleanup while fixing the race condition! LGTM other than these points:\n\n\n\tYou have a nocommit about removal of the constructors, I'd say we should deprecate them for one release (at least).\n\tCan you extract zkController.watchZKConfDir() back out, I think you moved it inline but it keeps things cleaner and makes more sense to have that as a method.\n\tAlso, shouldn't zkController.getConfigDirListener.OnReconnect() reset the watches on zk i.e. have a call to watchZKConfDir() added back?\n\tconfigLocation is no longer used in unregister, so you might want to remove that too.\n\n ",
+            "id": "comment-14506494"
+        },
+        {
+            "date": "2015-04-22T06:31:18+0000",
+            "author": "Shai Erera",
+            "content": "Thanks Anshum. Good catch on OnReconnect()! I applied all your comments. ",
+            "id": "comment-14506514"
+        },
+        {
+            "date": "2015-04-22T06:49:06+0000",
+            "author": "Anshum Gupta",
+            "content": "One last thing and it's a +1 from my end.\n\nCan you also remove the check for collection == null in the line below?That check would never be false due to the assert right above.\nIt's not something that you changed but I think it'd be good to just clean that up.\n\npublic void unregister(String coreName, CoreDescriptor cd) throws InterruptedException, KeeperException {\n    final String coreNodeName = cd.getCloudDescriptor().getCoreNodeName();\n    final String collection = cd.getCloudDescriptor().getCollectionName();\n    assert collection != null;\n\n    if (collection == null || collection.trim().length() == 0) {\n      log.error(\"No collection was specified.\");\n\n ",
+            "id": "comment-14506537"
+        },
+        {
+            "date": "2015-04-22T06:52:37+0000",
+            "author": "Anshum Gupta",
+            "content": "Also, as the test that you've added is only useful when we manually add breakpoints and debug, I guess it's a good idea to disable the test with that comment and not increase the time taken to really run the tests on Jenkins. What do you think? ",
+            "id": "comment-14506539"
+        },
+        {
+            "date": "2015-04-22T07:02:28+0000",
+            "author": "Shai Erera",
+            "content": "I think that removing that check is dangerous since someone who doesn't run w/ assertions enabled (i.e. in production) will hit an NPE, rather than see this error message. I would rather remove the assert and change the code as follows:\n\n\n    if (collection == null || collection.trim().length() == 0) {\n      log.error(\"No collection was specified.\");\n      assert false : \"No collection was specified: [\" + collection + \"]\";\n      return;\n    }\n\n\n\nAbout removing the test, I understand it seems like a waste of time to run a 30 seconds test that now seems to be fixed. But if we remove it, and a bug creeps back into the code, we'd never know as we don't test this case anywhere else. I prefer that we mark it (and the other test in that class as @Nightly). ",
+            "id": "comment-14506550"
+        },
+        {
+            "date": "2015-04-22T07:06:32+0000",
+            "author": "Shai Erera",
+            "content": "Marked tests as @Nightly and changed the assertion. BTW, I also noticed there is a potential bug: we check that collection.trim().length() isn't empty, but later we use collection as is. Thinking leading/trailing whitespaces in collection name doesn't make sense, I added code to CloudDescriptor to always call trim(). ",
+            "id": "comment-14506553"
+        },
+        {
+            "date": "2015-04-22T07:09:33+0000",
+            "author": "Shai Erera",
+            "content": "@Nightly annotation moved to class-level. ",
+            "id": "comment-14506558"
+        },
+        {
+            "date": "2015-04-22T07:13:06+0000",
+            "author": "Anshum Gupta",
+            "content": "That code change looks fine to me and +1 on the Nightly, I certainly don't want the test removed. \nLet's not add the trim in there as it's not done anywhere else and it's a fair assumption that we wouldn't get multiple whitespaces for a collection name. ",
+            "id": "comment-14506560"
+        },
+        {
+            "date": "2015-04-22T07:16:40+0000",
+            "author": "Shai Erera",
+            "content": "removed .trim() call in CloudDescriptor and also in ZkController.unregister() so it's consistent with the rest of the method. ",
+            "id": "comment-14506563"
+        },
+        {
+            "date": "2015-04-22T07:17:30+0000",
+            "author": "Mike Drob",
+            "content": "Also, as the test that you've added is only useful when we manually add breakpoints and debug, I guess it's a good idea to disable the test with that comment and not increase the time taken to really run the tests on Jenkins. What do you think?\nIt might be possible to reproduce the context switching/breakpoint behaviour by inserting several countdown latches into the test. This might end up being more trouble than it's worth, but attempting to reliably trigger race conditions can be nearly impossible otherwise. ",
+            "id": "comment-14506565"
+        },
+        {
+            "date": "2015-04-22T07:21:04+0000",
+            "author": "Anshum Gupta",
+            "content": "Thanks Shai! Here's my +1 again.\n\nMike Drob Thanks for pointing that out and it might be worth the effort but I'd suggest we commit this as a nightly test and then look at simulating the breakpoints by inserting the latches. ",
+            "id": "comment-14506569"
+        },
+        {
+            "date": "2015-04-22T08:25:28+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1675274 from Shai Erera in branch 'dev/trunk'\n[ https://svn.apache.org/r1675274 ]\n\nSOLR-7408: Let SolrCore be the only thing which registers/unregisters a config directory listener ",
+            "id": "comment-14506637"
+        },
+        {
+            "date": "2015-04-22T09:42:16+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1675301 from Shai Erera in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1675301 ]\n\nSOLR-7408: Let SolrCore be the only thing which registers/unregisters a config directory listener ",
+            "id": "comment-14506727"
+        },
+        {
+            "date": "2015-04-22T09:42:47+0000",
+            "author": "Shai Erera",
+            "content": "Committed to trunk and 5x. Thanks Anshum for the feedback! ",
+            "id": "comment-14506728"
+        },
+        {
+            "date": "2015-05-30T00:56:21+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682570 from hossman@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1682570 ]\n\nSOLR-7603: more test tweaks to protect ourselves from unexpected log levels in tests like the one introduced by SOLR-7408 ",
+            "id": "comment-14565736"
+        },
+        {
+            "date": "2015-05-30T00:59:41+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682571 from hossman@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1682571 ]\n\nSOLR-7603: more test tweaks to protect ourselves from unexpected log levels in tests like the one introduced by SOLR-7408 (merge r1682570) ",
+            "id": "comment-14565738"
+        },
+        {
+            "date": "2015-06-15T21:42:22+0000",
+            "author": "Anshum Gupta",
+            "content": "Bulk close for 5.2.0. ",
+            "id": "comment-14586774"
+        }
+    ]
+}

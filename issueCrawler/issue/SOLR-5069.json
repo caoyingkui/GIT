@@ -1,0 +1,177 @@
+{
+    "id": "SOLR-5069",
+    "title": "MapReduce for SolrCloud",
+    "details": {
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Won't Fix"
+    },
+    "description": "Solr currently does not have a way to run long running computational tasks across the cluster. We can piggyback on the mapreduce paradigm so that users have smooth learning curve.\n\n\n\tThe mapreduce component will be written as a RequestHandler in Solr\n\tWorks only in SolrCloud mode. (No support for standalone mode)\n\tUsers can write MapReduce programs in Javascript or Java. First cut would be JS ( ? )\n\n\n\nsample word count program\n\nhow to invoke?\n\nhttp://host:port/solr/collection-x/mapreduce?map=<map-script>&reduce=<reduce-script>&sink=collectionX\n\nparams \n\n\tmap :  A javascript implementation of the map program\n\treduce : a Javascript implementation of the reduce program\n\tsink : The collection to which the output is written. If this is not passed , the request will wait till completion and respond with the output of the reduce program and will be emitted as a standard solr response. . If no sink is passed the request will be redirected to the \"reduce node\" where it will wait till the process is complete. If the sink param is passed ,the rsponse will contain an id of the run which can be used to query the status in another command.\n\treduceNode : Node name where the reduce is run . If not passed an arbitrary node is chosen\n\n\n\n\nThe node which received the command would first identify one replica from each slice where the map program is executed . It will also identify one another node from the same collection where the reduce program is run. Each run is given an id and the details of the nodes participating in the run will be written to ZK (as an ephemeral node). \n\nmap script \n\n\nvar res = $.streamQuery($.param(\u201cq\"));//this is not run across the cluster. //Only on this index\nwhile(res.hasMore()){\n  var doc = res.next();\n  map(doc);\n}\n\nfunction  map(doc) {\n  var txt = doc.get(\u201ctxt\u201d);//the field on which word count is performed\n  var words = txt.split(\" \");\n   for(i = 0; i < words.length; i++){\n\t$.emit(words[i],{\u2018count\u2019:1});// this will send the map over to //the reduce host\n    }\n}\n\n\n\nEssentially two threads are created in the 'map' hosts . One for running the program and the other for co-ordinating with the 'reduce' host . The maps emitted are streamed live over an http connection to the reduce program\n\nreduce script\n\nThis script is run in one node . This node accepts http connections from map nodes and the 'maps' that are sent are collected in a queue which will be polled and fed into the reduce program. This also keeps the 'reduced' data in memory till the whole run is complete. It expects a \"done\" message from all 'map' nodes before it declares the tasks are complete. After  reduce program is executed for all the input it proceeds to write out the result to the 'sink' collection or it is written straight out to the response.\n\n\nvar pair = $.nextMap();\nvar reduced = $.getCtx().getReducedMap();// a hashmap\nvar count = reduced.get(pair.key());\nif(count === null) {\n  count = {\u201ccount\u201d:0};\n  reduced.put(pair.key(), count);\n}\ncount.count += pair.val().count ;\n\n\n\nexample output\n\n{\n\u201cresult\u201d:[\n\u201cwordx\u201d:{ \n         \u201ccount\u201d:15876765\n         },\n\u201cwordy\u201d : {\n           \u201ccount\u201d:24657654\n          }\n \n  ]\n}\n\n\n\nTBD\n\n\tThe format in which the output is written to the target collection, I assume the reducedMap will have values mapping to the schema of the collection",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13716486",
+            "date": "2013-07-23T15:29:31+0000",
+            "content": "Exciting idea! Almost as exciting as SolrCloud on MapReduce \n\nA few comments:\n\n\tdistributed map-reduce in reality is a sequence of:\n\t\n\t\tsplit input and assign splits to M nodes\n\t\tapply map() on M nodes in parallel\n\t\t\n\t\t\tfor large datasets the emitted data from mappers is spooled to disk\n\t\t\n\t\t\n\t\t\"shuffle\" - ie. partition and ship emitted data from M mappers into N reducers\n\t\t\n\t\t\t(wait until all mappers are done, so that each partition's key-space is complete)\n\t\t\n\t\t\n\t\tsort by key in each of N reducers, collecting values for each key\n\t\t\n\t\t\tagain, for large datasets this is a disk-based sort\n\t\t\n\t\t\n\t\tapply N reducers in parallel and emit final output (in N parts)\n\t\n\t\n\tif I understand it correctly the model that you presented has some limitations:\n\t\n\t\tas many input splits as there are shards (and consequently as many mappers)\n\t\tsingle reducer. Theoretically it should be possible to use N nodes to act as reducers if you implement the concept of partitioner - this would cut down the memory load on each reducer node. Of course, streaming back the results would be a challenge, but saving them into a collection should work just fine.\n\t\tno \"shuffling\" - all data from mappers will go to a single reducer\n\t\tno intermediate storage of data, all intermediate values need to fit in memory\n\t\twhat about the sorting phase? I assume it's an implicit function in the reducedMap (treemap?)\n\t\n\t\n\tsince all fine-grained emitted values from map end up being sent to 1 reducer, which has to collect all this data in memory first before applying the reduce() op, the concept of a map-side combiner seems useful, to be able to quickly minimize the amount of data to be sent to reducer.\n\tit would be very easy to OOM your Solr nodes at the reduce phase. There should be some built-in safety mechanism for this.\n\twhat parts of Solr are available in the script's context? Making all Solr API available could lead to unpredictable side-effects, so this set of APIs needs to be curated. E.g. I think it would make sense to make analyzer factories available.\n\n\n\nAnd finally, an observation: regular distributed search can be viewed as a special case of map-reduce computation  "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13716624",
+            "date": "2013-07-23T17:17:55+0000",
+            "content": "Thanks Andrzej\n\nI started off with a simple model so  that the version 1 can be implemented easily.\n\n'N' reducers add to implementation complexity. However , it should be done eventually.  \n\nno intermediate storage of data, all intermediate values need to fit in memory\n\nYes,in my model,  the mappers will be throttled so that we can fix the amount of intermediate data kept in memory. $.map() call would wait if the size threshold is reached\n\nwhat about the sorting phase? I assume it's an implicit function in the reducedMap (treemap?)\n\nwe should have the choice on how to sort the map .Yes, Some kind of sorted map should be offered .probably sort on some key's value in the map\n\n\nit would be very easy to OOM your Solr nodes at the reduce phase. \n\nSure, here the idea is to do some overflow to disk beyond a threshold. With memory getting abundant , we probably should use some off heap solution , so that the reduce is not I/O bound.\n\nwhat parts of Solr are available in the script's context\n\nGood that you asked. We should keep the API's available limited . For instance , anything that can alter the state of the system should not be exposed to the script. Anything that can help processing /manipulating data should be exposed "
+        },
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13716655",
+            "date": "2013-07-23T17:48:03+0000",
+            "content": "Sure, here the idea is to do some overflow to disk beyond a threshold.\nBerkeley DB, db4o, and an Apache-licensed MapDB (mapdb.org), and probably others, all provide persistent Java Collections API. We could use one of these - you could add a provider mechanism to separate the actual implementation from the plain Collections api.\n\n$.map() call would wait if the size threshold is reached\nThrottling the mappers wouldn't help with OOM on the reduce() side - reduce() can start only when all mappers are finished. I think a map-side combiner would be much more helpful, if possible (reductions that are not simple aggregations usually can't be performed in map-side combiners). "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13717922",
+            "date": "2013-07-24T03:14:07+0000",
+            "content": "reduce() can start only when all mappers are finished\n\nWhy. why can't reduce start as soon as the mappers start producing? whatever is emitted by the mapper is up for reducer to chew on. \n\nAll said,  map side combiner is definitely useful and would reduce memory/network IO "
+        },
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13718058",
+            "date": "2013-07-24T07:05:58+0000",
+            "content": "why can't reduce start as soon as the mappers start producing? \nBecause reducer needs to operate on the complete list of values for a given key. Take for example the wordcount - not waiting for all mappers would cause reducer to emit only partial aggregations. In general mappers should be free to emit arbitrary keys, so new values may appear at any moment until all mappers are finished. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13718067",
+            "date": "2013-07-24T07:19:56+0000",
+            "content": "I guess , I haven't explained correctly.\n\nThe reducer output is available only after all the mappers are done. But the reducer is started along with the mappers and is working in parallel .  "
+        },
+        {
+            "author": "Lukas Vlcek",
+            "id": "comment-13718068",
+            "date": "2013-07-24T07:21:38+0000",
+            "content": "Hello,\n\nmay be OT but in spite of the fact that having MapReduce in (near) real time [clustered] search server sounds very interesting and indeed useful, is this something that is good to put into the system?\n\nI might be naive but as far as I can understand MR tasks can be both RAM and IO (disk,network) intensive. How can one tune the system for fast indexing/search performance if the additional load put on the system from MR is hardly predictable?\n\nNot to mention the fact that MR is like a hammer. And if you put hammer into hands of users, then everything starts looking like a .... you know the story.\n\nRegards,\nLukas "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13718152",
+            "date": "2013-07-24T09:08:54+0000",
+            "content": "MR tasks can be both RAM and IO (disk,network) intensive\n\nYou are right. We won't recommend people to use the cluster for MR and search indexing at the same time . They will definitely see degraded performance. But then, that is expected , right? How is it better than setting up another cluster (Hadoop) for MR if if you need it?  "
+        },
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13718434",
+            "date": "2013-07-24T14:53:15+0000",
+            "content": "The reducer output is available only after all the mappers are done. But the reducer is started along with the mappers and is working in parallel.\n\nNoble Paul: Sure, you can start the reducer - but for any given key you have to wait anyway with processing until all values for a given key become available - and this practically means that the reducer has to wait until all mappers are done.\n\nHow can one tune the system for fast indexing/search performance if the additional load put on the system from MR is hardly predictable?\n\nLukas Vlcek: that's why I suggested that this framework should have the ability to specify a budget for job execution, at least in terms of RAM or key-value pair count. Still, for occasional analytic jobs or simple aggregations the load should be predictable or bearable, and the performance cost of using this tool would be negligible compared to the cost of integrating and operating a separate analytic platform. "
+        },
+        {
+            "author": "Lukas Vlcek",
+            "id": "comment-13718518",
+            "date": "2013-07-24T16:05:14+0000",
+            "content": "Andrew Bialecki: Well, I see the point. From the user point of view this sounds very cool and it will be interesting to see how this feature works out.\n\nThough, this reminds me the situation that happened in Google couple of year ago (I heard this from one ex-Googler, not sure if there is any official evidence) when they introduced MR platform internally and all summer interns started using it. A lot of non-optimal tasks started eating their resources - because it is so easy to translate a lot of problems into MR (but it does not mean that MR solution to the problem is the optimal one).\n\nAs for setting up a separate analytical platform, well... the cost of setting it up is one thing, but the benefit of existing tooling and experience is another one. Are you going to reimplement Mahout into Solr? - well may be you are not aiming at this level of complexity.\n\nYou can throttle the thing on many levels, as a result the task will just run longer, right? Isn't this in fact a big challenge? If I understand Lucene correctly, the costly part is if you need to keep aged IndexReaders around because this leads to higher number of opened segments and consumption of related resources. And what if the data included into the MR calculation changes (reindex/delete) in the meantime? Then you need to be careful in presenting the results to the clients because they may be too used to Hadoop MR where the original data set is still available.\n\nAnyway, I am sure you are already aware of all this. I am just curious  "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13718578",
+            "date": "2013-07-24T17:01:32+0000",
+            "content": "that's why I suggested that this framework should have the ability to specify a budget ...\n\nYoi are right. Even the version 1.0 should have a way to budget the RAM at mapper and reducer for a given task\n\nA lot of non-optimal tasks started eating their resources...\n\n\nbut the benefit of existing tooling and experience is another one\n\nActually it works both ways. Mahout (or other systems) will have more mature support for certain tasks. There are more people familiar with Solr/Lucene. That will help them to be up and running with little effort.\n\nas a result the task will just run longer, right?\n\nWell, that is the tradeoff you make. choose expensive h/w or wait longer\n\nthe costly part is if you need to keep aged IndexReaders around ...\n\nYes, If you have frequent commits and frequent MR tasks running. You will rarely run a long running process on a very frequently changing dataset . \n\nLucene does not delete 'data' because segments are cleaned up. They are just copied over if segment merges happen. If deletes happen in between , Lucene will behave much better because we always operate on the same IndexReader and the results will be consistent with the state of the data at the time the task is fired\n\n "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-13718762",
+            "date": "2013-07-24T19:56:12+0000",
+            "content": "Awesome stuff Noble!\n\nwhy can't reduce start as soon as the mappers start producing? whatever is emitted by the mapper is up for reducer to chew on.\nRight - and some things will be completely streamable w/o any need for buffering... think of re-implementing the terms component here - we can access terms in sorted order so the reducer would simply need to do a merge sort on the streams and then stream that result back!  "
+        },
+        {
+            "author": "Eks Dev",
+            "id": "comment-13718785",
+            "date": "2013-07-24T20:17:43+0000",
+            "content": "wow, this is getting pretty close to collection clustering and other candies, somehow to plug-in mahout and it's there\n\nGreat job and great direction for solr. End-applications not only need to find things, they often want to do something with them as well \n\nThanks!    "
+        },
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13719540",
+            "date": "2013-07-25T11:53:57+0000",
+            "content": "This is great to see - I asked about this in SOLR-1301 - https://issues.apache.org/jira/browse/SOLR-1301?focusedCommentId=13678948&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13678948 \n\n\nThe node which received the command would first identify one replica from each slice where the map program is executed . It will also identify one another node from the same collection where the reduce program is run. Each run is given an id and the details of the nodes participating in the run will be written to ZK (as an ephemeral node).\n\nLukas and Andrzej have already addressed my immediate thought when I read the above, but they talked about using the \"cost\" approach, limiting resource use, and such.  But I think we should learn from others' mistakes and choices here.  Is it good enough to limit resources?  Just limiting resources means that any concurrent queries will be effected - the question is just how much.  Would it be better to mark some nodes as \"eligible for running analytical/batch/MR jobs + search\" or \"eligible for running analytical/batch/MR jobs and NO search - i.e. nodes that are a part of the SolrCloud cluster, but run ONLY these jobs and do NOT handle queries\"?\n\nI think we saw DataStax do this with Cassandra and Brisk and we see that with people using HBase with HBase replication and using one HBase cluster for real-time/interactive access and the other cluster for running jobs. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13719550",
+            "date": "2013-07-25T12:00:06+0000",
+            "content": "Would it be better to mark some nodes as \"eligible for running analytical/batch/MR jobs + search\" \n\nInstead of marking certain nodes as (eligible for X)how about passing the node names in the request itself ? That way we are not introducing some kind of 'role' in the system but still get all the benefits? "
+        },
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13719554",
+            "date": "2013-07-25T12:06:36+0000",
+            "content": "Instead of marking certain nodes as (eligible for X)how about passing the node names in the request itself ? That way we are not introducing some kind of 'role' in the system but still get all the benefits?\n\nBut if searches are running on all nodes, then the above doesn't achieve complete separation of search vs. job work. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13719556",
+            "date": "2013-07-25T12:09:17+0000",
+            "content": "But if searches are running on all nodes, then the above doesn't achieve complete separation of search vs. job work.\n\nmakes sense. It should be something we should think of as a feature of Solr. Being a part of a cluster but not taking part in certain roles (leader/search/jobs etc) "
+        },
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13719563",
+            "date": "2013-07-25T12:17:32+0000",
+            "content": "It should be something we should think of as a feature of Solr. Being a part of a cluster but not taking part in certain roles (leader/search/jobs etc\n\nYeah, perhaps something like that.  We already have Overseer and Leader, which are also roles of some sort, though those are completely managed by SolrCloud, meaning SolrCloud/ZK do the node election and node assignment for these particular roles, AFAIK. While for search vs. job (vs. mixed) role the assignment is likely to come from a human+ZK. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-13719593",
+            "date": "2013-07-25T13:05:56+0000",
+            "content": "It should be something we should think of as a feature of Solr.\n\nRight - it's unrelated to this feature.  We've already kicked around the idea of \"roles\" for nodes for years now (like in SOLR-2765), and they would be useful in many contexts.  Someone actually needs to do the work though... patches welcome  "
+        },
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13719612",
+            "date": "2013-07-25T13:34:27+0000",
+            "content": "some things will be completely streamable w/o any need for buffering... think of re-implementing the terms component here - we can access terms in sorted order so the reducer would simply need to do a merge sort on the streams and then stream that result back!\nIt could be probably implemented as a special case, because it strongly depends on the map() output being sorted. However, in general case reducer must wait for all mappers to finish because mappers may produce keys out of order and non-unique.\n\n+1 on node roles, as a separate issue - it should not hold off this issue. "
+        },
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13719654",
+            "date": "2013-07-25T14:30:47+0000",
+            "content": "An alternative solution for minimizing the amount of data in memory during reduce phase is to use \"re-reduce\", or a reduce-side combiner, using Hadoop terminology.\n\nThis is an additional function that runs on the reducer and periodically performs intermediate reductions of already accumulated values for a key, and preserves the intermediate results (and discards the accumulated values). This function does not emit anything to the final output. Then the final reduction function operates on a mix of values that arrived since the last intermediate reduction, plus all results of previous intermediate reductions.\n\nThis works well for simple aggregations (where the additional function may be in fact a copy of the reduce function) but may not be suitable to all classes of problems. "
+        },
+        {
+            "author": "Andrzej Bialecki",
+            "id": "comment-13720869",
+            "date": "2013-07-26T15:07:39+0000",
+            "content": "See here for an explanation how this works in MongoDB: http://isurues.wordpress.com/2013/05/28/what-is-re-reduce-in-mongodb-map-reduce/ . CouchDB also uses the same reduce function, only it passes a boolean flag to inform the function whether a particular invocation is the first reduce (acting on values straight from mappers) or a re-reduce (acting on results of previous partial reduces). "
+        },
+        {
+            "author": "Markus Jelsma",
+            "id": "comment-14549383",
+            "date": "2015-05-18T22:29:54+0000",
+            "content": "Andrzej Bialecki  anything new to add to this topic? I am sure interest is still here  "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14552175",
+            "date": "2015-05-20T11:48:38+0000",
+            "content": "Is there some low hanging fruit that we can achieve easily? "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-14552414",
+            "date": "2015-05-20T14:44:38+0000",
+            "content": "Looks like SOLR-6526 (Solr Streaming API) is pretty much map-reduce?\nAnd then on top is SOLR-7377 (Solr Streaming Expressions) and SOLR-7560 (Parallel SQL) "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-16356095",
+            "date": "2018-02-07T21:19:26+0000",
+            "content": "Streaming API is there way to go "
+        }
+    ]
+}

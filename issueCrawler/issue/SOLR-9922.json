@@ -1,0 +1,185 @@
+{
+    "id": "SOLR-9922",
+    "title": "Write buffering updates to another tlog",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "7.4"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Currently, we write buffering logs to current tlog and not apply that updates to index. Then we rely on replay log to apply that updates to index. But at the same time there are some updates also write to current tlog and applied to the index. \n\nFor example, during peersync, if new updates come to replica we will end up with this tlog\ntlog : old1, new1, new2, old2, new3, old3\nold updates belong to peersync, and these updates are applied to the index.\nnew updates belong to buffering updates, and these updates are not applied to the index.\n\nBut writing all the updates to same current tlog make code base very complex. We should write buffering updates to another tlog file.\n\nBy doing this, it will help our code base simpler. It also makes replica recovery for SOLR-9835 more easier. Because after peersync success we can copy new updates from temporary file to current tlog, for example\ntlog : old1, old2, old3\ntemporary tlog : new1, new2, new3\n-->\ntlog : old1, old2, old3, new1, new2, new3",
+    "attachments": {
+        "SOLR-9922.patch": "https://issues.apache.org/jira/secure/attachment/12845490/SOLR-9922.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-04T09:00:16+0000",
+            "author": "Cao Manh Dat",
+            "content": "First attempt to solve this problem.\nIn this patch\n\n\tI create another tlog for storing buffer updates.\n\tDelete this buffer tlog files when applyBufferUpdates run successfully.\n\tIn case of buffer tlog is not deleted, then we will delete these files when create a new buffer tlog.\n\tRemove : FLAG_GAP, rollback, snapshot, hdfs hacks, complicate logic code inside UpdateLog...\n\n\n\nIn my opinion, in case of HDFSUpdateLog we should store buffer tlog in local file system, because these files have very short life and small. ",
+            "id": "comment-15797677"
+        },
+        {
+            "date": "2017-01-04T13:58:04+0000",
+            "author": "Mark Miller",
+            "content": "In my opinion, in case of HDFSUpdateLog we should store buffer tlog in local file system, because these files have very short life and small.\n\n-1, When you have a single shared filesystem, you really don't want to start splitting data management across distrib and a local filesystem as much as possible. Buffered data is not necessarily short lived, clusters that start with a high rate of incoming documents and many different other factors can make cases where these files are long lived and can take a lot of space. Much of the appeal of hdfs is managing space for large storage requirements from a single front rather than a single front plus each node.\n\nYonik Seeley should really weigh in on this idea of splitting up the tlog. ",
+            "id": "comment-15798322"
+        },
+        {
+            "date": "2017-01-04T15:08:19+0000",
+            "author": "Cao Manh Dat",
+            "content": "That's seem a good idea. I will consider this problem with upcoming patches. ",
+            "id": "comment-15798473"
+        },
+        {
+            "date": "2017-01-05T01:02:27+0000",
+            "author": "Cao Manh Dat",
+            "content": "Mark Miller What do you think about the ideas that \n\n\t\"If a node die during buffering, when that node restart we should not replay buffering updates?\" I run the cloud tests and didn't find any problems when we do that.\n\tEach time bufferUpdates() is called, we will discard previous buffer updates\n\n ",
+            "id": "comment-15799888"
+        },
+        {
+            "date": "2017-01-05T07:45:34+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch\n\n\tfix some bugs, all the test passed.\n\thdfsUpdateLog store buffered updates in hdfs\n\tbuffered updates won't be replay in case of node die upon buffering, update log will know that an old buffered updates exist, and will delete old buffer update tlog when\n\t\n\t\tensureLog() is called\n\t\tnew buffer tlog is created\n\t\n\t\n\n\n\nMark Miller There are only one thing that I concern is back-ward compatibly, the patch delete FLAG_GAP and related things. But I think when user update the Solr, their node must be in active state, so the the new version won't have to read old tlog.\nErick Erickson The CDCR tests passed, But I'm not sure the changes on CDCRUpdateLog are correct. So can you take a look at the patch? ",
+            "id": "comment-15800658"
+        },
+        {
+            "date": "2017-01-06T03:27:24+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch for this issue.\n\n\tFix bug when ensureLog delete replaying buffer tlog.\n\tRemove unnecessary flags on TransactionLog.write(AddUpdateCommand cmd, int flags), TransactionLog.writeDelete(), TransctionLog.writeDeleteByQuery()\n\tchange int UpdateLog.startingOperation to boolean UpdateLog.existOldBufferLog--> indicate the old buffer tlog is not applied.\n\tenable TestRecoveryHdfs.testDropBuffered()\n\n\n\nMark Miller : I think the patch is pretty solid now, can you review the patch? ",
+            "id": "comment-15803396"
+        },
+        {
+            "date": "2017-01-06T03:30:55+0000",
+            "author": "Mark Miller",
+            "content": "Sounds fine to me. If a node dies during buffering, that buffer should be discardable. ",
+            "id": "comment-15803401"
+        },
+        {
+            "date": "2017-01-06T03:33:02+0000",
+            "author": "Mark Miller",
+            "content": "so the the new version won't have to read old tlog.\n\nI suppose it depends? For example, our shutdown script used to kill Solr really fast on shutdown - like after 5 seconds. It's still pretty quick, maybe 30 seconds? But with lots of cores and data, it can easily take longer than for a shutdown. Some users also index during shutdown. So it's not too hard to imagine a shutdown, upgrade, and requirement to replay old tlogs. ",
+            "id": "comment-15803405"
+        },
+        {
+            "date": "2017-01-06T03:44:41+0000",
+            "author": "Cao Manh Dat",
+            "content": "That's right. But I think current patch don't have any problem with UpdateLog.recoverFromLog(). ",
+            "id": "comment-15803433"
+        },
+        {
+            "date": "2017-01-06T03:49:33+0000",
+            "author": "Mark Miller",
+            "content": "I guess I don't understand \"But I think when user update the Solr, their node must be in active state\"\n\nOr really, the whole statement \"But I think when user update the Solr, their node must be in active state, so the the new version won't have to read old tlog.\"\n\nThe way I read it, you are saying, when you update Solr, the new version won't have to read the old tlog\". So I'm mentioning where that could easily happen. But you have answered there is no problem in UpdateLog.recoverFromLog. I have not looked at the patch, so I assume I don't understand the quoted sentence fully. ",
+            "id": "comment-15803441"
+        },
+        {
+            "date": "2017-01-06T03:55:04+0000",
+            "author": "Mark Miller",
+            "content": "It's a good idea to loop the two chaosmonkey tests a lot to confirm changes in this area. Sometimes new failures have crept in (in which case we want to raise a JIRA issue) but even still you can gauge if the failure rate goes up or not before and after. Yonik has a script for this, but I usually just setup a local jenkins job. You can also use the ant beast stuff, or I have a beasting script here: https://gist.github.com/markrmiller/dbdb792216dc98b018ad\n\nJust for frame of reference, many of this out of sync failures these tests catch will fail one in 30, one in 50, one in 100. ",
+            "id": "comment-15803449"
+        },
+        {
+            "date": "2017-01-06T03:57:12+0000",
+            "author": "Cao Manh Dat",
+            "content": "Ok, So I'm talking about FLAG_GAP which only be set when a node is recovering. So I'm not sure that the patch won't mess up the recovery logic because I removed the FLAG_GAP on the patch.\n\nAbout UpdateLog.recoverFromLog(), I think it will still do they job perfectly if some updates had not been committed during shutdown. ",
+            "id": "comment-15803457"
+        },
+        {
+            "date": "2017-01-06T04:04:45+0000",
+            "author": "Mark Miller",
+            "content": "Hmm, from memory, FLAG_GAP is what indicates the updates are buffered and not real right? My first thought at a worry would be even if a node did not need to replay those buffered updates, if you can't tell they are buffered they could be incorrectly used in peer sync and realtime get and stuff. Or is FLAG_GAP the solution Yonik used to avoid peer sync after a failed recovery attempt even after restart? ",
+            "id": "comment-15803476"
+        },
+        {
+            "date": "2017-01-06T04:05:30+0000",
+            "author": "Cao Manh Dat",
+            "content": "That's sound a great test.\nBTW: Do you mean ChaosMonkeyNothingIsSafeTest, ChaosMonkeySafeLeaderTest? ",
+            "id": "comment-15803477"
+        },
+        {
+            "date": "2017-01-06T04:09:36+0000",
+            "author": "Cao Manh Dat",
+            "content": "In the current code, FLAG_GAP is used in RecoveryStrategy, we first check lastOperation have FLAG_GAP, if yes we are sure that buffering updates is not applied ( because the node failed during buffering ) so we skip peersync and go directly to replication process.\n\nIn my patch, I detect this event by checking that any old buffer log exists. So I'm worried about the case when the lastOperation have FLAG_GAP when users restart the whole cluster with the new code. Instead of going to replication process, the new code will go to peerSync. ",
+            "id": "comment-15803485"
+        },
+        {
+            "date": "2017-01-06T07:50:39+0000",
+            "author": "Cao Manh Dat",
+            "content": "Hi Mark, I used beast.sh to run ChaosMonkeyNothingIsSafeTest, ChaosMonkeySafeLeaderTest and both tests are passed! ",
+            "id": "comment-15803895"
+        },
+        {
+            "date": "2017-01-14T02:51:09+0000",
+            "author": "Cao Manh Dat",
+            "content": "Mark Miller : I think this will be fine if we run PeerSync after the upgrade because at the end of PeerSync, we do the fingerprint comparison which I think it's a very strong defensive check! ",
+            "id": "comment-15822658"
+        },
+        {
+            "date": "2017-01-21T01:11:52+0000",
+            "author": "Mark Miller",
+            "content": "so we skip peersync and go directly to replication process.\n\nOkay, got you, that's the latter thing I thought it might be.\n\nwe do the fingerprint comparison which I think it's a very strong defensive check!\n\nYeah, that sounds right. We had to be a lot more careful when we did just a small window check.\n\nI think we have seen other little issues where we could look at buffered docs from a failed attempt as recent valid tlog entries, but if anything this change should probably be a better defense by design for those kind of issues.  ",
+            "id": "comment-15832700"
+        },
+        {
+            "date": "2017-01-22T17:58:04+0000",
+            "author": "Mark Miller",
+            "content": "This looks pretty good to me. I do see testDropBuffered in TestRecovery failing, but I had to add a little fuzz to apply the patch to UpdateLog, so I don't know if that caused some problem or if it was a later commit or it's a real issue with the patch.\n\nSome nit pick notes:\n\nTestRecovery:702  - we should look into this closely - is there any good use cases we currently count on that tests wouldn't catch for example?\n// The updates that were buffered (but never applied) still appear in recent versions!\n// This is good for some uses, but may not be good for others.\n\nUpdateLog:959\nMaybe add a comment why ensureLog calls deleteOldBufferLog\n\nTestRecovery:752 bad javadoc - returns exception\n\nHdfsUpdateLog - unused imports\n\nRecoveryStrategy:289 - comment still talks about gap field\n\nHdfsUpdateLog has commented out dropBufferedUpdates method we should remove as well\n\nTransactionLog:154 source code formatting ",
+            "id": "comment-15833624"
+        },
+        {
+            "date": "2017-01-23T08:11:16+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch to latest source, fix all the errors mentioned by Mark Miller\nTestRecovery#testDropBuffered() passed after 100 of run. ",
+            "id": "comment-15834039"
+        },
+        {
+            "date": "2017-01-23T08:43:42+0000",
+            "author": "Cao Manh Dat",
+            "content": "we should look into this closely - is there any good use cases we currently count on that tests wouldn't catch for example?\nYeah, I agree that we should carefully about this change.\nYonik Seeley : What do you think about this problem? ",
+            "id": "comment-15834069"
+        },
+        {
+            "date": "2017-01-27T05:43:06+0000",
+            "author": "Cao Manh Dat",
+            "content": "Mark Miller in my opinion, the difference in RTG getVersions only appear when the replica in buffering state. So the only possible client for this api is another replica call PeerSync ( in leader election process ). On this case, I do not think the changes will make things different.\n\nOne further step will be not serving buffered updates in get versions, it will make things more clear. If you agree with this solution, I will do more tests to make sure that everything is good. ",
+            "id": "comment-15841651"
+        },
+        {
+            "date": "2018-06-01T02:46:54+0000",
+            "author": "Cao Manh Dat",
+            "content": "Attached a patch for this ticket which can be applied on the master branch. This issue is required for SOLR-12305.  ",
+            "id": "comment-16497491"
+        },
+        {
+            "date": "2018-06-03T08:41:26+0000",
+            "author": "Cao Manh Dat",
+            "content": "Newest patch after doing some cleanup and fixing bugs found on beasting tests. ",
+            "id": "comment-16499337"
+        },
+        {
+            "date": "2018-06-04T02:23:41+0000",
+            "author": "Cao Manh Dat",
+            "content": "Tests seem happy, I will do some review before committing the patch. ",
+            "id": "comment-16499676"
+        },
+        {
+            "date": "2018-06-04T04:32:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ab316bbc91c273b13c851a38ad5d14ef64ab3eec in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ab316bb ]\n\nSOLR-9922: Write buffering updates to another tlog ",
+            "id": "comment-16499729"
+        },
+        {
+            "date": "2018-06-04T04:33:34+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2a6f4862f96456c2aee4dcd3a51a5eb52ff8a0ad in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2a6f486 ]\n\nSOLR-9922: Write buffering updates to another tlog ",
+            "id": "comment-16499730"
+        }
+    ]
+}

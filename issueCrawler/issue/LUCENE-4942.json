@@ -1,0 +1,141 @@
+{
+    "id": "LUCENE-4942",
+    "title": "Indexed non-point shapes index excessive terms",
+    "details": {
+        "components": [
+            "modules/spatial"
+        ],
+        "fix_versions": [
+            "5.1"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Indexed non-point shapes are comprised of a set of terms that represent grid cells.  Cells completely within the shape or cells on the intersecting edge that are at the maximum detail depth being indexed for the shape are denoted as \"leaf\" cells.  Such cells have a trailing '+' at the end.  Such tokens are actually indexed twice, one with the leaf byte and one without.\n\nThe TermQuery based PrefixTree Strategy doesn't consider the notion of 'leaf' cells and so the tokens with '+' are completely redundant.\n\nThe Recursive [algorithm] based PrefixTree Strategy better supports correct search of indexed non-point shapes than TermQuery does and the distinction is relevant.  However, the foundational search algorithms used by this strategy (Intersects & Contains; the other 2 are based on these) could each be upgraded to deal with this correctly.  Not trivial but very doable.\n\nIn the end, spatial non-point indexes can probably be trimmed my ~40% by doing this.",
+    "attachments": {
+        "LUCENE-4942_non-point_excessive_terms.patch": "https://issues.apache.org/jira/secure/attachment/12703495/LUCENE-4942_non-point_excessive_terms.patch",
+        "LUCENE-4942-clone.diff": "https://issues.apache.org/jira/secure/attachment/12703941/LUCENE-4942-clone.diff",
+        "spatial.alg": "https://issues.apache.org/jira/secure/attachment/12703676/spatial.alg"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-04-18T17:32:05+0000",
+            "content": "Without the + (or equivalent) how do you know that everything below that is covered by the shape? ",
+            "author": "Ryan McKinley",
+            "id": "comment-13635391"
+        },
+        {
+            "date": "2013-04-18T17:59:38+0000",
+            "content": "You don't    This is why I believe TermQueryStrategy is fundamentally flawed for indexing non-point shapes.  Yet AFAIK it's the choice ElasticSearch wants to use (or at least wanted).  In ES if you indexed a country and your search box is something small in the middle of that country, you won't match that country.\n\nTo be clear I'm recommending two things:\n\n\tHave TermQueryStrategy not index its leaves with the '+' \u2013 it doesn't use them.\n\tHave RecursivePrefixTreeStrategy only index the leaf versions of those leaf cells, not a redundant non-leaf version.  Some non-trivial code needs to change in a few of the search algorithms.\n\n\n\nIn both cases, the semantics are the same; no new or fewer documents match.  But the spatial index is ~40% smaller I figure, faster indexing as well.  It's possible some of the search algorithms for RecursivePrefixTreeStrategy will be slightly slower since sometimes they'll need to visit an additional token at certain parts of the algorithms to check for both leaf and non-leaf indexed cells but I think it'll be quite negligible. ",
+            "author": "David Smiley",
+            "id": "comment-13635440"
+        },
+        {
+            "date": "2013-04-18T18:21:57+0000",
+            "content": "I see \u2013 so only index the leaves and traverse the terms for each query rather then a pile of term queries.\n\nSounds good, but it seems like benchmarking is the only way to know if it is a reasonable tradeoff!  ",
+            "author": "Ryan McKinley",
+            "id": "comment-13635473"
+        },
+        {
+            "date": "2013-04-18T18:43:49+0000",
+            "content": "There definitely needs to be benchmarking for spatial; but I feel confident in this case that that it'll be well worth it for RPT; I'm quite familiar with the algorithms in there.  It's an unquestionable win-win for TermQueryStrategy. ",
+            "author": "David Smiley",
+            "id": "comment-13635509"
+        },
+        {
+            "date": "2014-02-13T18:09:17+0000",
+            "content": "Somewhat related to this is my newfound realization that indexed non-point shapes will result in IntersectsPrefixTreeFilter (technically it's actually VisitorTemplate) scanning over these smallest grid cells / terms twice and thus calculate intersection twice \u2013 once with the leaf flag, once without.  This is likely a major performance bug.  It would be awkward to fix that right now, but it would be easy once there simply wasn't this redundant indexing of terms \u2013 hence this issue. ",
+            "author": "David Smiley",
+            "id": "comment-13900563"
+        },
+        {
+            "date": "2015-03-06T17:08:48+0000",
+            "content": "I'd like to solve this issue (excessive terms) and also address differentiating between fully-contained leaves vs approximated leaves (for LUCENE-5776) in one go tracked on this issue to avoid dealing with back-compat more than once.  That is, just once we change how PrefixTree derivative strategies encode the term data, instead of doing over more than one issue.  And I'm thinking on trunk wouldn't worry about the back-compat (it is trunk after all), and then the port to 5x would have to consider it \u2013 the down-side being some spatial code on trunk vs 5x may vary a bit.  Perhaps the back-compat detection in 5x would work via a check for Version similar to Analyzer's having a version property that can optionally be set.\n\nI'm not sure how contentious it may be to simply forgo back-compat.  Just re-index.  And you're not affected if all you have is point data, which seems to be at least 80% of the users using spatial.  And you're furthermore not affected if your pre-existing indexes have non-point data but the only predicate you use is Intersects (no Contains, no Within, no heatmaps). Again I'd guess that lobs off another 80% of users since Intersects is so common. ",
+            "author": "David Smiley",
+            "id": "comment-14350585"
+        },
+        {
+            "date": "2015-03-06T19:25:18+0000",
+            "content": "+1\n\nI'm not sure how contentious it may be to simply forgo back-compat\n\nI expect anyone would would be affected would rejoice at the tradeoff.  As is, the people who would be affected either have very few documents or ginormous indexes.\n\nWe could take a poll on solr-user to see if anyone is using RPT for non-points and a query is not Intersects (no need to worry about heatmaps... it has not been released yet!) ",
+            "author": "Ryan McKinley",
+            "id": "comment-14350763"
+        },
+        {
+            "date": "2015-03-09T21:12:50+0000",
+            "content": "The attached patch does not have the \"+\" / \"*\" (approximated leaf vs contained leaf) leaf type differentiation; that can wait.\n\nSummary of patch changes:\n\n\tCellTokenStream: removed the dual/redundant indexing it was doing for leaf cells.  This simplified it, and I further simplified it to the point that CTS is now really a generic TokenStream for a BytesRefIterator you give it.  I have a nocommit to rename CellTokenStream to BytesRefIteratorTokenStream.\n\tRelated to the CellTokenStream change, I refactored PrefixTreeStrategy a little to now have a protected createCellIteratorToIndex() and protected newCellToBytesRefIterator(), and added a CellToBytesRefIterator class. The particular arrangement paves the way for TokenStream re-use \u2014 LUCENE-5776 although leaves the actual re-use to occur later in a future patch on that issue.\n\tTermQueryPrefixTreeStrategy overrides newCellToBytesRefIterator to return a CTBRI subclass that does not have the leaf byte (since this strategy doesn\u2019t query for them).\n\tPrimary search-time changes were in AbstractVisitingPrefixTreeFilter (the base of Intersects, Within, heatmaps), WithinPrefixTreeFilter, and ContainsPrefixTreeFilter.\n\tContainsPrefixTreeFilter now does more leap-frogging than it used to; it\u2019s probably a bit faster as a result.\n\tEnhanced the toString()\u2019s in the Filters to include the query shape.\n\t(Refactoring) Cell.isLeaf() should always return true if it\u2019s level == maxLevels, and I clarified that when cell.isLeaf is false then this means this cell is a \u201cprefix\u201d (effectively the opposite of a leaf) which means there are cells at further resolutions (greater levels). For Quad & Geohash PrefixTree\u2019s, it\u2019s an implementation detail that it doesn\u2019t append the \u2018+\u2019 because doing so is redundant/implied.\n\t(Refactoring) AbstractVisitingPrefixTreeFilter (the base of Intersects, Within, heatmaps) no longer has a hasIndexedLeaves boolean flag to supposedly make it faster for the all-points case.  The checks where it might be relevant are very cheap so I\u2019d rather keep this class simpler.\n\n\n\nTests pass; I'll try precommit later.  I've yet to try lucene/benchmark and examine the index size change. ",
+            "author": "David Smiley",
+            "id": "comment-14353614"
+        },
+        {
+            "date": "2015-03-10T02:24:22+0000",
+            "content": "Boo ya!  It turns out the changes work with the previous index scheme with a trivial change.  I tested this by temporarily subclassing RPT to return a CellToBytesRefIterator that has the redundant prefixes on leaves.  I'll now create this as another test (subclassing the regular one) so that this stays tested. ",
+            "author": "David Smiley",
+            "id": "comment-14354146"
+        },
+        {
+            "date": "2015-03-10T16:03:57+0000",
+            "content": "I ran a benchmark comparison.  The improvements are sweet all around!\n33% smaller index\n35% less memory while indexing\n68% faster indexing (wow)\n44% faster searching (wow)\n\nI used a benchmark '.alg' file with quad tree, with reproducibly random circles to index and to search.  Search was \"Intersects\".  I attached the spatial.alg should someone want to see more parameters. ",
+            "author": "David Smiley",
+            "id": "comment-14355123"
+        },
+        {
+            "date": "2015-03-10T16:07:01+0000",
+            "content": "nice! ",
+            "author": "Ryan McKinley",
+            "id": "comment-14355128"
+        },
+        {
+            "date": "2015-03-10T16:39:26+0000",
+            "content": "Here's a slightly updated patch, doing the CellTokenStream rename, and addressed the nocommits.  ant precommit passes. I think this is ready to commit and get Jenkins beating on it.\n\nI think the Index tweaks planned for LUCENE-5579 need not bleed into this issue after all since I think back-compat will also come for free (no special code) and besides the leaf cell type differentiation should be set with a flag (do you want the differentiation or not?). ",
+            "author": "David Smiley",
+            "id": "comment-14355168"
+        },
+        {
+            "date": "2015-03-10T19:09:26+0000",
+            "content": "+1  \u2013 i did not run the benchmark, but was able to merge and have everything work\n\ngreat work! ",
+            "author": "Ryan McKinley",
+            "id": "comment-14355492"
+        },
+        {
+            "date": "2015-03-10T19:25:25+0000",
+            "content": "Commit 1665656 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1665656 ]\n\nLUCENE-4942: Optimize spatial PrefixTreeStrategy indexes for non-point data\n\n\tRedundant prefix terms on leaf cells are no longer emitted;\n\tCell.isLeaf should always return true at maxLevels\n\n ",
+            "author": "ASF subversion and git services",
+            "id": "comment-14355531"
+        },
+        {
+            "date": "2015-03-10T20:13:20+0000",
+            "content": "Commit 1665674 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1665674 ]\n\nLUCENE-4942: Optimize spatial PrefixTreeStrategy indexes for non-point data\n\n\tRedundant prefix terms on leaf cells are no longer emitted;\n\tCell.isLeaf should always return true at maxLevels\n\n ",
+            "author": "ASF subversion and git services",
+            "id": "comment-14355602"
+        },
+        {
+            "date": "2015-03-11T16:53:34+0000",
+            "content": "when fixing a failing test for SOLR-7228, it looks like the issue is caused by changes here.\n\nWithout this patch, the admin UI shows all tokens having the same value.  I mucked with the cone() function and now they show the right values.  I don't think cone() is called in normal operation \u2013 only for the debug properties in the admin UI\n\nDavid Smiley can you take a look? ",
+            "author": "Ryan McKinley",
+            "id": "comment-14357177"
+        },
+        {
+            "date": "2015-03-11T17:47:00+0000",
+            "content": "Commit 1665949 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1665949 ]\n\nLUCENE-4942: Fix BytesRefIteratorTokenStream's attribute clone method. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-14357270"
+        },
+        {
+            "date": "2015-03-11T17:54:36+0000",
+            "content": "Commit 1665951 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1665951 ]\n\nLUCENE-4942: Fix BytesRefIteratorTokenStream's attribute clone method. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-14357290"
+        },
+        {
+            "date": "2015-04-15T00:30:44+0000",
+            "content": "Bulk close after 5.1 release ",
+            "author": "Timothy Potter",
+            "id": "comment-14495349"
+        }
+    ]
+}

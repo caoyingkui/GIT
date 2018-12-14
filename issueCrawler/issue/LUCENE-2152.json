@@ -1,0 +1,96 @@
+{
+    "id": "LUCENE-2152",
+    "title": "Abstract Spatial distance filtering process and supported field formats",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "modules/spatial"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "3.1",
+        "resolution": "Won't Fix",
+        "status": "Closed"
+    },
+    "description": "Currently the second stage of the filtering process in the spatial contrib involves calculating the exact distance for the remaining documents, and filtering out those that fall out of the search radius.  Currently this is done through the 2 impls of DistanceFilter, LatLngDistanceFilter and GeoHashDistanceFilter.  The main difference between these 2 impls is the format of data they support, the former supporting lat/lngs being stored in 2 distinct fields, while the latter supports geohashed lat/lngs through the GeoHashUtils.  This difference should be abstracted out so that the distance filtering process is data format agnostic.\n\nThe second issue is that the distance filtering algorithm can be considerably optimized by using multiple-threads.  Therefore it makes sense to have an abstraction of DistanceFilter which has different implementations, one being a multi-threaded implementation and the other being a blank implementation that can be used when no distance filtering is to occur.",
+    "attachments": {
+        "LUCENE-2152.patch": "https://issues.apache.org/jira/secure/attachment/12427728/LUCENE-2152.patch",
+        "LUCENE-2152-alt.patch": "https://issues.apache.org/jira/secure/attachment/12430887/LUCENE-2152-alt.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-12-11T15:09:23+0000",
+            "content": "Added patch that implements above behavior.  Adds DistanceFilter interface with implementations for multi-threading and no-op, and LocationDataSet/Factory which is responsible for processing the different formats of data and converting it into a Point2D. ",
+            "author": "Chris Male",
+            "id": "comment-12789337"
+        },
+        {
+            "date": "2009-12-11T15:11:20+0000",
+            "content": "Linked in the issue where I first introduced the multi-threaded approach. ",
+            "author": "Chris Male",
+            "id": "comment-12789338"
+        },
+        {
+            "date": "2009-12-18T13:35:15+0000",
+            "content": "Updated patch so that it uses Point rather than Point2D. ",
+            "author": "Chris Male",
+            "id": "comment-12792474"
+        },
+        {
+            "date": "2009-12-18T13:57:46+0000",
+            "content": "Added full deprecation annotations ",
+            "author": "Chris Male",
+            "id": "comment-12792480"
+        },
+        {
+            "date": "2009-12-29T17:05:04+0000",
+            "content": "One part of this implementation that I'm still wrestling with is the storage of the computed distances.  Currently each docId computed-distance pair is stored in a Map which itself is stored in the DistanceFilter.  This can then be retrieved through the SpatialFilter.  This restricts the storage of the distances, which could be alot of values, to that chosen by the DistanceFilter.  If someone preferred not to store the distances at all, for memory sake maybe, then they have no control over this.  I'm thinking that it might be useful to have some sort of DistanceCollector abstraction through which users of the Filter can have greater control over how the distances are stored, if they are at all.  \n\nAny thoughts on this idea? ",
+            "author": "Chris Male",
+            "id": "comment-12795083"
+        },
+        {
+            "date": "2009-12-30T11:04:14+0000",
+            "content": "Chris, indeed this is a tricky one. One problem with arises related to the map used for distance caching is when you want to use spatial with a filter and sort in contrib/remote. At least in the current code (not your patch - haven't looked at it yet though) the sort instance is obtained from the filter and depends on the map instance filled by the filter. After serialization the instance disappears and sort doesn't work anymore on the remote side. if we could decouple the distance storage from the filter implementation we could also come up with a solution for the sorting problem like providing a remoteCollector that has any key value lookup function (internally) that can be used by the sort function to lookup the calculated values.\n\nI personally would go one step further and introduce an exchangeable distance calculation function in the first step and a collector in the second. It is even possible to introduce a delegation approach like the following example:\n\nDistanceFunction func = new MapCachingDistFunc(new DefaultDistanceFunc(new CustomFieldDecoder());\n\nfor docId in docs:\n  if func(docid, reader, point) <= dist:\n    bitSet.set(docid)\n\n\n\nThat way we could completely separate the problem into a function interface / abstract class and can provide several implementations. It would also be possible to solve our problem with sorting where we can pass a special RemoteDistanceFunction to both the sort and filter impl. I don't know how it would look like in the impl though. \n\nMaybe we can even use this function interface in the customscorequery as well. \n\nJust some random ideas.... ",
+            "author": "Simon Willnauer",
+            "id": "comment-12795282"
+        },
+        {
+            "date": "2009-12-30T11:54:23+0000",
+            "content": "I agree that we need to decouple the sort from the Filter.  My current patches don't do that well enough unfortunately so I want to address that.\n\nI like what you are suggesting, but I think there are a couple of things to consider.  The storage of the distances is not just for sorting sake, as you say its also needed in the CustomScoreQuery for boosting, and also for presentation of the results.  Given that, I'm still sort of favouring separating the distance calculation function from the storage mechanism.\n\nIf we added a DistanceCollector abstraction, then we could create a Remote impl for the Collector, and we could create a distance function (which I refer to as GeoDistanceCalculator in one of my other patches) which uses an existing DistanceCollector as a cache.\n\nWe could also make a NoOpDistanceCollector for those who don't want to actually store anything, and a RangeDistanceCollector for collecting values in ranges (which could be a space saving optimization, and could also help with distance range faceting). ",
+            "author": "Chris Male",
+            "id": "comment-12795293"
+        },
+        {
+            "date": "2009-12-30T12:08:51+0000",
+            "content": "Given that, I'm still sort of favouring separating the distance calculation function from the storage mechanism.\n\nThe actual reasons why I proposed it that way are kind of special. Imagine you do a search 1mile around point X, the next search is 2 miles around point X. Yet for such a case you could simply wrap the function in another cache function using the already existing cache as second level cache. All the logic for that would be encapsulated in a simple function. None of the logic would be necessary in any of the implementations like CustomScoreQuery, Sort or Filter. Yet if you separate them into two interfaces (not necessarily the java interface) you would have to have some logic which checks if the values is already cached somewhere. \nI'm not bound to this solution just throwing in randoms thoughts which could be useful for users to some extend. For me a distance is just a function and I don't care if it is cached or not. The logic which takes care on caching should be completely transparent IMO. If possible we should prevent calls inside the filter etc. like:\n\n\nif(cached):\n  getFromCache()\nelse\n  getFromFunc()\n\n ",
+            "author": "Simon Willnauer",
+            "id": "comment-12795295"
+        },
+        {
+            "date": "2009-12-30T12:19:45+0000",
+            "content": "Ha, genius.  I hadn't thought about the reuse between searches.  That would make a huge difference in a situation where a user is changing their zoom on a map.\n\nI'm with you now and agree whole heartedly with what you are suggesting.  I really love the idea of having a single consistent way of retrieving a distance for a document, whether it be the Filter itself, the Sort, a Query, or some output mechanism.  That would really hide away alot of the logic.\n\nWould you then also put the task of loading/decoding the appropriate lat/lng info for Documents inside this distance function idea as well? (I think this was what you were suggesting a couple of posts ago). ",
+            "author": "Chris Male",
+            "id": "comment-12795300"
+        },
+        {
+            "date": "2010-01-17T13:49:48+0000",
+            "content": "I am currently working on a new patch that will incorporate the ideas discussed here and will attach it shortly. ",
+            "author": "Chris Male",
+            "id": "comment-12801401"
+        },
+        {
+            "date": "2010-01-20T14:15:41+0000",
+            "content": "Attaching a new patch based on the above discussion.\n\nThis patch introduces the interface DocumentDistanceSource, which provides a single place to retrieve the distances for documents.  It uses the new PointDecoder interface (a simplified version of the LocationDataSet in the previous patches) and the GeoDistanceCalculators to determine the distance for a document.  \n\nIt comes with 2 implementations, SimpleDocumentDistanceSource which does the calculations always and does not cache, and MapCachingDocumentDistanceSource, which does some simple map caching of distances.\n\nBy using a combination of these impls, its possible for the user to choose whether they want the calculated distances to be stored or not.  It also moves the storage out from the Filter, returning the filter to a more stateless impl. ",
+            "author": "Chris Male",
+            "id": "comment-12802842"
+        },
+        {
+            "date": "2010-12-01T09:52:42+0000",
+            "content": "Closing along with LUCENE-2139 ",
+            "author": "Chris Male",
+            "id": "comment-12965641"
+        }
+    ]
+}

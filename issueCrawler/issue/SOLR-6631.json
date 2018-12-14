@@ -1,0 +1,146 @@
+{
+    "id": "SOLR-6631",
+    "title": "DistributedQueue spinning on calling zookeeper getChildren()",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "4.10.4",
+            "5.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The change from SOLR-6336 introduced a bug where now I'm stuck in a loop making getChildren() request to zookeeper with this thread dump:\n\nThread-51 [WAITING] CPU time: 1d 15h 0m 57s\njava.lang.Object.wait()\norg.apache.zookeeper.ClientCnxn.submitRequest(RequestHeader, Record, Record, ZooKeeper$WatchRegistration)\norg.apache.zookeeper.ZooKeeper.getChildren(String, Watcher)\norg.apache.solr.common.cloud.SolrZkClient$6.execute()<2 recursive calls>\norg.apache.solr.common.cloud.ZkCmdExecutor.retryOperation(ZkOperation)\norg.apache.solr.common.cloud.SolrZkClient.getChildren(String, Watcher, boolean)\norg.apache.solr.cloud.DistributedQueue.orderedChildren(Watcher)\norg.apache.solr.cloud.DistributedQueue.getChildren(long)\norg.apache.solr.cloud.DistributedQueue.peek(long)\norg.apache.solr.cloud.DistributedQueue.peek(boolean)\norg.apache.solr.cloud.Overseer$ClusterStateUpdater.run()\njava.lang.Thread.run()\n\nLooking at the code, I think the issue is that LatchChildWatcher#process always sets the event to its member variable event, regardless of its type, but the problem is that once the member event is set, the await no longer waits. In this state, the while loop in getChildren(long), when called with wait being Integer.MAX_VALUE will loop back, NOT wait at await because event != null, but then it still will not get any children.\n\n\nwhile (true) {\n  if (!children.isEmpty()) break;\n  watcher.await(wait == Long.MAX_VALUE ? DEFAULT_TIMEOUT : wait);\n  if (watcher.getWatchedEvent() != null)\n    { children = orderedChildren(null); }\n  if (wait != Long.MAX_VALUE) break;\n}\n\nI think the fix would be to only set the event in the watcher if the type is not None.",
+    "attachments": {
+        "SOLR-6631.patch": "https://issues.apache.org/jira/secure/attachment/12677437/SOLR-6631.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-10-27T22:57:59+0000",
+            "author": "Timothy Potter",
+            "content": "Here's a cut of a patch with the start of a unit test for DistributedQueue. I'm curious how we might be able to trigger a \"None\" event to get raised so I can add that to the unit test? Mainly I want to reproduce the scenario described in the bug report in the unit test if possible, but wasn't able to get ZK to raise a \"None\" event. ",
+            "id": "comment-14185970"
+        },
+        {
+            "date": "2014-10-28T01:45:41+0000",
+            "author": "Hoss Man",
+            "content": "I'm curious how we might be able to trigger a \"None\" event to get raised so I can add that to the unit test?\n\nIIUC: \"EventType.None\" only happens when there are \"session level events\" \u2013 ie: KeeperState in (Disconnected, SyncConnected (reconnected), Expired ).\n\nI think the fix would be to only set the event in the watcher if the type is not None.\n\nI'm not very familiar with this code, perhaps a better approach would be to only proceed with this code if the EventType recived is in an explicit set of expected types?\n\nwhichever way makes sense, one trick i find very helpful in situations like this (a: dealing with enums from third party packages; b: wanting to behave according to partitions of the enum space) is to not just \"do X if state in (A) \" but \"do X if state in (A) else no-op if state in (B) else ERROR\" so that if someone upgrades zookeeper and there are suddenly all new EventTypes we don't expect, they aren't silently ignored.\n\nthe EnumSet.allOf() and EnumSet.complimentsOf() methods can also help write very targetted unit tests to alert you to unexpected values as soon as you upgrade.\n\nSo for example...\n\n\npublic class DistributedQueue {\n  public static final EnumSet<EventType> EXPECTED_EVENTS = EnumSet.of(...);\n  public static final EnumSet<EventType> IGNORED_EVENTS = EnumSet.of(...);\n  ...\n    if (EXPECTED_EVENTS.contains(event.getType()) {\n      // do stuff\n      ...\n    } else if (IGNORED_EVENTS.contains(event.getType()) {\n      // NO-OP\n    } else {\n      log.error(\"WTF EVENT IS THIS? \" + ...)\n    }\n  ...\n}\npublic class TestDistributedQueue {\n  ...\n  /**\n   * if this test fails, don't change it - go audit these EnumSets and all their usages\n   */\n  public void testSanityOfEventTypes() {\n    EnumSet<EventType> known = EnumSet.copyOf(DistributedQueue.EXPECTED_EVENTS);\n    known.addAll(DistributedQueue.IGNORED_EVENTS);\n\n    EnumSet<EventType> unknown = EnumSet.complementOf(known);\n    assertEquals(\"un-known EventTypes found, zk upgrade?\", EnumSet.noneOf(EventType.class), unknown)\n  }\n\n ",
+            "id": "comment-14186206"
+        },
+        {
+            "date": "2014-10-29T12:30:12+0000",
+            "author": "Timothy Potter",
+            "content": "Thanks for the feedback Hoss. I was actually wondering if it would suffice to handle NodeChildrenChanged EventTypes in the LatchChildWatcher process method, i.e. change the code to:\n\nif (eventType == Event.EventType.NodeChildrenChanged) {\n ...\n}\n\nMark Miller or Ramkumar Aiyengar do either of you have any insight you can share on this? Specifically, I'd like to change the LatchChildWatcher.process to set the event member and notifyAll only if the EventType is NodeChildrenChanged, i.e.\n\n\n    @Override\n    public void process(WatchedEvent event) {\n      Event.EventType eventType = event.getType();\n      LOG.info(\"LatchChildWatcher fired on path: \" + event.getPath() + \" state: \"\n          + event.getState() + \" type \" + eventType);\n      if (eventType == Event.EventType.NodeChildrenChanged) {\n        synchronized (lock) {\n          this.event = event;\n          lock.notifyAll();\n        }\n      }\n    }\n\n\n\nOr do we need to handle the other event types and just not affect the event if the type is None as originally suggested by Jessica Cheng Mallet?\n\nNeed to get this one committed soon  ",
+            "id": "comment-14188305"
+        },
+        {
+            "date": "2014-10-29T13:21:23+0000",
+            "author": "Mark Miller",
+            "content": "if (eventType == Event.EventType.NodeChildrenChanged) {\n\n+1 - we are only interested in waiting around to see a child added - this watcher should not need to consider other events. ",
+            "id": "comment-14188326"
+        },
+        {
+            "date": "2014-10-29T13:38:16+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1635131 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1635131 ]\n\nSOLR-6631: DistributedQueue spinning on calling zookeeper getChildren() ",
+            "id": "comment-14188346"
+        },
+        {
+            "date": "2014-10-29T14:18:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1635142 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1635142 ]\n\nSOLR-6631: DistributedQueue spinning on calling zookeeper getChildren() ",
+            "id": "comment-14188373"
+        },
+        {
+            "date": "2014-10-29T14:46:31+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1635155 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1635155 ]\n\nBackout fix for SOLR-6631 as things like create collection are hanging now ",
+            "id": "comment-14188407"
+        },
+        {
+            "date": "2014-10-29T14:48:11+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1635157 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1635157 ]\n\nBackout fix for SOLR-6631 as things like create collection are hanging now ",
+            "id": "comment-14188408"
+        },
+        {
+            "date": "2014-10-29T16:46:24+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "I originally thought NodeChildrenChanged would be enough too, but it made the tests hang forever. That's when I realized that the zk.exist() call in offer() also uses this watcher, so it's not enough to just watch for NodeChildrenChanged.\n\nWe can either make the watcher set all not None events (None events don't remove watches, so they need to be excluded), or use a different kind of watch in the zk.exist() call. ",
+            "id": "comment-14188554"
+        },
+        {
+            "date": "2014-10-29T17:01:19+0000",
+            "author": "Mark Miller",
+            "content": "Whoops - glossed over that in my IDE call hierarchy.\n\na different kind of watch in the zk.exist() call\n\nI lean towards that - subclass or something - I think it's better for the current name of the watcher and think it's better the watch only processes the events it is actually interested in.\n\nNot a real big deal either way, but in the other case, let's change the name of the Watcher. ",
+            "id": "comment-14188575"
+        },
+        {
+            "date": "2014-10-30T15:30:11+0000",
+            "author": "Timothy Potter",
+            "content": "Thanks for the help Mark Miller and Jessica Cheng Mallet! I think this patch is ready to go (and no hangs this time)! Please give a quick review and I'll get it committed. ",
+            "id": "comment-14190235"
+        },
+        {
+            "date": "2014-10-30T17:24:29+0000",
+            "author": "Mark Miller",
+            "content": "+1, looks great to me. ",
+            "id": "comment-14190420"
+        },
+        {
+            "date": "2014-10-30T18:10:06+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "+1, thanks Tim! ",
+            "id": "comment-14190522"
+        },
+        {
+            "date": "2014-10-30T18:19:47+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1635573 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1635573 ]\n\nSOLR-6631: Part deux - refactor LatchChildWatcher to LatchWatcher that takes an optional EventType during construction to only release the latch when a specific event type is received. ",
+            "id": "comment-14190535"
+        },
+        {
+            "date": "2014-10-30T18:25:25+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1635576 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1635576 ]\n\nSOLR-6631: Part deux - refactor LatchChildWatcher to LatchWatcher that takes an optional EventType during construction to only release the latch when a specific event type is received. ",
+            "id": "comment-14190544"
+        },
+        {
+            "date": "2015-02-23T05:02:45+0000",
+            "author": "Anshum Gupta",
+            "content": "Bulk close after 5.0 release. ",
+            "id": "comment-14332947"
+        },
+        {
+            "date": "2015-02-26T12:04:02+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Reopening to backport to 4.10.4 ",
+            "id": "comment-14338299"
+        },
+        {
+            "date": "2015-02-26T12:07:39+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1662429 from shalin@apache.org in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1662429 ]\n\nSOLR-6631: DistributedQueue spinning on calling zookeeper getChildren() ",
+            "id": "comment-14338301"
+        },
+        {
+            "date": "2015-02-26T12:41:40+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1662435 from shalin@apache.org in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1662435 ]\n\nSOLR-6631: Fix bad merge ",
+            "id": "comment-14338332"
+        },
+        {
+            "date": "2015-03-05T15:36:30+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close for 4.10.4 release ",
+            "id": "comment-14348921"
+        }
+    ]
+}

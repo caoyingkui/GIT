@@ -1,0 +1,132 @@
+{
+    "id": "SOLR-10235",
+    "title": "fix last TestJdbcDataSource / mock issue with java9",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "The way TestJdbcDataSource was converted to use Mockito in SOLR-9966 still left one outstanding test that was incompatible with Java9: testRetrieveFromDriverManager() \n\nThe way this test worked with mock classes was also sketchy, but under java9 (even with Mockito) the attempt at using class names to resolve things in the standard SQL DriverManager isn't viable.\n\nIt seems like any easy fix is to create real class (with a real/fixed classname) that acts as a wrapper around a mockito \"Driver\" instance just for the purposes of checking that the DriverManaer related code is working properly.",
+    "attachments": {
+        "SOLR-10235.patch": "https://issues.apache.org/jira/secure/attachment/12856397/SOLR-10235.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-03-07T00:59:39+0000",
+            "content": "Attaching a patch showing what i had in mind.\n\nseems to work fine with both java8 & java9.\n\nUwe Schindler & Cao Manh Dat: do you guys see any problems with this type of approach? ",
+            "author": "Hoss Man",
+            "id": "comment-15898499"
+        },
+        {
+            "date": "2017-03-07T07:32:32+0000",
+            "content": "Hi Hoss Man,\nthanks for converting it, but there are 2 issues: getPropertyInfo(String url, Properties info) and jdbcCompliant() miss to delegate to wrapper; they call themselves leading to stack overflow. It looks like they are not called, but if the test gets extended it may overflow.\n\nOtherwise, I'd make the Mock setup in the constructor of the wrapper. With the current code, if the JDBC driver would actually create a new instance of the wrapper based on the class name, the driver would not have the recorded behaviour. To do this reove \"static\" from the inner class. getMockitoDriver() is then also obsolete.\n\nFinally, add @Override. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15898878"
+        },
+        {
+            "date": "2017-03-07T08:02:43+0000",
+            "content": "Here is a fixed patch. Actually I now understand the problem: JdbcDataSource tries to instantiate the class and create an instance if the driver is not already registered. But as the driver is registered manually before usage in our code, we don't want to have this. Because of this I added an empty ctor to disallow this. For \"registering\" the driver, we pass our mock connection to the driver and it passes. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15898906"
+        },
+        {
+            "date": "2017-03-07T08:16:41+0000",
+            "content": "In addition, I made the Driver class public, otherwise it's broken according to JDBC standards (Class.forName won't work). ",
+            "author": "Uwe Schindler",
+            "id": "comment-15898929"
+        },
+        {
+            "date": "2017-03-07T09:22:38+0000",
+            "content": "I changed the Driver a bit to only work on its \"supported URL\" (a ststic final String). This ensure that we do not pollute the JVM with a driver that \"owns\" every URL. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15899016"
+        },
+        {
+            "date": "2017-03-07T10:40:15+0000",
+            "content": "Sorry for posting so many patches. I reimplemented the Driver interface without mocks. This ensures that it will also work with later Java versions. It will return a version number and properties (if the DriverManager requires that metainformation), but return the mocked Connection instance, if the URL matches.\n\nI think that's ready now. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15899204"
+        },
+        {
+            "date": "2017-03-07T17:12:38+0000",
+            "content": "Uwe: i like this approach, three nits...\n\n1) the javadocs for MockDriver should explain the purpose of this class given how much of the rest of the outer class uses Mockito.\n\n2) I don't like that you're shadowing the variable named driver ... at first glance this could confuse people skimming code who have already seen the class level driver variable ... better to use mockDriver or fixedClassDriver or something like that.\n\n3) rather then returning null, I suggest MockDriver.connect(...) throw a new SQLException(\"attempted to use this driver with bogus url\") if acceptsURL(...) is false \u2013 so if the day comes when someone breaks the code, they'll have a decent error msg to identify the bug instead of an NPE. ",
+            "author": "Hoss Man",
+            "id": "comment-15899790"
+        },
+        {
+            "date": "2017-03-07T17:28:02+0000",
+            "content": "1) the javadocs for MockDriver should explain the purpose of this class given how much of the rest of the outer class uses Mockito.\n\nThe Javadocs already say that this is a simple Driver rimplementation, that returns a mock connection for any url that equals MY_JDBC_URL. I can add a note to the Javadocs why it is not a mock, but the purpose of this class is identical to the other \"mock\" classes in this package (there is a mock JNDI Data Source that behaves similar).\n\n2) I don't like that you're shadowing the variable named driver ... at first glance this could confuse people skimming code who have already seen the class level driver variable ... better to use mockDriver or fixedClassDriver or something like that.\n\noh sorry, will fix that. The original code used driver so I kept that. FYI: The problem with Java 9 was not the class name! I analyzed Java 9's DriverManager: The problem was caused by another workflow used internally when trying to find the right driver. If you use a \"Mock\" Driver implementation (as Mockito class), it requires that JDBC runtime calls the methods in same order, which is not defined in the spec. Because of that you have to implement a \"real\" driver allowing several ways to get a connection, a mock is not enough. This \"real\" driver must be prepared that the runtime may call methods in different order or suddenly use different methods like \"acceptURL\" for the purpose of looking up the correct driver. It must also interact in a sane way with other drivers registered in the runtime. As the driver is JVM-Global, a mock is too risky.\n\n3) rather then returning null, I suggest MockDriver.connect(...) throw a new SQLException(\"attempted to use this driver with bogus url\") if acceptsURL(...) is false \u2013 so if the day comes when someone breaks the code, they'll have a decent error msg to identify the bug instead of an NPE.\n\nI disagree with that, sorry. As there can be more than one driver installed in the system, DriverManager will ask all of them one after each other until one of them does not return null. The NPE is according to JDBC spec: it tells DriverManager to use next driver (RTFM). If all Drivers return null, DriverManager will finally say: \"invalid URL\". For historical reasons, DriverManager will not use the acceptsURL(), because older JDBC drivers may not implement that method and only return null. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15899806"
+        },
+        {
+            "date": "2017-03-07T17:36:09+0000",
+            "content": "I can add a note to the Javadocs why it is not a mock, but the purpose of this class is identical to the other \"mock\" classes in this package (there is a mock JNDI Data Source that behaves similar).\n\nMy point is that in this test class (TestJdbcDataSource) the new MockDriver class is the only \"mock\" class we explicitly define - all other code in this test uses Mockito based mocks, so it would be easy for someone down the road to look at this class and think \"this MockDriver class looks like cruft we can replace with another one line Mockito call\" ... basically i'm just suggesting that virtually the same verbage from the testRetrieveFromDriverManager method should be in  MockDriver's javadocs.\n\nI disagree with that, sorry. As there can be more than one driver installed in the system, ...\n\nAUGH! ... yoy are completely correct, i wasn't thinking holisticly about the DriverManager as a whole ... agreed, ignore that suggestion completley. ",
+            "author": "Hoss Man",
+            "id": "comment-15899816"
+        },
+        {
+            "date": "2017-03-07T17:41:12+0000",
+            "content": "New patch. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15899822"
+        },
+        {
+            "date": "2017-03-07T17:47:46+0000",
+            "content": "+1 ",
+            "author": "Hoss Man",
+            "id": "comment-15899830"
+        },
+        {
+            "date": "2017-03-07T18:01:34+0000",
+            "content": "Commit 0d2c027857bfca3486399b0e6b19a5887081287a in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0d2c027 ]\n\nSOLR-10235: Fix DIH's TestJdbcDataSource to work with Java 9 and other Java runtimes that do not use the same DriverManager implementation like Oracle's original one ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15899854"
+        },
+        {
+            "date": "2017-03-07T18:02:42+0000",
+            "content": "Commit d64920b5499ec1b95352dc520cb90d24f11c667d in lucene-solr's branch refs/heads/branch_6x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d64920b ]\n\nSOLR-10235: Fix DIH's TestJdbcDataSource to work with Java 9 and other Java runtimes that do not use the same DriverManager implementation like Oracle's original one ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15899855"
+        },
+        {
+            "date": "2017-03-07T20:09:16+0000",
+            "content": "I have this commit locally. precommit just failed to me\n\n-check-forbidden-all:\n[forbidden-apis] Reading bundled API signatures: jdk-unsafe-1.8\n[forbidden-apis] Reading bundled API signatures: jdk-deprecated-1.8\n[forbidden-apis] Reading bundled API signatures: jdk-non-portable\n[forbidden-apis] Reading bundled API signatures: jdk-reflection\n[forbidden-apis] Reading bundled API signatures: commons-io-unsafe-2.5\n[forbidden-apis] Reading API signatures: /Users/khludnevm/lucene-solr/lucene/tools/forbiddenApis/base.txt\n[forbidden-apis] Reading API signatures: /Users/khludnevm/lucene-solr/lucene/tools/forbiddenApis/servlet-api.txt\n[forbidden-apis] Reading API signatures: /Users/khludnevm/lucene-solr/lucene/tools/forbiddenApis/solr.txt\n[forbidden-apis] Loading classes to check...\n[forbidden-apis] Scanning classes for violations...\n[forbidden-apis] Forbidden class/interface use: java.util.logging.Logger [Use slf4j classes instead]\n[forbidden-apis]   in org.apache.solr.handler.dataimport.TestJdbcDataSource$MockDriver (TestJdbcDataSource.java, method declaration of 'getParentLogger()')\nbeware ",
+            "author": "Mikhail Khludnev",
+            "id": "comment-15900060"
+        },
+        {
+            "date": "2017-03-07T20:11:50+0000",
+            "content": "I haven't looked too closely at this patch, but for the DriverImpl for SolrJ JDBC we had to add a suppress annotation.\n\nhttps://github.com/apache/lucene-solr/blob/master/solr/solrj/src/java/org/apache/solr/client/solrj/io/sql/DriverImpl.java#L97\n\n\n  @SuppressForbidden(reason=\"Required by jdbc\")\n  public Logger getParentLogger() {\n    return null;\n  }\n\n ",
+            "author": "Kevin Risden",
+            "id": "comment-15900064"
+        },
+        {
+            "date": "2017-03-07T20:53:50+0000",
+            "content": "Oh yeah. Sorry, I'll fix. ",
+            "author": "Uwe Schindler",
+            "id": "comment-15900136"
+        },
+        {
+            "date": "2017-03-07T21:07:26+0000",
+            "content": "Commit d8442070cfbb0cec815a465a6c143e2b31870e34 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d844207 ]\n\nSOLR-10235: fix precommit ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15900161"
+        },
+        {
+            "date": "2017-03-07T21:08:32+0000",
+            "content": "Commit 2cc1c0ed29f696bf2ab5e72239f328c290c9101c in lucene-solr's branch refs/heads/branch_6x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2cc1c0e ]\n\nSOLR-10235: fix precommit ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15900164"
+        }
+    ]
+}

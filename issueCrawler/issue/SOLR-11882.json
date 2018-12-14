@@ -1,0 +1,247 @@
+{
+    "id": "SOLR-11882",
+    "title": "SolrMetric registries retain references to SolrCores when closed",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "metrics",
+            "Server"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.4",
+            "master (8.0)"
+        ],
+        "affect_versions": "7.1",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Description:\n\nOur setup involves using a lot of small cores (possibly hundred thousand), but working only on a few of them at any given time.\n\nWe already followed all recommendations in this guide: https://wiki.apache.org/solr/LotsOfCores\n\nWe noticed that after creating/loading around 1000-2000\u00a0empty cores, with no documents inside, the heap consumption went through the roof despite having set transientCacheSize to only 64 (heap size set to 12G).\n\nAll cores are correctly set to loadOnStartup=false and transient=true, and we have verified via logs that the cores in excess are actually being closed.\n\nHowever, a reference remains in the org.apache.solr.metrics.SolrMetricManager#registries that is never removed until a core if fully unloaded.\n\nRestarting the JVM loads all cores in the admin UI, but doesn't populate the ConcurrentHashMap until a core is actually fully loaded.\n\nI reproduced the issue on a smaller scale (transientCacheSize = 5, heap size = 512m) and made a report (attached) using eclipse MAT.\n\nDesired outcome:\n\nWhen a transient core is closed, the references in the SolrMetricManager should be removed, in the same fashion the reporters for the core are also closed and removed.\n\nIn alternative, a unloadOnClose=true|false flag could be implemented to fully unload a transient core when closed due to the cache size.\n\nNote:\n\nThe documentation mentions everywhere that the unused cores will be unloaded, but it's misleading as the cores are never fully unloaded.",
+    "attachments": {
+        "SOLR-11882.patch": "https://issues.apache.org/jira/secure/attachment/12907228/SOLR-11882.patch",
+        "solr.config.zip": "https://issues.apache.org/jira/secure/attachment/12907252/solr.config.zip",
+        "create-cores.zip": "https://issues.apache.org/jira/secure/attachment/12907253/create-cores.zip",
+        "SOLR-11882-7x.patch": "https://issues.apache.org/jira/secure/attachment/12916818/SOLR-11882-7x.patch",
+        "solr-dump-full_Leak_Suspects.zip": "https://issues.apache.org/jira/secure/attachment/12907147/solr-dump-full_Leak_Suspects.zip"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-01-23T03:30:58+0000",
+            "content": "Ignore that patch, something's pretty screwy with my test.\n\n\u00a0 ",
+            "author": "Erick Erickson",
+            "id": "comment-16335349"
+        },
+        {
+            "date": "2018-01-23T08:23:33+0000",
+            "content": "Erick Erickson I also uploaded our configuration and the test script used to create multiple cores.\nIf you want to test it, you'll need to add -Dfts.solr.indexdatadir=<directory> to your solr.in.sh.\u00a0\n\nExample:\n\nSOLR_OPTS=\"$SOLR_OPTS -Dfts.solr.indexdatadir=/tmp/solrdata\n\nThen, run ./create-cores.sh {1..1000}\n\nLet me know if you need more details. ",
+            "author": "Eros Taborelli",
+            "id": "comment-16335488"
+        },
+        {
+            "date": "2018-01-23T16:16:09+0000",
+            "content": "What I see at this point is that the number of cores in memory is actually capped by the total number of cores that have been defined. Say I have 30 transient cores and my transient core cache limit is 4. Eventually I see exactly 30 cores in memory.\n\nHowever, I have to stop my indexing program that's cycling through all the cores and trigger a GC for the SolrCores to drop back to 30. So if I randomly sample the number of Solr cores it'll be between 40-50 (or more, depending on how much free memory I have allocated) as the stress program is running, but when I stop indexing and trigger a GC, it drops back to exactly 30.\n\nDoes that square with what you see? This is still a problem of course, it should drop back to 4. ",
+            "author": "Erick Erickson",
+            "id": "comment-16335996"
+        },
+        {
+            "date": "2018-01-24T04:45:23+0000",
+            "content": "Andrzej Bialecki  kindly provided this suggestion, I applied it\n\n-\u00a0it fixes the cores lingering around. As above I had to stop indexing and force a GC to have the cores drop back to 4 in my test scenario. In \"real\" situations where you have hundreds/thousands of cores I'd expect the number of references to peak somewhat above your cache size as some wait around for GC\n\n2> precommit passes\n\n3> tests pass. I had one failure with\u00a0AutoscalingHistoryHandlerTest, then 3 of 10 failed (beasting). However, 2 of 10 failed without this patch so I don't think it's relevant.\n\nWhat I have not looked at yet is what happens when metrics are requested for non-resident cores, or whether having the cores come and go accumulates metrics over successive loads of the core. ",
+            "author": "Erick Erickson",
+            "id": "comment-16336891"
+        },
+        {
+            "date": "2018-01-24T08:11:27+0000",
+            "content": "Erick Erickson yes, that is what we see. ",
+            "author": "Eros Taborelli",
+            "id": "comment-16337104"
+        },
+        {
+            "date": "2018-01-24T09:24:45+0000",
+            "content": "Andrzej Bialecki kindly provided this suggestion, I applied it\nMy suggestion was to replace Gauge metrics in the registry inside SolrCoreMetricManager.close() with their last primitive values (because most of these Gauges are created as lambdas and keep referencing SolrCore, whereas values they produce don't reference the core) - this way we would stop referencing SolrCore but still preserve a snapshot of gauge values. Something like this:\n\nmetricRegistry.getGauges().forEach((k, v) -> {\n Object val = v.getValue();\n metricRegistry.remove(k);\n metricRegistry.register(k, (Gauge)() -> val);\n}\n\n\nI'm surprised your patch works, because SolrCoreMetricManager.close() is called from inside SolrCore.close(), and calling SolrCore.close() here again should IMHO lead to \"Too many closes\" exception... ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16337190"
+        },
+        {
+            "date": "2018-01-25T00:52:11+0000",
+            "content": "Oh total bother. I put up a second copy of the same\u00a0hack patch up rather than the one you coached me on that I tested with. I'll put the right\u00a0one up shortly. ",
+            "author": "Erick Erickson",
+            "id": "comment-16338504"
+        },
+        {
+            "date": "2018-01-27T21:04:56+0000",
+            "content": "Any reason not to commit this? Otherwise I'll commit this this weekend.... Now that I have the right patch up there. ",
+            "author": "Erick Erickson",
+            "id": "comment-16342313"
+        },
+        {
+            "date": "2018-01-29T03:43:50+0000",
+            "content": "Patch with CHANGES.txt ",
+            "author": "Erick Erickson",
+            "id": "comment-16342852"
+        },
+        {
+            "date": "2018-01-29T03:44:19+0000",
+            "content": "Commit f0509c19c16ded1557f8d7168acb0b7faf926ab7 in lucene-solr's branch refs/heads/master from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f0509c1 ]\n\nSOLR-11882: SolrMetric registries retain references to SolrCores when closed ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16342853"
+        },
+        {
+            "date": "2018-01-29T03:44:20+0000",
+            "content": "Commit c724845fabcdbffe15ad78f5335c77cae0900194 in lucene-solr's branch refs/heads/master from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c724845 ]\n\nSOLR-11882: SolrMetric registries retain references to SolrCores when closed ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16342855"
+        },
+        {
+            "date": "2018-01-29T03:44:22+0000",
+            "content": "Commit d85a1666a18423eeeda83ca89ce4ab959ce39066 in lucene-solr's branch refs/heads/master from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d85a166 ]\n\nSOLR-11882: SolrMetric registries retain references to SolrCores when closed ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16342856"
+        },
+        {
+            "date": "2018-01-29T03:50:14+0000",
+            "content": "Commit a729fc83311a2f6426664d098d2a5920e2b62852 in lucene-solr's branch refs/heads/branch_7x from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a729fc8 ]\n\nSOLR-11882: SolrMetric registries retain references to SolrCores when closed\n\n(cherry picked from commit f0509c1) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16342863"
+        },
+        {
+            "date": "2018-01-29T03:50:16+0000",
+            "content": "Commit 2feb3e794a03e07fa1eee34188d667f24d357db5 in lucene-solr's branch refs/heads/branch_7x from Erick\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2feb3e7 ]\n\nSOLR-11882: SolrMetric registries retain references to SolrCores when closed\n\n(cherry picked from commit c724845) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16342864"
+        },
+        {
+            "date": "2018-01-29T03:53:15+0000",
+            "content": "Thanks Andrzej!\n\n\u00a0 ",
+            "author": "Erick Erickson",
+            "id": "comment-16342868"
+        },
+        {
+            "date": "2018-01-30T13:24:22+0000",
+            "content": "This fix exposed another existing issue, which is not fatal but looks ugly:\n\nERROR - 2018-01-30 12:51:11.480; [c:gettingstarted s:shard1 r:core_node5 x:gettingstarted_shard1_replica_n2] org.apache.solr.common.SolrException; org.apache.lucene.store.AlreadyClosedException: this IndexReader is closed\n        at org.apache.lucene.index.IndexReader.ensureOpen(IndexReader.java:268)\n        at org.apache.lucene.index.StandardDirectoryReader.getVersion(StandardDirectoryReader.java:338)\n        at org.apache.lucene.index.FilterDirectoryReader.getVersion(FilterDirectoryReader.java:119)\n        at org.apache.lucene.index.FilterDirectoryReader.getVersion(FilterDirectoryReader.java:119)\n        at org.apache.solr.search.SolrIndexSearcher.lambda$initializeMetrics$14(SolrIndexSearcher.java:2262)\n        at org.apache.solr.metrics.SolrCoreMetricManager.lambda$close$93(SolrCoreMetricManager.java:156)\n        at java.util.TreeMap.forEach(TreeMap.java:1001)\n        at java.util.Collections$UnmodifiableMap.forEach(Collections.java:1505)\n        at org.apache.solr.metrics.SolrCoreMetricManager.close(SolrCoreMetricManager.java:155)\n        at org.apache.solr.core.SolrCore.close(SolrCore.java:1513)\n        at org.apache.solr.core.CoreContainer.registerCore(CoreContainer.java:898)\n        at org.apache.solr.core.CoreContainer.reload(CoreContainer.java:1292)\n        at org.apache.solr.core.SolrCore.lambda$getConfListener$38(SolrCore.java:2969)\n        at org.apache.solr.cloud.ZkController.lambda$fireEventListeners$190(ZkController.java:2610)\n        at java.lang.Thread.run(Thread.java:745)\n\n\n\nThis is caused by a bunch of too simplistic lambda expressions in SolrIndexSearch:2257 and following - basically, they should first check if the reader is still open, and return eg. -1 if it's not. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16345026"
+        },
+        {
+            "date": "2018-02-01T16:19:06+0000",
+            "content": "It turns out that this fix is wrong... \n\nThe new section in SolrCoreMetricManager.close() causes the new instances of gauges to be closed because the new core is registered first (and registers new instances of metrics) and only then the old one is closed - and it closes the new metrics instead of the old ones\u2026\n\nOne solution, which is more complicated than I\u2019d like, is to use a subclass of Gauge that has a tag (the same as we do with MetricReporters) and remove instances only when the tag matches the one in the core that is being closed\nor revert this fix and see if there\u2019s something better that we could do here. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16348833"
+        },
+        {
+            "date": "2018-02-01T16:24:55+0000",
+            "content": "OK, let's revert this. I am traveling today, so feel free if you'd like. I'll get to it this weekend if you don't get to it. ",
+            "author": "Erick Erickson",
+            "id": "comment-16348848"
+        },
+        {
+            "date": "2018-02-01T17:14:22+0000",
+            "content": "Commit 8418081c4ae5bfe752938c1ae6db9cf5063c8e7f in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8418081 ]\n\nRevert \"SOLR-11882: SolrMetric registries retain references to SolrCores when closed\"\n\nThis reverts commit f0509c19c16ded1557f8d7168acb0b7faf926ab7. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16348930"
+        },
+        {
+            "date": "2018-02-01T17:14:23+0000",
+            "content": "Commit b0b963c68e04a249b87d5b3ab70ade52d19d85ee in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b0b963c ]\n\nRevert \"SOLR-11882: SolrMetric registries retain references to SolrCores when closed\"\n\nThis reverts commit c724845fabcdbffe15ad78f5335c77cae0900194. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16348931"
+        },
+        {
+            "date": "2018-02-01T17:31:42+0000",
+            "content": "Commit 83696042649e5c7460c47d0ca121c46a58d2fa54 in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8369604 ]\n\nRevert \"SOLR-11882: SolrMetric registries retain references to SolrCores when closed\"\n\nThis reverts commit a729fc83311a2f6426664d098d2a5920e2b62852. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16348956"
+        },
+        {
+            "date": "2018-02-01T17:31:44+0000",
+            "content": "Commit b586dca89ff0b7c365dcbb3e1e403adf477790b1 in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b586dca ]\n\nRevert \"SOLR-11882: SolrMetric registries retain references to SolrCores when closed\"\n\nThis reverts commit 2feb3e794a03e07fa1eee34188d667f24d357db5. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16348957"
+        },
+        {
+            "date": "2018-03-14T21:22:05+0000",
+            "content": "Andrzej Bialecki  OK, I think the light finally dawned. We're talking about two different cases and they both have to be handled.\n\n1> transient core case, the one I'm started with. In this case, the core is closed out and may, some time in the near or far future be opened again. In this case the patch from 28-Jan is probably almost fine although there's still a (probably small but unacceptable) chance that a new version of the core would be opened before the closer thread got 'round to closing the old one.\n\n2> reopening a core which is the case you're talking about in your comment 1-Feb.\n\nIn <2> there's no problem with cores accumulating due to the reference in the metrics code since they've been released by the new assignment already.\n\nDoes that make sense?\n\nAnd is there a good way other than inspection to test any fixes I make?\n\nThanks! ",
+            "author": "Erick Erickson",
+            "id": "comment-16399440"
+        },
+        {
+            "date": "2018-03-16T20:39:26+0000",
+            "content": "Bah, I had some cruft in there, what I had in this comment doesn't work at all. ",
+            "author": "Erick Erickson",
+            "id": "comment-16402474"
+        },
+        {
+            "date": "2018-03-26T13:49:09+0000",
+            "content": "Here's the setup that I used to test and verify this issue:\n\n\tcreated core0/conf .. core9/conf dirs under server/solr/ and copied the _default configset to each of the conf dirs.\n\tcreated in each core0 .. core9 dir a core.properties file containing a single line: transient=true\n\tmodified server/solr/solr.xml to contain <int name=\"transientCacheSize\">2</int> under solr element\n\tran bin/solr start and issued a simple query request to each of the cores, to force its loading (and unloading from the small cache)\n\n\n\nAfter attaching a profiler I was able to verify that indeed 10 instances of SolrCore exist, all strongly referenced, and forcing GC doesn't affect this.\n\nI attached a possible patch - it associates each Gauge with the SolrInfoBean that registered it, and then unregisters these gauge instances that correspond to the bean that is being closed (whether it's SolrCore or other plugin).\n\nThere are a few things that I don't like about this patch, though: I used WeakReference to tell JVM that it can garbage collect the lambdas as soon as their parent object is unreferenced, and I had to explicitly call unregistration in SolrCoreMetricManager.close(). Either one of these didn't work on its own, although I think the unregistration step should - only when used both I could see that indeed the references to old transient cores were being released. So there's likely still some other factor at play here... but at least the patch can be used as a workaround. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16413869"
+        },
+        {
+            "date": "2018-03-26T18:41:58+0000",
+            "content": "Andrzej Bialecki  LGTM, after I cycle through my tests (and do a GC), my SolrCore count now drops back to (non-transient-cores + transient-queue-size) which is what I'd hoped for.\n\nThanks! ",
+            "author": "Erick Erickson",
+            "id": "comment-16414314"
+        },
+        {
+            "date": "2018-03-27T08:24:58+0000",
+            "content": "This looks like a pretty serious bug.\u00a0 I'm going to build another RC for the 7.3.0 release once SOLR-12141 is in, do you want to backport this fix as well or does it need more time to bake? ",
+            "author": "Alan Woodward",
+            "id": "comment-16415218"
+        },
+        {
+            "date": "2018-03-27T08:32:48+0000",
+            "content": "Alan Woodward the patch appears to be working but as I indicated above it's probably not the whole story, so let's wait at least for a few jenkins builds to confirm that it doesn't break anything.\n(Edit: at the moment the patch still causes multiple test failures so it still needs work). ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16415225"
+        },
+        {
+            "date": "2018-03-27T16:12:27+0000",
+            "content": "Alan Woodward This has been around since at least 6.4 I believe. Plus, it's rather obscure. In the normal course of events, we don't close cores and leave them closed.\n\nIf we re-open a core, the orphan reference is re-assigned. So if I open/close/open/close the same core a zillion times, I only have one SolrCore object.\n\nIt manifests itself is if someone is using \"transient cores\". In that case, if the transient core cache is capped at, say, 10 and I have 100 transient cores, after I cycle through them all I'll have 90 \"orphan\" references. I'll never have more than that though. And never less.\n\nFor anyone running \"stock\" Solr, it won't show up. People will open all the cores at startup and keep them open (even if reopened) and won't have any orphans.\n\nI suppose if people are unloading cores it might occur as well, but I think that's rare.\n\nAll FYI to evaluate whether you want to put it in 7.3. For people affected it is, indeed serious if they have a lot of cores.... ",
+            "author": "Erick Erickson",
+            "id": "comment-16415849"
+        },
+        {
+            "date": "2018-03-27T22:08:01+0000",
+            "content": "Alan Woodward The current patch is broken (Solr silently loses some metrics from active cores .. oops). I'm preparing a new patch that is conceptually simpler and appears to be working well.\n\nHowever, this new fix requires changing the API of SolrMetricProducer (new parameter in initializeMetrics(...) method) so I think it's suitable only for 8.0 - definitely not for 7.3. I think that at this point the only thing we can do for 7.3 is to add this issue to the\u00a0\"known bugs\" section. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16416320"
+        },
+        {
+            "date": "2018-03-27T22:22:18+0000",
+            "content": "definitely not for 7.3.\n\nCould we introspect the impl and do the right thing with new impls that take the new param? ",
+            "author": "Mark Miller",
+            "id": "comment-16416335"
+        },
+        {
+            "date": "2018-03-27T22:40:42+0000",
+            "content": "Could we introspect the impl and do the right thing with new impls that take the new param?\nThat would be exceedingly messy - this method is called in many components and from different contexts (eg. most but not all mbeans are initialized in SolrCore, but handlers are also initialized in CoreContainer, some components initialize their own sub-components, etc...) ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16416355"
+        },
+        {
+            "date": "2018-03-27T23:36:14+0000",
+            "content": "Updated patch. This adds a SolrCore instance identifier (tag) to all gauges in a registry, which are then matched and removed when SolrCore is closed.\n\nThe size of the patch is partially caused by the change in SolrMetricProducer.initializeMetrics(...) and the need to pass around the SolrCore instance tag.\nAll unit tests pass, and the scenario described above also passes, ie. produces only 2 strongly referenced SolrCore objects. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16416468"
+        },
+        {
+            "date": "2018-03-28T09:46:37+0000",
+            "content": "Commit 7260d9ce713b5f6378b97e4c64f3045eb62f98bd in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7260d9c ]\n\nSOLR-11882: SolrMetric registries retained references to SolrCores when closed. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16417100"
+        },
+        {
+            "date": "2018-03-29T11:40:57+0000",
+            "content": "Patch for branch_7x that allows us to maintain back-compat API - this is functionally identical to the patch for master except the changes in SolrMetricProducer interface. The old method is marked here as deprecated, and the new method has a default implementation that calls the old one - so third-party components that implement only the old method will be correctly called by Solr via the default impl. of the new method.\n\nIf there are no objections I'll commit this shortly. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16418820"
+        },
+        {
+            "date": "2018-04-03T09:40:58+0000",
+            "content": "Commit 483914b6a4c5aaa163625169066e8c6bb3942566 in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=483914b ]\n\nSOLR-11882: SolrMetric registries retained references to SolrCores when closed. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16423749"
+        }
+    ]
+}

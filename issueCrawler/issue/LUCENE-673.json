@@ -1,0 +1,71 @@
+{
+    "id": "LUCENE-673",
+    "title": "Exceptions when using Lucene over NFS",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "2.2"
+        ],
+        "affect_versions": "2.0.0",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "I'm opening this issue to track details on the known problems with\nLucene over NFS.\n\nThe summary is: if you have one machine writing to an index stored on\nan NFS mount, and other machine(s) reading (and periodically\nre-opening the index) then sometimes on re-opening the index the\nreader will hit a FileNotFound exception.\n\nThis has hit many users because this is a natural way to \"scale up\"\nyour searching (single writer, multiple readers) across machines.  The\nbest current workaround (I think?) is to take the approach Solr takes\n(either by actually using Solr or copying/modifying its approach) to\ntake snapshots of the index and then have the readers open the\nsnapshots instead of the \"live\" index being written to.\n\nI've been working on two patches for Lucene:\n\n\n\tA locking (LockFactory) implementation using native OS locks\n\n\n\n\n\tLock-less commits\n\n\n\n(I'll open separate issues with the details for those).\n\nI have a simple stress test where one machine is constantly adding\ndocs to an index over NFS, and another machine is constantly\nre-opening the index searcher over NFS.\n\nThese tests have revealed new details (at least for me!) about the\nroot cause of our NFS problems:\n\n\n\tEven when using native locks over NFS, Lucene still hits these\n    exceptions!\n\n\n\n    I was surprised by this because I had always thought (assumed?)\n    the NFS problem was because the \"simple\" file-based locking was\n    not correct over NFS, and that switching to native OS filesystem\n    locking would resolve it, but it doesn't.\n\n    I can reproduce the \"FileNotFound\" exceptions even when using NFS\n    V4 (the latest NFS protocol), so this is not just a \"your NFS\n    server is too old\" issue.\n\n\n\tThen, when running the same stress test with the lock-less\n    changes, I don't hit any exceptions.  I've tested on NFS version\n    2, 3 and 4 (using the \"nfsvers=N\" mount option).\n\n\n\nI think this means that in fact (as Hoss at one point suggested I\nbelieve), the NFS problems are likely due to the cache coherence of\nthe NFS file system (I think the \"segments\" file in particular)\nagainst the existence of the actual segment data files.\n\nIn other words, even if you lock correctly, on the reader side it will\nsometimes see stale contents of the \"segments\" file which lead it to\ntry to open a now deleted segment data file.\n\nSo I think this is good news / bad news: the bad news is, native\nlocking doesn't fix our problems with NFS (as at least I had expected\nit to).  But the good news is, it looks like (still need to do more\nthorough testing of this) the changes for lock-less commits do enable\nLucene to work fine over NFS.\n\n[One quick side note in case it helps others: to get native locks\nworking over NFS on Ubuntu/Debian Linux 6.06, I had to \"apt-get\ninstall nfs-common\" on the NFS client machines.  Before I did this I\nwould hit \"No locks available\" IOExceptions on calling the \"tryLock\"\nmethod.  The default nfs server install on the server machine just\nworked because it runs in kernel mode and it start a lockd process.]",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2006-10-20T23:51:52+0000",
+            "content": "It seems that NFS doesn't support delete-upon-last-close semantics.  That means that an IndexWriter can delete files out from underneath a cached IndexReader, and they're really gone, no? Stale NFS Filehandle exception. ",
+            "author": "Marvin Humphrey",
+            "id": "comment-12443975"
+        },
+        {
+            "date": "2006-10-21T13:18:09+0000",
+            "content": "Yes, you are absolutely correct.\n\nThe current implementation of Lucene's \"point in time\" searching\ncapability (ie, once an IndexSearcher is open, it searches the\n\"snapshot\" of the index at that point in time, even as writer(s) are\nchanging the index), directly relies on specific filesystem semantics\nof \"deletes of still open files\".\n\nBut, these semantics differ drastically across filesystems:\n\n\n\tOn WIN32 local filesystems you get \"Access Denied\" when trying to\n    delete open files.  Lucene catches this & retries.\n\n\n\n\n\tOn UNIX local filesystems, the delete succeeds but the underlying\n    file is still present & usable by open file handles (\"delete on\n    last close\") until they are closed.\n\n\n\n\n\tBut, on NFS, there is absolutely no support for this.  NFS server\n    (until version 4) is stateless and so makes no effort to let you\n    continue to access deleted files.\n\n\n\nThis means, at best for NFS (with \"lock-less commits\" fixes \u2013 still\nin progress) we can hope to reliably instantiate a reader (ie, no more\nintermittent exceptions on loading the segments), but, you will not be\nable to use the \"point in time searching\".  Meaning, when running a\nsearch, you must expect to get a \"stale NFS handle\" IOException, and\nre-open your index when that happens.\n\nI think, in the future, it would make sense to change how Lucene\nimplements \"point in time searching\" so that it doesn't rely on\nfilesystem semantics at all (which are clearly quite different in this\narea) and, instead, explicitly keeps segments_N files (and the\nsegments they reference) in the filesystem until \"it's decided\" (via\nsome policy, eg, \"keep the last N generations\" or \"keep past N days\nworth\") that they should be pruned.\n\nNote that such an explicit implementation would also resolve a\nlimitation of the current \"point in time searching\" which is: you\ncan't close your searcher and re-open it at that same point in time.\nIf your searcher crashes, or JVM crashes, or whatever, you are forced\nat that point to switch up to the current index.  You don't have the\nfreedom to re-open the snapshot you had been using.  An explicit\nimplementation would fix that.\n\nThe \"lock-less commits\" changes would make this quite straightforward\nas a future change, but I'm not aiming to do that for starters \u2013\n\"progress not perfection\"! ",
+            "author": "Michael McCandless",
+            "id": "comment-12444041"
+        },
+        {
+            "date": "2006-10-23T17:57:39+0000",
+            "content": "This is more of an aside than anything else, but V2-3 clients do have some support for delete after close, right? The whole .nfsXXXX thing? Server doesn't really need any support, though I think some versions \"include\" cron cleanup of old .nfsXXXX files that never got deleted. ",
+            "author": "Steven Parkes",
+            "id": "comment-12444069"
+        },
+        {
+            "date": "2006-10-23T19:20:05+0000",
+            "content": "> but V2-3 clients do have some support for delete after close, right? The whole .nfsXXXX thing?\n\nI don't think that works across boxes though.\nIf host \"a\" opens a file, and host \"b\" deletes that file, host \"a\" won't end up with the .nfs file but will end up with a \"Stale NFS file handle\" instead. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12444086"
+        },
+        {
+            "date": "2006-10-23T19:26:22+0000",
+            "content": "Yeah, I think you're right. I figured I was missing something. ",
+            "author": "Steven Parkes",
+            "id": "comment-12444088"
+        },
+        {
+            "date": "2007-06-22T20:40:47+0000",
+            "content": "This issue is now resolved by both LUCENE-701 and LUCENE-710 being fixed.\nAs far as I know there are no other outstanding issues preventing Lucene from\nworking over NFS.  Here's an excerpt from email I just sent to java-user:\n\nAs far as I know, Lucene should now work over NFS, except you will\nhave to make a custom deletion policy that works for your application.\n\nLucene had issues with NFS in three areas: locking, stale client-side\nfile caches and how NFS handles deletion of open files.  The first two\nwere fixed in Lucene 2.1 with lock-less commits (LUCENE-701) and the\nlast one is fixed in 2.2 with the addition of \"custom deletion\npolicies\" (LUCENE-710).\n\nFor a custom deletion policy you need to implement the\norg.apache.lucene.index.IndexDeletionPolicy interface in your own\nclass and pass an instance of that class to your IndexWriter.  This\nclass tells IndexWriter when it's safe to delete older commits.  By\ndefault Lucene uses an instance of KeepOnlyLastCommitDeletionPolicy.\n\nThe basic idea is to implement logic that can tell when your readers\nare done using an older commit in the index.  For example if you know\nyour readers refresh themselves once per hour then your deletion\npolicy can safely delete any commit older than 1 hour.\n\nBut please note that while I believe NFS should work fine, this has\nnot been heavily tested yet.  Also note that performance over NFS is\ngenerally not great.  If you do go down this route please report back\non any success or failure!  Thanks. ",
+            "author": "Michael McCandless",
+            "id": "comment-12507502"
+        },
+        {
+            "date": "2007-07-04T20:12:57+0000",
+            "content": "This is not quite resolved yet.  In the case where you have multiple\nmachines that can be writers, and the writer is able to quickly jump\nback and forth between them, there is at least one issue (LUCENE-948)\nthat prevents this from working. ",
+            "author": "Michael McCandless",
+            "id": "comment-12510241"
+        },
+        {
+            "date": "2007-09-30T11:29:27+0000",
+            "content": "More updates on the status of Lucene over NFS (see details in\nLUCENE-1011):\n\n\n\tFor the multi-writer (ie, writers on different machines) case,\n    sharing an index over NFS, Lucene currently can corrupt the index.\n    But the pending fix in LUCENE-1011 looks to resolve this.\n\n\n\n\n\tAlso in LUCENE-1011 is a set of tools to test whether locking is\n    working correctly in your environment.  If you are having problems\n    over NFS or some other \"interesting\" filesystem, it's best to\n    first run the LockStressTest tool to see if it's a locking\n    problem.\n\n\n\n\n\tSimpleFSLockFactory seems to work in cases where\n    NativeFSLockFactory does not.  So, from now on,\n    SimpleFSLockFactory should be the first lock factory you try to\n    use on NFS!\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12531314"
+        }
+    ]
+}

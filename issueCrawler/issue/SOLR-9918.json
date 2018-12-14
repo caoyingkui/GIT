@@ -1,0 +1,98 @@
+{
+    "id": "SOLR-9918",
+    "title": "An UpdateRequestProcessor to skip duplicate inserts and ignore updates to missing docs",
+    "details": {
+        "components": [
+            "update"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.4",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "This is an UpdateRequestProcessor and Factory that we have been using in production, to handle 2 common cases that were awkward to achieve using the existing update pipeline and current processor classes:\n\n\n\tWhen inserting document(s), if some already exist then quietly skip the new document inserts - do not churn the index by replacing the existing documents and do not throw a noisy exception that breaks the batch of inserts. By analogy with SQL, insert if not exists. In our use-case, multiple application instances can (rarely) process the same input so it's easier for us to de-dupe these at Solr insert time than to funnel them into a global ordered queue first.\n\tWhen applying AtomicUpdate documents, if a document being updated does not exist, quietly do nothing - do not create a new partially-populated document and do not throw a noisy exception about missing required fields. By analogy with SQL, update where id = ... Our use-case relies on this because we apply updates optimistically and have best-effort knowledge about what documents will exist, so it's easiest to skip the updates (in the same way a Database would).\n\n\n\nI would have kept this in our own package hierarchy but it relies on some package-scoped methods, and seems like it could be useful to others if they choose to configure it. Some bits of the code were borrowed from DocBasedVersionConstraintsProcessorFactory.\n\nAttached patch has unit tests to confirm the behaviour.\n\nThis class can be used by configuring solrconfig.xml like so..\n\n\n  <updateRequestProcessorChain name=\"skipexisting\">\n    <processor class=\"solr.LogUpdateProcessorFactory\" />\n    <processor class=\"org.apache.solr.update.processor.SkipExistingDocumentsProcessorFactory\">\n      <bool name=\"skipInsertIfExists\">true</bool>\n      <bool name=\"skipUpdateIfMissing\">false</bool> <!-- We will override this per-request -->\n    </processor>\n    <processor class=\"solr.DistributedUpdateProcessorFactory\" />\n    <processor class=\"solr.RunUpdateProcessorFactory\" />\n  </updateRequestProcessorChain>\n\n\n\nand initParams defaults of\n\n\n      <str name=\"update.chain\">skipexisting</str>",
+    "attachments": {
+        "SOLR-9918.patch": "https://issues.apache.org/jira/secure/attachment/12845408/SOLR-9918.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-04T02:26:31+0000",
+            "author": "Koji Sekiguchi",
+            "content": "I believe the proposal is very useful for users who need this function, but it is better for users if there is an additional explanation of the difference from the existing one that gives similar function.\n\nHow do users decide which UpdateRequestProcessor to use for their use cases as compared to SignatureUpdateProcessor? ",
+            "id": "comment-15796928"
+        },
+        {
+            "date": "2017-01-04T05:16:15+0000",
+            "author": "David Smiley",
+            "content": "Cool ",
+            "id": "comment-15797201"
+        },
+        {
+            "date": "2017-01-04T18:07:50+0000",
+            "author": "Tim Owen",
+            "content": "Fair points Koji - I have updated the patch with a bit more documentation. I've also added the example configuration in the Javadoc comment.\n\nProbably the Confluence page is the best place to put that kind of guideline notes on which processors to choose for different situations.\n\nIn the particular case of the SignatureUpdateProcessor, that class will cause the new document to overwrite/replace any existing document, not skip it, which is why I didn't use it for our use-case. ",
+            "id": "comment-15798916"
+        },
+        {
+            "date": "2017-01-06T03:04:45+0000",
+            "author": "Koji Sekiguchi",
+            "content": "Thank you for your additional explanation. I agree with you on the Confluence page is the best place to put that kind of guideline notes. I just wanted to see such information in the ticket, not javadoc, because I think it helps committers to understand the requirement and importance of this proposal.\n\nAs for SignatureUpdateProcessor, I thought it skipped to add the doc if the signature is same, but when I looked into the patch on SOLR-799, I noticed that it always updates the existing document even if the doc has the same signature. ",
+            "id": "comment-15803344"
+        },
+        {
+            "date": "2017-01-06T11:27:58+0000",
+            "author": "Tim Owen",
+            "content": "OK I see what you mean, I can explain our use-case if that helps to understand why we developed this processor, and when it might prove useful.\n\nWe have a Kafka queue of messages, which are a mixture of Create, Update and Delete operations, and these are consumed and fed into two different storage systems - Solr and a RDBMS. We want the behaviour to be consistent, so that the two systems are in sync, and the way the Database storage app works is that Create operations are implemented as effectively INSERT IF NOT EXISTS ... and Update operations are the typical SQL UPDATE .. WHERE id = .. that quietly do nothing if there is no row for id. So we want the Solr storage to behave in the same way.\n\nThere can occasionally be duplicate messages that Create the same id due to the hundreds of instances of the app that adds messages to Kafka, and small race conditions that mean two or more of them will do some duplicate work. We chose to accept this situation and de-dupe downstream by having both storage apps behave as above.\n\nAnother scenario is that, since we have the Kafka queue as a buffer, if there's any problems downstream we can always stop the storage apps, restore last night's backup, rewind the Kafka consumer offset (slightly beyond the backup point) and then replay. In this situation we don't want a lot of index churn for the overlap Create messages.\n\nWith updates, the apps which add Update messages only have best-effort knowledge of which document/row {{id}}s are relevant to the field/column being changed by the update message. So we quite commonly have messages that are optimistic updates, for a document that doesn't in fact exist (now). The database storage handles this quietly, so we wanted the same behaviour in Solr. Initially what happened in Solr was we'd get newly-created documents containing only the fields changed in the AtomicUpdate, so we added a required field to avoid that happening, which works but is noisy as we get a Solr exception each time (and then batch updates are messy because we have to split and retry).\n\nI looked at DocBasedVersionConstraintsProcessor but we don't have explicitly-managed versioning for our documents in Solr. Then I looked at SignatureUpdateProcessor but that does churn the index and overwrites documents, which we didn't want. Also considered TolerantUpdateProcessor but that isn't really solving the issue for inserts, it just would make some update batches less noisy.\n\nI'd say this processor is useful in situations where you have documents that don't have any concept of multiple versions that can be assigned by the app, and don't have any kind of fuzzy-ness about similar documents i.e. each document has a strong identity, akin to what a Database unique key is. ",
+            "id": "comment-15804336"
+        },
+        {
+            "date": "2017-01-07T03:07:10+0000",
+            "author": "Koji Sekiguchi",
+            "content": "Thank you for giving the great explanation which is more than I expected.  ",
+            "id": "comment-15806603"
+        },
+        {
+            "date": "2017-01-10T04:33:57+0000",
+            "author": "Koji Sekiguchi",
+            "content": "I think this is ready. ",
+            "id": "comment-15813849"
+        },
+        {
+            "date": "2017-01-11T02:53:38+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d66bfba5dc1bd9154bd48898865f51d9715e8d0c in lucene-solr's branch refs/heads/master from koji\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d66bfba ]\n\nSOLR-9918: Add SkipExistingDocumentsProcessor that skips duplicate inserts and ignores updates to missing docs ",
+            "id": "comment-15816965"
+        },
+        {
+            "date": "2017-01-11T03:15:30+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2979a1eacd916201548303245f81705da7f9cc36 in lucene-solr's branch refs/heads/branch_6x from koji\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2979a1e ]\n\nSOLR-9918: Add SkipExistingDocumentsProcessor that skips duplicate inserts and ignores updates to missing docs ",
+            "id": "comment-15817007"
+        },
+        {
+            "date": "2017-01-11T03:20:18+0000",
+            "author": "Koji Sekiguchi",
+            "content": "Thanks, Tim! ",
+            "id": "comment-15817014"
+        },
+        {
+            "date": "2017-01-11T06:51:00+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2437204730130dc8c03efb111ec7d4db456189ed in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2437204 ]\n\nSOLR-9918: Remove unused import to make precommit happy ",
+            "id": "comment-15817428"
+        },
+        {
+            "date": "2017-01-11T06:51:39+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2f721048d4e9e35ba81ad574d3927cdba798ee24 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2f72104 ]\n\nSOLR-9918: Remove unused import to make precommit happy\n\n(cherry picked from commit 2437204) ",
+            "id": "comment-15817430"
+        }
+    ]
+}

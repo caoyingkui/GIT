@@ -1,0 +1,66 @@
+{
+    "id": "SOLR-9377",
+    "title": "[subquery] augmenter doesn't work with RTG on uncommited docs",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Not A Problem",
+        "priority": "Major"
+    },
+    "description": "Spinning off from SOLR-9314...\n\nThe [subquery] DocTransformer can give unexpected results when used with RTG on uncommitted docs.\n\nTest code demonstrating the problem is being added to TestRandomFlRTGCloud as part of SOLR-9314, but it's being disabled for now due to this current bug.  As noted in that jira...\n\n\nThe subquery validation tries to search for all docs with teh same field value as the current doc, asserting that there is always at least 1 match \u2013 but this assertion currently fails ... by the looks of it this is (obviously) because it doesn't know to to use the realtime seracher re-opened by the RTG ... but based on how the SubQueryAugmenter is implemented, i'm not even certain how to go about it.",
+    "attachments": {
+        "SOLR-9377.patch": "https://issues.apache.org/jira/secure/attachment/12822707/SOLR-9377.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-08-05T01:26:22+0000",
+            "author": "Hoss Man",
+            "content": "\nI spent some time today looking into this and how to \"fix\" it.\n\nMy initial impression was that SubQueryAugmenter(Factory) was doing more work then it needed to.   It currently creates an EmbeddedSolrServer(req.getCore()) and operates at the (solrj) \"QueryRequest/QueryResponse\" level to execute the \"subquery\", pulling back a SolrDocumentList to populate it's own custom Result extends ResultContext for each document.\n\nMy thinking was, we could bypass EmbeddedSolrServer by just asking the SolrCore to execute a SolrQueryRequest we create directly around the realtime searcher (see below), and then use the DocList from the resulting SolrQueryResponse along w/ the other pieces we've accumulated to create a regular old BasicResultContext for each document.  ala...\n\n\nprivate static class SubQuerySolrQueryRequest extends SolrQueryRequestBase {\n  // we'd pass the ResultContext.getSearcher() here, so these queries would have access to the\n  // realtime seracher if we're used in an RTG request...\n  public SubQuerySolrQueryRequest(SolrCore core, SolrParams params, RefCounted<SolrIndexSearcher> searcherHolder) {\n    super(core, params);\n    this.searcherHolder = searcherHolder;\n  }\n}\n\n\n\nThe problem with this idea is the fromIndex param that this transformer supports.  It leans heavily on the existing code in EmbeddedSolrServer.request(...) method logic to figure out the correct core to use.  We'd have to refactor/unwind/duplicate some of that in order to operate directly at the \"go get a core by name, now execute a SubQuerySolrQueryRequest against it\" layer of the abstraction.\n\n\n\nUltimately i'm starting to wonder if the current behavior is actually the best/correct behavior?\n\nIn the test code that lead me to file this bug (see TestRandomFlRTGCloud & SubQueryValidator) the \"problems\" that arise are because the validation code for the [subquery] I'm using expects (at least) the original document to match the subquery against one of it's field values \u2013 and when it's read from the tlog it doesn't because the realtime searcher is not used.\n\nPerhaps that's ok?  Perhaps the only thing that's really important is that values from the doc used when building the subquery are accurate, and come from the tlog, and the query itself can (or perhaps MUST?) still be run against the same currently open searcher as if the user ran that subquery themselves?\n\n\n\nMikhail Khludnev: do you have any opinions on what we should consider the \"correct\" behavior in this situation? ",
+            "id": "comment-15408746"
+        },
+        {
+            "date": "2016-08-05T12:31:56+0000",
+            "author": "Mikhail Khludnev",
+            "content": "no comments.  ",
+            "id": "comment-15409392"
+        },
+        {
+            "date": "2016-08-09T00:55:31+0000",
+            "author": "Hoss Man",
+            "content": "\n\nI was working on some javadoc and test fixes to treat it as expected that [subquery] uses the regular searcher for the sub-request, when I uncovered a slightly broader bug that isn't constrained to uncommited RTG docs \u2013 it can also bite you if you don't have a documentCache and don't enableLazyFieldLoading in your configs (the realtime searcher that RTG can use in some cases doesn't use any caching, and the existing solrconfig-tlog.xml used by the RTG tests doesn't enableLazyFieldLoading)\n\nHere's an example of what this failure looks like...\n\n\n# start example\n$ bin/solr -e techproducts\n...\n\n# disable autocommit & lazy field loading\n$ curl --data-binary '{\"set-property\":{\"updateHandler.autoSoftCommit.maxTime\":\"-1\"},\"set-property\":{\"query.enableLazyFieldLoading\":false}}' -H 'Content-Type: application/json' 'http://localhost:8983/solr/techproducts/config'\n...\n\n# re-index w/o doing a commit\n$ bin/post -commit no -c techproducts example/exampledocs/*.xml\n...\n\n# do an RTG that involves:\n#  - a function in the fl (so RTG uses a realtime searcher)\n#  - a subquery in the fl that refers to field not otherwise included in the fl -- ie: price\n#\n# ...this will fail because the qubquery execution can't find a value for \"$row.price\" so\n#    the sub-request query parsing fails\n#\n$ curl 'http://localhost:8983/solr/techproducts/get?indent=true&id=SOLR1000&fl=id,product(popularity,3)&fl=xxx:%5Bsubquery%5D&xxx.q=%7B!field+f=price+v=$row.price%7D'\n{\n  \"error\":{\n    \"metadata\":[\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"org.apache.solr.common.SolrException\"],\n    \"msg\":\"while invoking xxx:[subquery] on doc=SolrDocument{id=stored,indexed,tokenized,omitNorms,indexOptions=DOCS<id:SOLR1000>, _version_=1542133\",\n    \"code\":400}}\n\n\n\n\nhere's the same problem demonstrated with a regular search...\n\n\n# hack to force documentCache to not init properly (no straight forward way to disable via API)\n# NOTE: expected to cause errors in log\n$ curl --data-binary '{\"set-property\":{\"query.documentCache.initialSize\":\"-1\"}}' -H 'Content-Type: application/json' 'http://localhost:8983/solr/techproducts/config'\n\n# do a simple query that involves:\n#  - a subquery in the fl that refers to field not otherwise included in the fl (price)\n#\n# ...this will fail because the qubquery execution can't find a value for \"$row.price\" so\n#    the sub-request query parsing fails\n$ curl 'http://localhost:8983/solr/techproducts/select?indent=true&q=id:SOLR1000&fl=id&fl=xxx:%5Bsubquery%5D&xxx.q=%7B!field+f=price+v=$row.price%7D'\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<response>\n\n<lst name=\"error\">\n  <lst name=\"metadata\">\n    <str name=\"error-class\">org.apache.solr.common.SolrException</str>\n    <str name=\"root-error-class\">org.apache.solr.common.SolrException</str>\n  </lst>\n  <str name=\"msg\">while invoking xxx:[subquery] on doc=SolrDocument{id=stored,indexed,tokenized,omitNorms,indexOptions=DOCS&lt;id:SOLR1000&gt;}</str>\n  <int name=\"code\">400</int>\n</lst>\n</response>\n\n\n\n\n\nThe \"right\" way to fix this is to have SubQueryAugmenter.getExtraRequestFields() return the list of field names it expects to find in the docs being transformed, but unfortunately I can't think of any way to identify the list of all $row.* params used in the subquery.\n\nSo for now, this patch works around this bug (which i'll file in a new jira soon) by only refering to fields in $row.* parms that it knows for certainly are included in the \"fl\" (ie: \"id\")\n ",
+            "id": "comment-15412751"
+        },
+        {
+            "date": "2016-08-09T02:51:55+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit e08d656a15a51ef2e38ceb983e786cc37eed834f in lucene-solr's branch refs/heads/branch_6x from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e08d656 ]\n\nSOLR-9377: Fix jdocs and test to match expected behavior, workaround SOLR-9396\n\n(cherry picked from commit 1164c17e0e1c81fae4aa1103506536f82f70cf3c) ",
+            "id": "comment-15412845"
+        },
+        {
+            "date": "2016-08-09T02:51:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1164c17e0e1c81fae4aa1103506536f82f70cf3c in lucene-solr's branch refs/heads/master from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1164c17 ]\n\nSOLR-9377: Fix jdocs and test to match expected behavior, workaround SOLR-9396 ",
+            "id": "comment-15412847"
+        },
+        {
+            "date": "2016-08-26T13:59:21+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close resolved issues after 6.2.0 release. ",
+            "id": "comment-15438987"
+        },
+        {
+            "date": "2018-12-02T04:27:38+0000",
+            "author": "mosh",
+            "content": "Perhaps that's ok? Perhaps the only thing that's really important is that values from the doc used when building the subquery are accurate, and come from the tlog, and the query itself can (or perhaps MUST?) still be run against the same currently open searcher as if the user ran that subquery themselves?\nAre there any performance implications in case sub-queries are executed using real time searchers?\n Perhaps there could be a flag sent as a parameter for this use case?\n Nonetheless,\n I found it really hard to come by.\n Perhaps this should be included in the ref guide(transforming-result-documents)? ",
+            "id": "comment-16706096"
+        }
+    ]
+}

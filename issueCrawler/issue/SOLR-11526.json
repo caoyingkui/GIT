@@ -1,0 +1,45 @@
+{
+    "id": "SOLR-11526",
+    "title": "CollectionAdminResponse.isSuccess() incorrect for most admin collections APIs",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "SolrJ"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "master (8.0)",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "CollectionAdminResponse has a boolean isSuccess method which reports whether the API was called successfully.  It returns true if it finds a non-null NamedList element called \"success\".  It returns false otherwise.\n\nUnfortunately, only a handful of the Collection-Admin APIs have this element.  APIs that don't contain this element in their response will always appear to have failed (according to isSuccess()).\n\nThe current implementation is correct for:\n\n\tCREATECOLLECTION\n\tRELOAD\n\tSPLITSHARD\n\tDELETESHARD\n\tDELETECOLLECTION\n\tADDREPLICA\n\tMIGRATE\n\n\n\nThe current implementation is incorrect for:\n\n\tCREATESHARD\n\tCREATEALIAS\n\tDELETEALIAS\n\tLISTALIASES\n\tCLUSTERPROP\n\tADDROLE\n\tREMOVEROLE\n\tOVERSEERSTATUS\n\tCLUSTERSTATUS\n\tREQUESTSTATUS\n\tDELETESTATUS\n\tLIST\n\tADDREPLICAPROP\n\tDELETEREPLICAPROP\n\tBALANCESHARDUNIQUE\n\tREBALANCELEADERS\n\n\n\n(these lists are incomplete)\n\nA trivial fix for this would be to change the implementation to check the \"status\" NamedList element (which is present in all Collection-Admin APIs).  My understanding is that the \"status' field is set to 0 always on success.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-10-23T23:10:40+0000",
+            "content": "I'd thought the \"status\" field would be enough to solve this, but it looks like it's 0 even on many failures:\n\n\n{\n  \"responseHeader\": {\n    \"status\": 0,\n    \"QTime\": 13058\n  },\n  \"failure\": {\n    \"127.0.0.1:45211_solr\": \"org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException:Error from server at http://127.0.0.1:45211/solr: Error CREATEing SolrCore 'foo_shard1_replica_n1': Unable to create core [foo_shard1_replica_n1] Caused by: access denied (\\\"java.io.FilePermission\\\" \\\"/some_invalid_dir/foo/tlog\\\" \\\"write\\\")\"\n  }\n}\n\n\n\nI feel like I'm misinterpreting the intent of the status field.  The few times I see it set as non-zero, it holds the HTTP status code from the request to Solr.  This seems like it could be used for success-determination, though maybe Solr doesn't use HTTP status codes consistently enough for this to be reliable.  I'll take a look at the logic used to set the status field for these APIs and see if using \"status\" is as reasonable as it appears at first blush. ",
+            "author": "Jason Gerlowski",
+            "id": "comment-16216016"
+        },
+        {
+            "date": "2017-10-24T22:16:37+0000",
+            "content": "This is bad. Thanks Jason for brining it up. \n\nI think as a first step if someone could shed some light as to whether we should look at the status code or the \"success\" key. I always used to believe that status!=0 is how users determined if an API call failed but you've shown an example where a failure still returns status=0 . \n\nMark Miller You have worked on two related Jiras : SOLR-5392 and SOLR-4576 .  Do you have some thoughts on this?\n\nIf I was to propose a change I would change the isSuccess method to check the status code and return true / false accordingly. And make sure TestCollectionAdminRequest / TestCollectionAPI actually test it \n\nThis might require a lot of changes though. For example DeleteShardCmd does this check today and now we should look at status code and not the \"success\" key we should first assert that the status code is 0\n\n\n        NamedList deleteResult = new NamedList();\n        try {\n          ((DeleteReplicaCmd)ocmh.commandMap.get(DELETEREPLICA)).deleteReplica(clusterState, replica, deleteResult, () -> {\n            cleanupLatch.countDown();\n            if (deleteResult.get(\"failure\") != null) {\n              synchronized (results) {\n                results.add(\"failure\", String.format(Locale.ROOT, \"Failed to delete replica for collection=%s shard=%s\" +\n                    \" on node=%s\", replica.getStr(COLLECTION_PROP), replica.getStr(SHARD_ID_PROP), replica.getStr(NODE_NAME_PROP)));\n              }\n            }\n            SimpleOrderedMap success = (SimpleOrderedMap) deleteResult.get(\"success\");\n            if (success != null) {\n              synchronized (results)  {\n                results.add(\"success\", success);\n              }\n            }\n          });\n\n\n\nYou mentioned in the description of the jira that createshard does not set a \"success\" key but I see this is CreateShardCmd.java. I don't think most of the others are still buggy like you mentioned.\n\n\n          } else {\n            SimpleOrderedMap success = (SimpleOrderedMap) results.get(\"success\");\n            if (success == null) {\n              success = new SimpleOrderedMap();\n              results.add(\"success\", success);\n            }\n            success.addAll((NamedList) addResult.get(\"success\"));\n          }\n        });\n\n\n\nA SolrJ user is calling CollectionAdminRequest#listCollections . This throws an exception so that's how today users are building success/failure logic ?  Users using the HTTP API directly would run into all of the issues you are mentioning though ",
+            "author": "Varun Thacker",
+            "id": "comment-16217799"
+        },
+        {
+            "date": "2017-10-25T03:41:21+0000",
+            "content": "For CreateShard (and the other collection APIs I classified in the description), I was judging them based on their example output for each API in the ref-guide.  (Example: CreateShard has no \"success\" tag).  So I guess maybe some of these doc snippets are just outdated?  I should have double checked, sorry for the confusion. I'll check the APIs and correct the list tomorrow.\n\nSo to summarize some of the outstanding questions/concerns mentioned so far:\n1. Many but not all error cases set the \"status\" field with an HTTP status code.  It's unclear whether this is intentional.\n2. Some but not all collection-APIs include a \"success\" field flag.  It's unclear whether all of them should, or there's some rationale behind having some APIs use the flag but not others.\n3. The implementation of CollectionAdminResponse.isSuccess() currently has issues because of (2).\n4. Some of the API output examples for the Collections API don't match what those APIs currently return.\n\n(Just trying to keep track of things)\n\nLooking forward to seeing if Mark can shed any light on things! ",
+            "author": "Jason Gerlowski",
+            "id": "comment-16218053"
+        },
+        {
+            "date": "2017-10-29T19:32:06+0000",
+            "content": "After Varun's previous comment, I wanted to recheck the doc snippets for each of the Collection-Admin APIs, to see which have the success element, and which don't.  Offering the revised list based on actually checking each API.\n\nAPIs with success element (isSuccess method is \"correct\" for these today)\n\n\tCREATE\n\tDELETE\n\tRELOAD\n\tSPLITSHARD\n\tCREATESHARD\n\tDELETESHARD\n\tADDREPLICA\n\tDELETEREPLICA\n\tBACKUP\n\tREPLACENODE\n\tMOVEREPLICA\n\tMIGRATE\n\n\n\nAPIs without success element (isSuccess method incorrect for these today)\n\n\tLIST\n\tMODIFYCOLLECTION\n\tCREATEALIAS\n\tDELETEALIAS\n\tLISTALIASES\n\tCLUSTERPROP\n\tADDROLE\n\tREMOVEROLE\n\tOVERSEERSTATUS\n\tREQUESTSTATUS\n\tDELETESTATUS\n\tADDREPLICAPROP\n\tDELETEREPLICAPROP\n\tBALANCESHARDUNIQUE\n\tREBALANCELEADERS\n\tFORCELEADER\n\tMIGRATESTATEFORMAT\n\tRESTORE\n\tDELETENODE\n\n\n\nThis list shouldn't affect how we go about fixing this bug.  Just wanted to provide a definitive list for any users hitting this bug who might stumble on this and be helped by it. ",
+            "author": "Jason Gerlowski",
+            "id": "comment-16224155"
+        }
+    ]
+}

@@ -1,0 +1,162 @@
+{
+    "id": "SOLR-11443",
+    "title": "Remove the usage of workqueue for Overseer",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "7.2",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "If we can remove the usage of workqueue, We can save a lot of IO blocking in Overseer, hence boost performance a lot.",
+    "attachments": {
+        "SOLR-11443.patch": "https://issues.apache.org/jira/secure/attachment/12890746/SOLR-11443.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-10-06T14:07:12+0000",
+            "content": "Patch for this ticket. The idea here is simple, we peek for 1000 messages in the queue, processed them, write new clusterstate to ZK, then poll out these messages. So we only poll out processed messages when new clusterstate is written. \nIn case of Overseer get restarted, all the uncommitted messages still in the queue ( no need for workqueue, only keep them for backward compatible ), we will reprocess them and still achieve the desired state.\n\nHere are some benchmark number ( OverseerTest.testPerformance() )\nBefore optimize : avgRequestsPerSecond: 1551.8934622998179\nAfter optmize : avgRequestsPerSecond: 3425.594762960455 ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16194627"
+        },
+        {
+            "date": "2017-10-11T03:34:07+0000",
+            "content": "Updated patch\n\n\tOne more optimization, instead of using poll() we can remove nodes in batch by using Zk.multi(), which saves us a lot of communications time between Overseer and Zk. I introduced a new method void DistributedQueue.remove(Collection<String> paths), which remove nodes in batch. (Scott Blum : what do you think about the implementation of this method?)\n\tIncreased the cap of Overseer queue to 100000, cause I think Overseer can handle more messages.\n\tThe patch including changes from SOLR-11447.\n\n\n\nI run the benchmark which number of state messages to 100000, here are result\nBefore optimize :\n\n72804 INFO  (TEST-OverseerTest.testPerformance-seed#[CA3B138EDD8B0BD5]) [    ] o.a.s.c.OverseerTest op: state, success: 100001, failure: 0\n72810 INFO  (TEST-OverseerTest.testPerformance-seed#[CA3B138EDD8B0BD5]) [    ] o.a.s.c.OverseerTest \t avgRequestsPerSecond: 2332.563593723015\n\n\nAfter optimize (5x times faster):\n\n42739 INFO  (TEST-OverseerTest.testPerformance-seed#[7E989E665D42FFFB]) [    ] o.a.s.c.OverseerTest op: state, success: 100001, failure: 0\n42742 INFO  (TEST-OverseerTest.testPerformance-seed#[7E989E665D42FFFB]) [    ] o.a.s.c.OverseerTest \t avgRequestsPerSecond: 11454.952022695608\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16199756"
+        },
+        {
+            "date": "2017-10-11T20:11:01+0000",
+            "content": "Love the idea; having a separate queue-work never made much sense to me.  I can look at the patch in a bit. ",
+            "author": "Scott Blum",
+            "id": "comment-16200881"
+        },
+        {
+            "date": "2017-10-11T22:13:34+0000",
+            "content": "I might be thinking about this wrong, but the test seems to trying to thread an invisible needle, I guess we're trying to shut down overseer halfway through the list of updates?  But we might very well just complete all operations quickly and restart overseer after they're all done. ",
+            "author": "Scott Blum",
+            "id": "comment-16201064"
+        },
+        {
+            "date": "2017-10-11T22:23:43+0000",
+            "content": "I feel like the maybeFlushBefore, maybeFlushAfter bits need a little more thinking.  Seems pretty arbitrary to only check the firstCommand; maybe we should completely separate command-specific flush trigger from general purpose flush trigger?  Then you could check command-level flushing on each command, if that's even still necessary. ",
+            "author": "Scott Blum",
+            "id": "comment-16201074"
+        },
+        {
+            "date": "2017-10-11T22:28:22+0000",
+            "content": "When would numUpdates diverge from updates.size()? ",
+            "author": "Scott Blum",
+            "id": "comment-16201081"
+        },
+        {
+            "date": "2017-10-11T22:36:24+0000",
+            "content": "Can you talk me through:\n\n\n    if (knownChildren.containsAll(paths)) {\n      knownChildren.removeAll(paths);\n      stats.setQueueLength(knownChildren.size());\n    } else {\n      knownChildren.clear();\n      isDirty = true;\n    }\n\n\n\nSeems like you could just always set this dirty; but if you're trying to in-memory surgery as an optimization, I don't understand the need for the containsAll check. ",
+            "author": "Scott Blum",
+            "id": "comment-16201095"
+        },
+        {
+            "date": "2017-10-11T22:44:47+0000",
+            "content": "it might be more clear to do the `processedNodes.add(head.first());` after calling processQueueItem, maybe conditionally based on whether onWriteAfter was called.  IE:\n\n\n            Set<String> processedNodes = new HashSet<>();\n            String[] curNode = new String[1];\n            while (!queue.isEmpty()) {\n              for (Pair<String, byte[]> head : queue) {\n                curNode[0] = head.first();\n                byte[] data = head.second();\n                final ZkNodeProps message = ZkNodeProps.load(data);\n                log.debug(\"processMessage: queueSize: {}, message = {} current state version: {}\", stateUpdateQueue.getStats().getQueueLength(), message, clusterState.getZkClusterStateVersion());\n                // The callback always be called on this thread\n                clusterState = processQueueItem(message, clusterState, zkStateWriter, true, new ZkStateWriter.ZkWriteCallback() {\n                  @Override\n                  public void onWriteBefore() throws Exception {\n                    stateUpdateQueue.remove(processedNodes);\n                    processedNodes.clear();\n                  }\n\n                  @Override\n                  public void onWriteAfter() throws Exception {\n                    processedNodes.add(curNode[0]);\n                    stateUpdateQueue.remove(processedNodes);\n                    processedNodes.clear();\n                    curNode[0] = null;\n                  }\n                });\n              }\n              if (curNode[0] != null) {\n                // e.g. onWriteAfter was not called\n                processedNodes.add(curNode[0]);\n              }\n              queue = new LinkedList<>(stateUpdateQueue.peekElements(1000, 100, node -> !processedNodes.contains(node)));\n            }\n\n ",
+            "author": "Scott Blum",
+            "id": "comment-16201107"
+        },
+        {
+            "date": "2017-10-11T22:48:48+0000",
+            "content": "Just a few nits / questions, otherwise LGTM.  Super great performance improvement and simplification. ",
+            "author": "Scott Blum",
+            "id": "comment-16201120"
+        },
+        {
+            "date": "2017-10-11T22:55:40+0000",
+            "content": "Should probably deprecate and update all the doc on the legacy workQueue to note that it's only to support the previous version since we don't add anything to it anymore. ",
+            "author": "Scott Blum",
+            "id": "comment-16201129"
+        },
+        {
+            "date": "2017-10-13T08:59:01+0000",
+            "content": "Thank Scott Blum for reviewing!\nI might be thinking about this wrong, but the test seems to trying to thread an invisible needle, I guess we're trying to shut down overseer halfway through the list of updates? But we might very well just complete all operations quickly and restart overseer after they're all done.\nI feel like the maybeFlushBefore, maybeFlushAfter bits need a little more thinking. Seems pretty arbitrary to only check the firstCommand; maybe we should completely separate command-specific flush trigger from general purpose flush trigger? Then you could check command-level flushing on each command, if that's even still necessary.\nWhen would numUpdates diverge from updates.size()?\n\nThat all relates to SOLR-11447 changes. \nFor the first one, I assume that you're talking about testDownNodeFailover, DOWNNODE message is converted to multiple ZKWriteCommands, so the test proves that if we flush clusterstate when processing the first command and Overseer get restarted right after the flushing, the rest of ZkWriteCommands will never get executed.\nFor the second comment, I fixed that in last patch of SOLR-11447. \nThe numUpdates count number of ZkWriteCommand was processed, updates.size() indicates how many collections get affected ( many ZkWriteCommands can affect single collection )\n\nSeems like you could just always set this dirty; but if you're trying to in-memory surgery as an optimization, I don't understand the need for the containsAll check.\n\nIt is a sanity check ( which can never happen ). But If we know that there are nodes get deleted but not present in the cache, the cache seems in the dirty state. Here is slightly better version of that code block.\n\n    int cacheSizeBefore = knownChildren.size();\n    knownChildren.removeAll(paths);\n    if (cacheSizeBefore - paths.size() == knownChildren.size()) {\n      stats.setQueueLength(knownChildren.size());\n    } else {\n      // There are elements get deleted but not present in the cache,\n      // the cache seems not valid anymore\n      knownChildren.clear();\n      isDirty = true;\n    }\n\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16203212"
+        },
+        {
+            "date": "2017-10-13T14:22:01+0000",
+            "content": "Updated patch for master\n1. Adding fallbackQueue concept, in the startup, we consider workQueue as fallbackQueue. Which contains messages that need to process one by one - if there a message that causes exception on writing new clusterstate to Zk, consider that as bad message and poll out from fallbackQueue.\n2. After that, stateUpdateQueue is used as fallbackQueue, cause we writing in batch, so if an exception is thrown on writing new clusterstate, we don't know which message is bad, so we go back to the beginning of the loop and do 1.  ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16203622"
+        },
+        {
+            "date": "2017-10-13T18:30:28+0000",
+            "content": "BTW, have you tried out github PRs?  It would be so much easier to review in that tool.  ",
+            "author": "Scott Blum",
+            "id": "comment-16203992"
+        },
+        {
+            "date": "2017-10-13T18:33:23+0000",
+            "content": "SOLR-11447 looks interesting, might well address that comment.\n\n\n    int cacheSizeBefore = knownChildren.size();\n    knownChildren.removeAll(paths);\n    if (cacheSizeBefore - paths.size() == knownChildren.size()) {\n      stats.setQueueLength(knownChildren.size());\n    } else {\n      // There are elements get deleted but not present in the cache,\n      // the cache seems not valid anymore\n      knownChildren.clear();\n      isDirty = true;\n    }\n\n\n\nI just kind of feel like you should unconditionally clear and set dirty, to catch any weird edge cases.  What if post removal, knownChildren.size() == 0 in the above code?  Having knownChildren empty and !isDirty seems runs the risk of report false queue empty status when in fact we just need to pull more nodes from ZK. ",
+            "author": "Scott Blum",
+            "id": "comment-16204001"
+        },
+        {
+            "date": "2017-10-13T23:10:01+0000",
+            "content": "Scott Blum We should not, unconditionally clear and set dirty, cause this will trigger get all zk node names ( which is very expensive ). Why should we do that if the cache still valid?? Yeah, knowChildren.size() == 0 should be addressed too. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16204325"
+        },
+        {
+            "date": "2017-10-14T02:34:29+0000",
+            "content": "GitHub user CaoManhDat opened a pull request:\n\n    https://github.com/apache/lucene-solr/pull/262\n\n    SOLR-11443: Remove the usage of workqueue for Overseer\n\n    SOLR-11443: Remove the usage of workqueue for Overseer\n\nYou can merge this pull request into a Git repository by running:\n\n    $ git pull https://github.com/CaoManhDat/lucene-solr jira/SOLR-11443\n\nAlternatively you can review and apply these changes as the patch at:\n\n    https://github.com/apache/lucene-solr/pull/262.patch\n\nTo close this pull request, make a commit to your master/trunk branch\nwith (at least) the following in the commit message:\n\n    This closes #262\n\n\ncommit 9543e85460b6d1264857c42b568d4a7f59c06007\nAuthor: Cao Manh Dat <datcm@apache.org>\nDate:   2017-10-14T02:33:17Z\n\n    SOLR-11443: Remove the usage of workqueue for Overseer\n\n ",
+            "author": "ASF GitHub Bot",
+            "id": "comment-16204436"
+        },
+        {
+            "date": "2017-10-14T03:09:21+0000",
+            "content": "LGTM ",
+            "author": "Scott Blum",
+            "id": "comment-16204443"
+        },
+        {
+            "date": "2017-10-14T03:11:36+0000",
+            "content": "Github user CaoManhDat commented on the issue:\n\n    https://github.com/apache/lucene-solr/pull/262\n\n    :+1:  ",
+            "author": "ASF GitHub Bot",
+            "id": "comment-16204444"
+        },
+        {
+            "date": "2017-10-14T08:05:46+0000",
+            "content": "Commit 9543e85460b6d1264857c42b568d4a7f59c06007 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9543e85 ]\n\nSOLR-11443: Remove the usage of workqueue for Overseer ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16204529"
+        },
+        {
+            "date": "2017-10-14T08:06:50+0000",
+            "content": "Github user asfgit closed the pull request at:\n\n    https://github.com/apache/lucene-solr/pull/262 ",
+            "author": "ASF GitHub Bot",
+            "id": "comment-16204530"
+        },
+        {
+            "date": "2017-10-16T09:33:26+0000",
+            "content": "Commit 265cf35503ccd50f38d4f5ba576910c25c8dd326 in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=265cf35 ]\n\nSOLR-11443: Remove the usage of workqueue for Overseer ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16205626"
+        },
+        {
+            "date": "2017-10-17T03:00:02+0000",
+            "content": "Commit 9fac59ef55a134ff363c8bc4f0e5589769cf4962 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9fac59e ]\n\nSOLR-11443: Update CHANGES.txt ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16206942"
+        },
+        {
+            "date": "2017-10-17T03:00:37+0000",
+            "content": "Commit 58730dcd6751427cf901552b4453eb817dfc631c in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=58730dc ]\n\nSOLR-11443: Update CHANGES.txt ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16206943"
+        }
+    ]
+}

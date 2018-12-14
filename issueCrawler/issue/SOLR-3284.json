@@ -1,0 +1,143 @@
+{
+    "id": "SOLR-3284",
+    "title": "ConcurrentUpdateSolrClient swallows exceptions",
+    "details": {
+        "affect_versions": "3.5,                                            4.0-ALPHA",
+        "status": "Open",
+        "fix_versions": [],
+        "components": [
+            "clients - java"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "StreamingUpdateSolrServer eats exceptions thrown by lower level code, such as HttpClient, when doing adds.  It may happen with other methods, though I know that query and deleteByQuery will throw exceptions.  I believe that this is a result of the queue/Runner design.  That's what makes SUSS perform better, but it means you sacrifice the ability to programmatically determine that there was a problem with your update.  All errors are logged via slf4j, but that's not terribly helpful except with determining what went wrong after the fact.\n\nWhen using CommonsHttpSolrServer, I've been able to rely on getting an exception thrown by pretty much any error, letting me use try/catch to detect problems.\n\nThere's probably enough dependent code out there that it would not be a good idea to change the design of SUSS, unless there were alternate constructors or additional methods available to configure new/old behavior.  Fixing this is probably not trivial, so it's probably a better idea to come up with a new server object based on CHSS.  This is outside my current skillset.",
+    "attachments": {
+        "SOLR-3284.patch": "https://issues.apache.org/jira/secure/attachment/12522963/SOLR-3284.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Sami Siren",
+            "id": "comment-13255433",
+            "date": "2012-04-17T09:42:01+0000",
+            "content": "What are the operations/error situations where you are not seeing an Exception when you expect one?\n\nBy default the ConcurrentUpdateSolrServer (StreamingUpdateSolrServer) just logs the exceptions from updates but you can override this functionality:\n\n\n    SolrServer server = new ConcurrentUpdateSolrServer(\"http://127.0.0.1:8983/solr\", 1, 1){\n      public void handleError(Throwable ex) {\n        //do something with the Throwable here\n        System.out.println(\"Something wrong!\" + ex.getMessage());\n      }\n    };\n    \n    server.add(new SolrInputDocument());\n\n\n\n\nThe current exception reporting is pretty limited and it is impossible to see which operation triggered the exception but such improvements should be done in separate issues. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13255602",
+            "date": "2012-04-17T14:42:50+0000",
+            "content": "If the Solr server goes down in between updates done with the concurrent server, doing further updates will fail, but the calling code will not know that.  With the Commons or Http server, an exception is thrown that my code catches.\n\nI don't think that just overriding handleError is enough.  If Solr goes down but the machine is still up, you have immediate failure detection because the connection will be refused.  If the server goes away entirely, it could take a couple of minutes to fail.  You would have to provide methods to check that 1) all background operations are complete and 2) they were error free.\n\nI can no longer remember whether an exception is thrown when trying a commit against a down machine with the concurrent server.  IIRC it does throw one in this instance.  I definitely believe that it should.  Perhaps the current handleError code could update class-level members (with names like \"boolean updateErrored\" and \"SolrServerException updateException\") that could be checked and used by the commit method.  If they are set, it would reset them and throw an exception (fast-fail) without actually trying the commit.  There should probably be a constructor option and a set method to either activate this new behavior or restore the original behavior.\n\nWhen I first designed my code, I was relying on the exceptions thrown by the commons server when doing the actual update, so it's too late by the time it reaches the commit - it has already updated the position values.  I now realize that this is incorrect design, though I might never have figured it out without my attempt to use the concurrent server.  It's going to be a bit painful to redesign my code to put off updating position values until after a successful commit operation.  It's something I do intend to do. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13255657",
+            "date": "2012-04-17T15:42:05+0000",
+            "content": "First crack at a patch for throwing delayed exceptions.  It should do this on any request when a previous request resulted in an error, not just on commits.  I did not attempt to make any unit tests.  I'm not entirely sure how unit tests work when things are supposed to succeed, how to simulate a failure is even less obvious. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13255659",
+            "date": "2012-04-17T15:43:28+0000",
+            "content": "The patch should also apply successfully to 3.6. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13255705",
+            "date": "2012-04-17T16:34:10+0000",
+            "content": "After looking at existing tests to see how I might implement tests for this new functionality, I couldn't see how to do it.  Also, I noticed that there are tests for SolrCloud and something else called ChaosMonkey.  All tests in solr/ pass with this patch, but I don't know how SolrCloud might be affected.  I would hope that it already handles exceptions properly and therefore wouldn't have any problems, but I have never looked at the code or used SolrCloud. "
+        },
+        {
+            "author": "Lance Norskog",
+            "id": "comment-13292206",
+            "date": "2012-06-09T06:40:42+0000",
+            "content": "In the trunk it is now ConcurrentUpdateSolrServer, and it swallows errors all over the place.\n\nI am a total fascist about fail-fast/fail-loud. A more obnoxious (fail-fast) design is:\n\n\tAny exception in a worker causes the main driver to kill all other workers.\n\tThe default handler after this is a rollback.\n\tAdd a flush() method to SolrServer.\n\t\n\t\tCUSS uses this to report back to the main thread that everything blew up.\n\t\tOther server classes would do a socket flush and wait and drain out any error text.\n\t\n\t\n\tUse a finalize() method to complain that the user did not call flush().\n\t\n\t\tThis is in all SolrServer classes- the same application code should do the same thing with every SolrServer implementation.\n\t\n\t\n\n\n\nWe tell our customers to not use SUSS/CUSS because it does not do errors right. Partly this causes problems because people tend to \"design to success\" (assume everything works) instead of \"design to failure\" (assume everything breaks). When CUSS breaks, the production scripting and staff do not notice. \n "
+        },
+        {
+            "author": "Mike Sokolov",
+            "id": "comment-13292507",
+            "date": "2012-06-10T12:13:25+0000",
+            "content": "Another approach we have been using in a similar parallel writing situation is to have the thread pool maintain a fixed-size list of exceptions.  Whenever a worker throws one, it gets put on the list.  Then at certain barrier conditions (flush, exception list full), the exceptions are collected together and re-thrown using an umbrella exception that wraps them.  At the same time, all worker threads are terminated. You do need flush(), or can you rely on the user calling commit() (and flush() internally then)?\n\nThis enables writing to continue even in the face of errors, but the errors do get reported eventually.  This makes the system to be more robust in the face of transient failure conditions.  "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13292573",
+            "date": "2012-06-10T20:13:08+0000",
+            "content": "Lance, if your idea (or your idea in combination with Mike's) can be implemented without a ton of work, it should definitely replace my patch.  If it's a royal pain, my patch is there as an interim solution and yours can be handled in another issue.\n\nIs the following a good summary of your idea?  If so, I think your idea is better.  I think it should be the default behavior for 4x and trunk.\n\nA user of ConcurrentUpdateSolrServer would make update requests, then call a publicly exposed flush(), either explicitly or implicitly by calling commit().  If the flush() fails due to a background failure, all requests since the last successful flush() would be rolled back.  If the user code is designed with this in mind, error handling is as good as HttpSolrServer.  HSS (and probably ESS) would use flush() internally.  The user would be free to call flush() themselves, but it would not be required.\n\nI'm curious about how things would be handled with autoCommit or commitWithin.  Is rollback possible when those are used? "
+        },
+        {
+            "author": "Alan Woodward",
+            "id": "comment-13437752",
+            "date": "2012-08-20T09:09:40+0000",
+            "content": "This interacts really badly with bad documents (SOLR-445) - once one of the Runners passes a bad document to SOLR, all documents subsequently processed by that Runner will be silently discarded, and there doesn't seem to be any way to detect this in client code. "
+        },
+        {
+            "author": "Mikhail Khludnev",
+            "id": "comment-13438072",
+            "date": "2012-08-20T18:36:15+0000",
+            "content": "Hi,\n\nExcuse me for hijacking, but server-side analog CUSS SOLR-3585 is really strict in case of any errors, it gives up and throws them back to clients.  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13530665",
+            "date": "2012-12-13T04:24:10+0000",
+            "content": "I'd love to see a way to get back specific error information about fails. That seems preferable to just stopping  or throwing an exception in a lot of cases. It would be nice to treat different cases separatley though - eg bad doc vs down server. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13556990",
+            "date": "2013-01-18T06:16:52+0000",
+            "content": "I had an idea for tracking the first update that caused an error.  This is a little convoluted, so bear with me a little, and let me know what you think.\n\nThis first part is something that I think would be a good idea to add even if the rest is useless: The server object will have a field called requestNumber, an AtomicInteger, that will be incremented every time an UpdateRequest is used.  When an UpdateRequest is made and it does not already contain a parameter called concurrentUpdateId, the string representation of the current requestNumber will be inserted into the request as the value of that parameter.  Originally I had planned to have it always use the incrementing integer values, but there will be a lot of people may already have an existing ID value, and using that value would be MUCH easier.  The concurrentUpdateId parameter that gets used will be included in the dummy response, and it can also be used when Runner logs status messages from each update.\n\nNow for the rest: One of the methods on the server object will set the error handling method that will get used.  One choice will be exactly the way it works now, including the ability to override the handleError method.  Another choice will be to raise a flag that can be checked manually using various get methods.  The remaining choice would be very similar to the patch already attached to this issue, except that the update ID of the update that caused the first internal exception will be in the message on the encapsulating exception.\n\nI've got some of this written already.  It is pushing my java skill boundaries a little.\n\nEven if the latter part is not implemented, if the first part goes in, the user could override a new HandleError(Exception,String) method to track the ID of every update that fails, not just the first. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13556991",
+            "date": "2013-01-18T06:18:38+0000",
+            "content": "I'll try to separate the patches for each half of this idea. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13636619",
+            "date": "2013-04-19T17:14:04+0000",
+            "content": "I think that having optional error reporting built into in the concurrent class is important, even if it cannot tell you which of your recent updates failed.  Does anyone think my patch is a good first step, should I try another approach, or is this whole idea doomed?\n\nI am not planning to close this issue at this time, but this comment is part of an effort to close old issues that I have reported.  Search tag: elyograg2013springclean "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13723187",
+            "date": "2013-07-30T00:20:02+0000",
+            "content": "I have a proposed patch that is very likely to need updating because it is so old.\n\nThere is an issue for CloudSolrServer, the one to route documents to the correct shard, that has a concurrent mode that apparently still will throw exceptions. Can that be adapted for use here? "
+        },
+        {
+            "author": "Stewart Sims",
+            "id": "comment-13995131",
+            "date": "2014-05-12T14:52:07+0000",
+            "content": "This has been a source of errors that were difficult for us to track down, when using the ConcurrentUpdateSolrServer to index a large volume of data (including some very large individual documents). We were confused for a long time as to why some documents were not being indexed, which turned out to be a combination of data errors and bad request errors due to too many concurrent requests. Once we switched to HttpSolrServer the problems with bad requests went away and we were able to get more informative exceptions which helped to find the data problems.\n\nHad my colleague not found the thread below, we would have struggled to figure out the exact causes of our problems:\nhttp://lucene.472066.n3.nabble.com/Missing-documents-with-ConcurrentUpdateSolrServer-vs-HttpSolrServer-td4033637.html\n\nOne alternative to a code change might be to advise caution with using the ConcurrentUpdateSolrServer with large volumes of data. HttpSolrServer seems for us (using Solr 4.2.1) to be more stable and only takes about 30% more time to index. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-15705521",
+            "date": "2016-11-29T15:03:09+0000",
+            "content": "It's telling that nowadays, internally in Solr there are actually 2 subclasses of ConcurrentUpdateSolrClient who both exist to handle errors:  SafeConcurrentUpdateSolrClient (in morphlines) and ErrorReportingConcurrentUpdateSolrClient (defined within and returned by  StreamingSolrClients, used by SolrCmdDistributor used by DistributedUpdateProcessor).  And note also that all constructors are of CUSC are deprecated even though the only way to actually implement handleError by a user implies you need to use them since the Builder doesn't expose configuring error handling.\n\nIMO the default behavior of CUSC should be basically just like SafeConcurrentUpdateSolrClient so that users see problems readily.  Perhaps also check & throw in request().  StreamingSolrClients can override to do it's special handling. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-15728020",
+            "date": "2016-12-07T07:41:53+0000",
+            "content": "You can use those hacks for specific use cases, but the only great solution for the general user client is really doing the work of efficiently returning error information for what could be tons of failed updates. \n\nIt's not a bad idea to offer the option of trying to quit on the first error. I'd make it a required construction param. Most users that I've seen that want to do this though, want to count on updates stopping after the first fail, so you can reason about how to handle the situation reasonably, but you can actually end up with a few updates beyond that in, so it's not as great as it sounds even when you do want that kind of behavior. \n "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-15728733",
+            "date": "2016-12-07T13:16:06+0000",
+            "content": "It's not a bad idea to offer the option of trying to quit on the first error. I'd make it a required construction param.\n\n+1 to make error handling a required param.  Although a 'false' setting is dubious... if you do that then... do you really want no errors back?  Or is 'false' supposed to be, false and provide your own error callback?  Perhaps make the error handler a lambda and no boolean flag.  If you pass a null lambda then you get the behavior of throwing as soon as we can (as seen in SafeConcurrentUpdateClient).  If lambda is non-null then it's invoked.  Furthermore, the CUSC instance might have setErrorIfUnset & getError methods for possible use by a custom lambda.\n\nMost users that I've seen that want to do this though, want to count on updates stopping after the first fail, so you can reason about how to handle the situation reasonably, but you can actually end up with a few updates beyond that in, so it's not as great as it sounds even when you do want that kind of behavior.\n\nWe can address this through documentation.  In particular, document that blockUntilFinished() (or trigging it indirectly via a commit or similar)  is the only way to ensure the documents you've sent have no error. "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-15728806",
+            "date": "2016-12-07T13:46:27+0000",
+            "content": "I really didn't expect to see any activity on this.  I mostly opened it so we'd have the ability to tell people that the limitations of the Concurrent client have not escaped our attention.\n\nThinking about the notion of it being possible for changes beyond the first error to have been indexed, I have to compare this to the way that I handle errors in my current SolrJ index maintenance program (using HttpSolrClient).\n\nA full update cycle consists of individual deletes, a possible mass delete query, reinserts, a possible reindex of a portion of the index, and then new docs (inserts).  If any part of that fails, I assume the entire cycle has failed.  I don't try to figure out exactly where a failure happened \u2013 all actions for a failed cycle are repeated on the next loop.\n\nThis works despite the imprecise error detection, because I have a properly configured and properly used uniqueKey field.  Also, I am not using the atomic update feature.  The increment, decrement, and add/remove functionality (for multiple values) in Atomic Update would be incompatible with failure scenarios where you can't be sure about which updates succeeded and which failed. "
+        }
+    ]
+}

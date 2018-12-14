@@ -1,0 +1,140 @@
+{
+    "id": "SOLR-3684",
+    "title": "Frequently full gc while do pressure index",
+    "details": {
+        "affect_versions": "4.0-ALPHA",
+        "status": "Open",
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ],
+        "components": [
+            "multicore"
+        ],
+        "type": "Improvement",
+        "priority": "Critical",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "Recently we test the Solr index throughput and performance, configure the 20 fields do test, the field type is normal text_general, start 1000 threads for Jetty, and define 5 cores.\n\nAfter test continued for some time, the solr process throughput is down very quickly. After check the root cause, find the java process always do the full GC. \nCheck the heap dump, the main object is StandardTokenizer, it is be saved in the CloseableThreadLocal by IndexSchema.SolrIndexAnalyzer.\n\nIn the Solr, will use the PerFieldReuseStrategy for the default reuse component strategy, that means one field has one own StandardTokenizer if it use standard analyzer,  and standardtokenizer will occur 32KB memory because of zzBuffer char array.\n\nThe worst case: Total memory = live threads*cores*fields*32KB\n\nIn the test case, the memory is 1000*5*20*32KB= 3.2G for StandardTokenizer, and those object only thread die can be released.\n\nSuggestion:\nEvery request only handles by one thread that means one document only analyses by one thread.  For one thread will parse the document\u2019s field step by step, so the same field type can use the same reused component. While thread switches the same type\u2019s field analyzes only reset the same component input stream, it can save a lot of memory for same type\u2019s field.\n\nTotal memory will be = live threads*cores*(different fields types)*32KB\n\nThe source code modifies that it is simple; I can provide the modification patch for IndexSchema.java: \nprivate class SolrIndexAnalyzer extends AnalyzerWrapper {\n\n\tprivate class SolrFieldReuseStrategy extends ReuseStrategy {\n\n\t      /**\n\n\t{@inheritDoc}\n\t       */\n\t      @SuppressWarnings(\"unchecked\")\n\t      public TokenStreamComponents getReusableComponents(String fieldName) {\n\t        Map<Analyzer, TokenStreamComponents> componentsPerField = (Map<Analyzer, TokenStreamComponents>) getStoredValue();\n\t        return componentsPerField != null ? componentsPerField.get(analyzers.get(fieldName)) : null;\n\t      }\n\n\t      /**\n\t       * {@inheritDoc}\n\t       */\n\t      @SuppressWarnings(\"unchecked\")\n\t      public void setReusableComponents(String fieldName, TokenStreamComponents components) \nUnknown macro: {\t        Map<Analyzer, TokenStreamComponents> componentsPerField = (Map<Analyzer, TokenStreamComponents>) getStoredValue();\t        if (componentsPerField == null) {\n\t          componentsPerField = new HashMap<Analyzer, TokenStreamComponents>();\n\t          setStoredValue(componentsPerField);\n\t        }\t        componentsPerField.put(analyzers.get(fieldName), components);\t      } \n\t}\n\n\n\n    protected final static HashMap<String, Analyzer> analyzers;\n    /**\n\n\tImplementation of \n{@link ReuseStrategy}\n that reuses components per-field by\n\tmaintaining a Map of TokenStreamComponent per field name.\n     */\n\n\n\n    SolrIndexAnalyzer() \n{\n      super(new solrFieldReuseStrategy());\n      analyzers = analyzerCache();\n    }\n\n    protected HashMap<String, Analyzer> analyzerCache() {\n      HashMap<String, Analyzer> cache = new HashMap<String, Analyzer>();\n      for (SchemaField f : getFields().values()) \n{\n        Analyzer analyzer = f.getType().getAnalyzer();\n        cache.put(f.getName(), analyzer);\n      }\n      return cache;\n    }\n\n    @Override\n    protected Analyzer getWrappedAnalyzer(String fieldName) \n{\n      Analyzer analyzer = analyzers.get(fieldName);\n      return analyzer != null ? analyzer : getDynamicFieldType(fieldName).getAnalyzer();\n    }\n\n    @Override\n    protected TokenStreamComponents wrapComponents(String fieldName, TokenStreamComponents components) \n{\n      return components;\n    }\n  }\n\n  private class SolrQueryAnalyzer extends SolrIndexAnalyzer {\n    @Override\n    protected HashMap<String, Analyzer> analyzerCache() {\n      HashMap<String, Analyzer> cache = new HashMap<String, Analyzer>();\n       for (SchemaField f : getFields().values()) \n{\n        Analyzer analyzer = f.getType().getQueryAnalyzer();\n        cache.put(f.getName(), analyzer);\n      }\n      return cache;\n    }\n\n    @Override\n    protected Analyzer getWrappedAnalyzer(String fieldName) \n{\n      Analyzer analyzer = analyzers.get(fieldName);\n      return analyzer != null ? analyzer : getDynamicFieldType(fieldName).getQueryAnalyzer();\n    }\n  }",
+    "attachments": {
+        "patch.txt": "https://issues.apache.org/jira/secure/attachment/12539985/patch.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Robert Muir",
+            "id": "comment-13428863",
+            "date": "2012-08-05T16:00:51+0000",
+            "content": "\nthe patch would let Solr reuse analyzers across field types, however:\n\n\tthe problem is you are indexing with 1000 threads. why are you using so many?\n  This is the root cause here, in general you can plan on having performance problems.\n\tif someone has a fieldType \"myType\" and they use it for \"field1\" and \"field2\",\n  and \"myType\" is itself a per-field analyzer (it does something different for\n  these two fields), then this code will sometimes analyze the fields the wrong way.\n\n "
+        },
+        {
+            "author": "Raintung Li",
+            "id": "comment-13429015",
+            "date": "2012-08-06T08:01:01+0000",
+            "content": "For 1, I want to test index's the throughput in solr cloud, start 1000 threads in the Jmeter, solr cloud server Jetty max threads is 10000.\nUsually pressure test throughput achieve the max, then keep or down smoothly, the average last status is stable.  In this case, the JVM look like the hungup, always do full gc, the cache for StandardTokenizer cost too many memory and thread still alive that cause the cache can't release, new request still come, the throughput become very bad.\n\nFor 2, how to create the per-field analyzer? Is it the same analyzer? analyzer.tokenStream had been declare final, how to create the tokenStream the different fields? For one thread use the same tokenstream it is safe, TokenStreamComponents it is thread's cache. Could you give more information?\n "
+        },
+        {
+            "author": "Mikhail Khludnev",
+            "id": "comment-13429027",
+            "date": "2012-08-06T08:35:30+0000",
+            "content": "Hello, \n\nQ1 gives one more usage for SOLR-3585. It uses dedicated thread pool with limited capacity to proceed updates. So, the core challenge will be solved. \n\nRaintung, \nupdating with the storm of small messages is not common for search engines world. Usual way is collecting them in bulks and index by modest number of threads. Sooner or later indexing hits io limit, therefore there is no profit to utilize CPU's by huge amount of indexing threads.   "
+        },
+        {
+            "author": "Raintung Li",
+            "id": "comment-13429038",
+            "date": "2012-08-06T09:13:29+0000",
+            "content": "Hi Mikhail,\n\nIt isn't really storm that only 1000 client send the message, and we have three solr index servers, and all servers have the same issues. \n\nMy suggestion just want to reduce wasteful memory, although memory is cheap now. To improve the performance to avoid io limit, we save into the memory, but also need calculate the memory usage even if JVM help us to manage the memory.\n\nBTW, the default Jetty thread config is 10000 in the solr, in this case the every server's alive threads are more than 1000.\n\n\n\n "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13429173",
+            "date": "2012-08-06T14:55:01+0000",
+            "content": "\nBTW, the default Jetty thread config is 10000 in the solr,\n\nCan we address this default thread config with a patch? This doesn't seem good, I guess if someone doesn't\nfix this I can easily DoS Solrs into eating up all their RAM until rebooted. Something like 100 seems just\nfine for QueuedThreadPool, so it will block in such cases (and probably just end out being faster overall).\n\n\nFor 2, how to create the per-field analyzer? Is it the same analyzer? analyzer.tokenStream had been declare final, how to create the tokenStream the different fields? For one thread use the same tokenstream it is safe, TokenStreamComponents it is thread's cache. Could you give more information?\n\nWell basically your patch should be a nice improvement about 99.9% of the time. There is a (maybe only theoretical)\ncase where someone has a lucene Analyzer MyAnalyzer configured as:\n\n<fieldType name=\"text_custom\" class=\"solr.TextField\">\n  <analyzer class=\"com.mypackage.MyAnalyzer\"/>\n</fieldType>\n...\n<field name=\"foo\" type=\"text_custom\" .../>\n<field name=\"bar\" type=\"text_custom\" .../>\n...\n\nIf MyAnalyzer has different behavior for \"foo\" versus \"bar\", then reuse-by-field-type will be incorrect. I'll think\nabout a workaround, maybe nobody is even doing this or depends on this. But I just don't know if the same thing\ncould happen for custom fieldtypes or whatever. Its just the kind of thing that could be a sneaky bug in the future.\n\nBut I agree with the patch! I'll see if we can address it somehow.\n\nSeparately I think we should also open an issue to reduce these jflex buffer sizes. char[16k] seems like serious\noverkill, the other tokenizers in lucene use char[4k]. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13429287",
+            "date": "2012-08-06T17:40:27+0000",
+            "content": "FYI: I lowered the jflex buffer sizes from 32kb to 8kb in LUCENE-4291.\n\nSo I think we should still:\n\n\tAddress this default jetty threadpool size of max=10,000. This is the real issue.\n\tSee if we can deal with the crazy corner case so we can impl your patch (reuse by fieldtype), which I think is a good separate improvement.\n\n "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-13429682",
+            "date": "2012-08-07T02:58:06+0000",
+            "content": "Address this default jetty threadpool size of max=10,000. This is the real issue.\n\nI had thought that jetty reused a small number of threads - O(n_concurrent_connections), regardless of what the max number of threads were? "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13429688",
+            "date": "2012-08-07T03:15:37+0000",
+            "content": "It does: I think the reuse is not the problem but the max?\n\nBy default i think it keeps min threads always (default 10), but our max of 10,000 allows it to temporarily\nspike huge (versus blocking). from looking at the jetty code, by default these will die off after 60s, which is fine,\nbut we enrolled so many entries into e.g. Analyzer's or SegmentReader's CloseableThreadlocals, that when they die off\nand the CTL does a purge, its just a ton of garbage.\n\nReally there isnt much benefit here in using so many threads at indexing time (dwpt's max threads is 8, unless changed\nin IndexWriterConfig, and this would have other bad side effects). At query time I think something closer to jetty's\ndefault of 254 would actually be better too.\n\nBut i looked at the history of this file, and it seems the reason it was set to 10,000 was to prevent a deadlock (SOLR-683) ?\nIs there a better solution to this now so that we can reduce this max?\n\nSeparately I've been fixing the analyzers that do hog ram because machines are getting more cores, so I think its\nworth it. But I think it would be nice if we can fix this max=10,000  "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13429815",
+            "date": "2012-08-07T03:43:17+0000",
+            "content": "rmuir20120906-bulk-40-change "
+        },
+        {
+            "author": "Eks Dev",
+            "id": "comment-13429985",
+            "date": "2012-08-07T07:07:12+0000",
+            "content": "We did it a long time ago on tomcat, as we use particularly expensive analyzers, so even for searching optimum is around Noo cores. Actually, that was the only big problem with solr we had.  \n\nActually, anything that keeps insane thread churn low helps. Not only max number of threads, but TTL time for idle threads should be also somehow increased. The longer threads live, the better. Solr is completely safe due to core-reloading and smart Index management, no point in renewing threads.   \n\nIf one needs to queue requests, that is just another problem,  but for this there no need to up max worker threads to more than number of cores plus some smallish constant\n\nWhat we would like to achieve is to keep separate thread pools for searching, indexing and \"the rest\"... but we never managed to figure out how to do it. even benign, /ping, /status.... whatever are increasing thread churn... If we were able to configure separate pools , we could keep small number of long-living threads for searching, even smaller number for indexing and one \"who cares\" pool for the rest. It is somehow possible on tomcat, if someone knows how to do it, please share.  "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-13430293",
+            "date": "2012-08-07T11:38:43+0000",
+            "content": "What we would like to achieve is to keep separate thread pools for searching, indexing and \"the rest\".\n\nYeah, exactly.  I'd love to be able to assign different thread pools to different URLs, but I don't know if that's doable in Jetty or not. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13430294",
+            "date": "2012-08-07T11:43:22+0000",
+            "content": "What about http://docs.codehaus.org/display/JETTY/Quality+of+Service+Filter ?\n "
+        },
+        {
+            "author": "Raintung Li",
+            "id": "comment-13430839",
+            "date": "2012-08-08T03:27:58+0000",
+            "content": "I just check all solr/lucene analyzer, the entrance is method createComponents, for different field name use different TokenStreamComponent that cause field type's cache is avalid. Is this way?\n protected TokenStreamComponents createComponents(String fieldName,\n      Reader reader) {\n...\n}\nthe parameter fieldName doesn't be used in solr/lucene self analyzer, maybe we can remove this parameter direct in Analyzer.java. We can identify this that one field type only match one analyzer. \n\nThe other simple way is define that only solr/lucene package path use field type's cache, the other custom's analyzer use field name's cache.\n\nFor different path thread pool issue, maybe can user different port to handle, we do it in the tomcat. "
+        },
+        {
+            "author": "Raintung Li",
+            "id": "comment-13431638",
+            "date": "2012-08-09T07:35:15+0000",
+            "content": "I update patch, only solr self TokenizerChain will be cached per filed type cache, the other is keep the old design, also update DynamicFieldType save into the analyzerCache. It is special fixed, very hard to identify the different TokenStreamComponent(or same TokenStreamComponent different Tokenizer/TokenStream) for different field in the same analyzer. "
+        },
+        {
+            "author": "Raintung Li",
+            "id": "comment-13437756",
+            "date": "2012-08-20T09:13:31+0000",
+            "content": "Any feedback? "
+        },
+        {
+            "author": "Lance Norskog",
+            "id": "comment-13438178",
+            "date": "2012-08-20T20:40:27+0000",
+            "content": "For multi-hosted Solr shops, per-collection throttling is the only way to go. This meta-admin can be done in a separate servlet war in the same servlet container. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13456392",
+            "date": "2012-09-15T12:49:26+0000",
+            "content": "Unassigned issues -> 4.1 "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13717192",
+            "date": "2013-07-23T18:47:25+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13971261",
+            "date": "2014-04-16T12:57:35+0000",
+            "content": "Move issue to Solr 4.9. "
+        }
+    ]
+}

@@ -1,0 +1,87 @@
+{
+    "id": "SOLR-11299",
+    "title": "Time partitioned collections (umbrella issue)",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "New Feature",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "Solr ought to have the ability to manage large-scale time-series data (think logs or sensor data / IOT) itself without a lot of manual/external work.  The most naive and painless approach today is to create a collection with a high numShards with hash routing but this isn't as good as partitioning the underlying indexes by time for these reasons:\n\n\n\tEasy to scale up/down horizontally as data/requirements change.  (No need to over-provision, use shard splitting, or re-index with different config)\n\tFaster queries:\n\t\n\t\tcan search fewer shards, reducing overall load\n\t\trealtime search is more tractable (since most shards are stable \u2013 good caches)\n\t\t\"recent\" shards (that might be queried more) can be allocated to faster hardware\n\t\taged out data is simply removed, not marked as deleted.  Deleted docs still have search overhead.\n\t\n\t\n\tOutages of a shard result in a degraded but sometimes a useful system nonetheless (compare to random subset missing)\n\n\n\nIdeally you could set this up once and then simply work with a collection (potentially actually an alias) in a normal way (search or update), letting Solr handle the addition of new partitions, removing of old ones, and appropriate routing of requests depending on their nature.\n\nThis issue is an umbrella issue for the particular tasks that will make it all happen \u2013 either subtasks or issue linking.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-08-30T19:19:23+0000",
+            "content": "Approach: I see conceptually two approaches. This could be done by adding a new type of DocRouter to the existing capabilities of shard managements within one collection (and other stuff!); see SOLR-9690.  It could also be done by managing a series of collections with an alias plus other components. This is implied by SOLR-9562.  There is some discussion in SOLR-9562 on the merits of both approaches.  At first I felt very strongly about shard based partitions because it fits well into Solr's existing code but I've come to realize it's got scalability challenges, so I no longer have any preference.  I'm going to proceed with collection based partitions.\n\nWhat follows are some implementation tasks (which might not necessarily map to JIRA issues):\n\n\tPartition name pattern encode/decode to date.  Truncate off '0' aligned parts to keep short where possible; just ensure it sorts properly). Consumes timezone param.\n\tSpecial time-partitioned collection alias \u2013 this is a special alias with additional settings.  Need C.R.U.D. with various settings:\n\t\n\t\tearliest date.  This might be computed from the 1st partition name instead of persisted to collection alias metadata. On creation this might be more conveniently set via date-math syntax like in facet.range.start.\n\t\tmax time.  Specify via facet.range.gap syntax?  Support implicit \"+1\" prefix if not there?\n\t\tmax docs.  A soft maximum that will often overflow somewhat \u2013 perhaps at the indexing rate of 1 minute worth of data.\n\t\ttimezone.  Read-only; otherwise would break how to interpret existing partition names.\n\t\tmax retention age  (date math syntax)\n\t\tcollection creation metadata: nodeset, numShards, replicationFactor, etc.\n\t\ttime field.  Read-only.  Field in Solr doc with a time.\n\t\tpreemptive create.  Boolean; wether to create shards in advance or otherwise block if not.\n\t\n\t\n\tIndex to a collection alias.   Work for add/delete/commit.\n\t\n\t\tCloudSolrClient: writing to a multi-collection alias results in an NPE. Instead should perhaps pick the first to align with HttpSolrCall's algorithm.\n\t\tHttpSolrCall: no changes required. Note it prefers the first collection in the alias list, so we ought to try to append to the front when adding new time-partition collections (reverse sorted).\n\t\tAdd a new URP or enhance DistributedURP with support for time partitions.  DURP is unwieldy; If use DURP try to separate out to a new helper class for most aspects.  Could a new URP be dynamically added at chain construction time if the core is referred to by a time-partioned collection alias?\n\t\n\t\n\tManagement. Use daemon mechanism in SOLR-11066 where appropriate.\n\t\n\t\tcreate new collections\n\t\t\n\t\t\tfrom maxTime exceeded  (+ pre-emptive)\n\t\t\tfrom maxDocs exceeded\n\t\t\n\t\t\n\t\tdelete old partitions\n\t\toptimize (segment merge) old partitions\n\t\n\t\n\tSearch optimization: minimize queried collections somehow \u2013 see SOLR-9562\n\n\n\nTechnical debt / cleanup:\n\n\tIn various places, a String variable by the name \"collection\" can actually be a comma separated list of them.  That's pretty terrible and ought to be cleaned up since it leads to bugs (see the NPE in CloudSolrClient above).  Bear minimum improvement is a variable rename... a step beyond is using a List<String>.  In some places the issue is also related methods (consider Aliases class\n\n ",
+            "author": "David Smiley",
+            "id": "comment-16147868"
+        },
+        {
+            "date": "2017-10-06T13:41:17+0000",
+            "content": "One thought that comes to mind is that with deletions of old collections, we could more or less think of it as solr collection based ring buffer...\n\nThe implicit assumption seems to be that writes are \"mostly ordered\" and that severely out of order writes might be rejected? I think that that's probably a critical assumption since I imagine that we'll have an alias that's moving from collection to collection for writes. Even if CloudSolrClient is able to write to the first collection in a multi-collection alias, this applies since we would need to reject a write not appropriate for that partition. And if that change is made does it have the potential to surprise folks who make an alias write to it and find all the docs in only one collection? Handling some sort of collection level routing will be needed if pre-allocation is to be useful in catching \"early\" or \"late\" writes near partition boundaries...\n\nThoughts on the possible URP/DURP maybe it's always present by default, but a silent no-op unless it sees that a time partitioned collection is being accessed, and only then does it do anything? This would require some highly efficient way of checking if something is a time series collection. Maybe a mandatory suffix/prefix on the collection name (\".tpc\" or \"TPC-\" or some such) so that there's no need to look anything up in zookeeper etc to know if it's a time series...? Downside is the potential for accidentally triggering it, so maybe a second more expensive check (attempt to parse out dateness from the name, ask zookeeper...whatever) could then revert to no-op if it failed so that slowdown rather than failure is the impact of an inadvertent suffix/prefix? suffix/prefix denoting time series collections could be configureable in solr.xml to make it possible to escape from naming clashes.\n\nAnother thought is that while date/time is the objective here, it would seem that any numeric field should work... ",
+            "author": "Gus Heck",
+            "id": "comment-16194601"
+        },
+        {
+            "date": "2017-10-06T15:20:59+0000",
+            "content": "Hi Gus.\n\nOne thought that comes to mind is that with deletions of old collections, we could more or less think of it as solr collection based ring buffer...\n\nPerhaps in an abstract sense but I don't think modeling it physically (creating X collections with some suffix ordinal name in advance) makes sense. I don't think it's a big deal to delete collections and create new ones.  This is very flexible to changing settings of how much data to retain but an actual ring buffer design is rigid.\n\nThe implicit assumption seems to be that writes are \"mostly ordered\" and that severely out of order writes might be rejected? I think that that's probably a critical assumption since I imagine that we'll have an alias that's moving from collection to collection for writes.  ...\n\nMy proposed design does not call for a so-called write alias, which would be a limitation for out-of-order.  Instead there is an URP (or add-on to DistributedURP) that can route to the proper partition.  For fixed time based partitions, it shouldn't be a big deal to add data out of order.  For size capped partitions, it's definitely incompatible.  For documents far in the future, instead of creating too many intermediate collections, we very well might reject it.\n\nThoughts on the possible URP/DURP maybe it's always present by default, but a silent no-op unless it sees that a time partitioned collection is being accessed, and only then does it do anything?  ...\n\nYeah maybe; more investigation is needed to help us pick. Perhaps collections involved in a time series have a boolean piece of metadata denoting it is a part of a time series?  Or a string back-reference to the alias?\n\nAnother thought is that while date/time is the objective here, it would seem that any numeric field should work...\n\nI've thought of this but I think the time based use case is so prevalent that I have doubts it's worth bothering to add non-time support.  It could be theoretically added in the future.  And such a user could abuse their number as a time to use this feature. ",
+            "author": "David Smiley",
+            "id": "comment-16194736"
+        },
+        {
+            "date": "2017-10-13T20:56:23+0000",
+            "content": "Nice article on some of these ideas by Mark Miller\nhttps://blog.cloudera.com/blog/2013/10/collection-aliasing-near-real-time-search-for-really-big-data/   4 years old but still relevant. ",
+            "author": "David Smiley",
+            "id": "comment-16204175"
+        },
+        {
+            "date": "2017-10-13T23:50:16+0000",
+            "content": "Was thinking about the timezone bit... it seems to me that just as in applications where one normally stores data as UTC and converts when needed, we should dodge the timezone metadata read-only issue and always name our partitions in terms of UTC... conversions can be done based on the timezone portion of the key date field in cases where we are not receiving UTC... if no timezone specifier assume UTC... \n\nI've seen an implementation of this sort of thing where routing was based on DateFormat parsing the partition names on each request, but I could also imagine that we might simplify things by naming the partitions based on epoch milliseconds, which could also be kept in alias metadata as a sorted list of partition boundaries with partitions named for their (inclusive) lower bound. Allowing pretty, human friendly collection names that are formatted versions of the lower bounds and mapping the collection start time values to those names could be a follow on enhancement just adding a layer of indirection... \n ",
+            "author": "Gus Heck",
+            "id": "comment-16204365"
+        },
+        {
+            "date": "2017-10-14T03:58:29+0000",
+            "content": "The timezone bit is for two things:\n\n\tthe interpretation of the partition time size.  A timezone is useful and in fact necessary for the same reasons as facet.range.gap with dates which support it.  See SOLR-2690 for context as to why TZ exists.\n\tallowing for shorter friendly collection names like mycollection_2017-10-13 instead of needing to get to the hour.  This isn't a big deal, granted.  I don't really like millisecond collection names, sorry.  Hey Hoss Man I recall we both attended an LSR presentation (Rocana?) that described a time partitioning strategy with the dubious choice of milliseconds in the name and you were like, oh yeah, ol collection 1507953042461 \u2013 there's some great data in there \n\n\n\nRE alias metadata for storing partition ranges... yeah I suppose that's possible but I admit I like the lean sufficiency of the names themselves in series being adequate.  The only problem I can think of with using the names alone is that you must have a complete contiguous series with no gaps of collections that haven't been created.  That doesn't seam like a serious limitation, I think?  If we wanted metadata on each partition like the start and end range, I'm not inclined to think the alias is where it goes \u2013 more likely it's metadata on the collection. ",
+            "author": "David Smiley",
+            "id": "comment-16204466"
+        },
+        {
+            "date": "2017-10-14T12:25:01+0000",
+            "content": "I agree that millisecond names are not friendly  and I did advocate cleaning that up in a second step in my comment... I'll look at SOLR-2690. My main worry about partition names being \"the key\" directly is the cost of DateFormat.parse() of some number of partition names for every doc... the non contiguous series would be an issue either way I suspect, and deleting collections in from the middle of your time series should be unsupported.  ",
+            "author": "Gus Heck",
+            "id": "comment-16204605"
+        },
+        {
+            "date": "2017-10-14T12:53:14+0000",
+            "content": "Ok I see your point about timezone. I wasn't thinking about the application of date math, which would still work if all was UTC but that would be very unfriendly to the user. ",
+            "author": "Gus Heck",
+            "id": "comment-16204613"
+        },
+        {
+            "date": "2017-10-14T20:29:24+0000",
+            "content": "the cost of DateFormat.parse() of some number of partition names for every doc\n\nAh, yes.  So it seems we could grab the Aliases instance and if it's the very same one as the last instance, then the previous parsing is still valid.  In other words, cache the parsing. ",
+            "author": "David Smiley",
+            "id": "comment-16204809"
+        },
+        {
+            "date": "2018-07-21T14:03:28+0000",
+            "content": "Is there any plan to make Time Routed Aliases working with CDCR (Cross Data Center Replication)?\u00a0TRA dynamically allocates collections based on static solrconfig.xml. CDCR requires per-collection configuration in solrconfig.xml (source, target). This is an important feature to us, as we have multiple DCs with bad network between them (classic SolrCloud replication is not possible due to latency), and we need to have DR plan. ",
+            "author": "Pavel Micka",
+            "id": "comment-16551701"
+        },
+        {
+            "date": "2018-07-23T03:38:42+0000",
+            "content": "RE CDCR: sorry, no.  I think it might be hard to add TRA support to CDCR.  The aliases would need to be synchronized, for one thing.  If you want to use TRAs and have some sort of DC fail-over, you'll have to build a higher level solution yourself, e.g. using a queue and various coordination mechanisms depending on your requirements. ",
+            "author": "David Smiley",
+            "id": "comment-16552252"
+        }
+    ]
+}

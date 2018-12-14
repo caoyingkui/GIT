@@ -1,0 +1,196 @@
+{
+    "id": "LUCENE-4602",
+    "title": "Use DocValues to store per-doc facet ord",
+    "details": {
+        "components": [
+            "modules/facet"
+        ],
+        "fix_versions": [
+            "4.2",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Spinoff from LUCENE-4600\n\nDocValues can be used to hold the byte[] encoding all facet ords for\nthe document, instead of payloads.  I made a hacked up approximation\nof in-RAM DV (see CachedCountingFacetsCollector in the patch) and the\ngains were somewhat surprisingly large:\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n                HighTerm        0.53      (0.9%)        1.00      (2.5%)   87.3% (  83% -   91%)\n                 LowTerm        7.59      (0.6%)       26.75     (12.9%)  252.6% ( 237% -  267%)\n                 MedTerm        3.35      (0.7%)       12.71      (9.0%)  279.8% ( 268% -  291%)\n\n\n\nI didn't think payloads were THAT slow; I think it must be the advance\nimplementation?\n\nWe need to separately test on-disk DV to make sure it's at least\non-par with payloads (but hopefully faster) and if so ... we should\ncutover facets to using DV.",
+    "attachments": {
+        "TestFacetsPayloadMigrationReader.java": "https://issues.apache.org/jira/secure/attachment/12564943/TestFacetsPayloadMigrationReader.java",
+        "FacetsPayloadMigrationReader.java": "https://issues.apache.org/jira/secure/attachment/12564942/FacetsPayloadMigrationReader.java",
+        "LUCENE-4602.patch": "https://issues.apache.org/jira/secure/attachment/12560094/LUCENE-4602.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-12-09T16:19:47+0000",
+            "content": "Patch with another prototype DV-backed collector.  This one only works\nfor single-valued fields (in \"dimension\" terminology, I think: the\ndocument can have multiple dimensions as long as each dimension has\nonly one category path under it).\n\nIt stores only a single ord per doc X\nfield into a PackedLongDocValuesField.  The collector then aggregates\nper-segment, during collection, but only the leaf ords, and then at\nthe end, it walks up the hierarchy, summing counts to the parent ords.\nIt's the fastest impl so far:\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n                HighTerm        0.71      (0.5%)        1.60      (2.3%)  124.1% ( 120% -  127%)\n                 MedTerm        4.43      (0.5%)       31.39      (6.6%)  609.1% ( 599% -  618%)\n                 LowTerm       10.28      (0.4%)       75.37      (3.8%)  633.0% ( 626% -  639%)\n\n\n\nBut it's somewhat hacked up (storing DV field directly myself)... Shai\nexplained that it's possible now to have facets store only the leaf\nord, so once we get DV cleanly integrated we should try that and\nre-rest. ",
+            "author": "Michael McCandless",
+            "id": "comment-13527519"
+        },
+        {
+            "date": "2012-12-09T20:42:11+0000",
+            "content": "Shai explained that it's possible now to have facets store only the leaf ord\n\nThis is a long shot (I haven't tried it yet), but I think that if you implement an OrdinalPolicy which always returns false, then only the leaf node will be written. I.e., I look at CategpryParentStream.incrementToken() code, which is used by CategoryDocumentBuilder to encode all the parents:\n\n\n      int ordinal = this.ordinalProperty.getOrdinal();\n      if (ordinal != -1) {\n        ordinal = this.taxonomyWriter.getParent(ordinal);\n        if (this.ordinalPolicy.shouldAdd(ordinal)) {\n          this.ordinalProperty.setOrdinal(ordinal);\n          try {\n            this.categoryAttribute.addProperty(ordinalProperty);\n          } catch (UnsupportedOperationException e) {\n            throw new IOException(e.getLocalizedMessage());\n          }\n          added = true;\n        } else {\n          this.ordinalProperty.setOrdinal(-1);\n        }\n      }\n\n\n\nIt looks like the leaf ordinal is added anyway, still didn't track where ... if you don't get to try it today, I'll verify tomorrow that indeed an OrdPolicy that returns false ends up w/ just leaf nodes written.\n\nWe should compare the current code + leaves only to the DV code + leaves only, to get a better estimate of the gains we should expect when moving to DV. ",
+            "author": "Shai Erera",
+            "id": "comment-13527623"
+        },
+        {
+            "date": "2012-12-10T05:07:57+0000",
+            "content": "I tried it by writing such OrdinalPolicy and indeed only the leaf nodes were written. Here's the code:\n\n\nDefaultFacetIndexingParams indexingParams = new DefaultFacetIndexingParams() {\n\n  @Override\n  protected OrdinalPolicy fixedOrdinalPolicy() {\n    return new OrdinalPolicy() {\n      public void init(TaxonomyWriter taxonomyWriter) {}\n      public boolean shouldAdd(int ordinal) { return false; }\n    };\n  }\n};\n\n\n\nCan you try current+leaves using this code? ",
+            "author": "Shai Erera",
+            "id": "comment-13527715"
+        },
+        {
+            "date": "2012-12-10T05:13:08+0000",
+            "content": "I think that we should make this a concrete impl in the code, as a singleton. DefaultOrdPolicy can be a singleton too. Opened LUCENE-4604 to track that. ",
+            "author": "Shai Erera",
+            "id": "comment-13527718"
+        },
+        {
+            "date": "2012-12-10T14:35:33+0000",
+            "content": "I reviewed DocValuesCountingFacetsCollector, nice work !\n\nSee my last comment on LUCENE-4565 about taxoReader.getParent, vs. using the parents[] directly. Specifically, I wonder if we'll see any gain if we move to use the parents[] array directly, instead of getParent (in getFacetResults):\n\n\n+      if (count != 0) {\n+        int ordUp = taxoReader.getParent(ord); // HERE\n+        while(ordUp != 0) {\n+          //System.out.println(\"    parent=\" + ordUp + \" cp=\" + taxoReader.getPath(ordUp));\n+          counts[ordUp] += count;\n+          ordUp = taxoReader.getParent(ordUp); // AND HERE\n+        }\n+      }\n\n ",
+            "author": "Shai Erera",
+            "id": "comment-13527958"
+        },
+        {
+            "date": "2012-12-10T22:44:40+0000",
+            "content": "Ooh, you're right: I should just pull the int[] parent array and access it directly.\n\nI don't think it'll help in my test (very few non-leaf ordinals in my hierarchy) but let's make sure we do that under LUCENE-4610. ",
+            "author": "Michael McCandless",
+            "id": "comment-13528387"
+        },
+        {
+            "date": "2012-12-13T00:12:50+0000",
+            "content": "OK good news!  I hacked up a way to index the byte[] into DocValues\nfield instead of payloads, and modified the previous\nCachingFacetsCollector to use DocValues instead of its own hacked\ncache (renamed it to DocValuesFacetsCollector):\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n                HighTerm        1.27      (2.9%)        2.29      (2.7%)   80.2% (  72% -   88%)\n                 MedTerm        4.79      (1.3%)       14.83      (4.0%)  209.5% ( 201% -  217%)\n                 LowTerm       10.50      (0.8%)       33.84      (1.9%)  222.3% ( 217% -  226%)\n\n\n\nThis is only a bit slower than my original hacked up\nCachingFacetsCollector results, so net/net DocValues looks to be just\nas good.\n\nThat was for in-RAM DocValues.  Then I tested with DirectSource\n(leaves DocValues on disk, but the file is hot (in OS's IO cache) in\nthis test):\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n                HighTerm        1.26      (1.1%)        1.43      (1.0%)   13.8% (  11% -   16%)\n                 MedTerm        4.78      (0.5%)       10.22      (1.7%)  113.9% ( 111% -  116%)\n                 LowTerm       10.49      (0.4%)       27.95      (1.4%)  166.6% ( 164% -  168%)\n\n\n\nNot bad!  Only a bit slower than in RAM ... so net/net I think we\nshould cutover facets to DVs? ",
+            "author": "Michael McCandless",
+            "id": "comment-13530518"
+        },
+        {
+            "date": "2012-12-13T04:26:40+0000",
+            "content": "Awesome !\n\nI think then we shuld focus on making the cut to DV then !\n\nFirst though, we should have a migration plan. I would prefer that we didn't force all our existing customers to do a one-time index upgrade, I'm not at all sure people will be thrilled with the idea. Just to clarify, our=my customers are not the ones that hold the indexes, they are the ones that develop the products and will need to face the real end-customer telling him that he needs to upgrade his potentially uber-large index ...\n\nSo what I was thinking is if the abstraction CLI layer could be used to fetch the ordinals from either payload or DV, based on the segment's version? And also, migrate segments gradually, e.g. as they are merged? Would we need a FacetsAtomicReader for that, which initializes the CLI per the segment version?\n\nIs it even possible to move payload data to DV during segment merging? I.e., even in the one-time upgrade...\n\nPlease don't mention re-indexing . ",
+            "author": "Shai Erera",
+            "id": "comment-13530667"
+        },
+        {
+            "date": "2012-12-13T04:32:26+0000",
+            "content": "On the patch side, I don't have any comments except, awesome ! ",
+            "author": "Shai Erera",
+            "id": "comment-13530669"
+        },
+        {
+            "date": "2012-12-13T11:32:04+0000",
+            "content": "Nice improvement! \n\nShai: I don't think we should block progress in open source over your specific customers back compat needs that go above and beyond lucene's back compat promise.\n\nUltimately, thats something only you care about, and something your customers pay you to solve. ",
+            "author": "Robert Muir",
+            "id": "comment-13530913"
+        },
+        {
+            "date": "2012-12-13T11:48:12+0000",
+            "content": "Who said anything about blocking progress? All I'm saying is that before we release these improvements, we need to have a migration plan. These are not just my customers. I think that there are other people that use this module, at least from questions that pop up here and there on the list.\n\nSure, we can tell everyone to re-index. But that's not how I prefer to work. I don't think that cutting over to DV is the only migration we should talk about. E.g. LUCENE-4623 would also require migration and any change in the future to how we decide to store/encode facets would require migration.\n\nIt would be good if we can think about a layer that will provide that migration. Today we have Codecs and Lucene guarantees that old segments will be read w/ old Codecs versions (per our back-compat policy). What I would like to develop is something similar, which can read facets from old segments in the old way, and ultimately when segments are merged, migrate data to the new format. Then we can tell customers that if they didn't migrate their indexes when Lucene 6.0 is released, they have to addIndexes or forceMerge or something.\n\nI know that this module has the @lucene.experimental tag on it all over the place, but I don't treat it as experimental at all. I would prefer that you help me develop this migration layer, even if just by contributing ideas, rather than tell me that it's my problem and that I get paid to solve it .\n\nI don't think that we should release code that breaks all apps out there and forces them to reindex. Unless the changes are really non-migratable. But in this case, I think it should be easy? If you want to chime in, I'll open a separate issue to discuss this. ",
+            "author": "Shai Erera",
+            "id": "comment-13530923"
+        },
+        {
+            "date": "2012-12-23T10:50:13+0000",
+            "content": "I created LUCENE-4647 to simplify CatDocBuilder so that we can make this cutover easily (while still supporting all existing features, e.g. associations). ",
+            "author": "Shai Erera",
+            "id": "comment-13539016"
+        },
+        {
+            "date": "2013-01-15T15:34:30+0000",
+            "content": "Patch cuts FacetFields over to DocValues. Changes included:\n\n\n\tFacetFields adds a StraightBytesDocValuesFields instead of a payload.\n\n\n\n\n\tAdded DocValuesCategoryListIterator which by default pulls a DocValues Source (i.e. not DirectSource) but can be configured otherwise. Perhaps CategoryListParams.createCategoryListIterator should take a boolean to pass down to DVCLI ...\n\n\n\n\n\tReplaced CategoryListParams.Term with String field. So now the CLP only defines the field it should go under (the term was a mistake done long time ago, made to allow control of the term under which the ordinals payload is written).\n\n\n\n\n\tAll tests pass. I still didn't add CHANGES, will do so later.\n\n\n\nI must say that with all the recent refactorings done to the facets package, the DV cutover took me literally 5 minutes!\n\nMike, I think this is ready for luceneutil . ",
+            "author": "Shai Erera",
+            "id": "comment-13553896"
+        },
+        {
+            "date": "2013-01-15T15:39:38+0000",
+            "content": "I also wrote a one-time upgrade utility FacetsPayloadMigrationReader. It's very similar in concept to OrdinalMappingAtomicReader in that it wraps another AtomicReader and exposes the facets payload as a DocValues.Source. It takes in the constructor a mapping from a field->Term which denotes from which Term's payload to read the ordinals and put under the DocValues field. It also supports partitions (that was the harder part).\n\nI would appreciate if someone reviews it. I wrote a matching test which is very extensive, I think, and covers multiple CLPs, partitions and deleted documents. I will attach it shortly.\n\nThis Reader and Test should go only under the 4x branch, as deprecated.\n\nThere is one nocommit in the patch regarding CategoryListCache. I think that now that we're on DocValues, it's not needed anymore (and also Mike compared DV to it before and the results weren't compelling). So I think we should remove it, but haven't yet done so. ",
+            "author": "Shai Erera",
+            "id": "comment-13553904"
+        },
+        {
+            "date": "2013-01-15T15:41:07+0000",
+            "content": "Test for migration ",
+            "author": "Shai Erera",
+            "id": "comment-13553906"
+        },
+        {
+            "date": "2013-01-15T15:41:43+0000",
+            "content": "Forgot that I renamed some classes (remove Payload), so this time patch is generated with --show-copies-as-adds. ",
+            "author": "Shai Erera",
+            "id": "comment-13553907"
+        },
+        {
+            "date": "2013-01-15T18:39:29+0000",
+            "content": "I tested this with Wikipedia (avg ~25 ords per doc across 9 dimensions; 2.5M unique ords):\n\n\n          Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n      PKLookup      188.75      (5.3%)      195.05      (2.1%)    3.3% (  -3% -   11%)\n      HighTerm        3.26      (0.8%)        3.80      (3.4%)   16.3% (  12% -   20%)\n       MedTerm        6.85      (0.8%)        9.14      (3.1%)   33.4% (  29% -   37%)\n       LowTerm       14.45      (1.5%)       24.41      (2.1%)   68.9% (  64% -   73%)\n\n\n\nNice!\n\nIt's odd how the pctg gains are the same for High/Med/LowTerm ... not sure why. ",
+            "author": "Michael McCandless",
+            "id": "comment-13554112"
+        },
+        {
+            "date": "2013-01-15T19:03:41+0000",
+            "content": "Indeed nice results, though they are still far from the uber-specialized Collectors you wrote .\n\nI think that we should see some more gains after we fix LUCENE-4620 (I'm going to do that tomorrow!).\n\nAlso, I want to write a special DGapVIntEncoder/Decoder - that should hopefully somewhat improve decoding time too. I opened LUCENE-4686.\n\nAnd I'm not sure if you used PackedInts to encode/decode the ordinals in your previous patches. If you were, then maybe LUCENE-4609 will bring some more improvements.\n\nOverall, I think this is good progress. With this patch, facets are now on DocValues, supporting all features. There are more optimizations / specializations to do - we should do them separately.\n\nMike, I remember in one of our chats we discussed the effectiveness of CategoryListCache. I seem to remember you said it had high RAM consumption, and also it didn't perform well. Do you perhaps have these results? I wonder if you can compare this patch (with in-mem DV) to a CategoryListCache CLI - if the results are not good, we should just nuke it. ",
+            "author": "Shai Erera",
+            "id": "comment-13554163"
+        },
+        {
+            "date": "2013-01-15T20:10:15+0000",
+            "content": "Found your comments about CategoryListCache\n\nI had separately previously tested the existing int[][][] cache (CategoryListCache) but it had smaller gains than this (73% for MedTerm), and it required more RAM (1.9 GB vs 377 RAM for this patch).\n\nThat was on 3 ordinals per document, and already consuming a very large piece of RAM. Also, the gains are not considerable vs the DocValues and PackedBytes versions that you had. And I assume that testing it with 25 ordinals per document is going to be even more costly.\nIn addition, CategoryListCache is not per-segment, so if we want to keep it, we'd need to do some major rewriting there. I suggest that we just nuke it for now and come back to it later. The problem with keeping it is that we need to maintain it, and if it's not that much better, I prefer to nuke it. ",
+            "author": "Shai Erera",
+            "id": "comment-13554261"
+        },
+        {
+            "date": "2013-01-15T20:12:25+0000",
+            "content": "+1 to nuke CategoryListCache. ",
+            "author": "Michael McCandless",
+            "id": "comment-13554265"
+        },
+        {
+            "date": "2013-01-15T20:20:16+0000",
+            "content": "Patch looks good, at least the parts that I understand: +1\n\nNice that drill-down fields are now indexed as DOCS_ONLY!! ",
+            "author": "Michael McCandless",
+            "id": "comment-13554278"
+        },
+        {
+            "date": "2013-01-15T20:52:30+0000",
+            "content": "Patch nukes CategoryListCache. Apparently TotalFacetCounts's API had it all over the place, but all their tests passed null! The cache was tested separately though ...\n\nAnyway, nuked all relevant stuff, as well as FacetRequest.createCLI (this was there just in case someone set a CLCache on FacetSearchParams) \u2013 createCLI is controlled by CLParams. I think that the cache should be controlled by that too .. but if we'll ever add such cache back, we'll have the opportunity to put it there.\n\nI think this is ready. I'll give it a couple more test runs and then commit. ",
+            "author": "Shai Erera",
+            "id": "comment-13554319"
+        },
+        {
+            "date": "2013-01-16T09:42:07+0000",
+            "content": "I've decided to add the migration code to trunk as well, because 5.0 is supposed to handle 4x indexes too. Anyway, it doesn't hurt that it's there. I improved the testing more, and added a static utility method which will make using it (doing the migration) easier.\n\nI beasted some, 'precommit' is happy, so will commit it shortly. ",
+            "author": "Shai Erera",
+            "id": "comment-13554878"
+        },
+        {
+            "date": "2013-01-16T09:46:20+0000",
+            "content": "[trunk commit] Shai Erera\nhttp://svn.apache.org/viewvc?view=revision&revision=1433869\n\nLUCENE-4602: migrate facets to DocValues ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13554881"
+        },
+        {
+            "date": "2013-01-16T10:10:09+0000",
+            "content": "Committed to trunk and 4x. For 4x I add to add @SuppressCodecs(\"Lucene3x\"). ",
+            "author": "Shai Erera",
+            "id": "comment-13554898"
+        },
+        {
+            "date": "2013-01-16T10:10:44+0000",
+            "content": "Thanks Mike. This is one great and important milestone for facets! ",
+            "author": "Shai Erera",
+            "id": "comment-13554900"
+        },
+        {
+            "date": "2013-01-16T10:16:10+0000",
+            "content": "[branch_4x commit] Shai Erera\nhttp://svn.apache.org/viewvc?view=revision&revision=1433878\n\nLUCENE-4602: migrate facets to DocValues ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13554902"
+        },
+        {
+            "date": "2013-05-10T10:34:45+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13654318"
+        }
+    ]
+}

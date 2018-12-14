@@ -1,0 +1,172 @@
+{
+    "id": "SOLR-2927",
+    "title": "SolrIndexSearcher's register do not match close and SolrCore's closeSearcher",
+    "details": {
+        "affect_versions": "4.0-ALPHA",
+        "status": "Closed",
+        "fix_versions": [
+            "4.10.3",
+            "5.0",
+            "6.0"
+        ],
+        "components": [
+            "search"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "SolrIndexSearcher's register method put the name of searcher, but SolrCore's closeSearcher method remove name of currentSearcher on infoRegistry.\n\tSolrIndexSearcher's register method put the name of cache, but SolrIndexSearcher's close do not remove the name of cache.\n\n\n\nso, there maybe lost some memory leak.",
+    "attachments": {
+        "mbean-leak-jira.png": "https://issues.apache.org/jira/secure/attachment/12677913/mbean-leak-jira.png",
+        "SOLR-2927.patch": "https://issues.apache.org/jira/secure/attachment/12679206/SOLR-2927.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13717234",
+            "date": "2013-07-23T18:47:34+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-13826336",
+            "date": "2013-11-19T09:22:50+0000",
+            "content": "\n\tSolrIndexSearcher's close method removes the name of the searcher so this is not a problem.\n\tSolrCore's close clears the infoRegistry so I don't think we hold on to any stats object\n\n\n\nAre you seeing memory leaks in your Solr process? "
+        },
+        {
+            "author": "Sharath Babu",
+            "id": "comment-13826851",
+            "date": "2013-11-19T19:27:52+0000",
+            "content": "SolrCore instantiates its SolrIndexSearcher asynchronously. If SolrCore hits an exception and closes before said SolrIndexSearcher is asynchronously opened, these mbeans will be registered after SolrCore clears its registry, so these  mbeans would be leaked.  "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13970953",
+            "date": "2014-04-16T12:56:43+0000",
+            "content": "Move issue to Solr 4.9. "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14188484",
+            "date": "2014-10-29T15:52:41+0000",
+            "content": "I have been able to reproduce this issue patching the code to throw an exception in SolrCore in branch 4_2 in constructor line 875\n...\n      resourceLoader.inform(resourceLoader);   \n      //DO NOT COMMIT THIS:\n      if(!\"metadata\".equals(name)) throw new RuntimeException(\"test exception\");\n ...\n\nyou can then curl any core\n$curl \"http://localhost:xxx/solr/CORE_NAME/select?q=:\"\n\nopen a jconsole and you will see the leaking mbean named \"solr/CORE_NAME\" "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14188495",
+            "date": "2014-10-29T16:03:31+0000",
+            "content": "proposed patch: in SolrCore.close() start with waiting for searcherExecutor and then empty the infoRegistry which will unregister the mbean.\nPatch is built against trunk\nPlease let me know if it is not the right version to build a patch. "
+        },
+        {
+            "author": "Michael Dodsworth",
+            "id": "comment-14194864",
+            "date": "2014-11-03T18:36:27+0000",
+            "content": "Shalin Shekhar Mangar any feedback on this? "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14195169",
+            "date": "2014-11-03T21:51:35+0000",
+            "content": "Thanks for pinging me Michael. This issue had been forgotten.\n\nI now understand the bug and I am able to reproduce it locally. I started with Cyrille's patch which introduced an exception in the SolrCore constructor and I added logging of all items which are added to JMX and all the items that are removed on close after the exception. With a little bit of awk and sort, I have this list of mbeans which are leaked:\n\ndocumentCache\nfieldValueCache\nfilterCache\nmlt\nperSegFilter\nquery\nqueryResultCache\nsearcher\nSearcher@778e65f2[techproducts]\n\n "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14195270",
+            "date": "2014-11-03T22:43:45+0000",
+            "content": "hi Shalin Shekhar Mangar,\nthis is great news.\nI have some of the mbeans leaking in the attached mbean-jira-leaked.png that I have attached.\nAlso, I have been able to fix the leak with the SOLR-2927.patch attached.\nDo you still see the leaking mbeans after applying the patch ?\n\nThe issue is a race condition.\nwhen opening a core, solr is preventing searchers from firing by starting a thread that blocks in a single threaded executor at line 783:\nsearcherExecutor.submit(new Callable() {\n@Override\npublic Object call() throws Exception {\nlatch.await();\nreturn null;\n}\n});\n\nOther events are queued using the thread executor line 864 when calling the getSearcher(false, false, null, true) method.\ngetSearcher calls registerSearcher which calls register which registers mbeans using the getInfoRegistry().put(key, value) method\n\non exception, the latch is released, so searcher threads can fire and write things in the mbean using the infoRegistry map.\n} catch (Throwable e) {\nlatch.countDown();//release the latch, otherwise we block trying to do the close. This should be fine, since counting down on a latch of 0 is still fine\n//close down the searcher and any other resources, if it exists, as this is not recoverable\nclose();\n\nAnd indeed it is what is happening in close()\n\nwe clean the mbean at line 990\ntry {\ninfoRegistry.clear();\n} catch (Throwable e) {\nSolrException.log(log, e);\n}\n\nand then wait for searcher thread completion at line 1070\ntry {\nExecutorUtil.shutdownAndAwaitTermination(searcherExecutor);\n} catch (Throwable e) {\nSolrException.log(log, e);\n}\n\nputting this before the registry clean actually solves the issue. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14196035",
+            "date": "2014-11-04T12:06:39+0000",
+            "content": "I still see two mbeans leaked after moving infoRegistry.clear after the executor has been shutdown and the searcher is closed. \n\nThe reason is that two components, MLTQParserPlugin and NestedQParserPlugin, use the same key name as QueryComponent and MLTComponent respectively while registering themselves. JMX is perfectly fine accepting mbeans with the same key because we use the key as the \"type\" and the mbean name (usually the class name) as the mbean \"id\" (it should have been the other way around but I didn't know enough about JMX when I wrote the original impl) but the map loses track of these mbeans and doesn't un-register them. We can't change the name of these parsers because it breaks back-compat.\n\nIn this patch, I used Cyrille's suggestion to move the clear after searcher is shutdown. I also use a JMX query to get all registered mbeans and un-register them. This gets rid of all leaks. "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14196075",
+            "date": "2014-11-04T13:07:03+0000",
+            "content": "great, thanks Shalin Shekhar Mangar.\nI tested the fix I provided against solr-4.2 branch, maybe that's why I did not have the 2 extra leaking mbeans. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14196214",
+            "date": "2014-11-04T15:21:14+0000",
+            "content": "Commit 1636603 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1636603 ]\n\nSOLR-2927: Solr does not unregister all mbeans upon exception in constructor causing memory leaks "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14196218",
+            "date": "2014-11-04T15:21:59+0000",
+            "content": "Commit 1636604 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1636604 ]\n\nSOLR-2927: Solr does not unregister all mbeans upon exception in constructor causing memory leaks "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14196222",
+            "date": "2014-11-04T15:23:57+0000",
+            "content": "I tested the fix I provided against solr-4.2 branch, maybe that's why I did not have the 2 extra leaking mbeans.\n\nYes, both of those qparsers are newer than 4.2.\n\nThis is fixed in trunk and branch_5x. Thanks Tom, Sharath, Michael and Cyrille! "
+        },
+        {
+            "author": "Michael Dodsworth",
+            "id": "comment-14196333",
+            "date": "2014-11-04T16:45:14+0000",
+            "content": "Thanks, Shalin Shekhar Mangar. Much appreciated. "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14196344",
+            "date": "2014-11-04T16:52:03+0000",
+            "content": "Thanks a lot Shalin Shekhar Mangar "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14198385",
+            "date": "2014-11-05T14:10:54+0000",
+            "content": "I removed the initial patch I provided as Shalin Shekhar Mangar enriched it for branch_5X "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14198657",
+            "date": "2014-11-05T17:06:28+0000",
+            "content": " I synced the trunk code and have some failures.\nI don't know how to check for trunk status other that rebuilding it (I did not find an url where we can check for trunk status)\n\nWhat failures have you seen?\n\nI wonder if it would be better to wait for searcherExecutor shutdown sooner than later because this thread can keep on doing some work whereas we are supposed to close the core.\n\nOnce the searcherExecutor is shutdown, there won't be any searcher thread doing any work (including warming). The on deck searcher is also closed before we clear the infoRegistry. "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14198667",
+            "date": "2014-11-05T17:13:40+0000",
+            "content": "hi Shalin Shekhar Mangar I have some questions regarding the patch you provided.\nI backported the fix into branch_4_2  and have some test failures.\n\nI updated the patch to have right after the closeHooks (line 1070)\n\n\tExecutorUtil.shutdown.AndAwaitTermination block\n\tinfoRegistry block\nWith that, I have no more failures.\n\n\n\nI wonder if it would be better to wait for searcherExecutor shutdown sooner than later because this thread can keep on doing some work whereas we are supposed to close the core.\nThanks "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14198750",
+            "date": "2014-11-05T18:03:33+0000",
+            "content": "[junit4:junit4] Tests with failures (first 10 out of 11):\n[junit4:junit4]   - org.apache.solr.MinimalSchemaTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.SyncSliceTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.UnloadDistributedZkTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.AliasIntegrationTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.BasicDistributedZk2Test (suite)\n[junit4:junit4]   - org.apache.solr.cloud.FullSolrCloudDistribCmdsTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.CollectionsAPIDistributedZkTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.ShardRoutingTest (suite)\n[junit4:junit4]   - org.apache.solr.cloud.RecoveryZkTest (suite)\n[junit4:junit4]   - org.apache.solr.handler.admin.ShowFileRequestHandlerTest (suite)\n[junit4:junit4] \n[junit4:junit4] \n[junit4:junit4] JVM J0:     2.84 ..   890.21 =   887.37s\n[junit4:junit4] JVM J1:     2.84 ..   767.84 =   765.00s\n[junit4:junit4] JVM J2:     2.84 ..   881.17 =   878.34s\n[junit4:junit4] JVM J3:     3.09 ..   768.09 =   765.01s\n[junit4:junit4] Execution time total: 14 minutes 50 seconds\n[junit4:junit4] Tests summary: 272 suites, 1148 tests, 11 suite-level errors, 14 ignored (2 assumptions)\n\nI have often this stack:\n[junit4:junit4]   2> 69753 T293 oasc.JmxMonitoredMap$SolrDynamicMBean.getMBeanInfo WARNING Could not getStatistics on info bean org.apache.solr.search.SolrIndexSearcher org.apache.lucene.store.AlreadyClosedException: this IndexReader is closed\n\nthis is a warning, but it is a class updated by the patch so mentioning it. "
+        },
+        {
+            "author": "Cyrille Roy",
+            "id": "comment-14202165",
+            "date": "2014-11-07T15:39:48+0000",
+            "content": "the deadlock in our 4_2 branch occurs when doing infoRegistry.\u200bclear(); after close\u200bSearcher().\nI'll integrate the patch taking this into account.\nThanks again Shalin Shekhar Mangar for the great work and feedback. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14230130",
+            "date": "2014-12-01T17:57:06+0000",
+            "content": "Reopening to backport in 4.10.3 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14230194",
+            "date": "2014-12-01T18:29:00+0000",
+            "content": "Commit 1642728 from shalin@apache.org in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1642728 ]\n\nSOLR-2927: Solr does not unregister all mbeans upon exception in constructor causing memory leaks "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14332662",
+            "date": "2015-02-23T05:01:12+0000",
+            "content": "Bulk close after 5.0 release. "
+        }
+    ]
+}

@@ -1,0 +1,109 @@
+{
+    "id": "LUCENE-4644",
+    "title": "Implement spatial WITHIN query for RecursivePrefixTree",
+    "details": {
+        "components": [
+            "modules/spatial"
+        ],
+        "fix_versions": [
+            "4.3"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "New Feature",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "",
+    "attachments": {
+        "LUCENE-4644_Spatial_Within_predicate_for_RecursivePrefixTree.patch": "https://issues.apache.org/jira/secure/attachment/12574867/LUCENE-4644_Spatial_Within_predicate_for_RecursivePrefixTree.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-12-24T15:47:04+0000",
+            "content": "There are a couple possible WITHIN semantics necessitating two implementations:\n\nAll WITHIN:  Consider a document that has a MULTIPOLYGON (they are disjoint).  Or even if you didn't use one of the WKT multi* shapes, you might have called createIndexableFields(shape) multiple times.  I've got some implementation code for this and I can already tell it's going to be pretty slow since it needs to go to all the cells where the shape isn't to collect disjoint docs.  So at the first level of recursion, it needs to visit 31 of the 32 grid cells and loop on docsEnum to find all docs with one of those terms. Since these are the top-most grid cells, these will each have a large number of matching docs relative to the smaller ones.  I think this implementation necessitates a term -> doc Ids cache when the docFreq is sufficiently high to warrant it.  The docIds could/should be Bits, and only bother caching when docFreq > 64 (a guess).\n\nSome WITHIN: I'm not sure how to name this but it basically means one of the indexed shapes for a document is properly WITHIN the query shape.  If you know that all of your indexed shapes are comprised of one shape then you'd always want to use this implementation.  It should be reasonably performant.  It will need to buffer the query shape slightly to ensure that it looks one grid cell away from the original query shape to see which docs are barely outside of the query shape and then use this knowledge to ensure such docs don't get in the results.  There is no shape.buffer() but that could be added to Spatial4j.  FWIW JTS implements this and it would be easy to add to some of the basic shapes (e.g. point, circle, rectangle). ",
+            "author": "David Smiley",
+            "id": "comment-13539284"
+        },
+        {
+            "date": "2013-01-02T22:54:36+0000",
+            "content": "WITHIN should mean that everything is completely within the query shape\n\nINTERSECTS means that something is within the query shape ",
+            "author": "Ryan McKinley",
+            "id": "comment-13542515"
+        },
+        {
+            "date": "2013-01-03T17:01:12+0000",
+            "content": "I confirm your interpretation of \"WITHIN\" semantics being the \"all within\" that I defined above, and so that should be the default.  \n\nMy \"some within\" definition is not synonymous with \"Intersects\", just to be clear.  It is a subset of \"Intersects\" where the boundary of the indexed shape does not cross the query shape.  As such, some of the indexed shape must be within the query shape but it cannot cross over directly outside of the query shape.  It can match more documents than the standard WITHIN will match, for those cases where the indexed shape is comprised of multiple disjoint pieces. ",
+            "author": "David Smiley",
+            "id": "comment-13543070"
+        },
+        {
+            "date": "2013-01-03T18:03:43+0000",
+            "content": "Take a look at the definitions on:\nhttp://docs.geoserver.org/latest/en/user/filter/ecql_reference.html#filter-ecql-reference\n\nIs \"some within\" the CROSSES operation?  \"some but not all interior points in common\"\n\n\n\nIt sounds like your bigger question is how to treat multi-valued fields in general.  Are they:\n1. each field evaluated individually\n2. treated as a single composite shape\n\nIs there a difference between:\n\n<doc>\n  <field name=\"f\">POINT( a b )</field>\n  <field name=\"f\">POINT( c d )</field>\n</doc>\n\n\nand:\n\n<doc>\n  <field name=\"f\">MULTIPOINT( a b, c d )</field>\n</doc>\n\n\n\n ",
+            "author": "Ryan McKinley",
+            "id": "comment-13543135"
+        },
+        {
+            "date": "2013-01-03T20:40:20+0000",
+            "content": "Is \"some within\" the CROSSES operation? \"some but not all interior points in common\"\nIt's not. By the way I prefer ESRI's docs which have bigger explainations with pictures.\n\nIt sounds like your bigger question is how to treat multi-valued fields in general.\n\nYes, that's the crux of it.  However the spatial index (the prefix tree) doesn't know the difference between your two examples; it'll wind up being the same set of indexed terms.  I'd put it to a user like this:\n\n\"If a document can have multiple shapes, whether by adding multiple (disjoint) shapes or by passing a shape that is comprised of multiple disjoint parts (e.g. MULTI*), then enable this option to treat each disjoint part separately as a candidate to match the WITHIN predicate. If enabled and at least one part is WITHIN, then the document matches.  This is much faster than the default setting which insists that the entirety of the spatial region covered by the indexed shape(s) must be WITHIN the query shape.\" ",
+            "author": "David Smiley",
+            "id": "comment-13543261"
+        },
+        {
+            "date": "2013-01-03T20:52:19+0000",
+            "content": "Do you understand why the default WITHIN semantics (as described in the first comment) will be pretty slow?  Do you have any other ideas beyond my term->docids cache proposal to speed this up?  If we can assume (with a boolean configurable flag) that most docs will have only one part to it (e.g. isn't a MULTI*) then perhaps there is an optimization we could make.  Oh I know.  So internally we could do the faster \"Some WITHIN\" algorithm to get the matching docIds, but these are then candidates that we have to figure out which of these should be removed because they have other parts outside of the query shape.  If we index in another field the set of center points of each disjoint part, stored via DocValues, then we have a fast method to weed out the false positives.  It just needs to iterate over the candidate docIds, fetch its center-points array, and if there is more than one entry then see if any are outside of the query shape. If there is one then remove the doc from the result. ",
+            "author": "David Smiley",
+            "id": "comment-13543271"
+        },
+        {
+            "date": "2013-01-04T03:07:35+0000",
+            "content": "Come to think of it, I can't even do a proper fast \"some within\" as I earlier hoped because the code wouldn't be able to (easily) detect when one disjoint part is within the query yet another spans the edge.\n\nAny way, I think the epiphany I had above on how to implement a fast (all) WITHIN, using an indexed center points cache, should work pretty well.  I'll proceed with that.  There could be an option to provide a hint that the center point cache isn't needed, like when you simply index a single point per document, for example. ",
+            "author": "David Smiley",
+            "id": "comment-13543565"
+        },
+        {
+            "date": "2013-03-21T20:00:12+0000",
+            "content": "Attached is a patch that implements a spatial \"Within\" predicate for RecursivePrefixTree.\n\nSummary of changes in patch, which includes some unrelated things:\n\n\tAdded SpatialPrefixTree.getDistanceForLevel(level):double  \u2013 used by the Within filter to help it 'buffer' the query shape slightly\n\tMigrated AbstractPrefixTreeFilter to use FixedBitSet instead of OpenBitSet, because FBS is preferred in Lucene (paraphrasing Uwe)\n\tMoved some point vs rect interpretation of a cell from AbstractVisitingPrefixTreeFilter to subclass IntersectsPrefixTreeFilter since that logic is not applicable to Within\n\n\n\nThe test is randomized and thus fairly thorough, notwithstanding that it doesn't test a geospatial context.  I'd like to add that but in order to do so, gridSnap would ideally use some utility classes/logic in Spatial4j trunk that isn't here.  So I'll add that in the future.\n\nThe big thing missing here is that this Within predicate will sometimes match false-positives in cases where the indexed shape for a document is really multi* shape \u2013 i.e. is composed of multiple disjoint parts.  I'd like to solve that separately using some sort of indexed field of center points of each disjoint part of indexed shapes.  Maybe as a separate issue?  But it would be nice to get this committed now, notwithstanding this interim limitation. ",
+            "author": "David Smiley",
+            "id": "comment-13609385"
+        },
+        {
+            "date": "2013-03-21T20:06:26+0000",
+            "content": "Within predicate will sometimes match false-positives in cases where the indexed shape for a document is really multi* shape\n\nThis is a totally fine caveat (false negatives are harder) but false positives can always be refined with brute force\n ",
+            "author": "Ryan McKinley",
+            "id": "comment-13609390"
+        },
+        {
+            "date": "2013-03-21T20:41:30+0000",
+            "content": "Ok so I'll perhaps commit this tomorrow or later if you want time to review the patch first.\n\nI think implementing the false-positive removal will introduce significantly more work to warrant a separate issue to track that.  For example, SOLR-4329 needs to get addressed, and probably LUCENE-4698.\n\nMy tentative CHANGES.txt entry will be (new feature):\n\n\tLUCENE-4644: Added support for the \"Within\" spatial predicate for RecursivePrefixTreeStrategy. It is for matching non-point indexed shapes; if you only have points (1/doc) then \"Intersects\" is equivalent and faster. If an indexed shape is comprised of multiple disjoint parts, then this predicate might match false-positives; see LUCENE-XXXX.\n\n\n\nIf before the next release this shortcoming is addressed then I'll remove that caveat. ",
+            "author": "David Smiley",
+            "id": "comment-13609445"
+        },
+        {
+            "date": "2013-03-22T04:28:55+0000",
+            "content": "It just dawned upon me that this limitation of Within finding false-positives could be remedied right now, without waiting for the faster approach in LUCENE-4869.  I see 3 configurable options:\n\n\n\tAs indicated in earlier discussion on this issue on the first comment, it can visit all regions outside the query shape and mark those docs for exclusion in the final results.  Yes this would be slow but it would work, and it would be particularly easy to implement as my existing code would only need a small modification.  So in summary, this approach can be addressed now, it's slow, it works.\n\tAllow a configurable buffer where the user wants Within, but is willing to disregard any regions that might be outside of that buffer that would create a false-positive match.  Is this useful?  It's easy to add to the existing code which is already doing shape buffering.\n\tThe approach in LUCENE-4869: filter false-positives out using a representative point from each disjoint piece of an indexed shape that is saved at index time.  This will be fast but will require memory and it'll take some time to get there based on where the APIs are at now.\n\n ",
+            "author": "David Smiley",
+            "id": "comment-13609906"
+        },
+        {
+            "date": "2013-03-25T16:00:35+0000",
+            "content": "Attached is a patch implementing #1 & #2 from before.  By default you get #1 behavior (slow but correct results), and if you want #2 (configurable buffer) you need to construct the WithinPrefixTreeFilter yourself.  I'll leave #3 to LUCENE-4869 and update its title & description a little.\n\nI added tests for this too, including an explicit test for an indexed shape of multiple disjoint parts far away to ensure that a Within query encompassing only one of those parts is not considered a match.\n\nRyan McKinley, can you please examine the patch, especially my API (javadocs etc.)?  I'd like to get this committed once you're satisfied. ",
+            "author": "David Smiley",
+            "id": "comment-13612761"
+        },
+        {
+            "date": "2013-03-27T05:04:01+0000",
+            "content": "+1\n\nIn a quick review all looks good.  ",
+            "author": "Ryan McKinley",
+            "id": "comment-13614936"
+        },
+        {
+            "date": "2013-05-10T10:32:44+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13653707"
+        }
+    ]
+}

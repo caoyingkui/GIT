@@ -1,0 +1,139 @@
+{
+    "id": "LUCENE-5029",
+    "title": "factor out a generic 'TermState' for better sharing in FST-based term dict",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.4"
+        ],
+        "affect_versions": "None",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Sub-task",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Currently, those two FST-based term dict (memory codec & blocktree) all use FST<BytesRef> as a base data structure, this might not share much data in parent arcs, since the encoded BytesRef doesn't guarantee that 'Outputs.common()' always creates a long prefix. \n\n\nWhile for current postings format, it is guaranteed that each FP (pointing to .doc, .pos, etc.) will increase monotonically with 'larger' terms. That means, between two Outputs, the Outputs from smaller term can be safely pushed towards root. However we always have some tricky TermState to deal with (like the singletonDocID for pulsing trick), so as Mike suggested, we can simply cut the whole TermState into two parts: one part for comparation and intersection, another for restoring generic data. Then the data structure will be clear: this generic 'TermState' will consist of a fixed-length LongsRef and variable-length BytesRef.",
+    "attachments": {
+        "LUCENE-5029.patch": "https://issues.apache.org/jira/secure/attachment/12585734/LUCENE-5029.patch",
+        "LUCENE-5029.algebra.patch": "https://issues.apache.org/jira/secure/attachment/12587876/LUCENE-5029.algebra.patch",
+        "LUCENE-5029.branch-init.patch": "https://issues.apache.org/jira/secure/attachment/12587968/LUCENE-5029.branch-init.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-06-01T17:54:40+0000",
+            "content": "A patch full of nocommits...\n\nFor 'common()' operation, simply pickup the smaller one, vice versa. And when two LongsRef are not comparable (e.g. one intermediate TermState vs. another intermediate), we can ignore that.\n\nThis behavior is quite different from current Outputs like PairOutputs, and of course we have other alternatives to test. ",
+            "author": "Han Jiang",
+            "id": "comment-13672181"
+        },
+        {
+            "date": "2013-06-13T12:18:14+0000",
+            "content": "Reuse our old BlockTermState, by adding a new field 'TermMetaData', so that each PostingsBaseFormat can override its own MetaData format. There is still one testcase won't pass (the multi-thread TestCodecs), when postingsformat is set to Lucene41WithOrd.\n\nActually, the field 'meta' in BlockTermState won't be changed until inside PostingsBaseFormat, this is something still weird: we don't need this in upper level (above term dict), but have to get it glued with TermState every time. ",
+            "author": "Han Jiang",
+            "id": "comment-13682174"
+        },
+        {
+            "date": "2013-06-13T15:47:52+0000",
+            "content": "Good lord I see you had to uncomment BlockTree's DEBUG prints: I'm\nsorry!  It's a good thing your hair situation is OK.\n\nSo the overall idea here is to break out a separate class\n(TermMetaData) that the PostingsBaseFormat uses to hold its \"private\nstuff\" about a term, and to \"require\" that only a monotonic long[] and\nan \"arbitrary\" byte[] are available to the PBF (this is so that FST\ncan more cleanly encode per-term PBF metadata).\n\nThe \"generic\" stuff \"belonging\" to the terms dict (docFreq,\ntotalTermFreq) remains in the BlockTermState.\n\nSeeing how much overhead this added, with a 2nd object per-term, and\nwith a double-encode process at write time in some cases (first\nwriting into the byte[], then reading from the byte[] and writing into\nthe \"final\" format), I'm a little nervous about this approach.\n\nIt's also not great that the PostingsBaseFormat is still \"responsible\"\nfor the block-encoding (holding pendingTerms, implementing\nread/flushTermsBlock and nextTerm): this is really an impl detail of\nthe terms dict and I had thought we could move into the terms dict so\nwe could simplify PBF's to be agnostic to whether the terms dict was\nblock-based or not.\n\nAlso, at write time, it'd be nice if the PBF got a DataOutput +\nLongsRef from the terms dict which it could write the term data to,\nand a \"matching\" DataInput + LongsRef at read time.  I'm not sure\nthese even need to reside in BlockTermState?\n\nA few specific questions:\n\n\n\tDoes something fail with a clear exception if a PBF tries to have a\n    long[n] go backwards?\n\n\n\n\n\tHow does a \"don't care\" long[n] value work?\n\n\n\n\n\tA few sources are missing the copyright header...\n\n\n\n\n\tInstead of \"base\" and \"extend\" maybe we should just name them \"longs\"\n    and \"bytes\"?\n\n\n\n\n\tThe \"bytes\" can be arbitrary length per term right?  So how come\n    TermMetaData ctor takes a length for it?\n\n\n\nFinally, I think the patch is a little too ambitious: for starters,\nwhile we are iterating on how to improve the API between terms dict\nand PBF, it's too costly to try to get all postings formats cutover.\nInstead, I think we should fork BlockTree to a new terms dict impl,\nand fork e.g. Lucene41PB/F, and iterate on that single PostingsFormat?\nThis should be much less code to change as we iterate on the approach? ",
+            "author": "Michael McCandless",
+            "id": "comment-13682352"
+        },
+        {
+            "date": "2013-06-13T16:10:48+0000",
+            "content": "Good lord I see you had to uncomment BlockTree's DEBUG prints: \n\nOops, sorry, I didn't remove those change from patch \n\nSeeing how much overhead this added, with a 2nd object per-term, and with a double-encode process at write time in some cases (first writing into the byte[],\n\nYes, it seem to hurt much. I think we can at least downgrade this to a long[] + extendable part, so that it can be customized as a new MetaData in PBF side?\nActually, the reason why we need long[], is that we need a 'cleaner' way to write Outputs algebras.\n\nIt's also not great that the PostingsBaseFormat is still \"responsible\" for the block-encoding (holding pendingTerms, implementing read/flushTermsBlock and nextTerm): \n\nWe can do this later, but the pulsing codec is the tricky one I didn't dare to dig too deep: it has to forece termBlockOrd=0 every time readTermsBlock is called. \nThis extra actioin won't be defined by term dict side.\n\nDoes something fail with a clear exception if a PBF tries to have a long[n] go backwards?\n\nHmm, Mike, I'm not sure... What is the goal to make it go backwards?\n\nHow does a \"don't care\" long[n] value work?\n\nI planned to make those don't care value defined in algebra operations. Like we have an instance A, defining A.subtract(B), in which those don't-care ones are always equal to \nrelated ones in B. And the Outpus will use those algebra operations to get common(), subtract(), add() work as well.\n\nThe \"bytes\" can be arbitrary length per term right? So how come TermMetaData ctor takes a length for it?\n\nSince current approach is to 'encode then decode' values to that bytes, the length is usually pre-defined... \nYes we have exceptions, like in pulsing codec, the posings data can also fit into this generic part. I'll change it. ",
+            "author": "Han Jiang",
+            "id": "comment-13682377"
+        },
+        {
+            "date": "2013-06-14T20:04:25+0000",
+            "content": "Just got rid of the hairy generalization  \nHere I just copy the BlockTreeTerms* + Posting*Base + Lucene41Postings* to \ncreate a temporary block based codec: TempBlock, to iterate \nthe new design.\n\nThe fail test in last patch comes from the reuse of TermState: \nwe have to deep copy TermMetaData as well so that with\nmulti-thread, the same TermMetaData won't be modified \nsimultaneously. This is somewhat sad because reusing itself\ncreates new objects. But we can leave that issue later.\n\nCurrent version of 'LUCENE-5029.patch' will work on latest trunk.\nBut it is too long to review... So I just create a subset in \n'LUCENE-5029.algebra.patch', I think you can just review on this, Mike.\n\nThe ideas are just the same in my last comment: \n1. Put those algebra operations to MetaData, \n   so that PF will customize them.\n2. Move those readTermBlock & flushBlock & buffering stuff to \n   term dict side, so that we have cleaner PF and pluggable PostingsBase\nTo simplify codes, I haven't use long[] and byte[] here, and \nI'll implement that read() in MetaData later. ",
+            "author": "Han Jiang",
+            "id": "comment-13683717"
+        },
+        {
+            "date": "2013-06-14T20:09:42+0000",
+            "content": "\nAlso, at write time, it'd be nice if the PBF got a DataOutput +\nLongsRef from the terms dict which it could write the term data to,\nand a \"matching\" DataInput + LongsRef at read time. I'm not sure\nthese even need to reside in BlockTermState?\n\nYes, we can move those byte[] and DataI/O into TermState, so that the API\nwill be simpler. But with this change, the concept of 'TermState' needs more\nexplanation & javadocs now. ",
+            "author": "Han Jiang",
+            "id": "comment-13683723"
+        },
+        {
+            "date": "2013-06-15T09:52:28+0000",
+            "content": "Update reader part, now we can safely remove termBlockOrd in BlockTermState, which means the API \nis OK for non-block based term dict. As for FST-based term dict, \n\nAlso, I remove 'nextTerm' from PostingsReaderBase as well (Since it's already defined in TermMetaData.read())\n\nThe remaining job is then to bring back TermStateOuputs. Mike, again I'm in doubt with that long[]+byte[] design, \nas you can see, although in the codes the algebra operations have to be full of if clauses, it's still quite clear. \n\nAnd as for FST part, I think it should also be convenient to distinguish delta-decode and normal-decode, even Term dict\npart sees nothing from TermMetaData \u2013 current FST already provides readOutput & readFinalOutput, and for each coming term,\nterm dict can operate the algebra methods along the arcs based on which kind of Output it is.\n\nThe patch is still against trunk, but strange that it fails on this single test:\n\n\nant test  -Dtestcase=TestDrillSideways -Dtests.method=testRandom -Dtests.seed=7FEAE9B6DF414156 -Dtests.slow=true -Dtests.postingsformat=TempBlock -Dtests.locale=ar_KW -Dtests.timezone=America/Indiana/Winamac -Dtests.file.encoding=US-ASCII\n\n\n\nBut I suppose it is unrelated? ",
+            "author": "Han Jiang",
+            "id": "comment-13684121"
+        },
+        {
+            "date": "2013-06-15T10:35:24+0000",
+            "content": "patch that only do the copy & paste on lastest trunk. Mike, we can use this as a startpoint in new branch. ",
+            "author": "Han Jiang",
+            "id": "comment-13684135"
+        },
+        {
+            "date": "2013-06-15T11:50:11+0000",
+            "content": "Thanks Han!\n\nI think the changes to TermState, the separate TermsMetaData, with the\nFST-like algebra, can be still further simplified.\n\nIn fact, I think we need to \"isolate\" the long[]/byte[] \"contract\"\nto the reading and writing, i.e. I think *TermState shouldn't have to\nchange at all.\n\nSpecifically, I think we should first do the amoeba step of moving\nflushTermsBlock and readTermsBlock out of the PostingsBaseFormat and\ninto the terms dict:\n\n\n\tFirst fork off the TempPostingsFormat (TempBlockTree,\n    TempPostingsBaseFormat, TempLucene41PF, etc.) and commit that to\n    new branch so we can iterate.\n\n\n\n\n\tChange TempPostingsWriterBase.finishTerm, to receive a long[] (not\n    a LongsRef I think?) and a DataOutput.\n\n\n\n\n\tChange TempPostingsReaderBase.nextTerm to receive a long[] (not a\n    LongsRef I think?) and a DataInput.\n\n\n\n\n\tUsing those new APIs, move flushTermsBlock (along with the\n    buffering of PendingTerms) into TempBlockTreeWriter and out of the\n    postings base format.  And similarly with readTermsBlock\n\n\n\nThis way, the *TermState can (I think?) remain unchanged, and the\nlong[]/byte[] is limited entirely to serialization.\n\nFor \"don't care\" values in the long[], I think the contract can simply\nbe that the writer should not change whatever value was already in the\nincoming array? ",
+            "author": "Michael McCandless",
+            "id": "comment-13684148"
+        },
+        {
+            "date": "2013-06-15T16:22:55+0000",
+            "content": "The patch is still against trunk, but strange that it fails on this single test:\n\nI committed a fix for this. ",
+            "author": "Michael McCandless",
+            "id": "comment-13684233"
+        },
+        {
+            "date": "2013-06-16T10:01:31+0000",
+            "content": "This patch keeps the original 'customize termstate in PBF' design. \nIt also pushes flushTermsBlock & readTermsBlock to term dict side.\n\nNow the rule is: if you PBF have some monotonical but 'don't care' values,\nalways fill -1 on them, so that term dict will reuse previous values to\n'pad' that -1s. Yes Mike, the algebra is really simple \n\nBut I still have a problem removing that termBlockOrd from BlockTermState:\nevery time a caller uses seekExact(), it is expected to get a new term\nstate in which 'termBlockOrd' is involved. However I cannot fully \nunderstand how this variable works, and maybe we can use metadataUpto\nto replace this? I'll try this later.\n\nCan you put the TestDrillSideway fix in lucene3069 branch as well? \nThanks  ",
+            "author": "Han Jiang",
+            "id": "comment-13684608"
+        },
+        {
+            "date": "2013-06-16T10:43:01+0000",
+            "content": "Patch looks great, thanks Han!  It's so awesome to see all that hairy\nterms block code disappearing from PostingsReader/Writer.\n\nI think you should commit it to the branch and then we can iterate on\nthe following?:\n\nI think only PostingsBaseWriter should have .longsSize(), and then the\nterms dict should store this int itself and later load it at read\ntime.  This keeps the index \"self documenting\", so an errant PBF that\nreports the wrong longsSize at read time is not possible.  Also, I\nthink it should not take a FieldInfo.  Per-field-ness is handled\nhigher up (PerFieldPostingsFormat).\n\nI think TempBlockTermsWriter.PendingMetaData should hold the byte[]\nnot the RAMOutputStream?  I think RAMOutputStream holds its buffer as\n1KB sized chunks... we only need the RAMOutputStream while the PBF is\nfinishing that term; after that we can extract & convert to byte[] I\nthink.\n\nInstead of -1 for \"don't care\", I think TempPostingsWriterBase impls\nshould simply not change the value?  This is part of the contract.\n\nInstead of making a separate PendingMetaData in the\nTempBlockTermWriter, can we put the byte[] + long[] onto the existing\nPendingTerm?  Then we can just pass the slice of PendingTerm down to\nflushTermsBlock, fixing it to skip the block entries.\n\nCan we rename nextTerm to decodeTerm?  (\"next\" used to be appropriate\nwhen it was decoding the next term in the block... but that's an impl\ndetail of the terms dict now).\n\nSeparately from this effort, now that this issue will make the\nper-term long[] visible to the terms dict, we can now easily\ninvestigate better ways of storing that long[] data than simple\ndelta-coded vLongs, e.g. maybe Simple64 \"column stride\" would work\nwell.  But this is separate  ",
+            "author": "Michael McCandless",
+            "id": "comment-13684612"
+        },
+        {
+            "date": "2013-06-16T10:43:25+0000",
+            "content": "Can you put the TestDrillSideway fix in lucene3069 branch as well? \n\nSure, I'll just sync up all trunk changes over ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13684613"
+        },
+        {
+            "date": "2013-06-16T10:47:53+0000",
+            "content": "\nBut I still have a problem removing that termBlockOrd from BlockTermState:\nevery time a caller uses seekExact(), it is expected to get a new term\nstate in which 'termBlockOrd' is involved. However I cannot fully \nunderstand how this variable works, and maybe we can use metadataUpto\nto replace this? I'll try this later.\n\nI think we won't be able to eliminate this, because the termBlockOrd (which records the position of this term in the block) is a necessary (from the term dict's standpoint) state for this term, because on seekExact followed by nextTerm, the terms dict needs to know which entry in the block to go to ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13684615"
+        },
+        {
+            "date": "2013-06-16T10:53:51+0000",
+            "content": "[lucene3069 commit] han\nhttp://svn.apache.org/viewvc?view=revision&revision=1493494\n\nLUCENE-5029: remove block based API from PBF ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13684621"
+        },
+        {
+            "date": "2013-06-16T12:24:56+0000",
+            "content": "[lucene3069 commit] han\nhttp://svn.apache.org/viewvc?view=revision&revision=1493502\n\nLUCENE-5029 simplify contract on generic long[] ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13684637"
+        },
+        {
+            "date": "2013-06-16T13:06:28+0000",
+            "content": "[lucene3069 commit] han\nhttp://svn.apache.org/viewvc?view=revision&revision=1493508\n\nLUCENE-5029: merge PendingMetaData into PendingTerm ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13684650"
+        },
+        {
+            "date": "2013-06-16T14:48:45+0000",
+            "content": "PostingsBase is now pluggable for non-block based term dict, \nand the introduction of long[] and byte[] naturally helps \nthe delta-encoding in both block-based term dict, and \nFST-based term dict. ",
+            "author": "Han Jiang",
+            "id": "comment-13684678"
+        },
+        {
+            "date": "2013-07-23T18:37:04+0000",
+            "content": "Bulk close resolved 4.4 issues ",
+            "author": "Steve Rowe",
+            "id": "comment-13716739"
+        }
+    ]
+}

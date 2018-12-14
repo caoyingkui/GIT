@@ -1,0 +1,128 @@
+{
+    "id": "SOLR-6691",
+    "title": "REBALANCELEADERS needs to change the leader election queue.",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.1",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The original code (SOLR-6517) assumed that changes in the clusterstate after issuing a command to the overseer to change the leader indicated that the leader was successfully changed. Fortunately, Noble clued me in that this isn't the case and that the potential leader needs to insert itself in the leader election queue before trigging the change leader command.\n\nInserting themselves in the front of the queue should probably happen in BALANCESHARDUNIQUE when the preferredLeader property is assigned as well.\n\nNoble Paul Do evil things happen if a node joins at the head but it's already in the queue? These ephemeral nodes in the queue are watching each other. So if node1 is the leader you have\nnode1 <- node2 <- node3 <- node4\nwhere <- means \"watches\".\n\nNow, if node3 puts itself at the head of the list, you have\n\nnode1 <- node2\n      <- node3 <- node4\n\n\n\nI think when I was looking at this it all \"just worked\". \n1> node 1 goes down. Nodes 2 and 3 duke it out but there's code to insure that node3 becomes the leader and node2 inserts itself at then end so it's watching node 4.\n\n2> node 2 goes down, nobody gets notified and it doesn't matter.\n\n3> node 3 goes down, node 4 gets notified and starts watching node 2 by inserting itself at the end of the list.\n\n4> node 4 goes down, nobody gets notified and it doesn't matter.",
+    "attachments": {
+        "SOLR-6691.patch": "https://issues.apache.org/jira/secure/attachment/12687659/SOLR-6691.patch",
+        "SOLR-6691-5x.patch": "https://issues.apache.org/jira/secure/attachment/12692868/SOLR-6691-5x.patch",
+        "BalanceLeaderTester.java": "https://issues.apache.org/jira/secure/attachment/12687660/BalanceLeaderTester.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-11-03T17:37:31+0000",
+            "author": "Erick Erickson",
+            "content": "Sorry for all the noise, silly formatting errors. ",
+            "id": "comment-14194772"
+        },
+        {
+            "date": "2014-11-04T09:43:23+0000",
+            "author": "Noble Paul",
+            "content": "yeah, this is pretty much what should be done. In the overseer roles feature, momentarily, 2 nodes watch the leader. \n\nBut if the wrong node wins because of a failure , the whole thing is repeated  ",
+            "id": "comment-14195960"
+        },
+        {
+            "date": "2014-11-19T16:34:17+0000",
+            "author": "Erick Erickson",
+            "content": "Noble Paul [~markrmiller]\n\nOK, I'm working this out (slowly). Here's the deal though. I don't see a graceful way of telling a node that is currently a leader to stop being leader. Oh, and it must re-insert itself at the end of the leader-elector queue. I don't really want to down the node, that seems far too harsh, but perhaps it's not.\n\nAlso, what I'm trying at this point (I'll improve if necessary before committing the patch).\n\nFor leader rebalancing, basically just delete the leader ephemeral election node. I'd like the leader node itself to do this but I don't yet see a clean way to inform the current leader it should abdicate that role. I can do this from anywhere, but it seems cleaner if the core itself does it.\n\n1> each node is watching the one before it. So when the leader ephemeral node disappears, the next node gets the event and looks through the queue to see if some other node is preferred leader. If so, it puts itself at the end of the leader election queue and does not become leader. But it does remove it's own ephemeral node so the next node in the chain gets that event and so on.\n\n1a> I'm having trouble having the leader that's abdicating get the message that it should abdicate its role. I'm trying to have the leader watch its own ephemeral node, is there a better way?\n\nNote that the only place this really produces churn is when a BALANCESHARDUNIQUE is issued and then immediately a REBALANCELEADERS is issued. Otherwise, when cores are loaded, if they are the preferred leader they insert themselves at the head of the leader-elector queue so REBALANCELEADERS in that case shouldn't cause any unnecessary churn.\n\nAs you can tell, I'm a bit stymied, I'll plug along but wondered if there's some prior art I haven't found yet.\n\nThanks! ",
+            "id": "comment-14218097"
+        },
+        {
+            "date": "2014-11-19T17:13:43+0000",
+            "author": "Noble Paul",
+            "content": "As you can tell, I'm a bit stymied, I'll plug along but wondered if there's some prior art I haven't found yet.\n\nPlz look at the overseer role feature. There is a core admin command which force-evicts an overseer. ",
+            "id": "comment-14218162"
+        },
+        {
+            "date": "2014-12-08T14:25:59+0000",
+            "author": "Erick Erickson",
+            "content": "Noble Paul Here's my promised note.\n\nThe code for figuring out who's \"the guy in front\" seems like it has a problem in my case. Pining here since every other time I've had problems here it's been a self-inflicted wound....\n\nBut this time I swear I have some evidence....\n\nSince the sorting is sensitive to session ID when two nodes have the same sequence ID, their order \"depends\". Note that since some of my tests are on a single Solr instance just rearranging shard leadership, I can have identical sessions, but the principle is the same for overseer. \n\nSo let's say core_node2 joins at head. Depending on the session it may sort before or after the previous node with sequence 000001. This may not ever really be a problem with the Overseer election though, can a node rejoin at head without also having a new session ID that's greater than any other ones in the election queue? Because if that's so, then the node rejoining will always sort after the other node with the same sequence ID and this case will not occur. But for shard election on a single node hosting, say, 6 replicas it definitely happens.\n\nAnyway, if core_node2 rejoins at head, it can look like either of these:\n\nsession1-core1-n_0000000\nsession2-core2-n_0000001\nsession3-core3-n_0000001\nsession4-core4-n_0000002\n\nor\n\nsession1-core1-n_0000000\nsession12-core3-n_0000001\nsession3-core2-n_0000001\nsession4-core4-n_0000002\n\nThe problem here is that the LeaderElector code finds the index of the node after the current sequence number then backs up two. So if core2 is looking for the \"guy in front\" in the first case, it'll watch itself. In the second case it'll watch core3 as it should.\n\nI've got what I think is a solution, but I have to beat it to death for a while first. Looking for whether this is a sound analysis at this point. ",
+            "id": "comment-14237904"
+        },
+        {
+            "date": "2014-12-08T15:42:23+0000",
+            "author": "Noble Paul",
+            "content": "The sort is not done on the entire string. If the node name is \"session12-core3-n_0000001\" the sort is only performed on the \"0000001\" part .\n ",
+            "id": "comment-14237983"
+        },
+        {
+            "date": "2014-12-08T19:25:27+0000",
+            "author": "Erick Erickson",
+            "content": "At a client, so please excuse the terseness. When the sequence IDs are equal, as they are in the case of a node that has rejoined at head, the secondary sort is the entire string, or I'm mis-reading this code.\n\n public static void sortSeqs(List<String> seqs) {\n    Collections.sort(seqs, new Comparator<String>() {   \n      @Override\n      public int compare(String o1, String o2) \n{\n        int i = Integer.valueOf(getSeq(o1)).compareTo(\n            Integer.valueOf(getSeq(o2)));\n        return i == 0 ? o1.compareTo(o2) : i ;\n      }\n    });\n  } ",
+            "id": "comment-14238310"
+        },
+        {
+            "date": "2014-12-09T05:20:24+0000",
+            "author": "Noble Paul",
+            "content": "When the sequence IDs are equal, as they are in the case of a node that has rejoined at head, the secondary sort is the entire string, or I'm mis-reading this code.\n\nThis second sort matters only for a brief amount of time , because we are going to send one of these contenders back to the tail soon. Yes, if the leader failed at this moment the wrong node becomes the leader. But the code is written in such a way to retry this if this occurs.  ",
+            "id": "comment-14238998"
+        },
+        {
+            "date": "2014-12-17T03:47:55+0000",
+            "author": "Erick Erickson",
+            "content": "OK, I think this is finally working as I expect. The attached java file is a stand-alone program that stresses the heck out of shard leader election. The idea is that you fire it up against a collection and it\n1> takes the initial state\n2> tries to issue the preferred leader command to a randome replica on each shard.\n3> issues the rebalanceleaders comand\n4> verifies that all the shard leader election queues have one entry for all the nodes that were there originally.\n5> verifies that the actual leader is the preferred leader\n6> goes to <2>.\n\nNote that the guts of this test are in the new unit test.\n\nI had to change the leader election code to get all this predictable, and that makes me a little nervous given how difficult that all was to get working in the first place so this makes me a little nervous, but the external test code beats all the leader election code up pretty fiercely which gives me hope.\n\nSo I have a couple of options here:\n1> go ahead and check it in. 5.0 appears to be receding here so it has some time to bake before release\n2> check it in to trunk and let it bake there for a while, perhaps until after 5.0 is cut, then merge and bake.\n\nOpinions? ",
+            "id": "comment-14249423"
+        },
+        {
+            "date": "2014-12-17T04:38:42+0000",
+            "author": "Noble Paul",
+            "content": "So I have a couple of options here: \n\n5.0 is veru near .This touches the guts of SolrCloud and any bug will have huge impact on the stability of the system. I would like this feature to be off from 5.0 and just keep in trunk till we have enough confidence ",
+            "id": "comment-14249455"
+        },
+        {
+            "date": "2014-12-23T18:01:25+0000",
+            "author": "Erick Erickson",
+            "content": "OK, I'm going to commit this one and re-enable REBALANCELEADERS (SOLR-6860) for trunk only and let it bake there until 5.0 gets cut and backport for 5.1. ",
+            "id": "comment-14257277"
+        },
+        {
+            "date": "2014-12-24T22:30:24+0000",
+            "author": "Erick Erickson",
+            "content": "Attaching the one I'm sure corresponds to the commit I'm about to do... ",
+            "id": "comment-14258569"
+        },
+        {
+            "date": "2014-12-25T04:24:57+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1647870 from Erick Erickson in branch 'dev/trunk'\n[ https://svn.apache.org/r1647870 ]\n\nSOLR-6691: Didn't set eol style on a new file ",
+            "id": "comment-14258636"
+        },
+        {
+            "date": "2015-01-16T18:11:29+0000",
+            "author": "Erick Erickson",
+            "content": "Messed up the original commit message so the proper revision didn't get here. Apply this before\nr1647870. Original message was:\n\"SOLR=6691: REBALANCELEADERS needs to change the leader election queue.\"\nObviously should have been:\n\"SOLR-6691: REBALANCELEADERS needs to change the leader election queue.\"\nThe associated SVN revision is r 1647857 ",
+            "id": "comment-14280585"
+        },
+        {
+            "date": "2015-01-17T00:18:53+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1652553 from Erick Erickson in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1652553 ]\n\nSOLR-6691: REBALANCELEADERS needs to change the leader election queue. ",
+            "id": "comment-14281034"
+        },
+        {
+            "date": "2015-01-17T00:20:22+0000",
+            "author": "Erick Erickson",
+            "content": "Reconciles change from CloudSolrServer to CloudSolrClient that was committed after the commit to trunk. ",
+            "id": "comment-14281036"
+        },
+        {
+            "date": "2015-04-15T00:30:49+0000",
+            "author": "Timothy Potter",
+            "content": "Bulk close after 5.1 release ",
+            "id": "comment-14495369"
+        }
+    ]
+}

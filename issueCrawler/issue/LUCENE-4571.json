@@ -1,0 +1,302 @@
+{
+    "id": "LUCENE-4571",
+    "title": "speedup disjunction with minShouldMatch",
+    "details": {
+        "components": [
+            "core/search"
+        ],
+        "fix_versions": [
+            "4.3",
+            "6.0"
+        ],
+        "affect_versions": "4.1",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "even minShouldMatch is supplied to DisjunctionSumScorer it enumerates whole disjunction, and verifies minShouldMatch condition on every doc:\n\n\n  public int nextDoc() throws IOException {\n    assert doc != NO_MORE_DOCS;\n    while(true) {\n      while (subScorers[0].docID() == doc) {\n        if (subScorers[0].nextDoc() != NO_MORE_DOCS) {\n          heapAdjust(0);\n        } else {\n          heapRemoveRoot();\n          if (numScorers < minimumNrMatchers) {\n            return doc = NO_MORE_DOCS;\n          }\n        }\n      }\n      afterNext();\n      if (nrMatchers >= minimumNrMatchers) {\n        break;\n      }\n    }\n    \n    return doc;\n  }\n\n\n\nStefan Pohl proposes (as well as I get it) to pop nrMatchers-1 scorers from the heap first, and then push them back advancing behind that top doc. For me the question no.1 is there a performance test for minShouldMatch constrained disjunction.",
+    "attachments": {
+        "LUCENE-4571.patch": "https://issues.apache.org/jira/secure/attachment/12570152/LUCENE-4571.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-11-23T15:50:38+0000",
+            "content": "I agree we should try to use advance() with this scorer. If it has say 3 terms and one is a very common \nterm (e.g. stopword-type term), it will drag the entire query down.\n\n\nFor me the question no.1 is there a performance test for minShouldMatch constrained disjunction. \n\nNo, currently there is not in luceneutil.\n\nAlso it would be good to think about splitting out ordinary disjunctions from disjunctions-with-minNrShouldMatch\nfrom booleanscorer2. The simple disjunction case could then be easily optimized more (e.g. defer score() until necessary\nand so on). ",
+            "author": "Robert Muir",
+            "id": "comment-13503234"
+        },
+        {
+            "date": "2012-11-23T21:09:30+0000",
+            "content": "It was a bad idea to reply to jira's mail. moving dialogue here:\n\nMikhail Khludnev\n\nRobert, am I right that establishing the perf test is the first necessary step, rather than the implementation itself.\nAlso, (don't really important but let me mention) what I'm really looking for is the disjunction query with an user supplied verification strategy, where minShouldMatch is just one of the way to verify match.\n\nRobert Muir\n\nRight, the best way to do this is to extend luceneutil (http://code.google.com/a/apache-extras.org/p/luceneutil) to test this case.\n\nKeep in mind that I'd also be interested to see how BooleanScorer compares to BooleanScorer2 for this situation. I already mentioned on the solr list (nobody replied) that solr never gets BooleanScorer, but from time to time I hear solr users complaining about BooleanScorer2's performance for min-should-match\n\nSo when trying to improve the performance of min-should-match, I think a very early step should be to see if we already have a better performing alternative that is just not being used: if thats the case then the best solution is to fix Solr's collectors to be able to cope with BooleanScorer.\n\nIntuitively I think its going to be like everything else, BS1 is better in some situations, BS2 in others.\n\n>>> Also, (don't really important but let me mention) what I'm really looking for is the disjunction query with an user supplied verification strategy, where minShouldMatch is just one of the way to verify match.\n\nI don't think our concrete scorers should have such a hook: they should be as dead simple as possible.\n\nIf you want to do this, I recommend just extending the abstract DisjunctionScorer (Currently DisjunctionSum and DisjunctionMax extend this, as I suggested we should think about splitting out a MinShouldMatchScorer as well: its confusing that pure disjunctions are all mixed up with min-should-match and the algorithms should actually work differently).\n ",
+            "author": "Mikhail Khludnev",
+            "id": "comment-13503281"
+        },
+        {
+            "date": "2012-11-26T21:50:55+0000",
+            "content": "Mikhail, Robert, thank you for following up on this and I'm happy to provide more details on ideas of how to use the minimumMatch constraint to speed up the execution of disjunctive queries.\n\nCurrently, one heap is used in disjunctive scorers to keep track of the next docid (next candidate), and only then these candidates are ruled out if below minimum number of terms / percentage of terms. If there is only one stop word or otherwise high docfreq term in the query, this will produce a huge number of candidates that only occur in very few query terms and only afterwards will be ruled out by the constraint again. As Robert pointed out, this leads to long processing times to attain the next valid candidate. Using BooleanScorer will probably only give improvement by a factor (in some cases), but also this scorers would still generate all these useless candidates.\nIt would be much more efficient to actively use the constraint as part of query processing and employ inverted list skipping (leap-frogging), which makes conjunctive queries so efficient, also for these kind of queries.\n\nAn efficient implementation could look like the following:\nAssume at least 5 out of 20 query terms have to match and imagine the terms/inverted lists to be sorted by the next docid. Then, the first potential candidate that satisfies the constraint would be the docid at position 5 and all of the inverted list at position 0-4 can be safely advanced and have to match to that docid in order to generate a real candidate worth scoring. The order, in which to try advancing terms 0-4 should probably be guided by the sparsity of the lists (guided by either docfreq, if available, or a heuristic such as the distance to the next docid), that is, inverted list 4 should first be advanced to the docid, then list 3,2,1, if previous advances are successful. Otherwise, the algorithm can start all over and try the next docid at 5th position. This leads to effective leap-frogging on the most sparse lists within the constraint which rules out matches not satisfying the constraint, most of the time without even touching the very high-frequency terms. Improvements all depend on the type of queries and number of docs per index.\n\nThere are different implementations possible to achieve such a behavior:\n1) Using the current heap and pull out the first 5 lists to get to the next candidate docid to which the other 4 then have to be advanced. This probably leads to more heap removal and addition operations than necessary with the next approaches.\n2) Always keep the first 5 lists fully sorted and use the heap to keep track of the next docid within lists 6-20. This invariant should simplify implementation and be competitive for small minimumMatch.\n3) Use two heaps: A max-heap to keep track of the largest docid within the first 5 inverted lists and a min-heap to keep track of the smallest docid within lists 6-20. This approach looks most efficient.\n\nThese implementations look like generalizations to pure disjunctive queries, but if there should be any impact they could be implemented as specializations used only for queries with a minimum match constraint. ",
+            "author": "Stefan Pohl",
+            "id": "comment-13504158"
+        },
+        {
+            "date": "2012-11-26T22:14:05+0000",
+            "content": "I like the ideas Stefan!\n\n\nUsing BooleanScorer will probably only give improvement by a factor (in some cases), but also this scorers would still generate all these useless candidates.\n\nIt might be hard to beat this one (which already supports minShouldMatch as a side effect of its coord computation anyway i think) in cases with\nlots of terms because I feel like inevitably supporting advance() on the subscorers will result in more heap operations/cpu (at least when i messed around on paper it seemed this way).\n\nIn fact in some situations I think even this one should be used when there are mandatory clauses: in any case booleanweight should have better heuristics to decide, limited by what the collector can deal with.\n\nCollectors that support out of order scoring today I think are likely a lot faster with these minShouldMatch types of queries than BooleanScorer2. Thats why i brought it up: it could be an easy win for e.g. solr users.\n\nBut when the number of terms is smallish and one is super-common, its silly we don't try to improve the BS2 impl to at least try to handle the worst case  \n\nAt least for the sake of simplicity (not necessarily performance) I still think it would be good to factor minshouldmatch behavior out of disjunctionsumscorer if we try to make it use advance() on subscorers. ",
+            "author": "Robert Muir",
+            "id": "comment-13504180"
+        },
+        {
+            "date": "2013-02-20T17:03:02+0000",
+            "content": "Robert, thank you for the excellent feedback.\n\nI didn't look at the BS in detail for a while, and all you say sounds very reasonable. My statement \"improvement by a factor\" was under the assumption that BS would similarly to BS2 generate all OR-candidates and only afterwards screen out many of them again due to the minimum-match constraint. If that's the case and we assume BS to be faster than BS2 by some factor, then it will be the very same factor faster with a larger collection, whereas an optimized BS2 might become faster than BS because it does not generate many useless candidates for queries that have only one super-common term (proportional to document collection size) and a minimum-match constraint of at least 2. Hope this makes sense now, but of course my assumption might be wrong \n\nIn fact, I got to think quite a bit about different approaches on how to implement a minimum-match optimized version of BS2 and converged on implementation approach 1) due to the others adding other expensive operations/overhead when getting down to all details. The attached patch contains a full drop-in replacement for the DisjunctionSumScorer in DisjunctionSumScorerMM.java and accordingly changes references within BooleanScorer2. All existing tests pass.\nAs this scorer is supposed to work with any subclauses (not only TermQuery), I decided for an implementation that dynamically orders the first mm-1 subscorers by the next docid, hence exploiting local within-inverted-list docid distributions. Fixing the mm-1 subscorers on basis of their doc frequency/sparseness estimation could be better (less heap operations, but no exploitation of within-list docid distributions), but this is currently only available for TermQuery as clauses and would hence limit the applicability of the implementation. Having an API to determine the sparseness of a subscorer already came up in some other tickets and many other Scorer implementations could similarly benefit from its availability.\n\nI however share your thinking about not intermingling too many aspects within one Scorer, making it overly complex and probably less amenable for VM optimizations (e.g. not as tight loops). This is why I implemented it in a different class, so you could go ahead and remove the mm-constraint from DisjunctionSumScorer and use either implementation depending on the given query.\nAlso, this implementation could still be tested response-time-wise for different representative queries of interest and different mm-constraint settings (luceneutil?). I wouldn't be surprised if my implementation is not as quick as DisjunctionSumScorer when mm=1, but I have anecdotal evidence that it does a great job (speedups of 2-3) for higher mm (and longer queries).\nI don't quite see why the attached implementation would do more heap operations, but I agree that it could be slower due to lengthier/more complex loops, a few more if statements etc.\n\nHope this contribution helps. ",
+            "author": "Stefan Pohl",
+            "id": "comment-13582325"
+        },
+        {
+            "date": "2013-02-20T17:11:16+0000",
+            "content": "Stefan this looks very promising! I think we should add support for this query to luceneutil and try it out.\n\nAbout the docfreq idea, a scorer/disi cost estimation patch exists in at least two places. For example termscorer returns docfreq. Disjunctions return sum over their subscorers. Actually this speeds up conjunctions in general and removes the need for the specialized conjunctiontermscorer. I think it would be useful here too? I'll find the link and add it to a comment in a bit ",
+            "author": "Robert Muir",
+            "id": "comment-13582337"
+        },
+        {
+            "date": "2013-02-20T17:21:51+0000",
+            "content": "Here's the most recent patch for what I discussed: LUCENE-4607 ",
+            "author": "Robert Muir",
+            "id": "comment-13582347"
+        },
+        {
+            "date": "2013-02-20T19:35:03+0000",
+            "content": "I fixed luceneutil to recognize +minShouldMatch=N, and made a trivial\ntasks file:\n\n\nHighMinShouldMatch4: ref http from name title +minShouldMatch=4\nHighMinShouldMatch3: ref http from name title +minShouldMatch=3\nHighMinShouldMatch2: ref http from name title +minShouldMatch=2\nHighMinShouldMatch0: ref http from name title\nLow1MinShouldMatch4: ref http from name dublin +minShouldMatch=4\nLow1MinShouldMatch3: ref http from name dublin +minShouldMatch=3\nLow1MinShouldMatch2: ref http from name dublin +minShouldMatch=2\nLow1MinShouldMatch0: ref http from name dublin\nLow2MinShouldMatch4: ref http from wings dublin +minShouldMatch=4\nLow2MinShouldMatch3: ref http from wings dublin +minShouldMatch=3\nLow2MinShouldMatch2: ref http from wings dublin +minShouldMatch=2\nLow2MinShouldMatch0: ref http from wings dublin\nLow3MinShouldMatch4: ref http struck wings dublin +minShouldMatch=4\nLow3MinShouldMatch3: ref http struck wings dublin +minShouldMatch=3\nLow3MinShouldMatch2: ref http struck wings dublin +minShouldMatch=2\nLow3MinShouldMatch0: ref http struck wings dublin\nLow4MinShouldMatch4: ref restored struck wings dublin +minShouldMatch=4\nLow4MinShouldMatch3: ref restored struck wings dublin +minShouldMatch=3\nLow4MinShouldMatch2: ref restored struck wings dublin +minShouldMatch=2\nLow4MinShouldMatch0: ref restored struck wings dublin\n\n\n\nSo, each query has 5 terms.  High* means all 5 are high freq, Low1*\nmeans one term is low freq and 4 are high, Low2* means 2 terms are low\nfreq and 3 are high, etc.\n\nI tested on the 10 M doc wikimedium index, and for both base (= trunk)\nand comp (= this patch) I forcefully disabled BS1:\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n     Low3MinShouldMatch2        3.95      (3.5%)        3.00      (2.1%)  -24.1% ( -28% -  -19%)\n     Low1MinShouldMatch2        1.93      (3.1%)        1.50      (2.1%)  -22.4% ( -26% -  -17%)\n     Low2MinShouldMatch2        2.52      (3.4%)        1.96      (2.0%)  -22.3% ( -26% -  -17%)\n     HighMinShouldMatch2        1.62      (3.2%)        1.27      (2.2%)  -21.3% ( -25% -  -16%)\n     HighMinShouldMatch3        1.65      (3.5%)        1.31      (2.3%)  -20.7% ( -25% -  -15%)\n     Low4MinShouldMatch0        6.91      (3.9%)        5.79      (1.6%)  -16.2% ( -20% -  -11%)\n     Low1MinShouldMatch3        1.98      (3.4%)        1.66      (2.3%)  -15.8% ( -20% -  -10%)\n     Low3MinShouldMatch0        3.69      (3.2%)        3.21      (2.1%)  -13.0% ( -17% -   -8%)\n     Low2MinShouldMatch0        2.38      (3.0%)        2.09      (1.9%)  -12.3% ( -16% -   -7%)\n     Low1MinShouldMatch0        1.84      (2.7%)        1.65      (2.2%)  -10.4% ( -14% -   -5%)\n     HighMinShouldMatch0        1.56      (2.9%)        1.41      (2.5%)   -9.8% ( -14% -   -4%)\n     HighMinShouldMatch4        1.67      (3.6%)        1.55      (2.8%)   -7.1% ( -13% -    0%)\n     Low2MinShouldMatch3        2.64      (3.8%)        2.65      (2.4%)    0.3% (  -5% -    6%)\n     Low1MinShouldMatch4        2.02      (3.5%)        2.36      (2.8%)   16.8% (  10% -   23%)\n     Low4MinShouldMatch2        8.53      (5.3%)       33.74      (5.8%)  295.8% ( 270% -  324%)\n     Low4MinShouldMatch3        8.56      (5.4%)       44.93      (8.6%)  424.8% ( 389% -  463%)\n     Low3MinShouldMatch3        4.25      (4.1%)       23.48      (8.8%)  452.7% ( 422% -  485%)\n     Low4MinShouldMatch4        8.59      (5.2%)       59.53     (11.1%)  593.3% ( 548% -  643%)\n     Low2MinShouldMatch4        2.68      (3.9%)       21.38     (14.3%)  696.8% ( 653% -  743%)\n     Low3MinShouldMatch4        4.25      (4.1%)       34.97     (15.4%)  722.5% ( 675% -  773%)\n\n\n\nThe new scorer is waaay faster when the minShouldMatch constraint is\nhighly restrictive, i.e. when .advance is being used on only low-freq\nterms (I think?).  It a bit slower for the no-minShouldMatch case\n(*MinShouldMatch0).  When .advance is sometimes used on the high freq\nterms it's a bit slower than BS2 today.\n\nI ran a 2nd test, this time with BS1 as the baseline.  BS1 is faster\nthan BS2, but indeed it still evaluates all subs and only rules out\nminShouldMmatch in the end.  I had to turn off luceneutil's score\ncomparisons since BS1/BS2 produce different scores:\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n     HighMinShouldMatch2        3.33      (8.8%)        1.30      (0.8%)  -60.9% ( -64% -  -56%)\n     HighMinShouldMatch3        3.35      (8.8%)        1.33      (1.0%)  -60.5% ( -64% -  -55%)\n     Low1MinShouldMatch2        3.79      (8.4%)        1.52      (0.9%)  -59.9% ( -63% -  -55%)\n     HighMinShouldMatch0        3.46      (9.1%)        1.43      (0.4%)  -58.5% ( -62% -  -53%)\n     Low1MinShouldMatch0        4.00      (8.9%)        1.68      (0.4%)  -58.0% ( -61% -  -53%)\n     Low2MinShouldMatch2        4.66      (8.0%)        1.99      (1.0%)  -57.3% ( -61% -  -52%)\n     Low2MinShouldMatch0        4.97      (8.6%)        2.12      (0.4%)  -57.3% ( -61% -  -52%)\n     Low1MinShouldMatch3        3.85      (8.6%)        1.68      (1.1%)  -56.3% ( -60% -  -50%)\n     Low4MinShouldMatch0       13.32      (8.8%)        5.87      (0.5%)  -56.0% ( -59% -  -51%)\n     Low3MinShouldMatch2        6.87      (8.4%)        3.03      (1.0%)  -55.9% ( -60% -  -50%)\n     Low3MinShouldMatch0        7.13      (8.7%)        3.27      (0.5%)  -54.1% ( -58% -  -49%)\n     HighMinShouldMatch4        3.40      (9.0%)        1.57      (1.3%)  -53.9% ( -58% -  -47%)\n     Low2MinShouldMatch3        4.92      (8.4%)        2.67      (1.4%)  -45.8% ( -51% -  -39%)\n     Low1MinShouldMatch4        4.04      (8.9%)        2.37      (1.5%)  -41.2% ( -47% -  -33%)\n     Low4MinShouldMatch2       14.17      (9.1%)       33.77      (2.9%)  138.4% ( 115% -  165%)\n     Low4MinShouldMatch3       14.28      (9.1%)       44.93      (3.1%)  214.7% ( 185% -  249%)\n     Low3MinShouldMatch3        7.39      (9.1%)       23.47      (3.7%)  217.4% ( 187% -  253%)\n     Low2MinShouldMatch4        5.13      (8.8%)       21.36      (5.5%)  316.4% ( 277% -  362%)\n     Low4MinShouldMatch4       14.30      (9.0%)       59.65      (4.4%)  317.3% ( 278% -  363%)\n     Low3MinShouldMatch4        7.41      (9.1%)       34.92      (5.2%)  371.2% ( 327% -  424%)\n\n\n\nSo it looks like BS1 is faster when the minShouldMatch isn't very\nrestrictive ... somehow we need some heuristics for BQ to pick the\nbest scorer given the estimated cost/number of hits of each subs vs\nthe minShouldMatch constraint (only in those cases when BS1 is\n\"allowed\"...).\n\nBut given that this new scorer drastically speeds up the BS2 case in the highly\nrestrictive cases, and only slows it down a bit for the other cases, I\nthink we should commit the new scorer, and then separately iterate on\nthe heuristics for when to choose which sub scorer? ",
+            "author": "Michael McCandless",
+            "id": "comment-13582453"
+        },
+        {
+            "date": "2013-02-21T02:41:49+0000",
+            "content": "\nBut given that this new scorer drastically speeds up the BS2 case in the highly\nrestrictive cases, and only slows it down a bit for the other cases, I\nthink we should commit the new scorer, and then separately iterate on\nthe heuristics for when to choose which sub scorer?\n\nI think so too. I am jetlagged so will spend lots of time reviewing the patch tomorrow morning.\n\nI do think we should fix our DisjunctionSumScorer to no longer do minShouldMatch and use it for mm=1\nas indicated by Stefan in his comment. This would remove all the XXX0 cases from being slower to\neither being the same or slightly faster. \n\nSeparately I can't help but be curious how the patch would perform if we combined it with LUCENE-4607\npatch (as we know this significantly helped conjunctions). As Stefan's TODO indicates, this would \nreduce some of the cpu overhead of this in some of the worst cases as well, and I think the \nperformance would all look just fine. ",
+            "author": "Robert Muir",
+            "id": "comment-13582816"
+        },
+        {
+            "date": "2013-02-21T13:09:26+0000",
+            "content": "Updated patch:\n\n\tI broke out the two cases such that pure disjunctions (without minShouldMatch) use DisjunctionSumScorer.\n\tI removed all minShouldMatch stuff from DisjunctionSumScorer, because it no longer needs to count to determine matches, I also made the counting lazy in score()... booleanscorer2 caches this anyway to ensure its only called once.\n\tI renamed Stefan's new scorer to MinShouldMatchScorer (I liked this name better)\n\n\n\nMike how hard is it to re-run your bench with this patch? I am currently on a laptop! ",
+            "author": "Robert Muir",
+            "id": "comment-13583163"
+        },
+        {
+            "date": "2013-02-21T13:14:24+0000",
+            "content": "Excellent, I will re-test! ",
+            "author": "Michael McCandless",
+            "id": "comment-13583166"
+        },
+        {
+            "date": "2013-02-21T13:55:07+0000",
+            "content": "base=trunk, comp=new patch (forced to use BS2):\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n     Low3MinShouldMatch2        3.99      (3.1%)        3.09      (4.0%)  -22.5% ( -28% -  -15%)\n     Low2MinShouldMatch2        2.55      (3.1%)        2.01      (3.2%)  -21.1% ( -26% -  -15%)\n     Low1MinShouldMatch2        1.94      (3.1%)        1.53      (3.0%)  -21.1% ( -26% -  -15%)\n     HighMinShouldMatch2        1.63      (3.3%)        1.30      (2.9%)  -20.1% ( -25% -  -14%)\n     HighMinShouldMatch3        1.66      (3.7%)        1.35      (3.8%)  -18.8% ( -25% -  -11%)\n     Low4MinShouldMatch0        7.00      (3.2%)        5.94      (0.6%)  -15.2% ( -18% -  -11%)\n     Low1MinShouldMatch3        2.00      (3.4%)        1.72      (4.3%)  -13.7% ( -20% -   -6%)\n     Low3MinShouldMatch0        3.73      (2.8%)        3.29      (0.5%)  -11.7% ( -14% -   -8%)\n     Low2MinShouldMatch0        2.41      (2.9%)        2.15      (0.6%)  -10.7% ( -13% -   -7%)\n     Low1MinShouldMatch0        1.86      (2.8%)        1.69      (0.8%)   -9.3% ( -12% -   -5%)\n     HighMinShouldMatch0        1.57      (3.1%)        1.44      (0.8%)   -8.7% ( -12% -   -4%)\n     HighMinShouldMatch4        1.69      (3.8%)        1.62      (5.2%)   -4.3% ( -12% -    4%)\n     Low2MinShouldMatch3        2.67      (3.5%)        2.76      (5.3%)    3.3% (  -5% -   12%)\n     Low1MinShouldMatch4        2.04      (3.5%)        2.47      (6.4%)   20.7% (  10% -   31%)\n     Low4MinShouldMatch2        8.66      (4.7%)       34.28      (9.3%)  295.7% ( 268% -  325%)\n     Low4MinShouldMatch3        8.70      (4.8%)       45.76     (10.7%)  425.8% ( 391% -  463%)\n     Low3MinShouldMatch3        4.30      (3.7%)       23.87     (14.0%)  455.6% ( 422% -  491%)\n     Low4MinShouldMatch4        8.73      (4.4%)       60.81     (12.8%)  596.4% ( 554% -  641%)\n     Low2MinShouldMatch4        2.71      (3.6%)       21.71     (19.0%)  700.4% ( 654% -  750%)\n     Low3MinShouldMatch4        4.30      (3.7%)       35.44     (16.8%)  723.8% ( 678% -  772%)\n\n\n\nWeird that minShouldMatch0 is still a bit slower ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13583197"
+        },
+        {
+            "date": "2013-02-21T13:59:08+0000",
+            "content": "Its almost the same results as before... I find that crazy to believe (unless its a benchmarking bug?)\n\nAre you sure you used latest patch? (the 19KB one). Worst case you could take this patch and 'svn revert' DisjunctionSumScorer.java: if that shows any performance differences vs trunk then its definitely a bug in the benchmark. ",
+            "author": "Robert Muir",
+            "id": "comment-13583200"
+        },
+        {
+            "date": "2013-02-21T14:36:16+0000",
+            "content": "good news: I was able to get luceneutil with 1M collection working on my laptop and reproduce mike's problem (just with ordinary tasks set).\n\nSo here's a patch reverting the cleanups to disjunctionsumscorer, but only using it when mm=1. This gives us same perf as trunk.\n\nIll go and see what i screwed up as this is unintuitive, but it doesnt need to delay this patch anyway. ",
+            "author": "Robert Muir",
+            "id": "comment-13583228"
+        },
+        {
+            "date": "2013-02-21T16:53:30+0000",
+            "content": "New patch results (BS2 trunk vs BS2 w/ last patch):\n\n\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n     Low3MinShouldMatch2        3.95      (3.6%)        3.18      (3.5%)  -19.7% ( -25% -  -13%)\n     Low1MinShouldMatch2        1.93      (3.0%)        1.57      (2.7%)  -18.8% ( -23% -  -13%)\n     Low2MinShouldMatch2        2.53      (3.4%)        2.06      (2.8%)  -18.6% ( -23% -  -12%)\n     HighMinShouldMatch2        1.62      (2.9%)        1.33      (2.8%)  -17.8% ( -22% -  -12%)\n     HighMinShouldMatch3        1.65      (3.0%)        1.38      (3.2%)  -16.5% ( -22% -  -10%)\n     Low1MinShouldMatch3        1.98      (3.1%)        1.76      (3.7%)  -11.2% ( -17% -   -4%)\n     Low1MinShouldMatch0        1.85      (2.9%)        1.78      (3.3%)   -3.7% (  -9% -    2%)\n     HighMinShouldMatch0        1.56      (2.8%)        1.51      (2.9%)   -3.6% (  -9% -    2%)\n     Low2MinShouldMatch0        2.39      (3.1%)        2.30      (3.8%)   -3.5% ( -10% -    3%)\n     Low3MinShouldMatch0        3.70      (3.3%)        3.59      (4.1%)   -3.0% ( -10% -    4%)\n     Low4MinShouldMatch0        6.93      (4.1%)        6.78      (6.4%)   -2.1% ( -12% -    8%)\n     HighMinShouldMatch4        1.67      (3.1%)        1.65      (4.6%)   -1.7% (  -9% -    6%)\n     Low2MinShouldMatch3        2.65      (3.5%)        2.80      (5.0%)    5.7% (  -2% -   14%)\n     Low1MinShouldMatch4        2.02      (3.2%)        2.49      (6.1%)   23.1% (  13% -   33%)\n     Low4MinShouldMatch2        8.57      (5.5%)       34.29     (10.1%)  300.0% ( 269% -  334%)\n     Low4MinShouldMatch3        8.61      (5.5%)       45.59     (10.5%)  429.3% ( 391% -  471%)\n     Low3MinShouldMatch3        4.26      (3.8%)       23.84     (13.3%)  459.8% ( 426% -  495%)\n     Low4MinShouldMatch4        8.64      (5.3%)       60.51     (13.9%)  600.2% ( 551% -  654%)\n     Low2MinShouldMatch4        2.69      (3.6%)       21.68     (17.7%)  705.5% ( 660% -  753%)\n     Low3MinShouldMatch4        4.27      (3.8%)       35.35     (16.5%)  728.4% ( 681% -  778%)\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-13583350"
+        },
+        {
+            "date": "2013-03-11T02:21:03+0000",
+            "content": "I played with this patch some the other night. the problem with my previous attempt was trying to defer score() until it was needed. this is not helpful to do if you are scoring.\n\nI'll pick this back up ASAP since clearly it can be a big win  ",
+            "author": "Robert Muir",
+            "id": "comment-13598485"
+        },
+        {
+            "date": "2013-03-11T23:32:41+0000",
+            "content": "Awesome co-op. Thanks, Robert & Mike, for picking this up.\n\nOne comment to 'deferring scoring': I don't know about all current use-cases for these Scorers, but if there are some that require only matching, then it is probably most efficient to have respective specializations for each Scorer to either only match or match+score. Independently, this appears to be an orthogonal consideration to separate matching from scoring within Scorers, e.g. for not having to have such separate specializations.\n\nIf you're just after saving some cycles for not to have a minor response time decrease for some queries, then it won't help as much for the optimized MinShouldMatchScorer as for the previous implementation because it now generates (and scores) much less candidates for each of which it is now much more likely to pass the MinShouldMatch-constraint and most of those will hence be scored anyways (in use-cases where scoring is required). This is probably what you mean by 'this is not helpful to do if you are scoring'?\n\nIt would be awesome to have that cost-API for (sub-)Scorers, as most Scorers can be rewritten to benefit from it (wow, you could even demonstrate this for conjunctive queries) and it also allows some optimizations to work with structured queries that otherwise would have a reduced scope to only work on flat bag-of-TermScorers queries.\nI would second that rewriting the attached new MinShouldMatchScorer to use the cost-API, that is, always excluding the very same most costly subScorers and heap-merging only the remaining ones would save quite a few heap operations and also simplify the implementation. This probably amounts to the desired ~15% response time improvement for the little restrictive mm-constraint queries so that it convincingly supersedes the previous MinShouldMatchScorer implementation.\n\nLooking forward to see the impact of this optimized MinShouldMatchScorer to the runtimes of use-cases such as:\nhttp://blog.mikemccandless.com/2013/02/drill-sideways-faceting-with-lucene.html ",
+            "author": "Stefan Pohl",
+            "id": "comment-13599481"
+        },
+        {
+            "date": "2013-03-14T20:51:47+0000",
+            "content": "\nIt would be awesome to have that cost-API for (sub-)Scorers\n\nI just committed this to trunk! Curious to see what you can come up with here since I know it benefits conjunctions over the \"first docid\" heuristic. ",
+            "author": "Robert Muir",
+            "id": "comment-13602709"
+        },
+        {
+            "date": "2013-03-20T17:54:49+0000",
+            "content": "During working on a new cost-API based implementation, I stumbled upon a bug in the previous implementation that affected the scores returned by the advance()-method of this Scorer. I assume that it has not been called for the measurements in the previous comments (and obviously current tests), so all above should be valid.\nFor reference, I however attach a fixed (soon to be obsolete) patch. ",
+            "author": "Stefan Pohl",
+            "id": "comment-13607920"
+        },
+        {
+            "date": "2013-03-20T21:12:38+0000",
+            "content": "Thanks for your effort on the cost-API, Robert!\n\nI changed the algorithm to now use the cost-API which should be saving some heap operations. The patch is based on trunk and also disables to sometimes use BS instead of BS2, only because of this 3 unrelated tests fail.\n\nI didn't find time yet to do comprehensive performance testing (see TODOs in the source code), but this should be a good first shot.\nMike, feel free running the same measurements on the same setup again if you're interested to compare to the previous numbers.\n\nRobert, this scorer should probably be called MinShouldMatch*Sum*Scorer to be even more precise, what do you think? ",
+            "author": "Stefan Pohl",
+            "id": "comment-13608222"
+        },
+        {
+            "date": "2013-03-20T21:15:48+0000",
+            "content": "Thanks Stefan! I will try to see if i can figure out how to run Mike's benchmark! ",
+            "author": "Robert Muir",
+            "id": "comment-13608230"
+        },
+        {
+            "date": "2013-03-21T04:56:00+0000",
+            "content": "Well, we have a problem in our tests for this minShouldMatch functionality.\n\nluceneutil benchmark verifies a few things by default: totalHitCount of queries and scores.\n\nWhen I try to benchmark the patch with 1M or 10M document indexes, the hitcounts differ: yet all lucene/solr tests pass with the patch.\n\nSo our tests are not good enough: I'll work on some better tests for this to try to make it easier to find. ",
+            "author": "Robert Muir",
+            "id": "comment-13608635"
+        },
+        {
+            "date": "2013-03-21T20:55:34+0000",
+            "content": "OK: I committed a new test (TestMinShouldMatch2), it demonstrates the bug.... this currently passes on trunk but fails with the patch.\n\nyou can also run it many times with ant test -Dtestcase=TestMinShouldMatch2 -Dtests.iters=100 and so on.\n\nthe test is not very thorough yet but its an improvement for now. ",
+            "author": "Robert Muir",
+            "id": "comment-13609460"
+        },
+        {
+            "date": "2013-03-21T21:51:08+0000",
+            "content": "[branch_4x commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1459522\n\nLUCENE-4571: improve minShouldMatch testing ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13609543"
+        },
+        {
+            "date": "2013-03-21T21:51:24+0000",
+            "content": "[trunk commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1459521\n\nLUCENE-4571: improve minShouldMatch testing ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13609546"
+        },
+        {
+            "date": "2013-03-22T02:28:29+0000",
+            "content": "Also for the record, the previous \"for reference patch\" (20/Mar/13 13:54) passes the new test (which doesnt check scores yet, just documents)\n\nSo its just the newest patch with a bug. I'm gonna play and see if I can spot it... because I really want to benchmark this thing! ",
+            "author": "Robert Muir",
+            "id": "comment-13609821"
+        },
+        {
+            "date": "2013-03-22T09:53:48+0000",
+            "content": "With your nice test, I was quickly able to track it down (a >= instead of a == fixed the issue). This was also present in the previous implementation, but there it was not wrong. New patch attached.\nThere are still some assertions failing, but for now I'd attribute them to problems with the test (are return statements is missing when actual==null?), because these assertions only fail within the baseline/expected impl. Lucenebench doesn't complain anymore, even when checking scores.\n\nInstead of re-implementing all of the previous basic implementation, do you think it would be possible to rather re-use a normal DisjunctionSumScorer and wrap it with a Scorer that discards candidates that don't match the mm-constraint? This way we would get correct scoring for free. E.g.\n\n        public int nextDoc() throws IOException {\n          int docid;\n          while (true) {\n            docid = wrappedScorer.nextDoc();\n            if (docid==NO_MORE_DOCS)\n              break;\n            // count how many (optional) subscorers match on the same docid, and check against constraint\n            int cntOpt = 0;\n            for (ChildScorer cs : this.subscorers) {\n              if (cs.child.docID() == docid && \"SHOULD\".equalsIgnoreCase(cs.relationship))\n                cntOpt++;\n            }\n            if (cntOpt>=mm)\n              break;\n          }          \n          return docid;\n        }\n\n\n\nI ran the perf test locally on the 1M doc index and got quite nice numbers. As we anticipated, the cost-API is very beneficial and the now added per-candidate early-stopping (less advance()-calls at the expense of additional if-statements) roughly doubles the speedups \n\n                    TaskQPS baseline      StdDevQPS my_modified_version      StdDev                Pct diff\n     Low4MinShouldMatch0       36.41      (3.1%)       35.18      (5.1%)   -3.4% ( -11% -    5%)\n     Low3MinShouldMatch0       21.31      (6.6%)       21.18      (3.9%)   -0.6% ( -10% -   10%)\n     Low2MinShouldMatch0       14.54      (7.4%)       14.45      (3.3%)   -0.6% ( -10% -   10%)\n     HighMinShouldMatch0        9.85      (9.1%)        9.82      (2.8%)   -0.3% ( -11% -   12%)\n     Low1MinShouldMatch0       11.68      (8.3%)       11.65      (3.1%)   -0.3% ( -10% -   12%)\n     HighMinShouldMatch2       10.12      (9.4%)       10.95      (2.8%)    8.2% (  -3% -   22%)\n     Low1MinShouldMatch2       12.08      (8.6%)       13.60      (3.2%)   12.5% (   0% -   26%)\n     Low2MinShouldMatch2       15.23      (7.8%)       18.22      (4.2%)   19.6% (   7% -   34%)\n     HighMinShouldMatch3       10.33      (9.2%)       13.21      (3.2%)   27.9% (  14% -   44%)\n     Low3MinShouldMatch2       22.72      (7.3%)       30.85      (5.8%)   35.8% (  21% -   52%)\n     Low1MinShouldMatch3       12.49      (8.3%)       17.92      (4.4%)   43.5% (  28% -   61%)\n     HighMinShouldMatch4       10.55      (9.0%)       18.29      (4.8%)   73.3% (  54% -   95%)\n     Low2MinShouldMatch3       16.08      (7.2%)       30.38      (6.8%)   88.9% (  69% -  110%)\n     Low1MinShouldMatch4       12.84      (7.9%)       32.68      (9.6%)  154.6% ( 126% -  186%)\n     Low4MinShouldMatch2       45.39      (3.2%)      222.71     (16.0%)  390.6% ( 360% -  423%)\n     Low3MinShouldMatch3       24.70      (6.2%)      215.56     (29.8%)  772.9% ( 693% -  862%)\n     Low4MinShouldMatch3       45.71      (3.1%)      636.23     (53.4%) 1292.0% (1198% - 1390%)\n     Low2MinShouldMatch4       16.48      (7.1%)      257.47     (47.6%) 1462.7% (1314% - 1633%)\n     Low4MinShouldMatch4       45.81      (3.3%)      811.82     (60.4%) 1672.1% (1557% - 1794%)\n     Low3MinShouldMatch4       24.87      (6.8%)      768.67    (119.4%) 2990.2% (2681% - 3344%)\n\n\nNote that these numbers are not directly comparable to the others in this ticket, but they give evidence that the new implementation is never (as far as this one query generalizes) slower than the previous one. ",
+            "author": "Stefan Pohl",
+            "id": "comment-13610081"
+        },
+        {
+            "date": "2013-03-22T10:13:25+0000",
+            "content": "HOLY SHIT! ",
+            "author": "Simon Willnauer",
+            "id": "comment-13610094"
+        },
+        {
+            "date": "2013-03-22T10:16:50+0000",
+            "content": "Agreed, these speedups are awesome! ",
+            "author": "Adrien Grand",
+            "id": "comment-13610099"
+        },
+        {
+            "date": "2013-03-22T11:07:43+0000",
+            "content": "Well, I'm standing on the shoulders of giants; each of you is taller than you might think, not even thinking about us working together\nThis wouldn't be possible without all your efforts pushing forward a cost-API and use-cases (e.g. faceting now makes use of these queries) that make this improvement significant.\n\nBut let's wait for Robert to confirm these results and the absence of (obvious major;p) bugs. ",
+            "author": "Stefan Pohl",
+            "id": "comment-13610148"
+        },
+        {
+            "date": "2013-03-22T12:40:13+0000",
+            "content": "Just over eight years ago, there was this remark the initial version of DisjunctionSumScorer:\n\n\n\t@todo Investigate whether it is possible to use skipTo() when\n\tthe minimum number of matchers is bigger than one, ie. try and use the\n\tcharacter of ConjunctionScorer for the minimum number of matchers.\n\n\n\nSo, thanks a lot for this.\n\nBtw. Confirming the absence of bugs is a lot to ask...\n ",
+            "author": "Paul Elschot",
+            "id": "comment-13610203"
+        },
+        {
+            "date": "2013-03-22T13:56:33+0000",
+            "content": "Thanks Stefan! I can confirm its passing tests and I'm seeing similar benchmark results (on iteration #9 now)\n\nthe benchmark takes some time on my computer: I'll report back what I see when its complete.\n\n\nThere are still some assertions failing, but for now I'd attribute them to problems with the test (are return statements is missing when actual==null?), because these assertions only fail within the baseline/expected impl. Lucenebench doesn't complain anymore, even when checking scores.\n\nAwesome! Thats definitely a test bug in assertNext()... its just very unlikely to happen (means that by rare chance, no documents got term \"j\" or whatever): so it hasn't tripped up in Jenkins. I'll fix this, thanks!\n\n\nInstead of re-implementing all of the previous basic implementation, do you think it would be possible to rather re-use a normal DisjunctionSumScorer and wrap it with a Scorer that discards candidates that don't match the mm-constraint? This way we would get correct scoring for free. E.g.\n\nWe could: I thought about this. However I did this slow one for a few reasons:\n\n\tdoesn't prevent any refactoring of core/ code (its a standalone thing just for testing)\n\tshould make things pretty easy to debug (this isnt yet done though)\n\tpossibility of finding bugs in the current implementation. especially as we near a bugfix release \n\n\n\nThe correct scoring is actually easy to add. But I didnt do this yet because I didnt want to hold up this issue on \"the perfect test\". To me the important thing here is matching the correct documents according to minNrShouldMatch. If this is correct, its pretty intuitive to me that scoring is correct too: wherever we increase nrMatchers there should also be a addition to the score.\n\nBut I'll improve this today so we all have that warm fuzzy feeling!\n\nAs far as I'm concerned this patch is ready to be committed today. I'll follow up with my benchmark results in a comment and improve \nthe tests a bit this morning though.\n\nThanks a lot for taking this on... awesome work. ",
+            "author": "Robert Muir",
+            "id": "comment-13610275"
+        },
+        {
+            "date": "2013-03-22T14:02:33+0000",
+            "content": "Ill open a followup issue as well to fix the logic of BooleanWeight to decide how it should execute minNrShouldMatch. ",
+            "author": "Robert Muir",
+            "id": "comment-13610284"
+        },
+        {
+            "date": "2013-03-22T14:18:20+0000",
+            "content": "For the initial commit here: I plan to turn this thing on always when minNrShouldMatch is > 1.\n\nWe can explore LUCENE-4872 to see if we can develop some detection to safely still use BooleanScorer in case where e.g. all the terms are high frequency or whatever. ",
+            "author": "Robert Muir",
+            "id": "comment-13610317"
+        },
+        {
+            "date": "2013-03-22T14:31:48+0000",
+            "content": "Here's my performance results.\n\n                    Task   QPS trunk      StdDev   QPS patch      StdDev                Pct diff\n                PKLookup      251.82      (1.3%)      239.58      (2.5%)   -4.9% (  -8% -   -1%)\n     Low4MinShouldMatch0        8.34      (6.0%)        8.62      (6.8%)    3.3% (  -8% -   17%)\n     Low1MinShouldMatch0        1.90      (3.9%)        1.99      (6.0%)    4.8% (  -4% -   15%)\n     Low2MinShouldMatch0        2.41      (4.3%)        2.53      (6.3%)    4.8% (  -5% -   16%)\n     Low3MinShouldMatch0        3.94      (4.4%)        4.13      (6.3%)    5.0% (  -5% -   16%)\n     HighMinShouldMatch0        1.61      (3.7%)        1.70      (6.0%)    5.1% (  -4% -   15%)\n     HighMinShouldMatch2        1.68      (4.1%)        1.94      (5.0%)   15.6% (   6% -   25%)\n     Low1MinShouldMatch2        1.99      (4.4%)        2.39      (5.4%)   19.8% (   9% -   30%)\n     Low2MinShouldMatch2        2.57      (5.0%)        3.27      (6.4%)   27.2% (  15% -   40%)\n     HighMinShouldMatch3        1.71      (4.3%)        2.48      (5.6%)   45.0% (  33% -   57%)\n     Low3MinShouldMatch2        4.24      (5.2%)        6.21      (8.4%)   46.3% (  31% -   63%)\n     Low1MinShouldMatch3        2.05      (4.6%)        3.25      (6.9%)   58.9% (  45% -   73%)\n     HighMinShouldMatch4        1.74      (4.5%)        3.52      (8.2%)  102.2% (  85% -  120%)\n     Low2MinShouldMatch3        2.67      (5.4%)        5.40     (10.7%)  102.3% (  81% -  125%)\n     Low1MinShouldMatch4        2.08      (4.9%)        5.74     (14.2%)  175.3% ( 148% -  204%)\n     Low4MinShouldMatch2       10.18      (8.7%)       48.51     (16.3%)  376.5% ( 323% -  439%)\n     Low3MinShouldMatch3        4.50      (5.9%)       40.66     (26.7%)  804.3% ( 728% -  889%)\n     Low4MinShouldMatch3       10.22      (8.7%)      151.37     (62.2%) 1380.9% (1204% - 1590%)\n     Low2MinShouldMatch4        2.71      (5.6%)       45.36     (43.9%) 1574.3% (1443% - 1720%)\n     Low4MinShouldMatch4       10.22      (8.7%)      222.35     (93.0%) 2075.6% (1816% - 2383%)\n     Low3MinShouldMatch4        4.50      (5.8%)      206.42    (197.7%) 4486.1% (4047% - 4979%)\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13610330"
+        },
+        {
+            "date": "2013-03-22T15:34:01+0000",
+            "content": "I beefed up tests (to try varying numbers of terms and varying numbers of minShouldMatch and to verify scoring) and things are looking good. \n\nHowever with the new tests I'm managing to hit the assert in \nminHeapRemove \"subScorer should always be found\" in some cases...\n\nIt seems like the assert is invalid in some corner case?\n\nIf i just disable the assert, the test passes with many iterations (correct matching and scoring).\n\nCould it just be the case where a scorer became exhausted in next() or advance(), and is already removed from the heap? ",
+            "author": "Robert Muir",
+            "id": "comment-13610388"
+        },
+        {
+            "date": "2013-03-22T16:01:58+0000",
+            "content": "[branch_4x commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1459842\n\nLUCENE-4571: also verify scores in this test ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610416"
+        },
+        {
+            "date": "2013-03-22T16:02:04+0000",
+            "content": "[branch_4x commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1459820\n\nLUCENE-4571: fix rare test bug and beef up matching tests some more ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610418"
+        },
+        {
+            "date": "2013-03-22T16:07:12+0000",
+            "content": "[trunk commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1459841\n\nLUCENE-4571: also verify scores in this test ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610432"
+        },
+        {
+            "date": "2013-03-22T16:07:18+0000",
+            "content": "[trunk commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1459819\n\nLUCENE-4571: fix rare test bug and beef up matching tests some more ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610433"
+        },
+        {
+            "date": "2013-03-22T16:31:04+0000",
+            "content": "\nIt seems like the assert is invalid in some corner case?\nI've put this in not to get distracted from the core algorithm and without thinking until end about it. That you spotted it seriously convinces me about your test!\n\n\nCould it just be the case where a scorer became exhausted in next() or advance(), and is already removed from the heap?\nYou're absolutely right, however, the assertion should not simply be removed as this breaks invariants (you might not spot race conditions stemming from this in case of this already rare event) and it is also not the most efficient.\nI attached a patch. ",
+            "author": "Stefan Pohl",
+            "id": "comment-13610737"
+        },
+        {
+            "date": "2013-03-22T17:28:59+0000",
+            "content": "I ran 1000 iterations of the test with this patch, I think we are good to go. ",
+            "author": "Robert Muir",
+            "id": "comment-13610962"
+        },
+        {
+            "date": "2013-03-22T17:33:05+0000",
+            "content": "+1 ",
+            "author": "Simon Willnauer",
+            "id": "comment-13610968"
+        },
+        {
+            "date": "2013-03-22T19:44:54+0000",
+            "content": "whew: committed, thanks Stefan!  ",
+            "author": "Robert Muir",
+            "id": "comment-13611137"
+        },
+        {
+            "date": "2013-03-22T20:20:32+0000",
+            "content": "Thanks Stefan, what an amazing improvement  ",
+            "author": "Michael McCandless",
+            "id": "comment-13611186"
+        },
+        {
+            "date": "2013-05-10T10:33:16+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13653877"
+        }
+    ]
+}

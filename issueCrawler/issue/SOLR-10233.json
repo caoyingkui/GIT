@@ -1,0 +1,242 @@
+{
+    "id": "SOLR-10233",
+    "title": "Add support for different replica types in Solr",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "New Feature",
+        "fix_versions": [
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "For the majority of the cases, current SolrCloud's  distributed indexing is great. There is a subset of use cases for which the legacy Master/Slave replication may fit better:\n\n\n\tDon\u2019t require NRT\n\tLIR can become an issue, prefer availability of reads vs consistency or NRT\n\tHigh number of searches (requiring many search nodes)\n\n\n\nSOLR-9835 is adding replicas that don\u2019t do indexing, just update their transaction log. This Jira is to extend that idea and provide the following replica types:\n\n\n\tRealtime: Writes updates to transaction log and indexes locally. Replicas of type \u201crealtime\u201d support NRT (soft commits) and RTG. Any realtime replica can become a leader. This is the only type supported in SolrCloud at this time and will be the default.\n\tAppend: Writes to transaction log, but not to index, uses replication. Any append replica can become leader (by first applying all local transaction log elements). If a replica is of type append but is also the leader, it will behave as a realtime. This is exactly what SOLR-9835 is proposing (non-live replicas)\n\tPassive: Doesn\u2019t index or writes to transaction log. Just replicates from realtime or append replicas. Passive replicas can\u2019t become shard leaders (i.e., if there are only passive replicas in the collection at some point, updates will fail same as if there is no leaders, queries continue to work), so they don\u2019t even participate in elections.\n\n\n\nWhen the leader replica of the shard receives an update, it will distribute it to all realtime and append replicas, the same as it does today. It won't distribute to passive replicas.\n\nBy using a combination of append and passive replicas, one can achieve an equivalent of the legacy Master/Slave architecture in SolrCloud mode with most of its benefits, including high availability of writes. \n\nAPI (v1 style)\n/admin/collections?action=CREATE\u2026&realtimeReplicas=X&appendReplicas=Y&passiveReplicas=Z\n/admin/collections?action=ADDREPLICA\u2026&type=[realtime/append/passive]\n\n\n\t\u201creplicationFactor=\u201d will translate to \u201crealtime=\u201c for back compatibility\n\tif passive > 0, append or realtime need to be >= 1 (can\u2019t be all passives)\n\n\n\nPlacement Strategies\n\nBy using replica placement rules, one should be able to dedicate nodes to search-only and write-only workloads. For example:\n\nshard:*,replica:*,type:passive,fleet:slaves\n\n\nwhere \u201ctype\u201d is a new condition supported by the rule engine, and \u201cfleet:slaves\u201d is a regular tag. Note that rules are only applied when the replicas are created, so a later change in tags won't affect existing replicas. Also, rules are per collection, so each collection could contain it's own different rules.\nNote that on the server side Solr also needs to know how to distribute the shard requests (maybe ShardHandler?) if we want to hit only a subset of replicas (i.e. *passive *replicas only, or similar rules)\n\nSolrJ\nSolrCloud client could be smart to prefer passive replicas for search requests when available (and if configured to do so). Passive replicas can\u2019t respond RTG requests, so those should go to realtime replicas. \n\nCluster/Collection state\n\n\n{\"gettingstarted\":{\n  \"replicationFactor\":\"1\",\n  \"router\":{\"name\":\"compositeId\"},\n  \"maxShardsPerNode\":\"2\",\n  \"autoAddReplicas\":\"false\",\n  \"shards\":{\n    \"shard1\":{\n      \"range\":\"80000000-ffffffff\",\n      \"state\":\"active\",\n      \"replicas\":{\n        \"core_node5\":{\n          \"core\":\"gettingstarted_shard1_replica1\",\n          \"base_url\":\"http://127.0.0.1:8983/solr\",\n          \"node_name\":\"127.0.0.1:8983_solr\",\n          \"state\":\"active\",\n          \"leader\":\"true\",\n          **\"type\": \"realtime\"**},\n        \"core_node10\":{\n          \"core\":\"gettingstarted_shard1_replica2\",\n          \"base_url\":\"http://127.0.0.1:7574/solr\",\n          \"node_name\":\"127.0.0.1:7574_solr\",\n          \"state\":\"active\",\n          **\"type\": \"passive\"**}},\n      }},\n    \"shard2\":{\n      ...\n\n\n\nBack compatibility\nWe should be able to support back compatibility by assuming replicas without a \u201ctype\u201d property are realtime replicas. \n\nFailure Scenarios for passive replicas\n\nReplica-Leader partition\nIn SolrCloud today, in this scenario the replica would be placed in LIR. With passive replicas, replicas may not be able to replicate from some time (and fall behind with the index) but queries can still be served. Once the connection is re-established the replication will continue. \n\nReplica ZooKeeper partition\nPassive replica will leave the cluster. \u201cSmart clients\u201d and other replicas (e.g. for distributed search) won\u2019t find it and won\u2019t query on it. Direct search requests to the replica may still succeed. \n\nPassive replica dies (or is unreachable)\nReplica won\u2019t be query-able. On restart, replica will recover from the leader, following the same flow as realtime replicas: set state to DOWN, then RECOVERING, and finally ACTIVE. Passive replicas will use a different RecoveryStrategy implementation, that omits preparerecovery, and peer sync attempt, it will jump to replication . If the leader didn't change, or if the other replicas are of type \u201cappend\u201d, replication should be incremental. Once the first replication is done, passive replica will declare itself active and start serving traffic.\n\nLeader dies\nPassive replica won\u2019t be able to replicate. The cluster won\u2019t take updates until a new leader is elected. Once a new leader is elected, updates will be back to normal. Passive replicas will remain active and serving query traffic during the \u201cwrite outage\u201d. Once the new leader is elected the replication will restart (maybe from a different node)\n\nLeader ZooKeeper partition\nSame as today. Leader will abandon leadership and a new replica will be elected as leader.\n\nQ&A\n\nCan I use a combination of passive + realtime?\nYou could. The problem is that, since realtime generate their own index, any change of leadership could trigger a full replication from all the passive replicas. The biggest benefits of append replicas is that they share the same index files, which means that even if the leader changes, the number of segments to replicate will remain low. For that reason, using append replicas is recommended when using passive.\n\nCan I use passive + append + realtime?\nThe issue with mixing realtime replicas with append replicas is that if a different realtime replica becomes the leader, the whole purpose of using append replicas is defeated, since they will all have to replicate the full index. \n\nWhat happens if replication from passives fail?\nTBD: In general we want those replicas to continue serving search traffic, but we may want to have a way to say \u201cIf can\u2019t replicate after X hours put yourself in recovery\u201d or something similar.\nVarun Thacker suggested that we include in the response time since the last successful replication, and then the client can choose what to do with the results (in a multi-shard request, this date would be the oldest of all shards).\n\nDo passive replicas need to replicate from the leader only?\nThis is not necessary. Passive replicas can replicate from any realtime or append replicas, although this would add some extra waiting time for the last updates. Replicating from a realtime replica may not be a good idea, see the question \u201cCan I use a combination of passive + realtime?\u201d\n\nWhat if I need NRT?\nThen you can\u2019t query append or passive replicas. You should use all realtime replicas\n\nWill new passive replicas start receiving traffic immediately after added?\npassive replicas will have the same states as realtime/append replicas, they\u2019ll join the cluster as \u201cDOWN\u201d and be moved to \u201cRECOVERY\u201d until they can replicate from the leader. Then they\u2019ll start the replication process and become \u201cACTIVE\u201d, at this point they\u2019ll start responding queries. They'll use a different RecoveryStrategy that skips peer sync and buffering of docs, and just replicates.\nWhat if a passive replica receives an update?\nThis will work the same as today with non-leader replicas, it will just forward the update to the correct leader.\nWhat is the difference between using active + passive with legacy master/slave?\nThese are just some I can think of:\n\n\tYou now need ZooKeeper to run in SolrCloud mode\n\tHigh availability for writes, as long as you have more than 1 active replica\n\tShard management by Solr at index time and query time.\n\tFull support for Collections and Collections API\n\tSolrCloudClient support\n\n\n\nI'd like to get some thoughts on this proposal.",
+    "attachments": {
+        "11431.consoleText.txt": "https://issues.apache.org/jira/secure/attachment/12869470/11431.consoleText.txt",
+        "SOLR-10233.patch": "https://issues.apache.org/jira/secure/attachment/12856382/SOLR-10233.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-03-07T00:06:10+0000",
+            "content": "Here is an initial patch, that adds the the Type enum to Replica and some handling of passive replicas. It relies on code from SOLR-9835 (an older patch, I'll update that next). Also full of nocommits. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15898424"
+        },
+        {
+            "date": "2017-03-07T00:29:07+0000",
+            "content": "the parameters are not explicit when you create the collection realtime=X&append=Y&passive=Z\n\nlet's make it realtimeReplicas=X&appendReplicas=Y&passiveReplicas=Z ",
+            "author": "Noble Paul",
+            "id": "comment-15898451"
+        },
+        {
+            "date": "2017-03-07T01:27:47+0000",
+            "content": "let's make it realtimeReplicas=X&appendReplicas=Y&passiveReplicas=Z\nSGTM. I'll change the names ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15898538"
+        },
+        {
+            "date": "2017-03-08T21:12:48+0000",
+            "content": "Here is the same patch, but updated to master and the latest changes of SOLR-9835 (as of yesterday).\nCao Manh Dat, not sure what you want to do with SOLR-9835, since it seems to be ready. I personally think that since this is changing the API completely I'd hold on committing, but I'll leave that decision to you (master may be fine). \nI'll create a branch for this feature too, to allow collaboration. \nIn this patch, TestPassiveReplica passes consistently, but I didn't check other tests, there were lot's of conflicts, since this patch and SOLR-9835 both use \"REALTIME_REPLICAS\" in a different way.\nI'll spend some time now to make the work of SOLR-9835 use the API defined here. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15901980"
+        },
+        {
+            "date": "2017-03-09T00:22:13+0000",
+            "content": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe Sounds good to me. I'm planning to do more work on the test ( can take one or two days ) before commit it to master. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-15902214"
+        },
+        {
+            "date": "2017-03-12T15:33:56+0000",
+            "content": "Should we use another word than \"passive\"? When talking about replicas, we already have the active/inactive state, and inactive~=passive so may cause confusion? Also, should we reserve the word \"realtime\" to a future version where we might introduce a proper realtime feature? An alternative terminology could perhaps be: type=push/sync/pull? Just an input, feel free to discard.\n\nHow do we control the poll interval for passive/pull replicas? A collection/replica property? Or must be separately set on replicationHandler?\n\nHow to convert a replica from a type to another? Should that be possible through MODIFYCOLLECTION?\n ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-15906553"
+        },
+        {
+            "date": "2017-03-13T17:42:34+0000",
+            "content": "Thanks for your comments Jan H\u00f8ydahl\nShould we use another word than \"passive\"? When talking about replicas, we already have the active/inactive state, and inactive~=passive so may cause confusion?\nNaming has been difficult for this issue. For passive, other options considered were \"read-only replica\" or \"slave replica\". I originally considered also calling \"active replica\" instead of \"append\", but that definitely would cause confusion. \nAlso, should we reserve the word \"realtime\" to a future version where we might introduce a proper realtime feature?\nThe thinking was that the replication+indexing is happening in \"realtime\" (before responding). It can definitely be confusing since the search is not really realtime as you said. \nAn alternative terminology could perhaps be: type=push/sync/pull?\nNot sure I like those much. \"Push\" would be misleading since only the leader pushes. I'd like the name to reflect what the replica is going to do with the documents. Maybe \"indexer\" or \"writer\" instead of \"realtime\"? \"realtime\" was also suggested in SOLR-9835.\nHow do we control the poll interval for passive/pull replicas? A collection/replica property? Or must be separately set on replicationHandler?\nAt this point I'm just using what was done for SOLR-9835, which sets the interval to autoCommitMaxTime/2 or 3 seconds. Later we can have a configuration in solrconfig.xml (note that the same as SOLR-9835, this code uses a new instance of ReplicationHandler)\nHow to convert a replica from a type to another? Should that be possible through MODIFYCOLLECTION?\nIn this first iteration this would not be supported for simplicity. In the future I think this could be done via API (would require a core reload for sure), although I would say it should be something that targets the replica, not the collection? Also, note my comment in the patch:\n\n-        String coreName = collectionName + \"_\" + position.shard + \"_replica\" + (position.index + 1);\n+        // TODO: Adding the suffix is great for debugging, but may be an issue if at some point we want to support a way to change replica type\n+        String coreName = collectionName + \"_\" + position.shard + \"_replica\" + position.suffix + (position.index + 1);\n\n\nI can revert that, but for debugging purposes this is actually very good. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15907929"
+        },
+        {
+            "date": "2017-03-14T22:21:35+0000",
+            "content": "Thanks for commenting. Perhaps the \"passive\" could be \"copy\", indicating that it is a copy of the index, not a locally produced one, while the append could be \"hotcopy\" indicating that it is still a copy but with ability to become leader (hot)  Well, I'll stop nit-picking for now, solid work man! ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-15925153"
+        },
+        {
+            "date": "2017-03-31T19:19:20+0000",
+            "content": "I now have some time to work on this feature again. Here is a new patch:\n\n\tChanges the API of \"onlyLeaderIndexes\" to the proposed \"num*Replicas\" style.\n\tAdded some more tests for passive replicas\n\tAdded some tests for \"Append\" replicas.\n\tUpdated to current master.\nSome tests are failing (after the change onlyLeaderIndexes->append replicas). I'm going to work on fixing those next. \nNaming is still open to change\n\n ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15951525"
+        },
+        {
+            "date": "2017-03-31T20:47:19+0000",
+            "content": "This patch fixes the tests. Biggest TODOs:\n\n\tCleanup RecoveryStrategy code duplication\n\tPassive replicas should not have a transaction log\n\tRemove the top level \"realtimeReplicas\" from the cluster state, no longer needed since now each replica has a type\n\tMore tests\n\n\n\nLater (maybe separate Jira)\n\n\tClient side changes\n\tReplica placement rules update\n\n ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15951615"
+        },
+        {
+            "date": "2017-04-03T23:51:02+0000",
+            "content": "After looking at the discussion and changes in SOLR-9045 I decided to remove the ReplicateOnlyRecoveryStrategy at least for now, and just add a new method to RecoveryStrategy that takes a different recovery path (just replication). I also made RecoveryStragety implement Runnable and Closeable instead of extending Thread, it doesn't seem that it's being used as a Thread anywhere anyway, I'm thinking in separating that change to a different Jira. Uploading the latest patch ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15954352"
+        },
+        {
+            "date": "2017-04-12T19:48:42+0000",
+            "content": "I'm taking a look through this FYI. I'll post some notes soon. ",
+            "author": "Mark Miller",
+            "id": "comment-15966481"
+        },
+        {
+            "date": "2017-04-14T03:37:43+0000",
+            "content": "This is great work Tom\u00e1s Fern\u00e1ndez L\u00f6bbe. It's a great extension of SOLR-9835 and both issues will overlap quite a bit with the Unified Replication for HDFS stuff I worked on in the past. I've spent some time going through it, but first some high level comments:\n\n\n\tWe should put this in a branch as you suggested. Tough patch for collaboration.\n\tWe should also looking at using reviewboard or github for review I think - so much surface area that it's hard to not be able to comment in the source.\n\tI mostly like the naming, except I'm also a little wary of realtime because we have always been careful to say nrt or nearRealtime (ok, ok, realtime get, but I suppose that is a little trickier). It would be nice to try and keep that designation somehow.\n\tIt still might be nice, for those not using these other types, to still be able to just use replicationFactor beyond back compat reasons. If you are not jumping into this world, specifying the number of realtimeReplicas is a bit confusing in comparison.\n\tWe almost certainly want to integrate this well with the chaos monkey tests. But we don't want to muddle what we have up any - it's hard enough to track these tests and their stability. We should make a new one that extends the existing ones and also uses these new types.\n\tI think replicas that cannot handle realtime get should def forward to replicas that can.\n\n\n\nThere are other code comments I have here and there, but given there is some work still being done, it probably makes sense to wait and get this in a branch and post those to some kind of source code commenting system.\n\nAnyway, I wanted to start with some basic feedback. More to come. ",
+            "author": "Mark Miller",
+            "id": "comment-15968561"
+        },
+        {
+            "date": "2017-04-14T13:36:20+0000",
+            "content": "I still would like the names to be a bit more descriptive. But honestly I can't think of anything much better yet. My best try is like nrtReplicas, tlogReplicas, and indexReplicas or something, and it's just not satisfying either. ",
+            "author": "Mark Miller",
+            "id": "comment-15969054"
+        },
+        {
+            "date": "2017-04-17T16:48:02+0000",
+            "content": "Thanks for the feedback Mark. I'll update the branch today and find the best way to have review. \nstill might be nice, for those not using these other types, to still be able to just use replicationFactor beyond back compat reasons\nI don't love the idea of having multiple ways of indicating the same thing, but I guess if we don't find a good/descriptive way to name realtime/index replicas you are right. \"replicationFactor\" is pretty standard. \nWe almost certainly want to integrate this well with the chaos monkey tests\nYes, I want to have a new chaos monkey test for different replica types. I want to work on that next. I also want to have tests specific to connection error handling using SocketProxy, those may be easier to debug than the chaos monkey tests, although not as much coverage probably. \nthink replicas that cannot handle realtime get should def forward to replicas that can.\nYes. One of the reasons I want no tlog on the passive replicas is to fail fast if any feature tries to use it. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15971325"
+        },
+        {
+            "date": "2017-04-28T23:00:00+0000",
+            "content": "GitHub user tflobbe opened a pull request:\n\n    https://github.com/apache/lucene-solr/pull/196\n\n    SOLR-10233: Add support for different replica types\n\n    Code is not done yet (although getting close). Opening the PR to make it easier to review.\n\nYou can merge this pull request into a Git repository by running:\n\n    $ git pull https://github.com/apache/lucene-solr jira/solr-10233\n\nAlternatively you can review and apply these changes as the patch at:\n\n    https://github.com/apache/lucene-solr/pull/196.patch\n\nTo close this pull request, make a commit to your master/trunk branch\nwith (at least) the following in the commit message:\n\n    This closes #196\n\n\ncommit 3d149074e143ec685a3d079e9acf33bd9e0e6b40\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-25T23:37:08Z\n\n    Moved patch to (new) branch. Updated to master\n\ncommit a217dfaaf43950fb229b088745d6207ce5106b6e\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-26T00:10:41Z\n\n    Added error handling tests for Passive Replicas\n\ncommit 0330b4abe5785e509b29d3bc7f461c4e57d153f7\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-26T23:21:40Z\n\n    Sometimes use legacyCloud in tests\n\ncommit 304add6f631494d28d952431055e89b8357c6a5a\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-26T23:28:25Z\n\n    Added ChaosMonkey tests with safe leader for passive replicas\n\ncommit 2c133d4cfb533900dcb72784c12b3829e8277c65\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-27T23:27:46Z\n\n    Added ChaosMonkey test without safe leader for passive replicas\n\ncommit a342edd9eee95c30eabd00824a7c69f1d36ba33a\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-27T23:38:24Z\n\n    Fix ChaosMonkey expire connection and connection loss properties\n\ncommit e7d54fa0b1e31b01be05c479975da36c53259a96\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-28T00:51:52Z\n\n    Added logging to ChaosMonkey\n\ncommit 0f9baa4919840e406122bba4ef87897121be0649\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-28T21:26:26Z\n\n    Minor improvements to ChaosMonkey tests\n\ncommit e7c8cec61c5b27bd9ce40eaa29a2f621a0bf2640\nAuthor: Tomas Fernandez Lobbe <tflobbe@apache.org>\nDate:   2017-04-28T22:53:12Z\n\n    Some code cleanup\n\n ",
+            "author": "ASF GitHub Bot",
+            "id": "comment-15989555"
+        },
+        {
+            "date": "2017-04-28T23:27:21+0000",
+            "content": "I didn't know if Github mirror was going to allow me to create the PR from the official branch, but apparently it does  Feel free to review and comment there. \nCode is not ready, but it's getting close:\n\n\tAdded new ChaosMonkey tests (\"SafeLeader\" and \"NothingIsSafe\"). I've been running them and the \"SafeLeader\" is doing great. \"NothingIsSafe\" found some shard inconsistencies, I'm looking at those now.\n\tCleaned some TODOs/nocommits, there are a couple missing.\n\tAdded a test to validate some connection error handling for passive replicas\n\tMade replica types work with \"legacyCloud\"\n\n\n\nTODOs:\n\n\tPassive replicas to forward RTG requests to leader\n\tMore tests (in particular, If anyone has an idea of a way to track replica state changes reliable to validate them, I tried it here, but the collection state watcher can see repeated states or miss states)\n\tun-deprecate replication factor, at least for the user APIs\n\tDefine better names, at least for \"REALTIME\"\n\n ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-15989578"
+        },
+        {
+            "date": "2017-05-08T19:11:19+0000",
+            "content": "I\u2019ve been doing some work on improving the tests in the branch. Also, now RTG requests with distrib=true will avoid PASSIVE and non-leader APPEND replicas. For distrib=false cases, PASSIVE replicas will error, but APPEND will proceed the same as today, since this is needed for leader sync.\n\nRegarding the naming, here are the options proposed\n\n\tREALTIME/PUSH/NRT/WRITER/INDEXER\n\tAPPEND/SYNC/TLOG/HOTCOPY/LAZY\n\tPASSIVE/PULL/INDEX/COPY/SLAVE/READ-ONLY\n\n\n\nBased on the suggestions and comments, I\u2019m going to rename:\n\n\tREALTIME -> NRT: It makes it obvious that if you want NRT results you need these kinds of replicas. Plus we\u2019ve been saying that Solr provides search in NRT and this is the mode currently supported\n\tAPPEND -> I\u2019m between LAZY and TLOG. The first one is more high level, the name itself doesn\u2019t say much of how the internals work. It\u2019s less specific than TLOG, but it does give you the idea that it will fall behind. Also, I think it kind of makes sense because the replica will \u201capply the updates to the index only if required (it becomes leader)\u201d. LAZY may be easily confused with PASSIVE. TLOG is good because it\u2019s clearer than LAZY in what the replica does. The main issue I see is that the REALTIME (or NRT) also has a transaction log, so may be confusing. Since Mark proposed TLOG, I\u2019m guessing he is +1 on that one so I\u2019ll just go with it, since i\u2019m on the fence.\n\tPASSIVE -> PULL, It is more obvious than \u201cPASSIVE\u201d on how the replica will work, and it doesn\u2019t get confused with a replica state.\n\n\n\nFeel free to comment if you have some good reason against those names. \n\nI\u2019ll be doing some more work on the tests this week. My plan is to commit this to master soon to have it for 7.0. Placement strategy and client changes are going to be done as followup tasks, I don\u2019t think those should block this. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16001357"
+        },
+        {
+            "date": "2017-05-16T22:23:43+0000",
+            "content": "Last changes\n\n\tAdded support for CreateShard and Backup/Restore with replica types.\n\tRenamed types as explained in my previous comment\n\tMerged to master\n\tOther minor changes to tests.\n\n\n\nTODO before commit:\n\n\tThere are still some TODOs and nocommits in the code to address\n\tCleanup some duplication in the new test code.\nA couple of things Anshum suggested offline:\n\tTest DELETENODE and DELETEREPLICA\n\tReplication from leader should fail if the leader changes\n\n\n\nMy plan is to defer to new Jiras:\n\n\tAdd support for replica types in replica placement strategies\n\tThere should be a way to tell CloudSolrClient to query only passive replicas\n\tautoAddReplicas doesn\u2019t work for different replica types\n\tWhen querying a replica of type PULL, it would be nice to get back the time since the last successful replication\n\tAdd ability for PULL replicas to go into recovery mode after X number of failed replications\n\n\n ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16013201"
+        },
+        {
+            "date": "2017-05-18T01:25:05+0000",
+            "content": "Just pushed some more changes to the branch. Addressed most of the TODOs, except for \"Replication from leader should fail if the leader changes\", which I think is fine to defer to another Jira. I plan to commit this soon if I see no problems with the tests. Mark Miller, you had some more comments and were waiting on the PR, do you still plan to review? If so, let me know and I can wait. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16015041"
+        },
+        {
+            "date": "2017-05-22T22:09:08+0000",
+            "content": "LGTM, and +1 to get this into master. We should give it as much time as we can on master before the release.\n\nHere are a few points I think we need to document or address:\n1. How would this work with Replica placement strategy. Considering the auto-scaling stuff would be released with 7.0, we should not be too bothered about supporting this with replica placement strategy.\n2. We should make sure that the auto-scaling effort that\u2019s running parallel to this is sync\u2019ed up.\n3. Integrate this with Version 2 APIs. \n4. Integration with SolrJ for reads, writes, and collection API calls. ",
+            "author": "Anshum Gupta",
+            "id": "comment-16020276"
+        },
+        {
+            "date": "2017-05-22T23:50:23+0000",
+            "content": "We should give it as much time as we can on master before the release.\n+1\nHow would this work with Replica placement strategy. Considering the auto-scaling stuff would be released with 7.0, we should not be too bothered about supporting this with replica placement strategy.\nMakes sense. \nWe should make sure that the auto-scaling effort that\u2019s running parallel to this is sync\u2019ed up.\nMakes sense too. New DSL was suggested for autoscaling/replica placement, we should make sure to include options to work with different replica types. I\u2019ll start the conversation in SOLR-9735 and subtasks. \nIntegrate this with Version 2 APIs\nGood point. I don\u2019t want to block this commit since it\u2019s already to difficult to review. I\u2019ll make this as part of another Jira, but should make sure to have that before 7.0  is released\nIntegration with SolrJ for reads, writes, and collection API calls.\nGood point\u2026\n\n\tClient side handling of search requests can be improved, but I think it would be fine to leave to another Jira. Ideally, one could tell the client to only query PULL replicas, if you want for example, something like Master/Slave, where masters are never queried. Also RTG requests could go to NRT replicas only (or leader in case of TLOG replicas). People also suggested being able to provide more complex rules of how to handle queries with different replica types.\n\tWrites should be handled automatically if you use CloudSolrClient, since the requests is going to the leader. If you use HttpSolrClient, nothing to do there, the request will get to the specified node, and it will be internally forwarded to the leader, same as today with no types.\n\tSo far I added SolrJ integration for create collection and add shard. I don\u2019t think other SolrJ actions will need modification. MODIFYCOLLECTION currently can\u2019t change \u201cnumTYPEReplicas\u201d, but I think that\u2019s fine, since there is no real action happening after a change like that, may be needed for the autoscale work though.\n\n ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16020419"
+        },
+        {
+            "date": "2017-05-23T03:00:54+0000",
+            "content": "Commit 2fc41d565a4a0408a09856a37d3be7d87414ba3f in lucene-solr's branch refs/heads/master from Tomas Fernandez Lobbe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2fc41d5 ]\n\nSOLR-10233: Add support for replica types ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16020595"
+        },
+        {
+            "date": "2017-05-23T03:06:25+0000",
+            "content": "The current replica placement strategy will be deprecated and the new policy framework will be used everywhere. it makes sense to start discussing the syntax in a separate ticket after SOLR-10278 is committed\n ",
+            "author": "Noble Paul",
+            "id": "comment-16020599"
+        },
+        {
+            "date": "2017-05-23T14:34:01+0000",
+            "content": "Saw a couple of ChaosMonkeySafeLeaderWithPullReplicasTest failures in Jenkins. I'll look into those.  ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16021261"
+        },
+        {
+            "date": "2017-05-23T14:58:16+0000",
+            "content": "My Jenkins had a non-reproducing failure for TestPullReplica - I'm attaching the log. ",
+            "author": "Steve Rowe",
+            "id": "comment-16021288"
+        },
+        {
+            "date": "2017-05-23T18:55:55+0000",
+            "content": "Thanks Steve, looking into fixing that.  ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16021665"
+        },
+        {
+            "date": "2017-05-25T16:37:30+0000",
+            "content": "Commit 1e4d2052e6ce10b4012eda8802a8d32ccadeeba3 in lucene-solr's branch refs/heads/master from Tomas Fernandez Lobbe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1e4d205 ]\n\nSOLR-10233: ChaosMonkeySafeLeaderWithPullReplicasTest - Catch SolrException while waiting for the cluster to be ready ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16024978"
+        },
+        {
+            "date": "2017-05-25T21:43:25+0000",
+            "content": "Github user tflobbe closed the pull request at:\n\n    https://github.com/apache/lucene-solr/pull/196 ",
+            "author": "ASF GitHub Bot",
+            "id": "comment-16025438"
+        },
+        {
+            "date": "2017-05-26T18:09:38+0000",
+            "content": "This Jenkins failure[1] may be related to this change. I'll take a look.\n\n\n[1] https://jenkins.thetaphi.de/job/Lucene-Solr-master-Linux/19713/ ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16026614"
+        },
+        {
+            "date": "2017-05-26T21:49:40+0000",
+            "content": "Commit 8f92fb4722709bec34b4c0330afb7cabba86e350 in lucene-solr's branch refs/heads/master from Tomas Fernandez Lobbe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8f92fb4 ]\n\nSOLR-10233: Correctly set maxShardsPerNode in BackupRestoreTestCase when using createNodeSet and replica types ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16026905"
+        },
+        {
+            "date": "2017-06-05T22:31:20+0000",
+            "content": "Looking at ChaosMonkey failure: https://jenkins.thetaphi.de/job/Lucene-Solr-master-Linux/19780/ ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16037781"
+        },
+        {
+            "date": "2017-06-06T23:40:22+0000",
+            "content": "Commit 46a5ae23a76fcf0cbb98ac3874ae69cdb90173a4 in lucene-solr's branch refs/heads/master from Tom\u00e1s Fern\u00e1ndez L\u00f6bbe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=46a5ae2 ]\n\nSOLR-10233: Some more logging to chaos monkey with replica types tests ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16039878"
+        },
+        {
+            "date": "2017-06-07T00:48:37+0000",
+            "content": "Commit 97655b880c0230c0d42baba314c28831ee729323 in lucene-solr's branch refs/heads/master from Tom\u00e1s Fern\u00e1ndez L\u00f6bbe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=97655b8 ]\n\nSOLR-10233: Cleanup warnings from ReplicateFromLeader ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16039930"
+        },
+        {
+            "date": "2017-06-07T00:48:39+0000",
+            "content": "Commit a03c3369e28a1c350842649726801e79285625e7 in lucene-solr's branch refs/heads/master from Tom\u00e1s Fern\u00e1ndez L\u00f6bbe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a03c336 ]\n\nSOLR-10233: Stop warning users about misconfigured ReplicationHandler when using replica types ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16039931"
+        },
+        {
+            "date": "2017-07-03T22:57:18+0000",
+            "content": "Marking this as resolved. Any extra related work should have it's own Jira. ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16072963"
+        }
+    ]
+}

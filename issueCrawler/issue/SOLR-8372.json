@@ -1,0 +1,96 @@
+{
+    "id": "SOLR-8372",
+    "title": "Canceled recovery can lead to data loss",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "A recovery via index replication tells the update log to start buffering updates.  If that recovery is canceled for whatever reason by the replica, the RecoveryStrategy calls ulog.dropBufferedUpdates() which stops buffering and places the UpdateLog back in active mode.  If updates come from the leader after this point (and before ReplicationStrategy retries recovery), the update will be processed as normal and added to the transaction log. If the server is bounced, those last updates to the transaction log look normal (no FLAG_GAP) and can be used to determine who is more up to date.",
+    "attachments": {
+        "SOLR-8372.patch": "https://issues.apache.org/jira/secure/attachment/12777780/SOLR-8372.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-12-10T03:14:05+0000",
+            "author": "Yonik Seeley",
+            "content": "I've been thinking about possible ways to deal with this:\n\n\tstop updates at a higher level... if the distributed update processor knows it's not in the right state to accept updates, then reject them\n\t\n\t\tthis has problems with race conditions unless the check/reject is with the bucket lock held\n\t\n\t\n\tkeep buffering updates when recovery is canceled.  When another call to bufferUpdates() is made, reset the starting position so we know where replay needs to start from.\n\tintroduce a new state into UpdateLog (the current states are REPLAYING, BUFFERING, APPLYING_BUFFERED, ACTIVE)\n\t\n\t\tthis new state would do what?  Silently drop updates it receives?  Throw an exception?  The latter would seem to complicate things further if it could possibly cause another node to put us into LIR again.\n\t\n\t\n\n\n\nIn anticipation of really hairy scenarios, keeping updates might be useful rather than dropping them.  So perhaps the \"keep buffering\" option may be simplest as it also avoids introducing another state?  We should normally receive only a a few more updates that were in the pipeline when something happened to our recovery attempt anyway (like the leader dying)?  ",
+            "id": "comment-15049944"
+        },
+        {
+            "date": "2015-12-10T12:42:52+0000",
+            "author": "Mark Miller",
+            "content": "Buffering seems fine to me. Now that we start buffering even before peer sync anyway, we are almost always in a buffering state anyway, other than the brief time between replaying buffered docs and starting the recovery again. ",
+            "id": "comment-15050925"
+        },
+        {
+            "date": "2015-12-10T16:33:09+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Continuing to buffer updates seems safe but why to reset the starting updates on another call to bufferUpdates()? Wouldn't the existing RecoveryInfo have the right start position already? ",
+            "id": "comment-15051199"
+        },
+        {
+            "date": "2015-12-10T16:43:01+0000",
+            "author": "Yonik Seeley",
+            "content": "Buffering is done during recovery-via-index-replication... the leader starts forwarding updates and then does a commit we can replicate from.  If that whole process is canceled and restarted, we only need to replay from the last time bufferUpdates() was called (all of the previously buffered updates should be in the new index snapshot we are going to get).\n\nAre there other scenarios where this wouldn't be the right thing to do?  I guess we need an audit of every place that bufferUpdates() is called. ",
+            "id": "comment-15051213"
+        },
+        {
+            "date": "2015-12-10T16:56:05+0000",
+            "author": "Mark Miller",
+            "content": "Shard splitting does use it.\n\nThere is also a general Solr admin API that start buffering. Looks like migrate uses that. ",
+            "id": "comment-15051229"
+        },
+        {
+            "date": "2015-12-10T17:02:32+0000",
+            "author": "Mark Miller",
+            "content": "Looks like for shard splitting it is just entering buffering earlier, to be sure it happens before the core can receive updates.\n\nI'm not so sure what migrate is doing on a first glance.\n\nFor both of them, I'm curious where the replay or drop happens. Seems a little hairy to rely on the RecoveryStrategy replay or drop. (Though I guess it seems a whole lot safer now that we always buffer docs in recovery, even if peer sync works.) ",
+            "id": "comment-15051243"
+        },
+        {
+            "date": "2015-12-10T17:14:18+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks for explaining that Yonik. Yes, resetting start position does seem like the right thing to do.\n\nShard splitting does use it.\n\nYes, sub-shard leader set update log to buffering mode during core creation. The sub-shard leader has no one to recover from so recovery is a no-op so it shouldn't be impacted by this change.\n\nThere is also a general Solr admin API that start buffering. Looks like migrate uses that.\n\nYes, that is used by migrate to enable buffering on the target collection's leader. After this call succeeds, a routing rule is added to the source collection which starts sending all relevant updates to the target collection.\n\nFor both of them, I'm curious where the replay or drop happens. Seems a little hairy to rely on the RecoveryStrategy replay or drop. (Though I guess it seems a whole lot safer now that we always buffer docs in recovery, even if peer sync works.)\n\nBoth use the REQUESTAPPLYUPDATES core admin action to apply buffered updates. RecoveryStrategy is not used here at all. If a migrate action fails, the target collection is still left in buffering state which shouldn't pose a problem if migrate is retried. ",
+            "id": "comment-15051267"
+        },
+        {
+            "date": "2015-12-10T17:21:08+0000",
+            "author": "Mark Miller",
+            "content": "Both use the REQUESTAPPLYUPDATES \n\nAh, was looking for a cmd like that but did not see it.\n\nAre there other scenarios where this wouldn't be the right thing to do?\n\nDoesn't seem so then? \n\nOnly thing I can think of is, what about the async nature of those core admin buffer calls - any chance of those overlapping with recovery strategy buffer calls? And if so, would that matter with this change? ",
+            "id": "comment-15051283"
+        },
+        {
+            "date": "2015-12-15T17:36:07+0000",
+            "author": "Yonik Seeley",
+            "content": "Here's a patch that allows bufferUpdates() to be called more than once, and removes the call to dropBufferedUpdates() from RecoveryStrategy.\n\nPreviously, if bufferUpdates() was called in a state!=ACTIVE, we simply returned w/o changing the state.  This is now logged at least.\n\nThis has an additional side effect of having buffered versions in our log that were never applied to the index.  This seems OK though... better not to lose updates in general. ",
+            "id": "comment-15058388"
+        },
+        {
+            "date": "2015-12-15T21:06:33+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1720250 from Yonik Seeley in branch 'dev/trunk'\n[ https://svn.apache.org/r1720250 ]\n\nSOLR-8372: continue buffering if recovery is canceled/failed ",
+            "id": "comment-15058808"
+        },
+        {
+            "date": "2015-12-15T21:07:27+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1720251 from Yonik Seeley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1720251 ]\n\nSOLR-8372: continue buffering if recovery is canceled/failed ",
+            "id": "comment-15058814"
+        },
+        {
+            "date": "2015-12-16T14:54:46+0000",
+            "author": "Mike Drob",
+            "content": "Yonik - it looks like logReplayFinish is never used; is that an oversight?\n\nAlso, logReplay might need to only release one permit before applying buffered updates, so that you can release again before the second apply? ",
+            "id": "comment-15060085"
+        }
+    ]
+}

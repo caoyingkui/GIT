@@ -1,0 +1,273 @@
+{
+    "id": "LUCENE-4930",
+    "title": "Lucene's use of WeakHashMap at index time prevents full use of cores on some multi-core machines, due to contention",
+    "details": {
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [
+            "4.3",
+            "6.0"
+        ],
+        "affect_versions": "4.2",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Our project is not optimally using full processing power during under indexing load on Lucene 4.2.0.  The reason is the AttributeSource.addAttribute() method, which goes through a WeakHashMap synchronizer, which is apparently single-threaded for a significant amount of time.  Have a look at the following trace:\n\n\"pool-1-thread-28\" prio=10 tid=0x00007f47fc104800 nid=0x672b waiting for monitor entry [0x00007f47d19ed000]\n   java.lang.Thread.State: BLOCKED (on object monitor)\n        at java.lang.ref.ReferenceQueue.poll(ReferenceQueue.java:98)\n\n\twaiting to lock <0x00000005c5cd9988> (a java.lang.ref.ReferenceQueue$Lock)\n        at org.apache.lucene.util.WeakIdentityMap.reap(WeakIdentityMap.java:189)\n        at org.apache.lucene.util.WeakIdentityMap.get(WeakIdentityMap.java:82)\n        at org.apache.lucene.util.AttributeSource$AttributeFactory$DefaultAttributeFactory.getClassForInterface(AttributeSource.java:74)\n        at org.apache.lucene.util.AttributeSource$AttributeFactory$DefaultAttributeFactory.createAttributeInstance(AttributeSource.java:65)\n        at org.apache.lucene.util.AttributeSource.addAttribute(AttributeSource.java:271)\n        at org.apache.lucene.index.DocInverterPerField.processFields(DocInverterPerField.java:107)\n        at org.apache.lucene.index.DocFieldProcessor.processDocument(DocFieldProcessor.java:254)\n        at org.apache.lucene.index.DocumentsWriterPerThread.updateDocument(DocumentsWriterPerThread.java:256)\n        at org.apache.lucene.index.DocumentsWriter.updateDocument(DocumentsWriter.java:376)\n        at org.apache.lucene.index.IndexWriter.updateDocument(IndexWriter.java:1473)\n        at org.apache.lucene.index.IndexWriter.addDocument(IndexWriter.java:1148)\n        at org.apache.lucene.index.IndexWriter.addDocument(IndexWriter.java:1129)\n\u2026\n\n\n\nWe\u2019ve had to make significant changes to the way we were indexing in order to not hit this issue as much, such as indexing using TokenStreams which we reuse, when it would have been more convenient to index with just tokens.  (The reason is that Lucene internally creates TokenStream objects when you pass a token array to IndexableField, and doesn\u2019t reuse them, and the addAttribute() causes massive contention as a result.)  However, as you can see from the trace above, we\u2019re still running into contention due to other addAttribute() method calls that are buried deep inside Lucene.\n\nI can see two ways forward.  Either not use WeakHashMap or use it in a more efficient way, or make darned sure no addAttribute() calls are done in the main code indexing execution path.  (I think it would be easy to fix DocInverterPerField in that way, FWIW.  I just don\u2019t know what we\u2019ll run into next.)",
+    "attachments": {
+        "thread_dump.txt": "https://issues.apache.org/jira/secure/attachment/12578422/thread_dump.txt",
+        "LUCENE-4930.patch": "https://issues.apache.org/jira/secure/attachment/12578521/LUCENE-4930.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-04-12T14:26:06+0000",
+            "content": "The problem here is a class-static map (it makes no difference between a WeakHashMap or WeakIdentityMap, which is Lucene's own impl). The problem here is that the contents of the map are rarely changing, so this would be a typical use-case for a offloaded reap() thread (like Google Commons Collections offers: The cleanup of the hashmap is moved to a separate thread).\n\nTo me it is still strange that you really see this problem: The poll() method on ReferenceQueue is using double-checked locking (it checks only a volatile field and should only reach the lock if there is anything to clean up in the queue). As the contents of the weak hash map only changes when new attribute classes are added this weak map should only be cleaned up when you reload cores and new class loader come into account\n\nDuring normal indexing this should have no contention at all. What Java version are you using, and is there really a visible slowdown caused by this - you gave no numbers! The contention here may be displayed in stack traces requested from threads, but its unlikely to have an effect on indexing (because the map is mostly static).\n\nFYI: This code is unchanged since Lucene 2.9! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630093"
+        },
+        {
+            "date": "2013-04-12T14:29:38+0000",
+            "content": "See line 98 of http://www.docjar.com/html/api/java/lang/ref/ReferenceQueue.java.html\n\nPlease note: The code should never reach this point, unless you reload solr cores and change classloaders, because the attributes classes (once in the map) should never be freed (unless the classloader removes the class). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630095"
+        },
+        {
+            "date": "2013-04-12T14:39:35+0000",
+            "content": "During normal indexing this should have no contention at all. What Java version are you using, and is there really a visible slowdown caused by this - you gave no numbers! The contention here may be displayed in stack traces requested from threads, but its unlikely to have an effect on indexing (because the map is mostly static).\n\nThe way this shows up is on a 16-core machine I only see 700-800% utilization.  So I'm losing 1/2 the available processing power available.\n\nThe JDK is the amd64 openjdk 1.6.0.  I'll try to chase down a patch level for you if that seems warranted. ",
+            "author": "Karl Wright",
+            "id": "comment-13630105"
+        },
+        {
+            "date": "2013-04-12T14:42:41+0000",
+            "content": "Please note: The code should never reach this point, unless you reload solr cores and change classloaders, because the attributes classes (once in the map) should never be freed (unless the classloader removes the class).\n\nWe're not doing anything fancy with cores, classloaders, etc.  This is a straight lucene application which creates a threadpool and just fires away.\n ",
+            "author": "Karl Wright",
+            "id": "comment-13630111"
+        },
+        {
+            "date": "2013-04-12T14:44:49+0000",
+            "content": "The way this shows up is on a 16-core machine I only see 700-800% utilization. So I'm losing 1/2 the available processing power available.\n\nAre you sure that this is caused by the lock? \n\nAs said before the code will never reach the lock, because the double-checked locking idiom (see my above link to ReferenceQueue) will exit before the lock (line 98 in the above source code link). As classes in JDK are never unloaded unless you unload a web application, the reference queue will be always empty (means head==null in ReferenceQueue).\n\nAre you using special JVM flags like ConcMarkSweepGC's ClassUnloading feature? ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630112"
+        },
+        {
+            "date": "2013-04-12T14:46:29+0000",
+            "content": "FYI: This code is unchanged since Lucene 2.9!\n\nThat may be.  As far as this application is concerned, we achieved 1600% CPU usage when our TokenStreams were doing a lot more stuff.  We made them do a lot less, and started to run into this issue, preventing further performance improvements. ",
+            "author": "Karl Wright",
+            "id": "comment-13630116"
+        },
+        {
+            "date": "2013-04-12T14:50:23+0000",
+            "content": "Are you sure that this is caused by the lock?\n\nI did a number of thread dumps while indexing was running.  Each time I found 7-8 threads waiting with a trace like I've included here.\n\nAre you using special JVM flags like ConcMarkSweepGC's ClassUnloading feature?\n\nHere's the java invocation:\n\njava -cp \"../search-address/target/search-address-2.27.0-SNAPSHOT.jar\" -XX:NewRatio=10 -Xmx14g -Xms14g com.nokia.search.address.indexer.Indexer \"./addr_index/\" \"$1\"/countries.csv \"$1\"/cities.csv \"$1\"/zip_7.csv \"$1\"/streets.csv \"$1\"/cityAbbreviations.csv \"$1\"/streetAbbreviations.csv \"$2\"\n ",
+            "author": "Karl Wright",
+            "id": "comment-13630120"
+        },
+        {
+            "date": "2013-04-12T14:52:56+0000",
+            "content": "\nWe\u2019ve had to make significant changes to the way we were indexing in order to not hit this issue as much, such as indexing using TokenStreams which we reuse\n\nI don't buy it Karl. Reusing is really the only supported way to index in lucene 4.x if you are using the typical apis (e.g. Analyzer): you went significantly out of your way to avoid reusing, by using some kind of expert methods (Its not clear to me exactly what you are doing).\n\nEither that... or there is an API trap, that led you to believe you should be using such expert methods...\n\nCan you describe how you are indexing? I'd like to either remove the expert methods in question, or add warnings to them.\n\n\n, when it would have been more convenient to index with just tokens. (The reason is that Lucene internally creates TokenStream objects when you pass a token array to IndexableField, and doesn\u2019t reuse them, and the addAttribute() causes massive contention as a result.\n\nAgain I don't understand what you mean by token array etc. Its not clear what APIs you are using... can you be more specific? ",
+            "author": "Robert Muir",
+            "id": "comment-13630123"
+        },
+        {
+            "date": "2013-04-12T14:53:37+0000",
+            "content": "The reason is that Lucene internally creates TokenStream objects when you pass a token array to IndexableField, and doesn\u2019t reuse them,\n\nThats the source of the issue. The problem is not contention in thgis specific part (addAttribute), the source is the heavy cost of creating new TokenStreams. This was a change in Lucene 4.0 (I am not happy with it and Robert and me already discussed about it a while ago). In Lucene 3.x, for single token fields, IndexWriter/DocInverter had a private single-token AttributeSource reused for new fields. Unfortunately with StringField this is gone - and indeed it creates a new single-token TokenStream over and over. This should be fixed to behave like Lucene 3.x (reuse a SingeToken TokenStream in StringField). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630125"
+        },
+        {
+            "date": "2013-04-12T14:55:31+0000",
+            "content": "A complete thread dump of the application while running. ",
+            "author": "Karl Wright",
+            "id": "comment-13630127"
+        },
+        {
+            "date": "2013-04-12T14:56:38+0000",
+            "content": "\nUnfortunately with StringField this is gone - and indeed it creates a new single-token TokenStream over and over. This should be fixed to behave like Lucene 3.x (reuse a SingeToken TokenStream in StringField).\n\nI'd still just remove it: to me its BypassTheAnalyzerAndCauseConfusionField. ",
+            "author": "Robert Muir",
+            "id": "comment-13630130"
+        },
+        {
+            "date": "2013-04-12T15:00:28+0000",
+            "content": "The problem is: StringTokenStream in Field.java, instantiated every time and not reused. This was done in Lucene 3.x by DocInverterByThread#SingleTokenAttributeSource (which was reaused for the whole Lifetime). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630134"
+        },
+        {
+            "date": "2013-04-12T15:04:21+0000",
+            "content": "I'd still just remove it: to me its BypassTheAnalyzerAndCauseConfusionField.\n\nRobert, as I said earlier, we REMOVED the usage of IndexableField that used Tokens and not TokenStreams.  So I can't give you that code - it is gone.  I can believe that reuse is still not working 100% optimally.  But if you look at the trace you will definitely see quite a lot of contention going on in the place I specified above. ",
+            "author": "Karl Wright",
+            "id": "comment-13630142"
+        },
+        {
+            "date": "2013-04-12T15:07:14+0000",
+            "content": "An easy way to fix this would be:\n\n\tRemove StringTokenStream from Field.java\n\tUse a static, private KeywordAnalyzer for Field.java, so it would automatically reuse. You would then need to create a StringReader for every StringField, but that's cheaper.\n\n ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630148"
+        },
+        {
+            "date": "2013-04-12T15:09:40+0000",
+            "content": "But if you look at the trace you will definitely see quite a lot of contention going on in the place I specified above.\n\nThe contention is only related to StringField, see pool-1-thread-19: This one uses StringField (or a similar type using a StringField like FieldType)! The other ones are related, but you see it at another place.\n\nIf you dont use StringField and instead a KeywordAnalyzer, this would be fixed. If you can verify this, we are done (the fix is in my previous comment). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630153"
+        },
+        {
+            "date": "2013-04-12T15:11:26+0000",
+            "content": "An easy way to fix this would be:\n\nHi Uwe, would your proposed fix address the blocked threads in the trace I've attached?  I know it would address the IndexableField non-TokenStream methods, which would be better for us in the end, but I'm curious now.  The reason I ask is because I see precisely ONE Field$StringTokenStream in the entire trace.\n ",
+            "author": "Karl Wright",
+            "id": "comment-13630155"
+        },
+        {
+            "date": "2013-04-12T15:17:51+0000",
+            "content": "Hi Uwe, would your proposed fix address the blocked threads in the trace I've attached?\n\nYes, but its still strange that you see blocked threads at all. If you look at ReferenceQueue's source code, posted above, the double-checked locking using a volatile field would never run into the lock (if classes are not unloaded). The Map is quasi static: the reference queue should never contain any entries - this is strange here.\n\nTo your question: The problem is that StringField uses the internal Field#StringTokenStream which is never ever reused. By using KeywordAnalyzer inside Field.java this would be solved (with the cost of creating a StringReader for every String). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630164"
+        },
+        {
+            "date": "2013-04-12T15:21:13+0000",
+            "content": "I see the issue:\nIn Java 6, line 98 it does not use double checked-locking (6b14 - I dont know the difference between b and u): http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/java/lang/ref/ReferenceQueue.java\n\nBut in 6u23 it does: http://javasourcecode.org/html/open-source/jdk/jdk-6u23/java/lang/ref/ReferenceQueue.java.html\n\nSo the above fix would help in Java 6, for Java 7 the issue is not there.\n\nKarl: Can you check your code with Java 7 or latest Java 6? ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630172"
+        },
+        {
+            "date": "2013-04-12T15:24:32+0000",
+            "content": "Karl: Can you check your code with Java 7?\n\nI'll see if I can find a way; our systems are pretty constrained in that dimension.\n ",
+            "author": "Karl Wright",
+            "id": "comment-13630177"
+        },
+        {
+            "date": "2013-04-12T15:28:58+0000",
+            "content": "Can we get the exect OpenJDK patch level of your code? Java 6b14 is very old...? Maybe you can download the source code of the OpenJDK patch level you are using ad post line 98 (and around). But from the stack trace it looks like you have the antque ReferenceQueue.java with the missing double-checked locking. If this is the case, the problem is your old Java version, sorry. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630182"
+        },
+        {
+            "date": "2013-04-12T15:36:18+0000",
+            "content": "Java 6 update 14 was an especially buggy release. That even has the double parsing bug, which allows people to put the JVM into an infinite loop with specially formed doubles. And it has a very bad bug with the parallel GC which loses memory (and there is no workaround).\n\nUpdate 14 is from May 2009, so that is missing almost four years of bug fixes. I really don't think we should accept bug reports based on that JVM.\n\nSo at least update to the latest Java 6 immediately. Since Java 6 is no longer supported, you should move to Java 7, too. ",
+            "author": "Walter Underwood",
+            "id": "comment-13630188"
+        },
+        {
+            "date": "2013-04-12T15:42:26+0000",
+            "content": "We should still create a separate issue about making Field.java reuse its StringTokenStream, because also without the lock creating a new StringTokenStream for every single field instance is horrible. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630198"
+        },
+        {
+            "date": "2013-04-12T16:09:05+0000",
+            "content": "We should still create a separate issue about making Field.java reuse its StringTokenStream\n\n+1 ",
+            "author": "Michael McCandless",
+            "id": "comment-13630238"
+        },
+        {
+            "date": "2013-04-12T16:15:30+0000",
+            "content": "These are the related bugs at Sun/Oracle:\n\n\thttp://bugs.sun.com/view_bug.do?bug_id=6706797 (was fixed in 6u14, \"6b14\" is an ealier build - I never understand what u and b means in version numbers...)\n\thttp://bugs.sun.com/view_bug.do?bug_id=6525425 (it is also fixed in Java 5)\n\n\n\nYou should really upgrade your Java versions (ideally to real Oracle ones, not OpenJDK to be 100% sure that this bug is fixed). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630246"
+        },
+        {
+            "date": "2013-04-12T16:29:57+0000",
+            "content": "I created LUCENE-4931 for reusing the StringTokenStream in oal.document.Field. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630272"
+        },
+        {
+            "date": "2013-04-12T17:02:31+0000",
+            "content": "I have checked the java we are using and it is the lastest java 6 openjdk  available for ubuntu 12.04 LTS (6b24-1.11.5-0ubuntu1~12.04.1). \nThere is a newer one available for 12.10 (6b27-1.12.3-0ubuntu1~12.10.1) but still the issue is also not fixed in that version ... so there is no way around that code without upgrading to java 7 ...\n\nThe code snippet from the reference queue looks like follows:\n\n     89     /**\n     90      * Polls this queue to see if a reference object is available.  If one is\n     91      * available without further delay then it is removed from the queue and\n     92      * returned.  Otherwise this method immediately returns <tt>null</tt>.\n     93      *\n     94      * @return  A reference object, if one was immediately available,\n     95      *          otherwise <code>null</code>\n     96      */\n     97     public Reference<? extends T> poll() {\n     98         synchronized (lock) {\n     99             return reallyPoll();\n    100         }\n    101     }\n\n\n\nSo it seems that Uwe is right about our java version not doing the double checking here before actually entering the synchronized block.\n\nHowever I'm not really sure if I understand the reason for lucene to actually use a WeakKeyHashMap here:\nI may be wrong but wouldn't that reap actually only happen when the Interface class itself is unloaded? That should be an extremely rare thing, or? If I understand the purpose of that code correctly it is meant to prevent a memory wasting for cases where the user does incremental indexing from time to time. In that case the attribute source would prevent the interface class and implementation class from being garbage collected in the mean time. But is that case actually really worth the effort (I don't know how big the memory footprint for an Attribute implementation class usually is)? I mean that would only affect the static fields here (and in plain lucene I could not find many of those) ...\n ",
+            "author": "Christian Ziech",
+            "id": "comment-13630329"
+        },
+        {
+            "date": "2013-04-12T17:40:24+0000",
+            "content": "You should really upgrade your Java versions (ideally to real Oracle ones, not OpenJDK to be 100% sure that this bug is fixed).\n\nUnfortunately I don't think that is feasible at this time.  But I'll research that further and see if we can do that.  If not we will work around it somehow. ",
+            "author": "Karl Wright",
+            "id": "comment-13630388"
+        },
+        {
+            "date": "2013-04-12T17:55:19+0000",
+            "content": "Running 6b14 is a very dangerous thing. Anyone who can send an HTTP request to your servers can put a  thread into an infinite loop.  ",
+            "author": "Walter Underwood",
+            "id": "comment-13630409"
+        },
+        {
+            "date": "2013-04-12T18:13:12+0000",
+            "content": "Running 6b14 is a very dangerous thing. Anyone who can send an HTTP request to your servers can put a thread into an infinite loop. \n\nWe never were running b14.  We are running b24. ",
+            "author": "Karl Wright",
+            "id": "comment-13630426"
+        },
+        {
+            "date": "2013-04-12T18:48:14+0000",
+            "content": "Hi,\n\n\nHowever I'm not really sure if I understand the reason for lucene to actually use a WeakKeyHashMap here:\nI may be wrong but wouldn't that reap actually only happen when the Interface class itself is unloaded? That should be an extremely rare thing, or? If I understand the purpose of that code correctly it is meant to prevent a memory wasting for cases where the user does incremental indexing from time to time. In that case the attribute source would prevent the interface class and implementation class from being garbage collected in the mean time. But is that case actually really worth the effort (I don't know how big the memory footprint for an Attribute implementation class usually is)? I mean that would only affect the static fields here (and in plain lucene I could not find many of those) ...\n\nThe issue is not class unloading in your own application while it is running. The VM will never do this. It will only unload classes, when the ClassLoader is released. This happens e.g. when you redeploy your webapplication in your Jetty or Tomcat container or (and this is the most important reason) when you reload Solr cores: If you have a custom analyzer JAR file in your plugins directory that uses custom attributes (like lucene-kuromoji.jar Japanese Analyzer), your would have a memory leak. Solr loads plugins in its own classloader. If you restart a core it reinitializes its plugins and releases the old classloader. If the AttributeSource would refer to these classes, they could never be unloaded. The same happens if you have a webapp that uses a lucene-core.jar file from outside the webapp (e.g. from Ubuntu repository in /usr/lib), but has own analyzers shipped in the webapp. In that case, the classes could not be unloaded on webapp shutdown.\n\nThe WeakIdentityMap prevents this big resource leak (permgen issue). If you wonder: The values in the map also have a WeakReference, because the key's weak reference and the Map.Entry is only removed when you actually call get() on the map. If you unload the webapp, nobody calls get() anymore, so all Map.Entry would refer to the classes and are never removed.\n\nOne optimization might be possible: As the number of classes in this map is very low and the important thing is to release the class reference when no longer needed, we could add an option to WeakIdentityMap to make reap() a no-op. This would keep the WeakReference and Map.Entrys in the map, but the classes could get freed. The small overhead (you can count the number of entries on your fingers) would be minimal and the lost WeakReferences in the map would be no problem.\n\nAnother approach would be to make DefaultAttributeSource have a lookup table (without weak keys) on all Lucene-Internal attributes (which are the only ones actually used by IndexWriter). I would prefer this approach.\n\nIn general the big issue you see in Lucene 4.x is the fact that StringField does not reuse its TokenStream (see LUCENE-4931). This would be easy to fix. But this requires that you reuse StringField instances (like the primary key) in your Documents. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630472"
+        },
+        {
+            "date": "2013-04-12T19:04:46+0000",
+            "content": "Christian, Karl: This is clearly a bug in Ubuntu's OpenJDK. If you know the history of OpenJDK6, you know that it was forked somewhere around update 10 (in fact from a prerelease of Java 7) and then OpenJDK 6 and Sun Java 6 went their own way. Unfortunately not all patches to Sun's implemetation were ported over to OpenJDK 6.\n\nIn general OpenJDK 6 has lots of problems, so I would personally not recommend to use it in professional applications. Its very fast to download Java 6 from oracle for Linux x64 and untar the JDK. After that you can use it, it must not be installed system wide. E.g. on my Ubuntu servers I have no system wide java installed, I use the one installed locally in the user account that runs the application. The biggest problem is that every linux distribution has its own patches and its own version of IcedTea and version numbers are completely different. So you never know which patches are in.\n\nWith OpenJDK7 there are no problems, the code is almost 100% identical to Oracle's Java 7 (only some special cases like sound support has own implementations, because Oracle was not able to release the code). In Java 8 no proprietary code will be there at all. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630498"
+        },
+        {
+            "date": "2013-04-12T19:15:26+0000",
+            "content": "In general the big issue you see in Lucene 4.x is the fact that StringField does not reuse its TokenStream (see LUCENE-4931). This would be easy to fix. But this requires that you reuse StringField instances (like the primary key) in your Documents.\n\nThis was already fixed by me in an earlier commit: LUCENE-4317\n\nTo work around the issue, you should reuse your Field instances together with the Document instance. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630517"
+        },
+        {
+            "date": "2013-04-12T19:21:44+0000",
+            "content": "Uwe,\n\nOur systems are set up by puppet, which is not going to be able to download Oracle JVM installation instances.  But thanks for the suggestion and the explanation. ",
+            "author": "Karl Wright",
+            "id": "comment-13630524"
+        },
+        {
+            "date": "2013-04-12T19:42:26+0000",
+            "content": "\nThe issue is not class unloading in your own application while it is running. The VM will never do this. It will only unload classes, when the ClassLoader is released. This happens e.g. when you redeploy your webapplication in your Jetty or Tomcat container or (and this is the most important reason) when you reload Solr cores: If you have a custom analyzer JAR file in your plugins directory that uses custom attributes (like lucene-kuromoji.jar Japanese Analyzer), your would have a memory leak. Solr loads plugins in its own classloader. If you restart a core it reinitializes its plugins and releases the old classloader. If the AttributeSource would refer to these classes, they could never be unloaded. The same happens if you have a webapp that uses a lucene-core.jar file from outside the webapp (e.g. from Ubuntu repository in /usr/lib), but has own analyzers shipped in the webapp. In that case, the classes could not be unloaded on webapp shutdown.\nThe WeakIdentityMap prevents this big resource leak (permgen issue). If you wonder: The values in the map also have a WeakReference, because the key's weak reference and the Map.Entry is only removed when you actually call get() on the map. If you unload the webapp, nobody calls get() anymore, so all Map.Entry would refer to the classes and are never removed.\nOne optimization might be possible: As the number of classes in this map is very low and the important thing is to release the class reference when no longer needed, we could add an option to WeakIdentityMap to make reap() a no-op. This would keep the WeakReference and Map.Entrys in the map, but the classes could get freed. The small overhead (you can count the number of entries on your fingers) would be minimal and the lost WeakReferences in the map would be no problem.\nAnother approach would be to make DefaultAttributeSource have a lookup table (without weak keys) on all Lucene-Internal attributes (which are the only ones actually used by IndexWriter). I would prefer this approach.\n\nI totally understood the problem with the unloading of the keys (but I think I worded it badly) - I just did not expect it to be grave since every reload would only leave behind two dead weak references and the related map entry. \n\nA possibly better option than making reap a no-op could be to only reap on put. I mean one usually invokes get() but once that event of unloading an interface actually happens and something new needs to be added one would reap the old keys (in worst case perhaps one unloading later).\n\nI also tried to think of a good way to have one AttributeFactory per class loader (I mean you only really have a problem if the class loader that loads the interface class is a child of the class loader that did load the the AttributeFactory class) but couldn't find one. ",
+            "author": "Christian Ziech",
+            "id": "comment-13630542"
+        },
+        {
+            "date": "2013-04-12T20:05:09+0000",
+            "content": "Our systems are set up by puppet, which is not going to be able to download Oracle JVM installation instances.\n\nSomeone has automated the process: http://www.webupd8.org/2012/01/install-oracle-java-jdk-7-in-ubuntu-via.html ",
+            "author": "Shawn Heisey",
+            "id": "comment-13630561"
+        },
+        {
+            "date": "2013-04-12T22:04:55+0000",
+            "content": "A possibly better option than making reap a no-op could be to only reap on put. I mean one usually invokes get() but once that event of unloading an interface actually happens and something new needs to be added one would reap the old keys (in worst case perhaps one unloading later).\n\nThis is a good idea. The attached patch implements this (optionally). This makes our own implementation better for such use cases like the original WeakHashMap (which always reaps on get). As WeakIdentityMap is a internal API, I made the setting a required parameter on creation.\n\nCurrently I pass false for the maps which have few keys, many gets and where unlikely keys are removed by the garbage collector.\n\nFor e.g. MMapDirectory, I pass true (but it does not matter, as this map is never read, only one time on close() of the master ByteBufferIndexInput). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630679"
+        },
+        {
+            "date": "2013-04-12T22:47:51+0000",
+            "content": "Small change: If you get the valuesIterator, reap() is also called, because the iterator also cleans up references (and modifies the internal map). So reap() has to be called (because its a hidden write operation.\n\nOtherwise the patch is ready to commit. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630712"
+        },
+        {
+            "date": "2013-04-12T23:12:00+0000",
+            "content": "Javadocs fixes and CHANGES.txt entry. Will commit this tomorrow.\n\nThanks Christian for the good idea! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630740"
+        },
+        {
+            "date": "2013-04-13T09:27:09+0000",
+            "content": "New patch. I kept the default mode of operation (reapOnRead=true) as default to not break backwards compatibility.\n\nWill commit in a moment. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630991"
+        },
+        {
+            "date": "2013-04-13T09:39:38+0000",
+            "content": "Committed to 4.x and trunk!\nThansk Christian for the tip and to Karl for reporting the issue.\n\nIn any case, I would strongly recommend to report the bug to Ubuntu/IcedTea developers, because their OpenJDK6 variant contains contains a bug that is already fixed since Java 6u15.\nPlease note: This bug may be fixed for you while indexing, but e.g. FieldCache uses the default WeakHashMap in Lucene, so whenever some code retrives a field from the FieldCache, you have the sync bottleneck (but there is already other synchronization involved, so it may not be an issue at all). If you are using MMapDirectory with this broken JDK: On searching you may also get the same synchronization issue, because ByteBufferIndexInput relies on the WeakIdentityMap#put() operation (and really needs the cleanup, disabling reap() for puts would kill you JVM after a short time). Every search request that opens a TermsEnum, posting list,... will be affected. This is just a warning! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13630998"
+        },
+        {
+            "date": "2013-05-10T10:34:21+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13654193"
+        }
+    ]
+}

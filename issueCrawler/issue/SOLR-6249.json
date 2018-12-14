@@ -1,0 +1,285 @@
+{
+    "id": "SOLR-6249",
+    "title": "Schema API changes return success before all cores are updated",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.0"
+        ],
+        "components": [
+            "Schema and Analysis",
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "See SOLR-6137 for more details.\n\nThe basic issue is that Schema API changes return success when the first core is updated, but other cores asynchronously read the updated schema from ZooKeeper.\n\nSo a client application could make a Schema API change and then index some documents based on the new schema that may fail on other nodes.\n\nPossible fixes:\n1) Make the Schema API calls synchronous\n2) Give the client some ability to track the state of the schema.  They can already do this to a certain extent by checking the Schema API on all the replicas and verifying that the field has been added, though this is pretty cumbersome.  Maybe it makes more sense to do this sort of thing on the collection level, i.e. Schema API changes return the zk version to the client.  We add an API to return the current zk version.  On a replica, if the zk version is >= the version the client has, the client knows that replica has at least seen the schema change.  We could also provide an API to do the distribution and checking across the different replicas of the collection so that clients don't need ot do that themselves.",
+    "attachments": {
+        "SOLR-6249.patch": "https://issues.apache.org/jira/secure/attachment/12668504/SOLR-6249.patch",
+        "SOLR-6249_reconnect.patch": "https://issues.apache.org/jira/secure/attachment/12672447/SOLR-6249_reconnect.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14097263",
+            "date": "2014-08-14T17:37:58+0000",
+            "content": "Going to start working on this ... a few initial thoughts:\n\nZkIndexSchemaReader has a ZK watcher to receive notification when the schema is updated. So we're talking about a very small window of time between the updated schema being written and all replicas seeing the update. Consequently I think it's reasonable for the core that accepted the API request to block with a reasonable timeout to give all the active replicas time to apply the update. In other words, I don't think we should put the burden on the client to assess the success / failure of the operation across all replicas. I'll need to figure out what to block on but ZooKeeper's two-phase commit recipe sounds applicable here in that the tx coordinator (the core that accepted the API request) can block until all other replicas ack that they've applied the updates successfully. Alternatively, the coordinator could just poll each active replica for the schema version it is using (along the lines of what Gregory suggested above) with a maximum amount of time the coordinator is allowed to keep polling replicas.\n\nI also think a replica that cannot process the update successfully should be put into the down state (so as to prevent it from receiving update/query requests). The replica should initiate this action itself if the update fails so that we don't have replicas with mixed schemas running in the cluster. I'll need to dig into the ramifications of that, but my thinking here is if 1 replica applies the update successfully and another fails, then we probably still want the request to succeed from the client perspective and just put the replica having problems into the down state. I prefer this over the approach where an update must succeed on all \"active\" replicas or fail entirely, which gets us into the realm of distributed transactions for these types of updates, which is now hard because the write to ZooKeeper has already occurred (requiring compensating transaction type solutions where we'd need to back out the write). "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14097720",
+            "date": "2014-08-14T21:41:21+0000",
+            "content": "Just jotting down more notes ...\n\nForgot that a managed-schema can be shared across many collections (potentially hundreds) so that complicates the blocking idea. We could have the API call block until a random active replica returns the expected zkversion using a new endpoint I'm adding /schema/zkversion (with some timeout built-in to avoid blocking too long). The idea here is that if 1 other replica has the update, then likely all do, which is a little loose but this is just to alleviate the need for a client application to add any polling code in the client side. In other words, we'll block for a short amount of time (just enough that another replica has the update) which should be sufficient and allow the client to proceed with using the update.\n\nLooked into the two-phase commit recipe in ZK and that seems like overkill for this. \n\nSeems to me like less coordination here is best? In other words, instead of the core that accepts the update request worrying about all the other cores that are going to see the update, it just assumes it will be successful. If any of the remote cores fail in processing the update, then they mark themselves as \"down\". This seems to solve the root of the problem raised by this ticket, namely a replica using the wrong version of a managed schema. It's likely that a replica that can't process a good update successfully will need some manual intervention anyway (such as missing a JAR file or something). "
+        },
+        {
+            "author": "Gregory Chanan",
+            "id": "comment-14097774",
+            "date": "2014-08-14T22:07:14+0000",
+            "content": "Forgot that a managed-schema can be shared across many collections (potentially hundreds) so that complicates the blocking idea\n\nDo we need to support that?  It seems like an anti-pattern to me; I did it the first time I tried to use a managed schema and got confused why all my schemas were changing when I \"just\" changed one.  I'm sure other people have had the same experience.  I'm not sure how much that changes your analysis, just a thought. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14097783",
+            "date": "2014-08-14T22:17:19+0000",
+            "content": "The idea here is that if 1 other replica has the update, then likely all do, which is a little loose but this is just to alleviate the need for a client application to add any polling code in the client side.\n\nEven when all cores hosting shards in a collection are on the same box, as in unit testing, and even though all cores receive schema change notifications within single-digit milliseconds of each other, the time it takes to reload the schema can vary by hundreds of milliseconds.  \n\nSeems to me like less coordination here is best? In other words, instead of the core that accepts the update request worrying about all the other cores that are going to see the update, it just assumes it will be successful.\n\nBut that's the current situation, right?\n\nIf any of the remote cores fail in processing the update, then they mark themselves as \"down\". This seems to solve the root of the problem raised by this ticket, namely a replica using the wrong version of a managed schema.\n\nThis sounds like a good idea, though we'll have to be careful that a schema update that fails everywhere doesn't bring a collection down.\n\nAs I mentioned above, though, the root of the problem is about versioning differences that result from varying schema load time. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14097787",
+            "date": "2014-08-14T22:19:01+0000",
+            "content": "the time it takes to reload the schema can vary by hundreds of milliseconds.\n\nOne source of this: I noticed that it takes leaders longer to reload than non-leaders. "
+        },
+        {
+            "author": "Gregory Chanan",
+            "id": "comment-14097812",
+            "date": "2014-08-14T22:29:12+0000",
+            "content": "Seems to me like less coordination here is best? In other words, instead of the core that accepts the update request worrying about all the other cores that are going to see the update, it just assumes it will be successful. If any of the remote cores fail in processing the update, then they mark themselves as \"down\". This seems to solve the root of the problem raised by this ticket, namely a replica using the wrong version of a managed schema. It's likely that a replica that can't process a good update successfully will need some manual intervention anyway (such as missing a JAR file or something).\n\nSure, less coordination is best.  I think there are multiple issues here, though:\n1) how do we handle Schema API modifications failing on some replicas?\n2) if i'm a client and I want to update the schema and send some updates that are dependent on the updated schema, how do I do that?  Right now, it's a pain (and without a client-visible version it may get more complicated if we add more schema APIs, e.g. removing fields).\n\nI don't think the \"wait for one replica\" idea solves either of those issues. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14097834",
+            "date": "2014-08-14T22:41:00+0000",
+            "content": "the time it takes to reload the schema can vary by hundreds of milliseconds\n\nOk, makes sense ... not sure what to do about it ... polling across all replicas seems sub-optimal as well (not to mention it's expensive to even collect that information where there are many collections) ... maybe a happy medium is to check all replicas in the same collection only?\n\nBut that's the current situation, right?\n\nClose, but with one main difference: if the update fails on one of the replicas (but succeeds on others), the one experiencing the failure still remains \"active\" and serves requests, i.e. there is no code that actively puts this core into the down state, that will need to be added.\n\na schema update that fails everywhere doesn't bring a collection down.\n\nIf it fails on the core that accepts the API request, it won't get written to ZK (thus leaving the other replicas un-affected). I hope that's how it already works but haven't tested that yet.\n\nDo we need to support that? It seems like an anti-pattern to me;\n\nI think we do. If you don't want collections sharing configuration, why set it up that way when you create the collections? In other words, if you create two collections and re-use the same configuration, wouldn't you expect updates to propagate to both? It think it is a pretty common thing to share configuration across collections \u2013 why do you think this is an anti-pattern? "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14097854",
+            "date": "2014-08-14T22:50:04+0000",
+            "content": "how do we handle Schema API modifications failing on some replicas?\n\nMy thinking is that replica has to be marked down (which means it no longer participates in update request processing or query execution). Seems complicated to try to back-out updates on replicas where the changes were successful, but I'm willing to explore that route too if we think it's a better path to go down.\n\nif i'm a client and I want to update the schema and send some updates that are dependent on the updated schema, how do I do that?\n\nI'm adding the /schema/zkversion endpoint you suggested, so it will be available to the client. We can also have the server-side code poll for this across the collection (see previous comment)\n "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-14097952",
+            "date": "2014-08-15T00:08:48+0000",
+            "content": "I only have one little SolrCloud setup, but right now every one of the collections that it has is using the same configuration set. I would expect that if I update my schema, it would apply the changes to all my collections, because I made the deliberate decision for them to share that configuration. Can our instructions for SolrCloud easily result in a situation where a user has multiple collections sharing a configuration, and is unaware of that fact?\n\nThe only likely situation that I can imagine where a schema will work on one server but not another is if it relies on a class that's loaded from a jar in a local lib directory that doesn't exist on every server. I'm not sure how we would detect that and roll back changes made up to that point. "
+        },
+        {
+            "author": "Gregory Chanan",
+            "id": "comment-14098098",
+            "date": "2014-08-15T03:20:32+0000",
+            "content": "I only have one little SolrCloud setup, but right now every one of the collections that it has is using the same configuration set. I would expect that if I update my schema, it would apply the changes to all my collections, because I made the deliberate decision for them to share that configuration. Can our instructions for SolrCloud easily result in a situation where a user has multiple collections sharing a configuration, and is unaware of that fact?\n\nThe confusing thing for me was that the schema API calls are on the collection (collectioName/schema), not the configuration.  So, it looks like you are just modifying the collection rather than the configuration, and surprising that another collection was modified (i.e. it doesn't matter if I call collection1/schema or collection2/schema if they use the same configuration).  I wouldn't have been surprised if the endpoint was on the configuration somehow (not sure how that would work though).  If you really understand how everything works under the covers, I guess it makes sense.\n\nI'm not sure how much this matters either.  I guess the question is what we do on failures and whether only the collection endpoint you modify has to succeed or all of the collections that use the configuration have to succeed else we run th failure code. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14132319",
+            "date": "2014-09-12T23:43:43+0000",
+            "content": "Here's a patch that gives a client the option to wait a max number of seconds by passing the updateTimeoutSecs parameter. This triggers the core processing the schema update to block and poll all replicas of the collection until they apply the change or timeout occurs. An exception is thrown if timeout occurs. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14134433",
+            "date": "2014-09-15T20:27:21+0000",
+            "content": "Updated patch - ignore the previous one\n\nTest coverage for this feature integrated into the TestCloudManagedSchemaConcurrent class. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14137791",
+            "date": "2014-09-17T19:30:55+0000",
+            "content": "Review posted at https://reviews.apache.org/r/25742/ "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14137797",
+            "date": "2014-09-17T19:37:39+0000",
+            "content": "One more thought about your patch, Timothy Potter: this is a nice addition to the API, but what do users do after the timeout causes the request to fail?  Wait more and then what?  There's no way to (later) confirm consistency.  Maybe the schema API should support async mode, which would allow for clients to poll for completion. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14143846",
+            "date": "2014-09-22T21:18:17+0000",
+            "content": "This mechanism is mainly a convenience for the client to not have to poll the zk version from all replicas themselves. If timeout occurs, then either A) one or more of the replicas couldn't process the update or B) one or more of the replicas was just being really slow. If A, then really the client app can't really proceed safely without resolving the root cause. Not really sure what to do about this without going down the path of having a distributed transaction that allows us to rollback updates if any replicas fail.\n\nIf B, the client can wait more, but then they would have to poll all the replicas themselves, which makes client's implement this same polling solution on their side as well, thus not very convenient.\n\nOne thing would could do to help make it more convenient for dealing with B and even possibly A is to use the solution I proposed for SOLR-6550 to pass back the URLs of the replicas that timed out using the extended exception metadata. That at least narrows the scope for the client but still inconvenient.\n\nAlternatively, async would work but at some point, doesn't the client have to give up polling? Hence we're back to effectively having a timeout. I took this ticket to mean that a client doesn't want to proceed with more updates until it knows all cores have seen the current update, so async seems to just move the problem out to the client. \n\nI'm happy to implement the async approach but from where I sit now, I think we should build distributed 2-phase commit transaction support into managed schema as it will be useful going forward for managed config. That way, clients can make a change and then be certain it was either applied entirely or not at all and their cluster remains in a consistent state. This of course would only be applied to schema and config changes so I'm not talking about distributed transactions for Solr in general. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14147834",
+            "date": "2014-09-25T15:05:29+0000",
+            "content": "Took a slightly different approach when waiting to see changes applied across all replicas after discussing this issue with Noble Paul. Essentially, instead of polling each replica until their zk schema version matches the expected, I'm now sending a GET request like: /schema/zkversion?refreshIfBelowVersion=N where N=expected version after saving the updates to ZooKeeper. This tells the replica to proactively refresh the schema if its current version is less than the value of the refreshIfBelowVersion parameter. Of course in a healthy cluster, the watcher on the managed-schema znode will likely fire long before this request comes in, which is why the refreshIfBelowVersion parameter is needed as we don't want to hit ZooKeeper more than necessary. This approach also blocks while the schema is being refreshed so we're not having to send multiple network requests to poll for the version.\n\nMoreover, if the refresh fails, then likely that replica's ZooKeeper session has expired or something bad like that so that core will go down and need to recover.\n\nOne thing to note here is that technically a GET request can make changes (if the refresh fires) which breaks pure REST principles. So I can easily move the refresh stuff out to a separate endpoint but it seemed more intuitive to just hang this off of the /schema/zkversion endpoint to me. In other words, a conditional PUT seemed just as ugly to me in this case. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14148967",
+            "date": "2014-09-26T09:28:59+0000",
+            "content": "I would have preferred to move the ZK watch to ZkStateReader . This will fail in case the zkclient is closed and a new one is opened. ZkStateReader should have an method watchNode(String , listener) and unwatchNode(String, listener) .\n\nI wonder if this watching all nodes is a scalable way because we will have to watch every single entry in the conf dir . A better idea is to just watch the /conf dir for chldren changed and the listener can lookup the versions of each files and update them locally "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14149189",
+            "date": "2014-09-26T14:13:08+0000",
+            "content": "A better idea is to just watch the /conf dir for chldren changed and the listener can lookup the versions of each files and update them locally\n\nThere can be directory children in the conf/ dir, e.g. lang/, and AFAIK, the children changed watch only applies to direct children, not recursively. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14149209",
+            "date": "2014-09-26T14:21:40+0000",
+            "content": "you are right, \nBut this model is not scalable at all.\n\nWe can keep a empty node under /conf and just update it everytime  any file is modified. It is much better to watch only one node  "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14149236",
+            "date": "2014-09-26T14:53:06+0000",
+            "content": "We can keep a empty node under /conf and just update it everytime any file is modified. It is much better to watch only one node\n\nThat won't work when people upload changes via external tools. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14149629",
+            "date": "2014-09-26T16:56:41+0000",
+            "content": "I don't think we should support users writing directly to zk. It will be a performance problem in the future "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14149889",
+            "date": "2014-09-26T19:54:13+0000",
+            "content": "Sure, makes sense: aim for a system that doesn't require direct zk access.  We're definitely not there yet, so we can't depend on this.  Specifically for this issue, we can't design a system that depends on users not writing directly to zk.  Right now, writing directly to zk is the only way to modify files not covered by our APIs. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14150369",
+            "date": "2014-09-27T03:34:23+0000",
+            "content": "Use account \"steve_rowe\" instead I agree with you . It is desirable  to support direct manipulation of ZK entries\n.But  ,we can still manage with a single watch for children for all files directly under /conf . When we are implementing the other features we can do something else. I don't foresee any problem because we go with this approach "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14151140",
+            "date": "2014-09-28T16:34:53+0000",
+            "content": "Refining our watcher strategy for conf znodes is definitely important but seems like it should be tackled in a separate JIRA ticket? Any further thoughts on the issues this ticket is trying to address specifically? If not, I'll commit to trunk. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14151162",
+            "date": "2014-09-28T17:52:44+0000",
+            "content": "yeah , you are right.\nLet's get this out of the way . I shall open another one. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14151690",
+            "date": "2014-09-29T13:41:06+0000",
+            "content": "Commit 1628181 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1628181 ]\n\nSOLR-6249: Schema API changes return success before all cores are updated "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14151702",
+            "date": "2014-09-29T14:01:04+0000",
+            "content": "Does it take care of zkclient losing connections? I "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14151776",
+            "date": "2014-09-29T15:12:24+0000",
+            "content": "It uses ZkIndexSchemaReader, which under the covers calls:\n\n{{        byte[] data = zkClient.getData(managedSchemaPath, watcher, stat, true);   }}\n\nThe last param says to retry on connection loss. Do you think we need to do more than this? "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14151786",
+            "date": "2014-09-29T15:24:29+0000",
+            "content": "I'm afraid , it is not sufficient. It just retries if the connection is lost in the getData() call. It does not take care of the case where the watcher is lost because of a zkclient failure. \n\nThe correct example is the constructor of ZkStateReader\n\n\n   zkClient = new SolrZkClient(zkServerAddress, zkClientTimeout, zkClientConnectTimeout,\n        // on reconnect, reload cloud info\n        new OnReconnect() {\n            //implement stuff here\n         }\n        });\n\n\n\nthis ensures that the watchers are persisted across reconnect.\n\nThis is why I suggested the ZkStateReader is the right place to set watchers "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14151809",
+            "date": "2014-09-29T15:41:08+0000",
+            "content": "Ok, that makes sense but seems like a generic issue vs. specific to this class. We could solve this specifically right now doing what you suggest but rather than polluting ZkStateReader with utility methods for setting watchers, I think we should have a generic watcher support class. ZkStateReader's job is to handle collection state right? It's not some generic ZK utility class that the rest of the code should use. There should be a ticket for refactoring any code that sets a watcher to do it correctly, including ZkIndexSchemaReader, or is this the only place in the code that doesn't set a watcher correctly? "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14151818",
+            "date": "2014-09-29T15:45:37+0000",
+            "content": "I was just giving out an easy solution.This logic can be pushed to SolrZkClient and ZkStateReader and everyone else can use it from there.  "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14151842",
+            "date": "2014-09-29T16:04:06+0000",
+            "content": "Sure but I'm tired of all this tribal knowledge around how to do something right in the code. We need a clear path for future coders to follow and it seems like a watcher support class is the right solution. I've opened SOLR-6571 please make comments there. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14151850",
+            "date": "2014-09-29T16:11:21+0000",
+            "content": "This is not really tribal knowledge - it's ZooKeeper 101. Watchers do no persist across session timeouts and you need to re-create any watchers on reconnecting after a session timeout. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14151854",
+            "date": "2014-09-29T16:14:22+0000",
+            "content": "Ok fair enough .... clearly the implementer of ZkIndexSchemaReader (not me) missed that day. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-14151860",
+            "date": "2014-09-29T16:17:48+0000",
+            "content": "The fault is all mine.  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14151861",
+            "date": "2014-09-29T16:18:26+0000",
+            "content": "The last param says to retry on connection loss. Do you think we need to do more than this?\n\nAgain, ZooKeeper 101.\n\nYou can lose the ZK connection generally in two ways:\n\n\n\tConnectionLoss\n\tSessionExpiration\n\n\n\nWhen you lose the connection due to ConnectionLoss, all the Watches remain. You have a couple choices - you can retry and hope the connection is reestablished, or do something else (see the leader election algorithm for an example of needing to do something else). Usually, you want to retry until you get a session expiration. That is what passing true as the final param does for you - it handles ConnectionLoss in the way you want to handle it 99% of the time.\n\nSessionExpiration means the connection was lost for too long. Watches do not span sessions. In this case, when you reconnect to ZooKeeper, it's pretty use case specific how you need to handle things, but at a minimum, it usually means re-creating any watches. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14151926",
+            "date": "2014-09-29T17:26:46+0000",
+            "content": "I'll commit another fix to address the watcher re-connect issue for ZkIndexSchemaReader. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14155734",
+            "date": "2014-10-01T22:56:20+0000",
+            "content": "Here's an additional patch that addresses the ZkIndexSchemaReader watcher reconnect issue discussed in the comments.\n\nNoble Paul please take a quick look. I know you recommended integrating this into ZkStateReader, but I did it in ZkController instead because on the server-side, ZkStateReader actually uses the OnReconnect implementation in ZkController. The basic idea here is that any component that sets up a watcher can register an OnReconnect listener with ZkController to be called after a reconnected Zk session; see the command method in ZkIndexSchemaReader for an example.\n\nIf this looks acceptable to everyone watching, I'll commit and then backport to branch_5x "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14156712",
+            "date": "2014-10-02T16:24:17+0000",
+            "content": "Here's an updated patch for the reconnect issue with some unit testing added to verify the watcher fires correctly after a zk session expiration. I think this is good to go. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14157709",
+            "date": "2014-10-03T05:49:36+0000",
+            "content": "do we need to make a copy here in ZkController? the only synchronization is on reconnectListeners and it's OK if new listeners addition should wait.\n\nOnReconnect[] toNotify = null;\n              synchronized (reconnectListeners) {\n                toNotify = reconnectListeners.toArray(new OnReconnect[0]);\n              }\n\n\n\nthe rest seems to be fine "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14158089",
+            "date": "2014-10-03T15:28:42+0000",
+            "content": "Commit 1629229 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1629229 ]\n\nSOLR-6249: support re-establishing a new watcher on the managed schema znode after zk session expiration. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14158134",
+            "date": "2014-10-03T16:07:00+0000",
+            "content": "Commit 1629246 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1629246 ]\n\nSOLR-6249: support re-establishing a new watcher on the managed schema znode after zk session expiration. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14332593",
+            "date": "2015-02-23T05:00:51+0000",
+            "content": "Bulk close after 5.0 release. "
+        }
+    ]
+}

@@ -1,0 +1,126 @@
+{
+    "id": "SOLR-11216",
+    "title": "Race condition in peerSync",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [
+            "7.5",
+            "master (8.0)"
+        ],
+        "affect_versions": "7.4",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "When digging into SOLR-10126. I found a case that can make peerSync fail.\n\n\tleader and replica receive update from 1 to 4\n\treplica stop\n\treplica miss updates 5, 6\n\treplica start recovery\n\t\n\t\treplica buffer updates 7, 8\n\t\treplica request versions from leader,\n\t\tin the same time leader receive update 9, so it will return updates from 1 to 9 (for request versions) when replica get recent versions ( so it will be 1,2,3,4,5,6,7,8,9 )\n\t\treplica do peersync and request updates 5, 6, 9 from leader\n\t\treplica apply updates 5, 6, 9. Its index does not have update 7, 8 and maxVersionSpecified for fingerprint is 9, therefore compare fingerprint will fail",
+    "attachments": {
+        "SOLR-11216.patch": "https://issues.apache.org/jira/secure/attachment/12927469/SOLR-11216.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-11-21T01:07:16+0000",
+            "content": "Cao Manh Dat\nCan this fail if the leader processes updates out of order e.g. what if leader processed updates in the order 6 and has yet to process 5. Now the replica requests update 6. However, leader has just finished processing 5 (including a soft/hard commit) and when leader calculates index fingerprint up to 6, the leader's fingerprint will include version 5 as well. \n\nConsidering all the race conditions, I think making fingerprint robust is tricky.  ",
+            "author": "Pushkar Raste",
+            "id": "comment-16260117"
+        },
+        {
+            "date": "2018-06-11T04:22:54+0000",
+            "content": "The problem here relates to \"on-wire\" updates which get returned in \"getVersions\" request but do not present in replica's buffering tlog. Here are couples of solution\n\n\tSolution 1: After submitting \"getVersions\" request, the replica will wait for some time. Therefore \"on-wire\" updates will land on buffering tlog. This is the simplest solution but less robust than solution 2.\n\tSolution 2: On finding missed updates, the replica will consider buffered updates as missed one. Hence will request these updates from the leader and apply them to its local index -> It will make the fingerprint comparison success.\n\tSolution 3: On finding missed updates, the replica will consider any updates with version larger than minVersion(buffered updates) are non-missed updates (the \"on-wire\" updates will be filled on applyBufferedUpdates() call). We only do fingerprint comparison up-to minVersion(buffered updates).\n\n\n\nI kinda like Solution 3 because of its efficient and robust, but it comes with the cost of complexity and the effort for proof it. \n\nPushkar Raste Yeah, that case will be very tricky to solve, but at least we should solve some common cases. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16507649"
+        },
+        {
+            "date": "2018-06-12T14:34:04+0000",
+            "content": "Attached a patch for this ticket, based on Solution 3. It needs more test, but the overall result seems good. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16509691"
+        },
+        {
+            "date": "2018-06-12T17:58:27+0000",
+            "content": "from 20,000 foot level. Any time based solution is just brittle, solution 2 sounds like a workaround. solution 3 seems to fit the bill.\n\n\u00a0 ",
+            "author": "hamada",
+            "id": "comment-16509971"
+        },
+        {
+            "date": "2018-06-13T11:53:48+0000",
+            "content": "After spent a day adding more test and debugging test's failures. I think that with the current IndexFingerprint implementation we can't go with Solution 3.\nFirstly, to go with Solution 3, we must compute the fingerprint of the index up to a specified point. But just by looking at the current index, we can't do that. Ie:\nA leader :\n\n\twith updates: doc1(v=0), doc2(v=1), doc3(v=3), delete(doc3, v=4), doc2(v=5).\n\tits index will be: doc1(v=0), doc2(v=5)\n\n\n\nA replica :\n\n\twith index: doc1(v=0), doc2(v=1)\n\n\n\nCase 1:\nA replica asks for updates and fingerprint up to (include) v=3. The Leader will return updates doc3(v=3)\n\n\tleader's fingerprint will be hash of doc1(v=0) (it will skip doc2, since its version = 5 > specified version 3)\n\treplica' fingerprint will be hash of  doc1(v=0), doc2(v=1), doc3(v=3)\n-> incorrect fingerprint.\n\n\n\nThere are many other cases which are very tricky to solve. Therefore I think the best thing to do now is Solution 2. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16511004"
+        },
+        {
+            "date": "2018-06-13T11:55:28+0000",
+            "content": "Attached patch for anyone wants to reproduce problems of Solution 3. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16511005"
+        },
+        {
+            "date": "2018-06-15T14:30:53+0000",
+            "content": "Attached patch for Solution 2. Created a new class PeerSyncWithLeader with some duplications with its original class (PeerSync) but what we will gain here is an easier to understand flow (fewer flags) and optimized for doing peerSync on recovery.\nAny objections about this separations? Shalin Shekhar Mangar Mark Miller ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16513887"
+        },
+        {
+            "date": "2018-06-15T17:02:37+0000",
+            "content": "General review comments, some not related to the patch but relevant In general.\n\nPeerSyncWithLeader\u00a0\n\nuse\u00a0\n\nstartingVersions.isEmpty() rather than size() == 0, same for 215\n\nThe following try/finally can return, in which case proc is not closed, Is this intentional, and if so please add a comment to the effect\n\nline 299, consider sizing the List properly to avoid \u00a0garbage side effect from growing the list, same applies to line 317\n\n\u00a0\n\nHttpShardHandler.java\u00a0\n\nif (urls.size()==0) { with\u00a0if (urls.isEmpty()) {\n\n\u00a0\n\nRecoveryStrategy.java\n\nline 223 and 613, 235 (on\u00a0core.getDeletionPolicy().getLatestCommit().getGeneration())\u00a0may result in an NPE\u00a0\n\nline 436\u00a0\n\nSolrQueryRequest req = new LocalSolrQueryRequest(core,\n new ModifiableSolrParams());\u00a0\n\nrequest is not safely closed, is this intentional? won't this break the reference count mechanism?\n\n\u00a0\n\n\u00a0 ",
+            "author": "hamada",
+            "id": "comment-16514102"
+        },
+        {
+            "date": "2018-06-15T19:03:10+0000",
+            "content": "\nSolrQueryRequest req = new LocalSolrQueryRequest(core,\nnew ModifiableSolrParams()); \n\nrequest is not safely closed, is this intentional? won't this break the reference count mechanism?\n\nYeah, it does look like it should be closed.  A SolrQueryRequest grabs a searcher reference on-demand, so that may be why it isn't causing an issue with any tests (the commit command doesn't grab a searcher reference with the provided request).  It should be fixed anyway though.\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-16514244"
+        },
+        {
+            "date": "2018-06-15T23:41:37+0000",
+            "content": "Thank guys for your reviews. This is a rough patch which needs to change/move things around to make it cleaner. To be more clear the process of the new PeerSync (PeerSyncWithLeader) is\n\n\tReplica gets its recent updates versions\n\tReplica requests recent updates versions + fingerprint from the leader\n\tReplica requests missed updates (updates in buffer tlog are considered missed updates) up to leader's fingerprint.maxVersionEncountered\n\tReplica apply missed updates then compare its fingerprint with leader's fingerprint in step 2\n\n\n\nThe reason for getting the fingerprint in step 2 is we do not trust fingerprint.maxVersionSpecified. Therefore we must use the fingerprint of the leader with fingerprint.maxVersionSpecified==Long.MAX_VALUE (or fingerprint of leader's index at the time of step 2). We may need to block updates between getting recent versions and computing fingerprint on the leader's side, but let do it later.\n\nBy request updates up to fingerprint.maxVersionEncountered. We will make sure that after apply updates, replica.maxVersionEncountered will equal with the leader, hence its fingerprint will be the same as the leader.\n\nAnother optimization here is on step 3, instead of considering buffered updates as missed updates, we just need to memo the buffered updates need to be applied on step 4.\n\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16514525"
+        },
+        {
+            "date": "2018-06-18T04:24:23+0000",
+            "content": "Attached a patch with refactoring. The code seems much cleaner now. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16515335"
+        },
+        {
+            "date": "2018-06-19T07:20:47+0000",
+            "content": "Attached a patch including the optimization metionted above, including more javadocs and TODO notes. I will beast the test with PeerSyncReplicationTest to make sure it works correct.\nIf the result ok and no objections, I will commit the patch soon. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16516747"
+        },
+        {
+            "date": "2018-06-20T15:59:36+0000",
+            "content": "Committed: https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;a=commit;h=daff67e27931680c783485bdd197ef65c47971fe  ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16518315"
+        },
+        {
+            "date": "2018-06-25T16:18:40+0000",
+            "content": "Policeman Jenkins found a reproducing seed for a TestStressCloudBlindAtomicUpdates.test_dv_idx() failure that git bisect blames on commit 412116f on this issue https://jenkins.thetaphi.de/job/Lucene-Solr-7.x-Linux/2190/:\n\n\nChecking out Revision 82b793df56c8c9fb50c29f46f39465453a87f2b2 (refs/remotes/origin/branch_7x)\n[...]\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestStressCloudBlindAtomicUpdates -Dtests.method=test_dv_idx -Dtests.seed=9E9025C836D166FA -Dtests.multiplier=3 -Dtests.slow=true -Dtests.locale=ga -Dtests.timezone=Europe/Monaco -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] FAILURE 11.4s J1 | TestStressCloudBlindAtomicUpdates.test_dv_idx <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: Some docs had errors -- check logs expected:<0> but was:<7>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([9E9025C836D166FA:BEC5000EA0DCB1B]:0)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressCloudBlindAtomicUpdates.checkField(TestStressCloudBlindAtomicUpdates.java:342)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressCloudBlindAtomicUpdates.test_dv_idx(TestStressCloudBlindAtomicUpdates.java:231)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:748)\n[...]\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene70), sim=RandomSimilarity(queryNorm=true): {}, locale=ga, timezone=Europe/Monaco\n   [junit4]   2> NOTE: Linux 4.13.0-41-generic i386/Oracle Corporation 1.8.0_172 (32-bit)/cpus=8,threads=1,free=238679536,total=536870912\n\n ",
+            "author": "Steve Rowe",
+            "id": "comment-16522479"
+        },
+        {
+            "date": "2018-06-26T08:12:07+0000",
+            "content": "Another reproducing seed from https://jenkins.thetaphi.de/job/Lucene-Solr-BadApples-master-Linux/56/:\n\n\nChecking out Revision 095f9eb90db92649a0805e83ff5a0ec93763a31f (refs/remotes/origin/master)\n[...]\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestStressCloudBlindAtomicUpdates -Dtests.method=test_dv_idx -Dtests.seed=3006617022AC9671 -Dtests.multiplier=3 -Dtests.slow=true -Dtests.badapples=true -Dtests.locale=de -Dtests.timezone=Etc/GMT+5 -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n   [junit4] FAILURE 14.5s J1 | TestStressCloudBlindAtomicUpdates.test_dv_idx <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: Some docs had errors -- check logs expected:<0> but was:<4>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([3006617022AC9671:A57A14B8FE703B90]:0)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressCloudBlindAtomicUpdates.checkField(TestStressCloudBlindAtomicUpdates.java:342)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressCloudBlindAtomicUpdates.test_dv_idx(TestStressCloudBlindAtomicUpdates.java:231)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:748)\n   [junit4]   2> 1499188 INFO  (TEST-TestStressCloudBlindAtomicUpdates.test_dv_stored-seed#[3006617022AC9671]) [    ] o.a.s.SolrTestCaseJ4 ###Starting test_dv_stored\n[...]\n\n\n ",
+            "author": "Steve Rowe",
+            "id": "comment-16523391"
+        },
+        {
+            "date": "2018-07-03T02:03:14+0000",
+            "content": "Commit d38a1753d5f5a5e265743d262a6e158d0bdfb870 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d38a1753 ]\n\nSOLR-11216: Fix test failures, since the new PeerSyncWithLeader won't open a realtime searcher everytime ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16530683"
+        },
+        {
+            "date": "2018-07-03T02:04:14+0000",
+            "content": "Commit 32ccf6132614677b6bcef2f159a05d211284f3b1 in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=32ccf61 ]\n\nSOLR-11216: Fix test failures, since the new PeerSyncWithLeader won't open a realtime searcher everytime ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16530699"
+        }
+    ]
+}

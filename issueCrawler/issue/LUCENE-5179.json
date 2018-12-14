@@ -1,0 +1,84 @@
+{
+    "id": "LUCENE-5179",
+    "title": "Refactoring on PostingsWriterBase for delta-encoding",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Sub-task",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "A further step from LUCENE-5029.\n\nThe short story is, previous API change brings two problems:\n\n\tit somewhat breaks backward compatibility: although we can still read old format,\n  we can no longer reproduce it;\n\tpulsing codec have problem with it.\n\n\n\nAnd long story...\n\nWith the change, current PostingsBase API will be like this:\n\n\n\tterm dict tells PBF we start a new term (via startTerm());\n\tPBF adds docs, positions and other postings data;\n\tterm dict tells PBF all the data for current term is completed (via finishTerm()),\n  then PBF returns the metadata for current term (as long[] and byte[]);\n\tterm dict might buffer all the metadata in an ArrayList. when all the term is collected,\n  it then decides how those metadata will be located on disk.\n\n\n\nSo after the API change, PBF no longer have that annoying 'flushTermBlock', and instead\nterm dict maintains the <term, metadata> list.\n\nHowever, for each term we'll now write long[] blob before byte[], so the index format is not consistent with pre-4.5.\nlike in Lucne41, the metadata can be written as longA,bytesA,longB, but now we have to write as longA,longB,bytesA.\n\nAnother problem is, pulsing codec cannot tell wrapped PBF how the metadata is delta-encoded, after all\nPulsingPostingsWriter is only a PBF.\n\nFor example, we have terms=[\"a\", \"a1\", \"a2\", \"b\", \"b1\" \"b2\"] and itemsInBlock=2, so theoretically\nwe'll finally have three blocks in BTTR: [\"a\" \"b\"]  [\"a1\" \"a2\"]  [\"b1\" \"b2\"], with this\napproach, the metadata of term \"b\" is delta encoded base on metadata of \"a\". but when term dict tells\nPBF to finishTerm(\"b\"), it might silly do the delta encode base on term \"a2\".\n\nSo I think maybe we can introduce a method 'encodeTerm(long[], DataOutput out, FieldInfo, TermState, boolean absolute)',\nso that during metadata flush, we can control how current term is written? And the term dict will buffer TermState, which\nimplicitly holds metadata like we do in PBReader side.\n\nFor example, if we want to reproduce old lucene41 format , we can simple set longsSize==0, then PBF\nwrites the old format (longA,bytesA,longB) to DataOutput, and the compatible issue is solved.\nFor pulsing codec, it will also be able to tell lower level how to encode metadata.",
+    "attachments": {
+        "LUCENE-5179.patch": "https://issues.apache.org/jira/secure/attachment/12598495/LUCENE-5179.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-08-16T17:08:18+0000",
+            "content": "Patch for branch3069, tests pass for all 'temp' postings format. ",
+            "author": "Han Jiang",
+            "id": "comment-13742399"
+        },
+        {
+            "date": "2013-08-16T20:07:32+0000",
+            "content": "So, the idea with this patch is to go back to letting the PBF encode\nthe metadata for the term?  Just, one term at a time, not the whole\nblock that we have on trunk today.\n\nAnd the reason for this is back-compat?  Ie, so that in test-framework\nwe can have writers for the old formats?\n\nOne thing that this change precludes is having the terms dict use\ndifferent encodings than simple delta vInt to encode the long[]\nmetadata, e.g. Simple9/16 or something?  But that's OK ... we can\nexplore those later.\n\nIt's sort of frustrating to have to compromise the design just for\nback-compat ... e.g. we could instead cheat a bit, and have the\nwriters write the newer format.  It's easy to make the readers read\neither format right?\n\nBut ... I don't understand how this change helps Pulsing, or rather\nwhy Pulsing would have trouble w/ the API we have today? ",
+            "author": "Michael McCandless",
+            "id": "comment-13742561"
+        },
+        {
+            "date": "2013-08-16T20:33:31+0000",
+            "content": "Is it for real back compat or for \"impersonation\" ? ",
+            "author": "Robert Muir",
+            "id": "comment-13742575"
+        },
+        {
+            "date": "2013-08-16T21:12:17+0000",
+            "content": "I believe it's for impersonation.  Real back-compat (reader can read the old index format using the new APIs) should work fine, I think? ",
+            "author": "Michael McCandless",
+            "id": "comment-13742605"
+        },
+        {
+            "date": "2013-08-16T22:25:55+0000",
+            "content": "we have had imperfect impersonation before (For example PreFlexRWFieldInfosReader).\n\nBut the idea was to exercise to the best extent possible: e.g. if somehow we can make a Reader in the \"RW\" package (impersonator) that subclasses the \"real\" reader and overrides the term metadata piece, at least we are still testing the postings lists and term bytes and so on.\n\nand the real reader in lucene/core still gets some basic tests from TestBackwardsCompatibility. ",
+            "author": "Robert Muir",
+            "id": "comment-13742665"
+        },
+        {
+            "date": "2013-08-17T01:42:46+0000",
+            "content": "Is it for real back compat or for \"impersonation\" ?\nReal back-compat (reader can read the old index format using the new APIs) should work fine, I think?\n\nYes, this should be 'impersonation', but actually the back-compat I mentioned is a weak requirement.\nI'm not happy with this revert as well, so let's see if we can do something to hack it! \n\nThe strong requirement is, if we need pulsing work with the new API, there should be something to tell pulsing how to encode each term.\n\nIdeally pulsing should tell term dict longsSize=0, while maintaining wrapped PF's longsSize.\n\nThe calling chain is:\n\n\n termdict ~~finishTermA(long[0], byte[]...)~> pulsing ~~finishTermB(long[3], byte[]...)~> wrappedPF\n\n\n\nTake the terms=[ \"a\" \"a1\" ... ] example, when term \"b\" is finished:\n\nthe wrappedPF will fill long[] and byte[] with its metatdata, and pulsing will instead fills byte[]\nas its 'fake' metadata. When term is not inlined, pulsing will have to encode wrapped PF's long[] into byte[],\nbut its too early! Since term \"b\" should be delta-encoded with term \"a\", and pulsing will never know this...\n\nIf we only need pulsing to work, there is a trade off: the pulsing returns wrapped PF's longsSize,\nand term dict can do the buffering. For Lucene41Pulsing with position+payloads, we'll have to write 3 zero VLong,\nalong with the pulsing byte[] for an inlined term... and it's not actually 'pulsing' then.\n\n\n ",
+            "author": "Han Jiang",
+            "id": "comment-13742787"
+        },
+        {
+            "date": "2013-08-17T01:58:03+0000",
+            "content": "By the way, Mike, I think this change doesn't preclude the Simple9/16 encoding you mentioned.\n\nYou can have a look at the changed TempFSTTermsWriter, here we always pass 'true' to encodeTerm, \nso PBF will not do any delta encoding. Instead FST takes the responsibility. \n\nWhen we need to block encode the long[] for a whole term block, term dict can simply buffer all the \nlong[] returned by encodeTerm(...,true), then use the compressin algorithm.\n\nWhether to do VLong/delta encode is still decided by term dict, not PBF.'encodeTerm' only operates \n'delta-encode', and provde PBF the chance to know how current term is flushed along with other terms. ",
+            "author": "Han Jiang",
+            "id": "comment-13742792"
+        },
+        {
+            "date": "2013-08-17T10:36:33+0000",
+            "content": "\nWhen we need to block encode the long[] for a whole term block, term dict can simply buffer all the \nlong[] returned by encodeTerm(...,true), then use the compressin algorithm.\n\nOh, that's great!\n\nOK, and I understand how Pulsing makes this tricky (it always does!), so I think the .encodeTerm approach is a good solution?  Let's go with that?\n\nI wonder if (later!) we could allow the PBF to determine how many longs are needed on a term by term basis ... e.g. encodeTerm could return an int saying how many longs it used.  At decode time the PBF would have to look only at the existing stats for the term (docFreq, tTF) and then tell the terms dict how many longs to decode for that term.  But let's not pursue this now ... top priority is getting the branch ready to merge back to trunk! ",
+            "author": "Michael McCandless",
+            "id": "comment-13742895"
+        },
+        {
+            "date": "2013-08-17T10:57:29+0000",
+            "content": "Thanks! I'll commit. ",
+            "author": "Han Jiang",
+            "id": "comment-13742902"
+        },
+        {
+            "date": "2013-08-17T10:59:27+0000",
+            "content": "Commit 1514978 from Han Jiang in branch 'dev/branches/lucene3069'\n[ https://svn.apache.org/r1514978 ]\n\nLUCENE-5179: refactoring on PostingsWriterBase for delta-encoding ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13742903"
+        }
+    ]
+}

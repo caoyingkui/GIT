@@ -1,0 +1,414 @@
+{
+    "id": "SOLR-9835",
+    "title": "Create another replication mode for SolrCloud",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The current replication mechanism of SolrCloud is called state machine, which replicas start in same initial state and for each input, the input is distributed across replicas so all replicas will end up with same next state. \n\nBut this type of replication have some drawbacks\n\n\tThe commit (which costly) have to run on all replicas\n\tSlow recovery, because if replica miss more than N updates on its down time, the replica have to download entire index from its leader.\n\n\n\nSo we create create another replication mode for SolrCloud called state transfer, which acts like master/slave replication. In basically\n\n\tLeader distribute the update to other replicas, but the leader only apply the update to IW, other replicas just store the update to UpdateLog (act like replication).\n\tReplicas frequently polling the latest segments from leader.\n\n\n\nPros:\n\n\tLightweight for indexing, because only leader are running the commit, updates.\n\tVery fast recovery, replicas just have to download the missing segments.\n\n\n\nOn CAP point of view, this ticket will trying to promise to end users a distributed systems :\n\n\tPartition tolerance\n\tWeak Consistency for normal query : clusters can serve stale data. This happen when leader finish a commit and slave is fetching for latest segment. This period can at most pollInterval + time to fetch latest segment.\n\tConsistency for RTG : if we do not use DQBs, replicas will consistence with master just like original SolrCloud mode\n\tWeak Availability : just like original SolrCloud mode. If a leader down, client must wait until new leader being elected.\n\n\n\nTo use this new replication mode, a new collection must be created with an additional parameter liveReplicas=1\n\nhttp://localhost:8983/solr/admin/collections?action=CREATE&name=newCollection&numShards=2&replicationFactor=1&realtimeReplicas=1",
+    "attachments": {
+        "SOLR-9835.patch": "https://issues.apache.org/jira/secure/attachment/12843366/SOLR-9835.patch",
+        "OnlyLeaderIndexesTest-fail-1.zip": "https://issues.apache.org/jira/secure/attachment/12859409/OnlyLeaderIndexesTest-fail-1.zip"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-12-07T20:27:51+0000",
+            "author": "Erick Erickson",
+            "content": "I believe that if we do implement this, it should make SOLR-9706 obsolete. The proposed replication mode sounds like it would make manually issuing a fetchIndex unnecessary since the use-case for SOLR-9706 I'm familiar with is exactly only indexing to the leader and having the followers use the regular polling mechanism which doesn't block during replication.\n\nAt least we should verify whether SOLR-9706 is made obsolete by this proposal. ",
+            "id": "comment-15729828"
+        },
+        {
+            "date": "2016-12-08T13:12:43+0000",
+            "author": "Pushkar Raste",
+            "content": "I am curious to know how soft commits (in memory segments) would be handled. ",
+            "id": "comment-15732174"
+        },
+        {
+            "date": "2016-12-08T15:33:07+0000",
+            "author": "Mark Miller",
+            "content": "Soft commits are for near realtime and doing master->slave replication won't benefit from that. Effectively, soft commits won't be useful. ",
+            "id": "comment-15732527"
+        },
+        {
+            "date": "2016-12-08T15:43:40+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I'm curious about the handling of searcher reopens (which would create a new segment, afaict). Such a searcher reopen can happen if an RTG request uses filters. \n\n                 ulog.openRealtimeSearcher();  // force open a new realtime searcher\n\n ",
+            "id": "comment-15732554"
+        },
+        {
+            "date": "2016-12-08T15:53:15+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Hold your questions for a bit. Dat and I are working on a design and we will try to answer your questions as much as we can. We will post it in a couple of days. ",
+            "id": "comment-15732576"
+        },
+        {
+            "date": "2016-12-09T15:05:15+0000",
+            "author": "Cao Manh Dat",
+            "content": "Here are the detail design that I and Shalin have been working for recently\n\nOverview\nThe current replication mechanism of SolrCloud is called state machine, which replicas start in same initial state and for each input, the input is distributed across replicas so all replicas will end up with same next state.\n\nBut this type of replication has some drawbacks :\n\n\tThe indexing and commits have to run on all replicas\n\tSlow recovery, because if replica miss more than N updates on its down time, the replica has to (usually) download the entire index from its leader.\n\n\n\nSo we introduce another replication for SolrCloud called state transfer, which acts like master/slave replication. Basically:\n\n\tLeader distribute the update to other replicas, but only the leader applies the update to IndexWriter; other replicas just store the update to UpdateLog (act like replication)\n\tReplicas frequently polling the latest segments from leader.\n\n\n\nPros:\n\n\tLightweight for indexing, because only leader are running the updates and commits\n\tVery fast recovery. If a replica fails, it just has to download newest segments, instead of re-downloading entire index.\n\n\n\nCons :\n\n\tLeader can become a hotspot when there are many replicas (we can optimize later)\n\tLonger turnaround time compared to current NRT replication\n\n\n\nCommit\nWhen we commit, we write the version of update command into the commit data in addition to the timestamp that is written today.\n\nUpdate\n\n\tWhen a replica receive an update request it will forward the update request to\n\t\n\t\tCorrect leader ( in case of add document, delete by id )\n\t\tAll leaders ( in case of delete by query, commit )\n\t\n\t\n\tLeader assigns version to update as it does today, writes to update log and applies the update to IndexWriter\n\tLeader distributes the update to its replicas\n\tWhen replica receives an update, it writes the update to update log and return successfully\n\tLeader return successful\n\n\n\nPeriodic Segment Replication\nReplica will poll the leader for the latest commit point generation and version and compare against the latest commit point locally. If it is the same, then replication is successful and nothing needs to be done. If not, then:\n\n\tReplica downloads all files since the local commit point from the leader\n\tInstalls into the index, synchronize on the update log, close the old tlog, create a new one and copy over all records from the old tlog which have version greater than the latest commit point\u2019s version. This is to ensure that any update which hasn\u2019t made it to the index is preserved in the current tlog. This might lead to duplication of updates in the previous and the current tlogs but that is okay.\n\tReplica re-opens the searcher\n\n\n\nFor example:\nLeader has the following tlogs\n\n\tTLog1 has versions 1,2,3,commit\n\tTLog2 has versions 4,5\n\n\n\nBefore segment replication, the replica have the following tlogs:\n\n\tTLog1 - 1,2,3,4,commit\n\n\n\nAfter segment replication, the replica will have the following tlogs:\n\n\tTLog1 - 1,2,3,4,commit\n\tTLog2 - 4,5\n\n\n\n\nDuring this process, the replica does not need to be put into \u2018recovery\u2019 state. It continues to be \u2018active\u2019 and participate in indexing and searches.\n\nReplica recovery\n\n\tReplica puts itself in \u2018recovery\u2019 state.\n\tReplica compares its latest commit point against the leader\n\tIf the index is same as leader, then it performs \u2018peersync\u2019 with the leader but only writes the peersync updates to its update log\n\tIf the index is not the same as leader or if peersync fails, the replica:\n\t\n\t\tPuts its update log in \u201cbuffering\u201d state\n\t\tIssues a hard commit to the leader\n\t\tCopies the index commit points from the leader that do not exist locally\n\t\tPublishes itself as \u2018active\u2019\n\t\n\t\n\tThe \u201cbuffering\u201d state in the above steps ensures that any updates that haven\u2019t been committed to the leader are also present/replicated to the replica\u2019s current transaction log\n\n\n\nWith respect to the current recovery strategy in Solr, we need only one change which is to check the index version of leader vs replica before we attempt a peersync.\n\nLeader Election\nWhen a leader dies, a candidate replica will become a new leader. The leader election algorithm remains mostly the same except that after the \u201csync\u201d step, the leader candidate will replay its transaction log before publishing itself as the leader.\n\nCollection property to switch replication scheme\nA new property called \u201conlyLeaderIndexes\u201d will be added to the collection. Any collection that has this property set to true will only index to the elected leader and the rest of the replicas will only fetch index segments from the leader as described above in the document. This property must be set during collection creation. It will default to \u201cfalse\u201d. Existing collections cannot be switched to using the new replication scheme. Future work can attempt to fix that.\n\nFAQ\n\nQ: What happens on a soft-commit?\nA: soft-commit is nothing but a searcher opened using the IndexWriter which flushes a new segment to the disk but does not commit it. In this case, the newly written segment not being part of a commit point, is not replicated at all. Effectively, soft commits are not useful in this new design currently. Future work may attempt to solve this problem. This same answer applies to searcher re-opens due to real-time-get. ",
+            "id": "comment-15735547"
+        },
+        {
+            "date": "2016-12-09T19:16:26+0000",
+            "author": "Pushkar Raste",
+            "content": "Instead of periodic polling, can leader upon receiving and processing a commit command, send a notification to replicas asking them to sync up? ",
+            "id": "comment-15736051"
+        },
+        {
+            "date": "2016-12-12T12:09:58+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Instead of periodic polling, can leader upon receiving and processing a commit command, send a notification to replicas asking them to sync up?\n\nWe thought about that but we ended up favoring the polling model because the poll request is cheap and we can use existing replication handler code. We will keep the poll interval at half the auto commit time for a start. For this issue, we want to keep the changes limited as much as possible but we can consider a notification feature in later enhancements. ",
+            "id": "comment-15741742"
+        },
+        {
+            "date": "2016-12-14T14:54:31+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\nCollection property to switch replication scheme\n\nA new property called \u201conlyLeaderIndexes\u201d will be added to the collection. Any collection that has this property set to true will only index to the elected leader and the rest of the replicas will only fetch index segments from the leader as described above in the document. This property must be set during collection creation. It will default to \u201cfalse\u201d. Existing collections cannot be switched to using the new replication scheme. Future work can attempt to fix that.\n\nInstead of a hardcoded property name, i.e. onlyLeaderIndexes=true/false, I suggest that we have something like \"replicationScheme=onlyLeaderIndexes\" (or some other value for the current replication scheme). That would keep the door open for us to add any other replication scheme in future. ",
+            "id": "comment-15748538"
+        },
+        {
+            "date": "2016-12-15T07:59:12+0000",
+            "author": "Cao Manh Dat",
+            "content": "Here a the patch for this issue, I didn't do anything related to Leader Recovery, just wanna upload the patch soon so anyone can comment first.\n\n\tAdd onlyLeaderIndexes property to DocCollection\n\tModified SolrIndexWriter#setCommitData(IndexWriter iw, long commitCommandVersion) to store version of commit command to commit point.\n\tStart replication process to periodically poll latest segments from leader when replica become active\n\tAdd UpdateCommand.IGNORE_INDEXWRITER so\n  + DistributedUpdateProcessor can look into the role of current core to add the flag to command\n  + DirectUpdateHandler2 based on the existence of IGNORE_INDEXWRITER to skip making changes to IW, just write down the updateCommand to its tlog\n\tMake sure that the current tlog of replicas have all uncommit updates\n  + When replication process is complete\n  + When replica restart\n\n\n ",
+            "id": "comment-15750712"
+        },
+        {
+            "date": "2016-12-15T13:37:51+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch for this issue\n\n\tWhen a new tlog is created, it copy all old updates that not have been made to its local index.\n\n ",
+            "id": "comment-15751394"
+        },
+        {
+            "date": "2016-12-26T13:50:22+0000",
+            "author": "Cao Manh Dat",
+            "content": "Yonik SeeleyYonik Seeley : Here are scenario for the problem that I encountered today\n\n\tan replica ( let's call it rep1 ) is on recovering mode -> its ulog will be on buffering state.\n\trep1 receives an update ( contain doc1 ), rep1 will write the update to its tlog without updating ulog.map for real-time-get\n\trep1 replay buffered updates, rep1 will write doc1 to its index, and update ulog.map for real-time-get ( but in this case, ulog.map will point doc1 -> position = -1 because we don't write updateCommand with REPLAY flag to tlog )\n\tclient call real-time-get for doc1\n\trep1 will always open a real-time-searcher for this case. Because ulog.map for doc 1 return position = -1\n\n\n\nI just wonder why we do that currently? Why don't we just write the update to tlog and ulog.map so we don't have to open a new real-time-searcher for this case? ",
+            "id": "comment-15778369"
+        },
+        {
+            "date": "2016-12-28T10:47:12+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch\n\n\tLeader Recovery\n\tReplica recovery will always do replication ( skip peersync ) because I found it very complex to fix all the bugs caused by peersync in this mode. We can support peersync for this mode in future.\n\n ",
+            "id": "comment-15782633"
+        },
+        {
+            "date": "2016-12-31T01:49:23+0000",
+            "author": "Pushkar Raste",
+            "content": "How are we handling leader failure here. if replicas are some what out of sync with the original leader, how would we elect a new leader. \n\nWhen the leader fails and a new leader gets elected, the  new leader asks all the replicas to sync with the new leader. My understanding is, \"since we are replicating index by fetching segments from leader, most of the segments on all the replicas should look the same, hence all the replicas will not go into full index copying\". Is that correct ? ",
+            "id": "comment-15788716"
+        },
+        {
+            "date": "2016-12-31T03:10:44+0000",
+            "author": "Cao Manh Dat",
+            "content": "Currently, PeerSync sync on tlog, so it is not a problem if the indexes on all replicas are the same. So Leader Election will be the same as today except that when new leader sync success with other replicas, it must replay its tlog to make all necessary changes to its index. ",
+            "id": "comment-15788811"
+        },
+        {
+            "date": "2017-01-03T02:23:41+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch for this issues, the changes are pretty solid now. \n\nThe main difference between onlyLeaderIndexes mode and current mode is in onlyLeaderIndexes mode we can serve stale data. So I modified TestInjection to make replicas wait for indexFetcher finish upon receiving commit request, then we can reuse existing tests for SolrCloud to test for onlyLeaderIndexes mode. These are failed tests (5/206 tests of SolrCloud)\n\n\tCdcrVersionReplicationTest, ShardSplitTest, SyncSliceTest: we can notify to users that onlyLeaderIndexes hasn't  supported for CDCR, ShardSplit and SyncSlice yet.\n\tLeaderFailureAfterFreshStartTest, PeerSyncReplicationTest : we don't support peersync yet.\nI think all these tests can be ignored for this issue, we can tackle these failed on other tickets.\n\n\n\nI also run the jepsen tests for this mode ( https://lucidworks.com/blog/2014/12/10/call-maybe-solrcloud-jepsen-flaky-networks/ ). The tests are passed so I think we can pretty sure that new mode is consistency and partition tolerance. ",
+            "id": "comment-15793929"
+        },
+        {
+            "date": "2017-01-03T09:04:55+0000",
+            "author": "Cao Manh Dat",
+            "content": "\n\tClean up the patch.\n\tEnable onlyLeaderIndexes mode on some tests.\n\n ",
+            "id": "comment-15794569"
+        },
+        {
+            "date": "2017-01-03T19:16:07+0000",
+            "author": "Noble Paul",
+            "content": "What is the public interface for this feature? How do I enable/disable this feature? Is there a command? ",
+            "id": "comment-15795916"
+        },
+        {
+            "date": "2017-01-04T02:50:45+0000",
+            "author": "Cao Manh Dat",
+            "content": "Right now, to create a collection in onlyLeaderIndexesMode we must use \"Create Collection API\" with additional parameter : onlyLeaderIndexes=true. When a collection is created on a mode, it will stick to that mode.\n\nIn further ticket, we can support switch between modes. ",
+            "id": "comment-15796970"
+        },
+        {
+            "date": "2017-01-04T02:59:34+0000",
+            "author": "Noble Paul",
+            "content": "I would like this to be added to the description of the ticket ",
+            "id": "comment-15796982"
+        },
+        {
+            "date": "2017-01-05T09:29:10+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch, change boolean onlyLeaderIndexes to int liveReplicas. liveReplicas indicate the number of replica ( running on old replication mode ). If liveReplicas = 1 it will be the same as onlyLeaderIndexes = true, all non-leader replicas will fetch latest index from leader. If liveReplicas = -1 it will be the same as onlyLeaderIndexes = false.\n\nRight now the valid value for liveReplicas are 1 and -1.\n\nThis will enable the opportunity to configure a cluster with some replicas run in old mode and some replicas run in new replication mode. ",
+            "id": "comment-15800881"
+        },
+        {
+            "date": "2017-01-10T19:29:13+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Great idea! just took a quick look at the patch to understand this better. I have a couple of questions/comments, I know this is work in progress, so feel free to disregard any of my comments if you are working on them:\n\n\nonlyLeaderIndexes = zkStateReader.getClusterState().getCollection(collection).getLiveReplicas() == 1;\n\n\nMaybe add a method to DocCollection like isOnlyLeaderIndexes() (or choose other name)? I understand why you did this, but this code is repeated many times, maybe can be improved for now.\n\n\nprivate Map<String, ReplicateFromLeader> replicateFromLeaders = new HashMap<>();\n\n\nDoes this need to be synchronized?\n\n\n-  private final String masterUrl;\n+  private String masterUrl;\n\n\nshould masterUrl now be volatile?\n\n\n+  public static boolean waitForInSyncWithLeader(SolrCore core, Replica leaderReplica) throws InterruptedException {\n+    if (waitForReplicasInSync == null) return true;\n+\n+    Pair<Boolean,Integer> pair = parseValue(waitForReplicasInSync);\n+    boolean enabled = pair.first();\n+    if (!enabled) return true;\n+\n+    Thread.sleep(1000);\n+    HttpSolrClient leaderClient = new HttpSolrClient.Builder(leaderReplica.getCoreUrl()).build();\n+    long leaderVersion = -1;\n+    String localVersion = null;\n+    try {\n+      for (int i = 0; i < pair.second(); i++) {\n+        if (core.isClosed()) return true;\n+        ModifiableSolrParams params = new ModifiableSolrParams();\n+        params.set(CommonParams.QT, ReplicationHandler.PATH);\n+        params.set(COMMAND, CMD_DETAILS);\n+\n+        NamedList<Object> response = leaderClient.request(new QueryRequest(params));\n+        leaderVersion = (long) ((NamedList)response.get(\"details\")).get(\"indexVersion\");\n+\n+        localVersion = core.getDeletionPolicy().getLatestCommit().getUserData().get(SolrIndexWriter.COMMIT_TIME_MSEC_KEY);\n+        if (localVersion == null && leaderVersion == 0) return true;\n+\n+        if (localVersion != null && Long.parseLong(localVersion) == leaderVersion) {\n+          return true;\n+        } else {\n+          Thread.sleep(500);\n+        }\n+      }\n+\n+    } catch (Exception e) {\n+      log.error(\"Exception when wait for replicas in sync with master\");\n+    } finally {\n+      try {\n+        if (leaderClient != null) leaderClient.close();\n+      } catch (IOException e) {\n+        e.printStackTrace();\n+      }\n+    }\n+\n+    return false;\n+  }\n\n\n\nIn many cases in the tests the leader will change before the replication happens, right? Does it make sense to discover the leader inside of the loop? Also, is there a way to remove that Thread.sleep(1000) at the beginning? This code will be called very frequently in tests. ",
+            "id": "comment-15815930"
+        },
+        {
+            "date": "2017-01-10T21:28:59+0000",
+            "author": "Noble Paul",
+            "content": "Maybe add a method to DocCollection like isOnlyLeaderIndexes() (or choose other name)? \n\nhow about getLiveReplicasCount() ? ",
+            "id": "comment-15816241"
+        },
+        {
+            "date": "2017-01-10T21:44:59+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "I'm just saying, we use the count to detect the mode, and everywhere we are getting the count and inferring the mode depending on the count (count==1 -> onlyLeaderIndexes, count==-1 -> default mode), Instead of that, lets put that logic inside of the DocCollection and ask it for the mode. Anyway, this is not too important, just a suggestion.  ",
+            "id": "comment-15816283"
+        },
+        {
+            "date": "2017-01-10T23:32:09+0000",
+            "author": "Yago Riveiro",
+            "content": "how about getLiveReplicasCount() ?\n\nIf I'm reading the code and found a method called getLiveReplicasCount(), I expected that return the number of live replicas for a shard, and if the only value that can return is 1 for onlyLeaderIndexes and -1 for the rest is not a good name.\n\nSomething like: zkStateReader.getClusterState().getCollection(collection).getReplicationMode() that returns an enum(ONLY_LEADER_INDEXES, ALL_REPLICAS_INDEXES) or something like that.\n ",
+            "id": "comment-15816535"
+        },
+        {
+            "date": "2017-01-10T23:48:21+0000",
+            "author": "Noble Paul",
+            "content": "It will have a proper count in the future. A mixed mode has to be there eventually. Enum can't accommodate that ",
+            "id": "comment-15816564"
+        },
+        {
+            "date": "2017-01-10T23:58:29+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "As I said, I understand the reason why it was done this way, but the code right now is only using the count to identify the mode. In the future, the count alone won't be enough in any of those sections to determine what to do, you'll have to identify the mode first and then take some more actions (e.g. Am I in the list of replicas that index or not?).  ",
+            "id": "comment-15816584"
+        },
+        {
+            "date": "2017-01-11T02:35:19+0000",
+            "author": "Cao Manh Dat",
+            "content": "Thanks a lot for your comments!\n\nMaybe add a method to DocCollection like isOnlyLeaderIndexes()\nAs you know, we won't use isOnlyLeaderIndexes() in the future ( it won't have enough information ), so I just do not want to add a public method on DocCollection ( solrj ) and remove it in the future.\nDoes this need to be synchronized?\nYeah, I think we should.\nshould masterUrl now be volatile?\nI don't see any reason why we need masterUrl to be volatile? IndexFetcher instance is not being shared across threads.\nIn many cases in the tests the leader will change before the replication happens, right? Does it make sense to discover the leader inside of the loop? Also, is there a way to remove that Thread.sleep(1000) at the beginning? This code will be called very frequently in tests.\nThat's a good idea.\n ",
+            "id": "comment-15816918"
+        },
+        {
+            "date": "2017-01-11T02:49:11+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "I don't see any reason why we need masterUrl to be volatile? IndexFetcher instance is not being shared across threads.\nIsn't it being used by the ReplicationHandler? Different requests would use the same instance from different threads, right?  ",
+            "id": "comment-15816951"
+        },
+        {
+            "date": "2017-01-11T02:52:09+0000",
+            "author": "Cao Manh Dat",
+            "content": "I created a new ReplicationHandler to do the replication process, so it will not use the same instance from different threads.\n\nreplicationProcess = new ReplicationHandler();\nreplicationProcess.init(replicationConfig);\nreplicationProcess.inform(core);\n\n ",
+            "id": "comment-15816959"
+        },
+        {
+            "date": "2017-01-12T03:49:34+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch for this issue :\n\n\tRemove UpdateCommand.NOTICE_INDEXWRITER flag by not replaying buffer log if the updates is not made to IW. This changes help the patch more compact\n\tWhen replica recover,\n\t\n\t\treplica won't apply buffer updates\n\t\tfix bug: RTG support for buffering updates ( along with test )\n\t\n\t\n\tZkController.replicateFromLeaders is thread-safe now\n\tWhen cluster restart, only leaders should call ulog.recoverFromLog(), tested by TestCloudRecovery\n\tOnlyLeaderIndexesTest\n\t\n\t\ttest for RTG\n\t\ttest for replicas are consistent\n\t\tmore test for replica recovery\n\t\n\t\n\tMore tests and fixed bugs\n\n\n\nI will try to write more tests for all possible cases during Replica Recovery and Leader Election. Hoping that I can find more bugs by doing this. ",
+            "id": "comment-15820080"
+        },
+        {
+            "date": "2017-01-13T14:01:54+0000",
+            "author": "Cao Manh Dat",
+            "content": "This is my final patch, cleanup to make the patch more robust. ( all related tests are passed, included jepsen tests ).\nShalin Shekhar Mangar Can you review this patch? ",
+            "id": "comment-15821813"
+        },
+        {
+            "date": "2017-01-14T05:36:00+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Dat. I have started reviewing your patch. ",
+            "id": "comment-15822697"
+        },
+        {
+            "date": "2017-02-03T02:58:01+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch to latest source. ",
+            "id": "comment-15850983"
+        },
+        {
+            "date": "2017-02-14T07:47:14+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch, resolve the potential problem with SOLR-5944. \nIn this patch, updates is being sorted before applying when a replica become new leader. ",
+            "id": "comment-15865297"
+        },
+        {
+            "date": "2017-02-16T03:14:36+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch, change liveReplicas to realtimeReplicas ",
+            "id": "comment-15869050"
+        },
+        {
+            "date": "2017-02-22T19:24:18+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Dat. Sorry it took me a while to finish reviewing. A few questions/comments\n\n\n\tLeaderInitiatedRecoveryThread \u2013 What is the reason behind adding SocketTimeoutException in the list of communication errors on which no more retries are made?\n\tZkController.register method \u2013 The condition for !isLeader && onlyLeaderIndexes can be replaced by the isReplicaInOnlyLeaderIndexes variable.\n\tSince there is no log replay on startup on replicas anymore, what if the replica is killed (which keeps its state as 'active' in ZK) and then the cluster is restarted and the replica becomes leader candidate? If we do not replay the discarded log then it could lead to data loss?\n\tUpdateLog \u2013 Can you please add javadocs outlining the motivation/purpose of the new methods such as copyOverBufferingUpdates and switchToNewTlog e.g. why does switchToNewTlog require copying over some updates from the old tlog?\n\tIt seems that any commits that might be triggered explicitly by the user can interfere with the index replication. Suppose that a replication is in progress and a user explicitly calls commit which is distributed to all replicas, in such a case the tlogs will be rolled over and then when the ReplicateFromLeader calls switchToNewTlog(), the previous tlog may not have all the updates that should have been copied over. We should have a way to either disable explicit commits or protect against them on the replicas.\n\tUpdateLog \u2013 why does copyOverBufferUpdates block updates while calling switchToNewTlog but ReplicateFromLeader doesn't? How are they both safe?\n\tCan we add tests for testing CDCR and backup/restore with this new replication scheme?\n\tZkController.startReplicationFromLeader \u2013 Using a ConcurrentHashMap is not enough to prevent two simultaneous replications from happening concurrently. You should use the atomic putIfAbsent to put a core to the map before starting replication.\n\tAren't some of the guarantees of real-time-get are relaxed in this new mode especially around delete-by-queries which no longer apply on replicas? Can you please document them as a comment on the issue that we can transfer to the ref guide in future?\n\n ",
+            "id": "comment-15879022"
+        },
+        {
+            "date": "2017-02-23T02:09:38+0000",
+            "author": "Cao Manh Dat",
+            "content": "Thanks Shalin Shekhar Mangar!\nLeaderInitiatedRecoveryThread \u2013 What is the reason behind adding SocketTimeoutException in the list of communication errors on which no more retries are made?\nThis change come from a jepsen test. This bug is also affect current mode. I created another issue for this bug SOLR-9913. We can skip this change for this ticket.\nZkController.register method \u2013 The condition for !isLeader && onlyLeaderIndexes can be replaced by the isReplicaInOnlyLeaderIndexes variable.\nYeah, that's right\nSince there is no log replay on startup on replicas anymore, what if the replica is killed (which keeps its state as 'active' in ZK) and then the cluster is restarted and the replica becomes leader candidate? If we do not replay the discarded log then it could lead to data loss?\nVery good catch, I try to resolve this problem.\nUpdateLog \u2013 Can you please add javadocs outlining the motivation/purpose of the new methods such as copyOverBufferingUpdates and switchToNewTlog e.g. why does switchToNewTlog require copying over some updates from the old tlog?\nSure!\nIt seems that any commits that might be triggered explicitly by the user can interfere with the index replication. Suppose that a replication is in progress and a user explicitly calls commit which is distributed to all replicas, in such a case the tlogs will be rolled over and then when the ReplicateFromLeader calls switchToNewTlog(), the previous tlog may not have all the updates that should have been copied over. We should have a way to either disable explicit commits or protect against them on the replicas.\nI don't think so, switchToNewTlog() is based on commit version at lucene index level (commit.getUserData().get(SolrIndexWriter.COMMIT_COMMAND_VERSION)), so we will always roll over updates in right way.\nUpdateLog \u2013 why does copyOverBufferUpdates block updates while calling switchToNewTlog but ReplicateFromLeader doesn't? How are they both safe?\nGood catch I think we should blockUpdates in switchToNewTlog as well.\nCan we add tests for testing CDCR and backup/restore with this new replication scheme?\nCDCR is very complex, I don't think we should support CDCR in this new replication mode now.\nZkController.startReplicationFromLeader \u2013 Using a ConcurrentHashMap is not enough to prevent two simultaneous replications from happening concurrently. You should use the atomic putIfAbsent to put a core to the map before starting replication.\nYeah, that's sounds a good idea.\nAren't some of the guarantees of real-time-get are relaxed in this new mode especially around delete-by-queries which no longer apply on replicas? Can you please document them as a comment on the issue that we can transfer to the ref guide in future?\nI will update the ticket description now. Basically RTG is not consistency for DBQs ",
+            "id": "comment-15879721"
+        },
+        {
+            "date": "2017-02-23T04:38:09+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Also, lets add a simple test to ensure that in-place updates work on a replica:\n\n\tIndex few documents to leader, including a full document with id=0.\n\tCommit\n\tIndex few more documents\n\tCommit\n\tUpdate id=0 document in-place\n\tCommit\n\tAssert that the document with id=0 has the same updated value in the leader and the replica.\n\n ",
+            "id": "comment-15879841"
+        },
+        {
+            "date": "2017-02-23T08:51:15+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I don't think so, switchToNewTlog() is based on commit version at lucene index level (commit.getUserData().get(SolrIndexWriter.COMMIT_COMMAND_VERSION)), so we will always roll over updates in right way.\n\nI understand that we use the commit version of the latest commit but the copyOverOldUpdates method only copies updates from the last tlog. If a hard commit happened between the time that we started replication and finished replication, the last tlog will not have all updates that should be copied over. Example:\n\n\tLeader has the following tlog with these versions:\n\t\n\t\ttlog0: 1,2,3,4,commit\n\t\ttlog1: 5,6\n\t\n\t\n\tReplica has tlogs:\n\t\n\t\ttlog0: 1,2,3,4,5\n\t\treplication from leader starts\n\t\tuser calls explicit commit on replica\n\t\ttlog1: 6\n\t\treplication completes and we call switchToNewTLog which copies over all versions greater than 4 from the last tlog\n\t\ttlog2: 6\n\t\n\t\n\n\n\nIn this case, the update with version 5 is lost and will no longer be available in case this replica becomes leader.\n\nCDCR is very complex, I don't think we should support CDCR in this new replication mode now.\n\nOkay, let's create a follow-up issue for this. CDCR is important enough that we must support it eventually. But I think backup/restore must be supported and tested. ",
+            "id": "comment-15880130"
+        },
+        {
+            "date": "2017-02-24T01:50:52+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch based on comments of Shalin Shekhar Mangar and Ishan Chattopadhyaya\n\n2. ZkController.register method \u2013 The condition for !isLeader && onlyLeaderIndexes can be replaced by the isReplicaInOnlyLeaderIndexes variable.\nDone!\n3. Since there is no log replay on startup on replicas anymore, what if the replica is killed (which keeps its state as 'active' in ZK) and then the cluster is restarted and the replica becomes leader candidate? If we do not replay the discarded log then it could lead to data loss?\nTo solve this problem, we call copyOverOldUpdates from the last recent tlog on startup.\n4. UpdateLog \u2013 Can you please add javadocs outlining the motivation/purpose of the new methods such as copyOverBufferingUpdates and switchToNewTlog e.g. why does switchToNewTlog require copying over some updates from the old tlog?\nDone!\n6. UpdateLog \u2013 why does copyOverBufferUpdates block updates while calling switchToNewTlog but ReplicateFromLeader doesn't? How are they both safe?\nBoth of them are blocking updates now.\n8. ZkController.startReplicationFromLeader \u2013 Using a ConcurrentHashMap is not enough to prevent two simultaneous replications from happening concurrently. You should use the atomic putIfAbsent to put a core to the map before starting replication.\nDone!\n\nAlso, lets add a simple test to ensure that in-place updates work on a replica\n\nI modified TestInPlaceUpdatesDistrib to run in random mode. If the tests run on the new mode, we will skip some outOfOderDBQs tests. ",
+            "id": "comment-15881765"
+        },
+        {
+            "date": "2017-02-27T11:06:32+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tDat, can you please add javadocs for all the new methods in UpdateLog?\n\tI was looking into SOLR-9706 and it applies to this patch too. However, the fix is easy because most of the corruption checks added by SOLR-6640 aren't necessary in this new replication mode so we can safely skip them.\n\n ",
+            "id": "comment-15885586"
+        },
+        {
+            "date": "2017-02-28T07:37:36+0000",
+            "author": "Cao Manh Dat",
+            "content": "Shalin Shekhar Mangar sure,\nThis is the updated patch, that I added doc for all new public methods at UpdateLog ",
+            "id": "comment-15887477"
+        },
+        {
+            "date": "2017-03-03T07:21:37+0000",
+            "author": "Cao Manh Dat",
+            "content": "Shalin Shekhar Mangar Newest patch, ignore block introduced by SOLR-6640. ",
+            "id": "comment-15893851"
+        },
+        {
+            "date": "2017-03-07T00:08:00+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Cao Manh Dat, I created SOLR-10233 with some related work ",
+            "id": "comment-15898427"
+        },
+        {
+            "date": "2017-03-07T00:38:05+0000",
+            "author": "Cao Manh Dat",
+            "content": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe That sounds great. I will create a branch for this ticket and run some jenkins tests for the patch before committing. ",
+            "id": "comment-15898465"
+        },
+        {
+            "date": "2017-03-10T17:52:53+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Cao Manh Dat, I do see some random failures in OnlyLeaderIndexesTest when beasting, do you too?\nAlso, I noticed this code in the test\n\n    try {\n      checkRTG(1, 1, cluster.getJettySolrRunners());\n      fail(\"Doc1 is deleted but it's still exist\");\n    } catch (AssertionError e) {}\n\n\nwhich seems wrong ",
+            "id": "comment-15905479"
+        },
+        {
+            "date": "2017-03-11T01:13:43+0000",
+            "author": "Cao Manh Dat",
+            "content": "@tomasflobbe I also see the tests failed but in this line\n\ncheckRTG(3,7, cluster.getJettySolrRunners());\n\n\nThe reason for that is LIR is being kicked off when we add document 7 ( SOLR-9555 ). But I don't think the code you mentioned is an error. ",
+            "id": "comment-15905973"
+        },
+        {
+            "date": "2017-03-11T01:24:02+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "The reason for that is LIR is being kicked off when we add document 7 ( SOLR-9555 ). \nYes, saw that in my testing too\nBut I don't think the code you mentioned is an error.\nfail(\"Doc1 is deleted but it's still exist\") will throw an AssertionError if hit, but this code is swallowing that error ",
+            "id": "comment-15905980"
+        },
+        {
+            "date": "2017-03-11T01:26:10+0000",
+            "author": "Cao Manh Dat",
+            "content": "That's right. I will fix that problem today. ",
+            "id": "comment-15905981"
+        },
+        {
+            "date": "2017-03-14T04:47:46+0000",
+            "author": "Cao Manh Dat",
+            "content": "Latest patch for this ticket. Will commit it soon. ",
+            "id": "comment-15923572"
+        },
+        {
+            "date": "2017-03-14T07:38:00+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7830462d4b7da3acefff6353419e71cde62d5fee in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7830462 ]\n\nSOLR-9835: Create another replication mode for SolrCloud ",
+            "id": "comment-15923724"
+        },
+        {
+            "date": "2017-03-14T09:20:57+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 120274b451646ddd9e1de9e12a4904414f881c7c in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=120274b ]\n\nSOLR-9835: Update CHANGES.txt ",
+            "id": "comment-15923854"
+        },
+        {
+            "date": "2017-03-14T09:54:43+0000",
+            "author": "Mark Miller",
+            "content": "Looks like this broke the build? I compile errors about missing ZkController methods. ",
+            "id": "comment-15923897"
+        },
+        {
+            "date": "2017-03-14T09:55:43+0000",
+            "author": "Mark Miller",
+            "content": "Nevermind, some local glitch. Got it cleaned up. ",
+            "id": "comment-15923899"
+        },
+        {
+            "date": "2017-03-17T16:30:06+0000",
+            "author": "Yonik Seeley",
+            "content": "OnlyLeaderIndexesTest just failed for me. Seems like it fails sometimes for jenkins too:\nhttps://jenkins.thetaphi.de/job/Lucene-Solr-master-Windows/6455/ ",
+            "id": "comment-15930253"
+        },
+        {
+            "date": "2017-03-18T05:23:52+0000",
+            "author": "Mark Miller",
+            "content": "Yeah, I see this too. It doesn't beast too terribly though. I'll attach some fail logs. ",
+            "id": "comment-15931066"
+        },
+        {
+            "date": "2017-03-20T01:22:05+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 4bc75dbf235145fad5ec1001004c663e15449523 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4bc75db ]\n\nSOLR-9835: Fix OnlyLeaderIndexesTest failure, inplace updates is not copied over properly ",
+            "id": "comment-15932053"
+        },
+        {
+            "date": "2017-03-27T09:44:33+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d156aafd1d5cfda2d7b56e4c73c6ddee43d48e91 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d156aaf ]\n\nSOLR-9835: TestInjection.waitForInSyncWithLeader() should rely on commit point of searcher ",
+            "id": "comment-15942950"
+        },
+        {
+            "date": "2017-03-27T14:36:19+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit cd66a5ff51b7a9ff55edaa9fb5d7df5af42707e4 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cd66a5f ]\n\nSOLR-9835: Fixed precommit failure. ",
+            "id": "comment-15943368"
+        },
+        {
+            "date": "2017-04-03T23:28:29+0000",
+            "author": "Erick Erickson",
+            "content": "will this be ported to 6x and what is the expected timeframe if so? Or will it just be a 7.0 feature? ",
+            "id": "comment-15954328"
+        },
+        {
+            "date": "2017-04-04T02:25:16+0000",
+            "author": "Cassandra Targett",
+            "content": "will this be ported to 6x and what is the expected timeframe if so? Or will it just be a 7.0 feature?\n\nIn this comment to SOLR-10233: https://issues.apache.org/jira/browse/SOLR-10233?focusedCommentId=15901980&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15901980, Tom\u00e1s notes that some API changes will be made in the course of developing that feature, and those changes will impact the work done on this issue already. Because of this, these changes will be kept on master for the time-being to avoid back-compat issues. ",
+            "id": "comment-15954479"
+        },
+        {
+            "date": "2017-05-17T22:51:18+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Cao Manh Dat, I have a nocommit in SOLR-10233 related to a change you did as part of this Jira:\n\n@@ -260,7 +263,7 @@ public class RecoveryStrategy extends Thread implements Closeable {\n       UpdateRequest ureq = new UpdateRequest();\n       ureq.setParams(new ModifiableSolrParams());\n       ureq.getParams().set(DistributedUpdateProcessor.COMMIT_END_POINT, true);\n-      ureq.getParams().set(UpdateParams.OPEN_SEARCHER, false);\n+      ureq.getParams().set(UpdateParams.OPEN_SEARCHER, onlyLeaderIndexes);\n       ureq.setAction(AbstractUpdateRequest.ACTION.COMMIT, false, true).process(\n           client);\n     }\n\n\nWhy do we need to open searcher in the leader when doing a commit on leader for recovery? ",
+            "id": "comment-16014895"
+        },
+        {
+            "date": "2017-07-03T23:00:42+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Marking this as resolved. Any extra related work should have it's own Jira. ",
+            "id": "comment-16072965"
+        },
+        {
+            "date": "2017-07-11T16:58:47+0000",
+            "author": "Cao Manh Dat",
+            "content": "Thanks Tom\u00e1s Fern\u00e1ndez L\u00f6bbe! ",
+            "id": "comment-16082512"
+        }
+    ]
+}

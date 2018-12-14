@@ -1,0 +1,117 @@
+{
+    "id": "SOLR-5552",
+    "title": "Leader recovery process can select the wrong leader if all replicas for a shard are down and trying to recover as well as lose updates that should have been recovered.",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.6.1",
+            "4.7",
+            "6.0"
+        ],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "priority": "Critical",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "One particular issue that leads to out-of-sync shards, related to SOLR-4260\n\nHere's what I know so far, which admittedly isn't much:\nAs cloud85 (replica before it crashed) is initializing, it enters the wait process in ShardLeaderElectionContext#waitForReplicasToComeUp; this is expected and a good thing.\nSome short amount of time in the future, cloud84 (leader before it crashed) begins initializing and gets to a point where it adds itself as a possible leader for the shard (by creating a znode under /collections/cloud/leaders_elect/shard1/election), which leads to cloud85 being able to return from waitForReplicasToComeUp and try to determine who should be the leader.\ncloud85 then tries to run the SyncStrategy, which can never work because in this scenario the Jetty HTTP listener is not active yet on either node, so all replication work that uses HTTP requests fails on both nodes ... PeerSync treats these failures as indicators that the other replicas in the shard are unavailable (or whatever) and assumes success. Here's the log message:\n2013-12-11 11:43:25,936 [coreLoadExecutor-3-thread-1] WARN solr.update.PeerSync - PeerSync: core=cloud_shard1_replica1 url=http://cloud85:8985/solr couldn't connect to http://cloud84:8984/solr/cloud_shard1_replica2/, counting as success\nThe Jetty HTTP listener doesn't start accepting connections until long after this process has completed and already selected the wrong leader.\nFrom what I can see, we seem to have a leader recovery process that is based partly on HTTP requests to the other nodes, but the HTTP listener on those nodes isn't active yet. We need a leader recovery process that doesn't rely on HTTP requests. Perhaps, leader recovery for a shard w/o a current leader may need to work differently than leader election in a shard that has replicas that can respond to HTTP requests? All of what I'm seeing makes perfect sense for leader election when there are active replicas and the current leader fails.\nAll this aside, I'm not asserting that this is the only cause for the out-of-sync issues reported in this ticket, but it definitely seems like it could happen in a real cluster.",
+    "attachments": {
+        "SOLR-5552.patch": "https://issues.apache.org/jira/secure/attachment/12618616/SOLR-5552.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13847614",
+            "date": "2013-12-13T16:20:36+0000",
+            "content": "Here's a first cut at a solution sans unit tests, which relies on a new Slice property - last_known_leader_core_url. However I'm open to other suggestions on how to solve this issue if someone sees a cleaner way.\n\nDuring the leader recovery process outlined in the description of this ticket, the ShardLeaderElectionContext can use this property as a hint to replicas to defer to the previous known leader if it is one of the replicas that is trying to recover. Specifically, this patch only applies if all replicas are \"down\" and the previous known leader is on a \"live\" node and is one of the replicas trying to recover. This may be too restrictive but it covers this issue nicely and minimizes chance of regression for other leader election / recovery cases.\n\nHere are some log messages from the replica as it exits the waitForReplicasToComeUp process that show this patch working:\n\n>>>\n\n2013-12-13 08:51:26,992 [coreLoadExecutor-3-thread-1] INFO  solr.cloud.ShardLeaderElectionContext  - Enough replicas found to continue.\n2013-12-13 08:51:26,992 [coreLoadExecutor-3-thread-1] INFO  solr.cloud.ShardLeaderElectionContext  - Last known leader is http://cloud84:8984/solr/cloud_shard1_replica1/ and I am http://cloud85:8985/solr/cloud_shard1_replica2/\n2013-12-13 08:51:26,992 [coreLoadExecutor-3-thread-1] INFO  solr.cloud.ShardLeaderElectionContext  - Found previous? true and numDown is 2\n2013-12-13 08:51:26,992 [coreLoadExecutor-3-thread-1] INFO  solr.cloud.ShardLeaderElectionContext  - All 2 replicas are down. Choosing to let last known leader http://cloud84:8984/solr/cloud_shard1_replica1/ try first ...\n2013-12-13 08:51:26,992 [coreLoadExecutor-3-thread-1] INFO  solr.cloud.ShardLeaderElectionContext  - There may be a better leader candidate than us - going back into recovery\n\n<<<\nThe end result was that my shard recovered correctly and the data remained consistent between leader and replica. I've also tried this with 3 replicas in a Slice and when the last known leader doesn't come back, which works as it did previously.\n\nLastly, I'm not entirely certain I like how the property gets set in the Slice constructor. It may be better to set this property in the Overseer? Or even store the last_known_leader_core_url in a separate znode, such as /collections/<COLL>/last_known_leader/shardN. I do see some comments in places about keeping the leader property on the Slice vs. in the leader Replica so maybe that figures into this as well? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13848693",
+            "date": "2013-12-15T21:50:08+0000",
+            "content": "I think what we want to do here is look at having the core actually accept http requests before it registers and enters leader election - any issues we find doing this should be issues anyway, as we already have this case on a ZooKeeper expiration and recovery. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13849245",
+            "date": "2013-12-16T15:54:52+0000",
+            "content": "Thanks for the feedback. I was originally thinking that would be the better way to go but didn't know how many rabbit trails that would lead down. Will get working on another patch using this approach. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13849290",
+            "date": "2013-12-16T16:29:57+0000",
+            "content": "It might be a little rabbit trail, but one I think will be well worth following. The ZooKeeper expiration path is not as well tested and anything we find is likely to lead to further bug fixes around that. I hope. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13855254",
+            "date": "2013-12-22T20:31:02+0000",
+            "content": "I took a couple hours to look at this today. Here is a patch that fixes a few things - will probably file another JIRA issue or two around them.\n\n\n\tFirst, it registers cores in zk on startup in background threads. Turns out it's not super simple to know when http is up, but in my testing, things seem to work out all right if we just don't block things in filter#init when we load the cores. Regardless, it's a large improvement and this was a serious bug. We have never had enough cluster restart tests. Though, as it turns out, this seems difficult to reproduce in tests for some reason, though easy by hand.\n\n\n\n\n\tThere was a problem when we looked to see if anyone else was active in determining if we become the leader. That is really no good, I thought I had removed it before.\n\n\n\n\n\tWe could start recovering from a leader that was in the middle of replaying his tran log, which is nasty because the pre replication commit can be ignored and those updates are not distributed.\n\n "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13855266",
+            "date": "2013-12-22T20:34:42+0000",
+            "content": "Fantastic investigation and report Mr. Potter - extremely helpful. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13855279",
+            "date": "2013-12-22T21:17:17+0000",
+            "content": "Commit 1553031 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1553031 ]\n\nSOLR-5552: Leader recovery process can select the wrong leader if all replicas for a shard are down and trying to recover as well as lose updates that should have been recovered.\nSOLR-5569 A replica should not try and recover from a leader until it has published that it is ACTIVE. \nSOLR-5568 A SolrCore cannot decide to be the leader just because the cluster state says no other SolrCore's are active. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13855284",
+            "date": "2013-12-22T21:23:30+0000",
+            "content": "Commit 1553034 from Mark Miller in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1553034 ]\n\nSOLR-5552: Leader recovery process can select the wrong leader if all replicas for a shard are down and trying to recover as well as lose updates that should have been recovered.\nSOLR-5569 A replica should not try and recover from a leader until it has published that it is ACTIVE. \nSOLR-5568 A SolrCore cannot decide to be the leader just because the cluster state says no other SolrCore's are active. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13856062",
+            "date": "2013-12-24T00:53:03+0000",
+            "content": "Glad it was helpful even though my patch was crap  I'll test against trunk in my env as well. Thanks. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13856159",
+            "date": "2013-12-24T05:36:34+0000",
+            "content": "Ran my manual test process on trunk and could not reproduce the out-of-sync issue! From the logs, the recovery process definitely starts after the HTTP listener is up. Looking good on trunk. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13858168",
+            "date": "2013-12-28T23:22:58+0000",
+            "content": "Sweet, thanks!  "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13858169",
+            "date": "2013-12-28T23:26:06+0000",
+            "content": "Commit 1553970 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1553970 ]\n\nSOLR-5552: Add CHANGES entry\nSOLR-5569: Add CHANGES entry\nSOLR-5568: Add CHANGES entry "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13858172",
+            "date": "2013-12-28T23:27:27+0000",
+            "content": "Commit 1553971 from Mark Miller in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1553971 ]\n\nSOLR-5552: Add CHANGES entry\nSOLR-5569: Add CHANGES entry\nSOLR-5568: Add CHANGES entry "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13858177",
+            "date": "2013-12-28T23:36:40+0000",
+            "content": "Commit 1553973 from Mark Miller in branch 'dev/branches/lucene_solr_4_6'\n[ https://svn.apache.org/r1553973 ]\n\nSOLR-5552: Leader recovery process can select the wrong leader if all replicas for a shard are down and trying to recover as well as lose updates that should have been recovered.\nSOLR-5569 A replica should not try and recover from a leader until it has published that it is ACTIVE.\nSOLR-5568 A SolrCore cannot decide to be the leader just because the cluster state says no other SolrCore's are active. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13858184",
+            "date": "2013-12-29T00:01:17+0000",
+            "content": "Commit 1553978 from Mark Miller in branch 'dev/branches/lucene_solr_4_6'\n[ https://svn.apache.org/r1553978 ]\n\nSOLR-5552: Add CHANGES entry\nSOLR-5569: Add CHANGES entry\nSOLR-5568: Add CHANGES entry "
+        }
+    ]
+}

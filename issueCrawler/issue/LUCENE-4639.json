@@ -1,0 +1,240 @@
+{
+    "id": "LUCENE-4639",
+    "title": "Improving _TestUtil.getTempDir",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.1",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Spinoff from here: http://lucene.472066.n3.nabble.com/TestUtil-getTempFile-may-fail-on-quot-Access-Denied-quot-td4028048.html.\n\n_TestUtil.getTempDir uses createTempFile and then deletes the file. While this usually works, if someone runs tests by multiple JVMs and does not ensure each JVM gets an isolated temp.dir to work in, that my result in two JVMs sharing the same directory.\n\nAlso, on Windows, if you call getTempDir on an existing directory, you get an \"Access is denied\" exception.\n\nDawid proposed a simple solution to just call mkdirs() continuously until success. I'd like to try that.\n\nAlso, I think that genTempFile could use some house cleaning, e.g.:\n\n\ttempFileLocker can be just an Object instance? Why do we need a class?\n\tIf we initialize counter and counterBase in a static clause, we can avoid checking if counter==0 as well as passing Random to genTempFile (that will remove any suspicion that it does anything randomly)\n\t\n\t\tAlso, instead of synchronizing on tempFileLocker, can we just use AtomicInteger for the counter?\n\t\n\t\n\n\n\nI'll modify getTempDir first. It documents \"does not create the directory\", I want to make sure no test fails due that.",
+    "attachments": {
+        "LUCENE-4639.patch": "https://issues.apache.org/jira/secure/attachment/12561859/LUCENE-4639.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-12-20T07:05:18+0000",
+            "content": "Here's a test which reproduces the Access is denied exception on Windows, if run with the same seed (pick any seed, I used: )\n\n\n  @Test\n  public void testAccessDenied() throws Exception {\n    _TestUtil.getTempDir(\"testAccessDenied\");\n    fail(\"msg\");\n  }\n\n\n\nI cannot actually commit that test, but if you run it twice on Windows (w/ the same seed), you will hit the Access is denied.\nHowever it passes with the changes to getTempDir (calling mkdir()). I will verify that no test breaks b/c getTempDir now creates the directory. ",
+            "author": "Shai Erera",
+            "id": "comment-13536829"
+        },
+        {
+            "date": "2012-12-20T09:08:48+0000",
+            "content": "Patch addresses the following:\n\n\n\tgetTempDir call genTempFile and mkdir() until success.\n\tcounter and counterBase are initialized statically.\n\t\n\t\tcounter is now AtomicInt, so no need for tempFileLock and the sync block.\n\t\n\t\n\tFixed few Lucene testNoDir tests which tested the code when the directory does not exist - they delete the directory returned from getTempDir.\n\tFixed few Solr tests which incorrectly called getTempDir in an attempt to create a temporary file!\n\t\n\t\tIt's good then that getTempDir creates the directory. If anyone's code uses it improperly, he'll get an exception.\n\t\n\t\n\n\n\nAll Lucene and Solr tests pass. Would appreicate if someone can give it another look before I commit it. ",
+            "author": "Shai Erera",
+            "id": "comment-13536876"
+        },
+        {
+            "date": "2012-12-20T10:16:22+0000",
+            "content": "A few quick comments.\n\n+    do {\n+      f = genTempFile(desc, \"tmp\", LuceneTestCase.TEMP_DIR);\n+    } while (!f.mkdir());\n\n\nPerhaps there should be a retry counter here with some upper limit of retries just to cater for things like access denied errors or disk full errors (which will make this loop run forever).\n\n\n+  static {\n+    final Random random = new Random(RandomizedContext.current().getRandom().nextLong());\n\n\n\nStatic blocks should be avoided because they can be executed outside of the scope of the runner (you cannot be sure when a class is loaded). Use BeforeClass hooks or (better) initialize a volatile lazily.\n\n\ncounter = new AtomicInteger(((newInt / 65535) & 0xFFFF) + 0x2710);\n\n\n\nWhat's this magic for? \n\n ",
+            "author": "Dawid Weiss",
+            "id": "comment-13536915"
+        },
+        {
+            "date": "2012-12-20T10:34:38+0000",
+            "content": "Perhaps there should be a retry counter here with some upper limit of retries just to cater for things like access denied errors or disk full errors (which will make this loop run forever).\n\nThis loop doesn't catch exceptions/errors. Access denied and disk full errors will be thrown further. In general, adding a retry counter is not a bad idea, but I didn't change the current logic (which looped while !f.createNewFile()). So I think we can avoid the retry counter for now?\n\nWhat's this magic for?\n\nI have no idea . I just copied the lazily init code that was in genTempFile. At first I thought it increases randomness or uniqueness, but it's not true. if two randoms return the same int in nextInt(), counter will be set the same. The division by 65535 and \"AND\"-ing with 0xFFFF is I guess to keep the number small and positive.\n\nUse BeforeClass hooks or (better) initialize a volatile lazily.\n\nBeforeClass isn't good I think, b/c this counter is reset for the entire JVM, and note that baseCounter is served as the JVM identifier. Perhaps randomized-runner could expose a method which returns the JVM PID and we'd just use it?\n\nIf we go with the lazy initalization, then we're basically back to the previous code, which synchronized in genTempFile on a lock and did the initialization trick there. It wasn't bad, I just thought that it's a waste to do this sync for every file. I have an idea how to avoid the sync unnecessarily. Will post a new patch soon. ",
+            "author": "Shai Erera",
+            "id": "comment-13536925"
+        },
+        {
+            "date": "2012-12-20T10:42:08+0000",
+            "content": "Patch lazily initalizes counter, avoiding synchronizing after it has been initalized. If the runner will be able to give us the JVM PID (or maybe we can pull it from Java), maybe we should set counter = baseCounter = PID and be done with it? Then, all can be final, no need for volatile or any randomness? It is after all just a counter. ",
+            "author": "Shai Erera",
+            "id": "comment-13536930"
+        },
+        {
+            "date": "2012-12-20T10:45:04+0000",
+            "content": "Access denied and disk full errors will be thrown further\n\nmkdir doesn't declare any IOExceptions so I don't think it applies. Try it \n\nRemove that magic noise. I don't see the need for it.\n\nPerhaps randomized-runner could expose a method which returns the JVM PID and we'd just use it?\n\nJVM doesn't have access to process PIDs; there are heuristics but they're not guaranteed and may not be available. Also, I wouldn't worry about that lazy sync - compared to any I/O cost it's probably nothing. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13536933"
+        },
+        {
+            "date": "2012-12-20T10:58:02+0000",
+            "content": "mkdir doesn't declare any IOExceptions so I don't think it applies. Try it\n\nI did try my test with that patch and it passes (if ran twice w/ same seed). I guess the problem w/ Windows is that it adheres to the specifics, as written. If a \"file\" exists, returns false. But if a directory exists, it throws an exception. mkdir() doesn't trip on it.\n\nI found that ManagementFactory.getRuntimeMXBean().getName() can suggest the PID, but I guess that's what you mean by a \"hint\". I read on one thread that the runner should report the PID of a hang thread or something ... well definitely the words \"runner\" and \"report PID\" were mentioned in the same context. That's why I thought it has access to this info, maybe w/ some tricks from platform.jar ...\n\nRegarding the magic noise, we still need the first part to get a short file name (convenience) and positive (to be on the safe side - don't want to create files w/ '-' in their name). The noise I gather you refer to 0x2710? It's 10000 in decimal (couldn't someone just write that !?), but I still can't figure out why it is added to whatever the result of nextInt/64K ... I'll remove it.\n\nShould I upload a newer patch, or are you ok with committing it (+ the removal of magic)? ",
+            "author": "Shai Erera",
+            "id": "comment-13536941"
+        },
+        {
+            "date": "2012-12-20T11:01:03+0000",
+            "content": "I'll also make counterBase a String. we redundantly do Integer.toString(counterBase) on every genTempFile. ",
+            "author": "Shai Erera",
+            "id": "comment-13536943"
+        },
+        {
+            "date": "2012-12-20T11:06:30+0000",
+            "content": "But if a directory exists, it throws an exception. mkdir() doesn't trip on it.\n\nThat was my point \u2013 it'll just run forever when it cannot create any directories?\n\nwell definitely the words \"runner\" and \"report PID\"\n\nThere is a system property passed from ANT's junit4 task that contains whatever runtimemx/getname returns. It doesn't have to be a PID and it may not be available \u2013 this functionality simply isn't guaranteed by the contract. Current process's PID API should be available in Java8. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13536954"
+        },
+        {
+            "date": "2012-12-20T11:20:24+0000",
+            "content": "it'll just run forever when it cannot create any directories?\n\nI see. If you think it's that critical, I can add it. Would 100 be a reasonable threshold? ",
+            "author": "Shai Erera",
+            "id": "comment-13536962"
+        },
+        {
+            "date": "2012-12-20T11:29:18+0000",
+            "content": "You can put even 10000 in there; the thing is \u2013 if it's large enough and it still cannot create any folder it should just drop and throw an exception signalling something abnormal has happened. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13536965"
+        },
+        {
+            "date": "2012-12-20T11:46:47+0000",
+            "content": "Added retry threshold. ",
+            "author": "Shai Erera",
+            "id": "comment-13536978"
+        },
+        {
+            "date": "2012-12-20T14:16:05+0000",
+            "content": "I dont want us to have to call _TestUtil.rmXXX in our tests after we get a temp dir.\n\nthis whole problem here doesnt even affect us, it shouldnt impact our tests. ",
+            "author": "Robert Muir",
+            "id": "comment-13537033"
+        },
+        {
+            "date": "2012-12-20T15:27:57+0000",
+            "content": "I dont want us to have to call _TestUtil.rmXXX in our tests after we get a temp dir.\n\nWe don't need to do that. Only 3 tests that needed to assert that if a directory doesn't exist need to do that. None of the other tests were affected.\n\nthis whole problem here doesnt even affect us, it shouldnt impact our tests.\n\nWhat do you mean \"doesnt even affect us\"? It prevents us from running the same test w/ same seed on Windows b/c of that stupid exception.\n\nThis is such a trivial change, why do you oppose it? ",
+            "author": "Shai Erera",
+            "id": "comment-13537078"
+        },
+        {
+            "date": "2012-12-20T15:33:38+0000",
+            "content": "I don't oppose the issue (improving getTempDir), but I don't think we should make the test api confusing.\n\nparticularly:\n\n\nWhile this usually works, if someone runs tests by multiple JVMs and does not ensure each JVM gets an isolated temp.dir to work in, that my result in two JVMs sharing the same directory.\n\nThis is never the situation for us, we sandbox our JVMs. \n\nSo i think its safe to assume the result of getTempDir does not exist. ",
+            "author": "Robert Muir",
+            "id": "comment-13537083"
+        },
+        {
+            "date": "2012-12-20T15:40:19+0000",
+            "content": "But with this fix, we don't need to assume anything, right? The method will return a File which denotes a directory that is ready for you.\n\nReally, tests with the name testNoDir should not rely on the behvior of getTempDir. They should delete the directory/file before they start to ensure they're testing the right thing ... even if we make getTempDir do f.mkdir() followed by f.delete(), I'd still want to fix the noDir tests to delete whatever they get. As a developer, when reviewing these tests, it would be then clear that the test doesn't make any assumptions ... ",
+            "author": "Shai Erera",
+            "id": "comment-13537089"
+        },
+        {
+            "date": "2012-12-20T20:19:10+0000",
+            "content": "\n+    if (counter == null) {\n+      synchronized (counterLock) {\n+        if (counter == null) {\n+          final Random random = new Random(RandomizedContext.current().getRandom().nextLong());\n+          int value = (random.nextInt() / 65535) & 0xFFFF; // make sure the number is small and positive\n+          // need to update counterBase before counter (read-after volatility)\n+          counterBase = Integer.toString(value);\n+          counter = new AtomicInteger(value);\n+        }\n\n\n\nThis is confusing with a volatile and a critical section. I'd just leave the counter as a non-volatile, regular field (not even an atomic int) and always enter the synchronized block for lazy updates. Optimizing this makes no sense to me, it's a no-cost anyway. Also:\n\n\n(random.nextInt() / 65535) & 0xFFFF\n\n\nis probably just as good as doing the masking:\n\nrandom.nextInt() & 0xFFFF\n\n\n\nI'd say +1 for the patch, even if I agree with Robert that running with multiple JVMs in a shared folder is probably asking for a 10 hour debugging session hunting for a heisenbug... But the patch is an improvement because it allows doing repeated tests that leave unremovable stuff behind from within the same JVM (which can be done with a repeat annotation or with a system property). ",
+            "author": "Dawid Weiss",
+            "id": "comment-13537346"
+        },
+        {
+            "date": "2012-12-20T20:28:45+0000",
+            "content": "I guess im still unsure about pulling the random within the loop.\n\nIt seems to me that then our test reproducibility depends upon when we last ran 'ant clean'. I had a big comment about this before (which this patch deletes). I don't understand how we can safely pull randomness in a loop that depends upon previous test runs.\n\nSeems like this would reduce reproducibility.\n\nBut if you guys are +1, please go ahead  ",
+            "author": "Robert Muir",
+            "id": "comment-13537357"
+        },
+        {
+            "date": "2012-12-20T20:33:09+0000",
+            "content": "The randomness is unaffected. Before, it called nextLong(), but only used that Random once, for initializing the counter. The rest of the times it just created a new Random, pulling nextLong() from the master Random. Now, it pulls that long once, for initialization only. The rest getTempDir/getTempFile won't do any pulling of unnecessary longs.\nAt least as I understand it, it is safe?\n\nDawid, I will revert the changes to the counter init, and make it back a native member wrapped in a synchronized block. I agree volatile + AtomicInt are an overkill here. ",
+            "author": "Shai Erera",
+            "id": "comment-13537361"
+        },
+        {
+            "date": "2012-12-20T20:39:09+0000",
+            "content": "I just dont get it:\n\n    do {\n      f = genTempFile(desc, \"tmp\", LuceneTestCase.TEMP_DIR);\n    } while (!f.mkdir() && (attempt++) < GET_TEMP_DIR_RETRY_THRESHOLD);\n\n\n\nHere is getTempDir calling genTempFile in a loop, depending upon whether not files already exist.\n\nHere is genTempFile:\n\n        if (counter == null) {\n          final Random random = new Random(RandomizedContext.current().getRandom().nextLong());\n\n\n\nSo it may or may not pull randomness, depending upon whether or not this was the first test class to run in this JVM?!\nThis seems like it would completely destroy test reproducibility.\n\nApologies if I am missing something. ",
+            "author": "Robert Muir",
+            "id": "comment-13537365"
+        },
+        {
+            "date": "2012-12-20T20:44:32+0000",
+            "content": "Oh, I see your point now. I misread the code before, and thought that the test pulls one random always, and then one int if it initializes. But nextInt() is called on the new Random, not master Random, and therefore if it pulls the int or not does not affect the randomness of the test.\n\nSorry for missing that, I will return that line. ",
+            "author": "Shai Erera",
+            "id": "comment-13537367"
+        },
+        {
+            "date": "2012-12-20T21:00:26+0000",
+            "content": "Robert is right \u2013 it needs to be calling the context's random exactly the same number of times, regardless of the number of loop iterations. Exactly how it was before in other words. Well spotted, Robert. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13537373"
+        },
+        {
+            "date": "2012-12-20T21:19:54+0000",
+            "content": "Dawid, I've decided not to change the \"magic formula\". For two reasons:\n\n\n\tThat's not the reason I opened this issue - all I want is to be able to run the same test w/ same seed on Windows and not get Access is denied. And in light of all the recent comments, I think it's better if the rest of the logic stays as-is.\n\tI think that the magic formula tries to reduce the chance for collision by using the higher bits of the integer (div by 64K is like >>16). Not sure how different it is for an int, as it's only 4 bytes, so after the division you're still left w/ the same range of values as if you did & 0xFFFF. Maybe the code originally pulled a long? Hmm ... but I think that won't matter either.\n\n\n\nAnyway, if we want to change any of this randomness / magic formulas, maybe we should just set counter statically to System.currentTimeMillis() or System.nanoTime() & 0xFFFF. But I'm too tired to think about this now. For now, I just want to allow rerunning tests on Windows.\n\nI'll attach a patch shortly. ",
+            "author": "Shai Erera",
+            "id": "comment-13537383"
+        },
+        {
+            "date": "2012-12-20T21:23:20+0000",
+            "content": "Patch adds back the randomness thing (thanks Robert for catching that!). I did modify the comment to explain why we do this. The previous comment, at least to me, did not explain it well (why does it depend on when did I last run 'ant clean'?).\n\nAlso added back to magic formula. We can separately think what we want to do with it, and e.g. if we want to stop using random(), and use currentTimeMS or nanoTime ... ",
+            "author": "Shai Erera",
+            "id": "comment-13537389"
+        },
+        {
+            "date": "2012-12-20T21:29:34+0000",
+            "content": "\nThe previous comment, at least to me, did not explain it well (why does it depend on when did I last run 'ant clean'?).\n\nBecause if you run with the same seed, it would try to make the same directory, but that would exist from the previous test run. so it would be bad to pull randomness again, and so on. this would basically make tests not reproduce unless you ran 'ant clean' first to prevent collisions. ",
+            "author": "Robert Muir",
+            "id": "comment-13537396"
+        },
+        {
+            "date": "2012-12-20T21:35:56+0000",
+            "content": "I know what that division does and I think it doesn't matter here; since you're pulling pseudo-random bits anyway shifting doesn't make it any more random than just masking.\n\nA random is fine here, no need to use system timers (which are non-debuggable at all, unlike the pseudo-randomness). ",
+            "author": "Dawid Weiss",
+            "id": "comment-13537400"
+        },
+        {
+            "date": "2012-12-20T21:42:34+0000",
+            "content": "ant clean only cleans the temp.dir if it's under build.dir, right? Is the new comment incorrect? It's too late here, and I'm starting to not think clear . If it is incorrect, or not as good, I'll just use the original comment.\n\nDawid, I get your point, I don't think it makes any difference either. But Robert put that code there, and he's been right about everything else on that issue and that code . ",
+            "author": "Shai Erera",
+            "id": "comment-13537403"
+        },
+        {
+            "date": "2012-12-20T22:23:04+0000",
+            "content": "But Robert put that code there, and he's been right about everything else on that issue and that code.\n\nI'm sure he'll speak up if it was some magic wisdom we're not aware of  This said, this makes whoever reads the code stop and waste his time on thinking wtf. this is. I think the idea was to have a random number fit in a constant number of digits; effectively the same thing (even shorter but with hex digits) can be achieved by doing:\n\nString.format(Locale.ENGLISH, \"%04x\", rnd.nextInt() & 0xFFFF); \n\n\n ",
+            "author": "Dawid Weiss",
+            "id": "comment-13537434"
+        },
+        {
+            "date": "2012-12-21T05:34:42+0000",
+            "content": "I dont know about magic wisdom, it comes from harmony (http://svn.apache.org/viewvc/harmony/enhanced/java/trunk/classlib/modules/luni/src/main/java/java/io/File.java?view=log) and ensures this portion of the name is 5 digits (the other part limited to 3). I'm sure this is important for 8.3 file systems  \n\nas far as why the code ensures the first digit is never a 0, i have no idea. looks like IBM contributed this code so you would know better than me. maybe some mainframe cares about that, or something else i cant think about. my opinion: keep the craziness, change 0x2710 to 10000, and add the link above as to where the craziness came from. ",
+            "author": "Robert Muir",
+            "id": "comment-13537693"
+        },
+        {
+            "date": "2012-12-21T07:21:23+0000",
+            "content": "I agree, I'll keep this formula and add the link to Harmony (also clarify in a comment that 0x2710 == 10000). Will commit this shortly. ",
+            "author": "Shai Erera",
+            "id": "comment-13537724"
+        },
+        {
+            "date": "2012-12-21T07:31:46+0000",
+            "content": "Nah, you shouldn't keep things that are intellectual noise. This is intellectual noise to me. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13537728"
+        },
+        {
+            "date": "2012-12-21T07:48:18+0000",
+            "content": "I looked at that code in Harmony and I sustain my opinion that this code fragment is irrelevant. They pick a per-vm seed and then a counter starting from that. If you create enough files the counter will roll over to next digits anyway so they add the 10000 for aesthetic reasons more than anything. More: if the seeds for two or more vm's are picked close to each other they'll soon enter a tight race to allocate new files. This isn't something you want to reproduce, it's something you want to avoid.\n\nThe process of generating temporary file names should avoid conflicts with other processes and with itself. A congruential random generator with a long cycle should be more than fine to avoid such conflicts (the probability of picking an identical seed in the master generator is unavoidable but very tiny), I don't think there is any need to have a \"vm-identification\" string as they do in Harmony. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13537742"
+        },
+        {
+            "date": "2012-12-23T07:49:01+0000",
+            "content": "I don't think there is any need to have a \"vm-identification\" string as they do in Harmony.\n\nI think it's convenient? Maybe if we change the runner/build framework to generate a truly unique work.dir for each JVM (see the email I sent to dev@), then we can remove it. I'll keep it for now, as it helps identifying which directories were created by the same JVM, in case you want to debug something (as they're not deleted on build failure).\n\nI'll remove the magic formula and just mask w/ 0xFFFF. ",
+            "author": "Shai Erera",
+            "id": "comment-13538985"
+        },
+        {
+            "date": "2012-12-23T08:19:06+0000",
+            "content": "[trunk commit] Shai Erera\nhttp://svn.apache.org/viewvc?view=revision&revision=1425439\n\nLUCENE-4639: improve _TestUtil.getTempDir ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13538992"
+        },
+        {
+            "date": "2012-12-23T08:45:02+0000",
+            "content": "Committed to trunk and 4x ",
+            "author": "Shai Erera",
+            "id": "comment-13538996"
+        },
+        {
+            "date": "2012-12-23T08:50:51+0000",
+            "content": "[branch_4x commit] Shai Erera\nhttp://svn.apache.org/viewvc?view=revision&revision=1425440\n\nLUCENE-4639: improve _TestUtil.getTempDir ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13538998"
+        }
+    ]
+}

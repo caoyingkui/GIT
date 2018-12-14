@@ -1,0 +1,612 @@
+{
+    "id": "LUCENE-2312",
+    "title": "Search on IndexWriter's RAM Buffer",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/search"
+        ],
+        "type": "New Feature",
+        "fix_versions": [],
+        "affect_versions": "4.0-ALPHA",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "In order to offer user's near realtime search, without incurring\nan indexing performance penalty, we can implement search on\nIndexWriter's RAM buffer. This is the buffer that is filled in\nRAM as documents are indexed. Currently the RAM buffer is\nflushed to the underlying directory (usually disk) before being\nmade searchable. \n\nTodays Lucene based NRT systems must incur the cost of merging\nsegments, which can slow indexing. \n\nMichael Busch has good suggestions regarding how to handle deletes using max doc ids.  \nhttps://issues.apache.org/jira/browse/LUCENE-2293?focusedCommentId=12841923&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12841923\n\nThe area that isn't fully fleshed out is the terms dictionary,\nwhich needs to be sorted prior to queries executing. Currently\nIW implements a specialized hash table. Michael B has a\nsuggestion here: \nhttps://issues.apache.org/jira/browse/LUCENE-2293?focusedCommentId=12841915&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12841915",
+    "attachments": {
+        "LUCENE-2312.patch": "https://issues.apache.org/jira/secure/attachment/12457086/LUCENE-2312.patch",
+        "LUCENE-2312-FC.patch": "https://issues.apache.org/jira/secure/attachment/12466663/LUCENE-2312-FC.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-03-12T23:15:20+0000",
+            "content": "In regards to the terms dictionary, keeping it sorted or not, I think it's best to sort it on demand because otherwise there will be yet another parameter to pass into IW (i.e. sortRAMBufTerms or something like that).   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12844749"
+        },
+        {
+            "date": "2010-03-13T07:32:58+0000",
+            "content": "I set out implementing a simple method DocumentsWriter.getTerms\nwhich should return a sorted array of terms over the current RAM\nbuffer. While I think this can be implemented, there's a lot of\ncode in the index package to handle multiple threads, which is\nfine, except I'm concerned the interleaving of postings won't\nperform well. So I think we'd want to implement what's been\ndiscussed in LUCENE-2293, per thread ram buffers. With that\nchange, it seems implementing this issue could be\nstraightforward. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12844826"
+        },
+        {
+            "date": "2010-03-13T15:00:15+0000",
+            "content": "From LUCENE-2293: (b-tree, or, simply sort-on-demand the\nfirst time a query needs it, though that cost increases the\nlarger your RAM segments get, ie, not incremental to the # docs\nyou just added)\n\nFor the terms dictionary, perhaps a terms array (this could be a\nRawPostingList[], or an array of objects with pointers to a\nRawPostingList with some helper methods like getTerm and\ncompareTo), is kept in sorted order, we then binary search and\ninsert new RawPostingLists/terms into the array. We could\nimplement a 2 dimensional array, allowing us to make a per\nreader copy of the 1st dimension of array. This would maintain\ntransactional consistency (ie, a reader's array isn't changing\nas a term enum is traversing in another thread). \n\nAlso, we have to solve what happens to a reader using a\nRAM segment that's been flushed. Perhaps we don't reuse RAM at\nthat point, ie, rely on GC to reclaim once all readers using\nthat RAM segment have closed.\n\nI don't think we have a choice here?  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12844891"
+        },
+        {
+            "date": "2010-03-13T15:17:56+0000",
+            "content": "\nFor the terms dictionary, perhaps a terms array (this could be a\nRawPostingList[], or an array of objects with pointers to a\nRawPostingList with some helper methods like getTerm and\ncompareTo), is kept in sorted order, we then binary search and\ninsert new RawPostingLists/terms into the array. We could\nimplement a 2 dimensional array, allowing us to make a per\nreader copy of the 1st dimension of array. This would maintain\ntransactional consistency (ie, a reader's array isn't changing\nas a term enum is traversing in another thread).\n\nI don't think we can do term insertion into an array \u2013 that's O(N^2)\ninsertion cost \u2013 we should use a btree instead.\n\nAlso, we could store the first docID stored into the term, too \u2013 this\nway we could have a ordered collection of terms, that's shared across\nseveral open readers even as changes are still being made, but each\nreader skips a given term if its first docID is greater than the\nmaxDoc it's searching.  That'd give us point in time searching even\nwhile we add terms with time...\n\n\nAlso, we have to solve what happens to a reader using a RAM segment that's been flushed. Perhaps we don't reuse RAM at that point, ie, rely on GC to reclaim once all readers using that RAM segment have closed.\n\nI don't think we have a choice here?\n\nI think we do have a choice.\n\nEG we could force the reader to cutover to the newly flushed segment\n(which should be identical to the RAM segment), eg by making [say] a\nDelegatingSegmentReader.\n\nStill... we'd probably have to not re-use in that case, since there\ncan be queries in-flight stepping through the RAM postings, and, we\nhave no way to accurately detect they are done.  But at least with\nthis approach we wouldn't tie up RAM indefinitely...\n\nOr maybe we simply state that the APP must aggressively close NRT\nreaders with time else memory use grows and grows... but I don't\nreally like that.  We don't have such a restriction today... ",
+            "author": "Michael McCandless",
+            "id": "comment-12844898"
+        },
+        {
+            "date": "2010-03-14T06:05:07+0000",
+            "content": "Mike, Why does DocFieldConsumers have DocFieldConsumer one and two?  How is this class used?  Thanks. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845030"
+        },
+        {
+            "date": "2010-03-14T06:26:27+0000",
+            "content": "\nAlso, we could store the first docID stored into the term, too - this\nway we could have a ordered collection of terms, that's shared across\nseveral open readers even as changes are still being made, but each\nreader skips a given term if its first docID is greater than the\nmaxDoc it's searching. That'd give us point in time searching even\nwhile we add terms with time...\n\nExactly. This is what I meant in my comment: \nhttps://issues.apache.org/jira/browse/LUCENE-2293?focusedCommentId=12841915&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12841915\n\nBut I mistakenly said lastDocID; of course firstDocID is correct. ",
+            "author": "Michael Busch",
+            "id": "comment-12845031"
+        },
+        {
+            "date": "2010-03-14T06:27:35+0000",
+            "content": "I'll try to tackle this one! ",
+            "author": "Michael Busch",
+            "id": "comment-12845032"
+        },
+        {
+            "date": "2010-03-14T07:03:33+0000",
+            "content": "A few notes so far:\n\n\n\tIW flush could become thread dependent (eg, it'll only flush\nfor the current doc writer) or maybe it should flush all doc\nwriters? Close will shut down and flush all doc writers.\n\n\n\n\n\tA new term will first check the hash table for existence (as\ncurrently), if it's not in the term hash table only then will it\nbe added to the btree (btw, binary search is O(log N) on\naverage?) This way we're avoiding the somewhat costlier btree\nexistence check per token.\n\n\n\n\n\tThe algorithm for flushing doc writers based on RAM\nconsumption can simply be, on exceed, flush the doc writer\nconsuming the most RAM? \n\n\n\n\n\tI gutted the PerThread classes, then realized, it's all too\nintertwined. I'd rather get something working, than spend an\nexcessive amount of time rearranging code that already works. \n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845036"
+        },
+        {
+            "date": "2010-03-14T07:29:15+0000",
+            "content": "\n\tIW commitMerge calls docWriter's remapDeletes, a synchronized method to prevent concurrent updates.  I'm not sure how we should efficiently block calls to the different DW's.\n\n\n\n\n\t_mergeInit calls docWriter getDocStoreSegment - unsure what to change\n\n\n\n\n\tSome of the config settings (such as maxBufferedDocs) can simply be removed from DW, and instead accessed via WriterConfig\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845041"
+        },
+        {
+            "date": "2010-03-14T09:49:52+0000",
+            "content": "Michael are you also going to [first] tackle truly separating the RAM segments?  I think we need this first ...\n\nMike, Why does DocFieldConsumers have DocFieldConsumer one and two? How is this class used? Thanks.\n\nThis is so we can make a \"tee\" in the indexing chain.  Here's the default chain (copied out of comment in DW):\n\nDocConsumer / DocConsumerPerThread\n  --> code: DocFieldProcessor / DocFieldProcessorPerThread\n    --> DocFieldConsumer / DocFieldConsumerPerThread / DocFieldConsumerPerField\n      --> code: DocFieldConsumers / DocFieldConsumersPerThread / DocFieldConsumersPerField\n        --> code: DocInverter / DocInverterPerThread / DocInverterPerField\n          --> InvertedDocConsumer / InvertedDocConsumerPerThread / InvertedDocConsumerPerField\n            --> code: TermsHash / TermsHashPerThread / TermsHashPerField\n              --> TermsHashConsumer / TermsHashConsumerPerThread / TermsHashConsumerPerField\n                --> code: FreqProxTermsWriter / FreqProxTermsWriterPerThread / FreqProxTermsWriterPerField\n                --> code: TermVectorsTermsWriter / TermVectorsTermsWriterPerThread / TermVectorsTermsWriterPerField\n          --> InvertedDocEndConsumer / InvertedDocConsumerPerThread / InvertedDocConsumerPerField\n            --> code: NormsWriter / NormsWriterPerThread / NormsWriterPerField\n        --> code: StoredFieldsWriter / StoredFieldsWriterPerThread / StoredFieldsWriterPerField\n\n\n\nThe tee is so the doc fields can go to both DocInvert (for creating postings & term vectors) and to stored fields writer. ",
+            "author": "Michael McCandless",
+            "id": "comment-12845057"
+        },
+        {
+            "date": "2010-03-14T10:00:26+0000",
+            "content": "IW flush could become thread dependent \n\nRight, we want this \u2013 different RAM segments should be flushed at different times.  This gives us better concurrency since IO/CPU resource consumption will now be more interleaved.  While one RAM segment is flushing, the others are still indexing.\n\n\nA new term will first check the hash table for existence (as\ncurrently), if it's not in the term hash table only then will it\nbe added to the btree (btw, binary search is O(log N) on\naverage?) This way we're avoiding the somewhat costlier btree\nexistence check per token.\n\nYes, we could have btree on-the-side but still use hash for mapping (vs using btree alone).  Hash will be faster lookups... btree could be created/updated on demand first time something needs to .next() through the TermsEnum.\n\n{quote\nThe algorithm for flushing doc writers based on RAM\nconsumption can simply be, on exceed, flush the doc writer\nconsuming the most RAM\n{quote}\n\nSounds good   The challenge will be balancing things... eg if during the time 1 RAM segment is flushed, the others are able to consume more RAM that was freed up by flushing this one RAM segment, you've got a problem... or maybe at that point you go and flush the next one now using the most RAM, so it'd self balance with time.\n\nThis will mean the RAM usage is able to flare up above the high water mark...\n\n\nI gutted the PerThread classes, then realized, it's all too\nintertwined. I'd rather get something working, than spend an\nexcessive amount of time rearranging code that already works.\n\nFor starters I would keep the *PerThread, but create multiple DWs?  Ie, removing the PerThread layer doesn't have to happen at first.\n\nOr we could do the nuclear option \u2013 make a new indexing chain. ",
+            "author": "Michael McCandless",
+            "id": "comment-12845059"
+        },
+        {
+            "date": "2010-03-14T10:10:35+0000",
+            "content": "IW commitMerge calls docWriter's remapDeletes, a synchronized method to prevent concurrent updates. I'm not sure how we should efficiently block calls to the different DW's.\n\nYeah this is because when we buffer a delete Term/Query, the docID we store against it is absolute.  It seems like it could/should be relative (ie, within the RAM segment), then remapping wouldn't be needed when a merge commits.  I think?\n\n_mergeInit calls docWriter getDocStoreSegment - unsure what to change\n\nIt wouldn't anymore once we have private RAM segments: we would no longer share doc stores across segments, meaning merging will always merge doc stores and there's no need to call that method nor have all the logic in SegmentMerger to determine whether doc store merging is required.\n\nThis will necessarily be a perf hit when up and building a large index from scratch in a single IW session.  Today that index creates one large set of doc stores and never has to merge it while building.  This is the biggest perf downside to this change, I think.\n\nBut maybe the perf loss will not be so bad, because of bulk merging, in the case when all docs always add the same fields in the same order.  Or... if we could fix lucene to always bind the same field name to the same field number (LUCENE-1737) then we'd always bulk-merge regardless of which & which order app adds fields to docs.\n\nSome of the config settings (such as maxBufferedDocs) can simply be removed from DW, and instead accessed via WriterConfig\n\nAhh, you mean push IWC down to DW?  That sounds great. ",
+            "author": "Michael McCandless",
+            "id": "comment-12845061"
+        },
+        {
+            "date": "2010-03-14T22:37:45+0000",
+            "content": "Mike, rollback is pausing all threads and calling doc writer abort.  This should probably happen across all (per thread) doc writers? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845149"
+        },
+        {
+            "date": "2010-03-14T23:20:35+0000",
+            "content": "Well, we need to keep our transactional semantics. So I assume while a flush will happen per doc writer independently, a commit will trigger all (per thread) doc writers to flush. Then a rollback also has to abort all per thread doc writers. ",
+            "author": "Michael Busch",
+            "id": "comment-12845155"
+        },
+        {
+            "date": "2010-03-14T23:27:20+0000",
+            "content": "\nMichael are you also going to [first] tackle truly separating the RAM segments? I think we need this first ...\n\nYeah I agree.  I started working on a patch for separating the doc writers already.\n\nI also have a separate indexing chain prototype working with searchable RAM buffer (single-threaded), but slightly different postinglist format (some docs nowadays only have 140 characters  ). It seems really fast.  I spent a long time thinking about lock-free algorithms and data structures, so indexing performance should be completely independent of the search load (in theory).  I need to think a bit more about how to make it work with \"normal\" documents and Lucene's current in-memory format. ",
+            "author": "Michael Busch",
+            "id": "comment-12845157"
+        },
+        {
+            "date": "2010-03-15T04:19:09+0000",
+            "content": "I got the basics of the term enum working, it can be completed\nfairly easily. So I moved on to term docs... There we got some\nwork to do? Because we're not storing the skip lists in the ram\nbuffer, currently. I guess we'll need a new\nFreqProxTermsWriterPerField that stores the skip lists as\nthey're being written? How will that work? Doesn't the\nmulti-level skip list assume a set number of docs?  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845179"
+        },
+        {
+            "date": "2010-03-15T09:35:44+0000",
+            "content": "Yes, commit should flush & sync all doc writers, and rollback must abort all of them.\n\nI also have a separate indexing chain prototype working with searchable RAM buffer (single-threaded)\n\nYay!\n\nbut slightly different postinglist format (some docs nowadays only have 140 characters ).\n\nNew sponsor, eh?  \n\nBut, yes, I suspect an indexer chain optimized to tiny docs can get sizable gains.\n\nWhat change to the postings format?  Is the change only in the RAM\nbuffer or also in the index?  If it's in the index... we should\nprobably do this under flex.\n\nIt seems really fast. I spent a long time thinking about lock-free algorithms and data structures, so indexing performance should be completely independent of the search load (in theory). I need to think a bit more about how to make it work with \"normal\" documents and Lucene's current in-memory format.\n\nSounds like awesome progress!!  Want some details over here  ",
+            "author": "Michael McCandless",
+            "id": "comment-12845255"
+        },
+        {
+            "date": "2010-03-15T09:40:52+0000",
+            "content": "\nI got the basics of the term enum working, it can be completed\nfairly easily. So I moved on to term docs... There we got some\nwork to do? Because we're not storing the skip lists in the ram\nbuffer, currently. I guess we'll need a new\nFreqProxTermsWriterPerField that stores the skip lists as\nthey're being written? How will that work? Doesn't the\nmulti-level skip list assume a set number of docs?\n\nSounds like you & Michael should sync up!\n\nGood question on skipping \u2013 for first cut we can have no skipping\n(and just scan)?  Skipping may not be that important in practice,\nunless RAM buffer becomes truly immense.  Of course, the tinier the\ndocs the more important skipping will be... ",
+            "author": "Michael McCandless",
+            "id": "comment-12845257"
+        },
+        {
+            "date": "2010-03-15T15:48:55+0000",
+            "content": "Good question on skipping - for first cut we can have no\nskipping (and just scan)? \n\nTrue.\n\nOne immediate thought is to have a set skip interval (what was\nit before when we had single level?), and for now at least have\na single level skip list. That we can grow the posting list with\ndocs, and the skip list at the same time. If the interval is\nconstant there won't be a need to rebuild the skip list. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845374"
+        },
+        {
+            "date": "2010-03-15T16:56:41+0000",
+            "content": "Pre-advanced apology for permanently damaging (well I guess it\ncan be deleted) the look and feel of this issue with a thwack of\ncode, however I don't want to post the messy patch, and I'm\nguessing there's something small as to why the postings\niteration on the freq byte slice reader isn't happening\ncorrectly (ie, it's returning 0).\n\n\npublic class DWTermDocs implements TermDocs {\n    final FreqProxTermsWriterPerField field;\n    final int numPostings;\n    final CharBlockPool charPool;\n    FreqProxTermsWriter.PostingList posting;\n    char[] text;\n    int textOffset;\n    private int postingUpto = -1;\n    final ByteSliceReader freq = new ByteSliceReader();\n    final ByteSliceReader prox = new ByteSliceReader();\n\n    int docID;\n    int termFreq;\n    \n    DWTermDocs(FreqProxTermsWriterPerField field, FreqProxTermsWriter.PostingList posting) throws IOException {\n      this.field = field;\n      this.charPool = field.perThread.termsHashPerThread.charPool;\n      //this.numPostings = field.termsHashPerField.numPostings;\n      this.numPostings = 1;\n      this.posting = posting;\n      // nextTerm is called only once to \n      // set the term docs pointer at the \n      // correct position\n      nextTerm();\n    }\n    \n    boolean nextTerm() throws IOException {\n      postingUpto++;\n      if (postingUpto == numPostings)\n        return false;\n\n      docID = 0;\n\n      text = charPool.buffers[posting.textStart >> DocumentsWriter.CHAR_BLOCK_SHIFT];\n      textOffset = posting.textStart & DocumentsWriter.CHAR_BLOCK_MASK;\n\n      field.termsHashPerField.initReader(freq, posting, 0);\n      if (!field.fieldInfo.omitTermFreqAndPositions)\n        field.termsHashPerField.initReader(prox, posting, 1);\n\n      // Should always be true\n      boolean result = nextDoc();\n      assert result;\n\n      return true;\n    }\n    \n    public boolean nextDoc() throws IOException {\n      if (freq.eof()) {\n        if (posting.lastDocCode != -1) {\n          // Return last doc\n          docID = posting.lastDocID;\n          if (!field.omitTermFreqAndPositions)\n            termFreq = posting.docFreq;\n          posting.lastDocCode = -1;\n          return true;\n        } else\n          // EOF\n          return false;\n      }\n      final int code = freq.readVInt();\n      if (field.omitTermFreqAndPositions)\n        docID += code;\n      else {\n        docID += code >>> 1;\n        if ((code & 1) != 0)\n          termFreq = 1;\n        else\n          termFreq = freq.readVInt();\n      }\n      assert docID != posting.lastDocID;\n      return true;\n    }\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845404"
+        },
+        {
+            "date": "2010-03-15T18:02:17+0000",
+            "content": "I don't see anything obviously wrong \u2013 you excised this code from the same code that's used when merging the postings during flush? ",
+            "author": "Michael McCandless",
+            "id": "comment-12845432"
+        },
+        {
+            "date": "2010-03-15T18:35:20+0000",
+            "content": "The code is from FreqProxFieldMergeState which accepts in it's\nconstructor FreqProxTermsWriterPerField. One difference is\ninstead of operating on an array of posting lists, the code\nabove assumes one posting list.\n\nThe numPostings was always 0 when testing \n\nthis.numPostings = field.termsHashPerField.numPostings;\n \nIn the code above it's hard coded to 1. \n\nMaybe there's some initialization that's not happening correctly?\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845448"
+        },
+        {
+            "date": "2010-03-15T19:03:14+0000",
+            "content": "Ahh, I think it's because you're not calling compactPostings/sortPostings in the THPF, right?\n\nThose methods collapse the hash table in-place (ie move all the nulls out), and sort.\n\nSo you have to re-work the code to not do that and instead use whatever structure you have for visiting terms in sorted order.  Then stepping through the docs should just work, but, you gotta stop at the max docID, right?\n\nHmm... what does JMM say about byte arrays?  If one thread is writing to the byte array, can any other thread see those changes? ",
+            "author": "Michael McCandless",
+            "id": "comment-12845464"
+        },
+        {
+            "date": "2010-03-15T20:09:39+0000",
+            "content": "Ahh, I think it's because you're not calling\ncompactPostings/sortPostings in the THPF, right?\n\nThose methods collapse the hash table in-place (ie move all the\nnulls out), and sort.\n\nYep, got that part. \n\nSo you have to re-work the code to not do that and\ninstead use whatever structure you have for visiting terms in\nsorted order. Then stepping through the docs should just work,\nbut, you gotta stop at the max docID, right?\n\nRight, the terms in sorted order is working... The freq\nByteSliceReader is reading nothing however (zeroes). Either it's\ninit'ed to the wrong position, or there's nothing in there? Or\nsomething else.  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845493"
+        },
+        {
+            "date": "2010-03-15T20:25:31+0000",
+            "content": "Also wanted to add that the PostingList lastDocID is correct. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845503"
+        },
+        {
+            "date": "2010-03-16T02:37:09+0000",
+            "content": "I have a test case showing the term docs working... I'm going to try to add the term positions methods. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845663"
+        },
+        {
+            "date": "2010-03-16T03:23:17+0000",
+            "content": "Basic term positions working, need to figure out how to do lazy loading payloads... ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845679"
+        },
+        {
+            "date": "2010-03-16T03:26:23+0000",
+            "content": "In thinking about the terms dictionary, we're going to run into concurrency issues right if we just use TreeMap?  Can't we simply use the lock free ConcurrentSkipListMap?  Yeah it's a part of Java6 however why reinvent the wheel? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845680"
+        },
+        {
+            "date": "2010-03-16T04:06:48+0000",
+            "content": "Payloads works (non-lazy loading), however ByteSliceReader doesn't implement a seek method so I think we simply need to load each payload as we increment nextPosition?  The cost shouldn't be too much because we're simply copying small byte arrays (in the heap). ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845696"
+        },
+        {
+            "date": "2010-03-16T04:32:27+0000",
+            "content": "\nSounds like awesome progress!! Want some details over here \n\nSorry for not being very specific.  The prototype I'm experimenting with has a fixed length postings format for the in-memory representation (in TermsHash).  Basically every posting has 4 bytes, so I can use int[] arrays (instead of the byte[] pools).  The first 3 bytes are used for an absolute docID (not delta-encoded). This limits the max in-memory segment size to 2^24 docs.  The 1 remaining byte is used for the position.  With a max doc length of 140 characters you can fit every possible position in a byte - what a luxury!   If a term occurs multiple times in the same doc, then the TermDocs just skips multiple occurrences with the same docID and increments the freq.  Again, the same term doesn't occur often in super short docs.\n\nThe int[] slices also don't have forward pointers, like in Lucene's TermsHash, but backwards pointers.  In real-time search you often want a strongly time-biased ranking.  A PostingList object has a pointer that points to the last posting (this statement is not 100% correct for visibility reasons across threads, but we can imagine it this way for now).  A TermDocs can now traverse the postinglists in opposite order.  Skipping can be done by following pointers to previous slices directly, or by binary search within a slice. ",
+            "author": "Michael Busch",
+            "id": "comment-12845703"
+        },
+        {
+            "date": "2010-03-16T05:09:06+0000",
+            "content": " Hmm... what does JMM say about byte arrays? If one thread is writing\nto the byte array, can any other thread see those changes? \n\nThis is the very right question to ask here. Thread-safety is really the by\nfar most complicated aspect of this feature. Jason, I'm not sure if you\nalready figured out how to ensure visibility of changes made by the writer\nthread to the reader threads?\n\nThread-safety in our case boils down to safe publication. We don't need\nlocking to coordinate writing of multiple threads, because of LUCENE-2324. But\nwe need to make sure that the reader threads see all changes they need to see\nat the right time, in the right order. This is IMO very hard, but we all like\nchallenges \n\nThe JMM gives no guarantee whatsover what changes a thread will see that\nanother thread made - or if it will ever see the changes, unless proper\npublication is ensured by either synchronization or volatile/atomic variables.\n\nSo e.g. if a writer thread executes the following statements:\n\npublic static int a, b;\n\n...\n\na = 1; b = 2;\n\na = 5; b = 6;\n\n\n\nand a reader threads does:\n\nSystem.out.println(a + \",\" + b);\n\n\n\nThe thing to remember is that the output might be: 1,6! Another reader thread\nwith the following code: \n\nwhile (b != 6) {\n  .. do something \n}\n\n\nmight further NEVER terminate without synchronization/volatile/atomic.\n\nThe reason is that the JVM is allowed to perform any reorderings to utilize\nmodern CPUs, memory, caches, etc. if not forced otherwise.\n\nTo ensure safe publication of data written by a thread we could do\nsynchronization, but my goal is it here to implement a non-blocking and\nlock-free algorithm. So my idea was it to make use of a very subtle behavior\nof volatile variables. I will take a simple explanation of the JMM from Brian\nGoetz' awesome book \"Java concurrency in practice\", in which he describes the\nJMM in simple happens-before rules. I will mention only three of those rules,\nbecause they are enough to describe the volatile behavior I'd like to mention\nhere (p. 341)\n\nProgram order rule: Each action in a thread happens-before every action in\nthat thread that comes later in the program order.\n\nVolatile variable rule: A write to a volatile field happens-before every\nsubsequent read of that same field.\n\nTransitivity: If A happens-before B, and B happens-before C, then A\nhappens-before C.\n\nBased on these three rules you can see that writing to a volatile variable v\nby one thread t1 and subsequent reading of the same volatile variable v by\nanother thread t2 publishes ALL changes of t1 that happened-before the write\nto v and the change of v itself. So this write/read of v means crossing a\nmemory barrier and forcing everything that t1 might have written to caches to\nbe flushed to the RAM. That's why a volatile write can actually be pretty\nexpensive.\n\nNote that this behavior is actually only working like I just described since\nJava 1.5. Behavior of volatile variables was a very very subtle change from\n1.4->1.5!\n\nThe way I'm trying to make use of this behavior is actually similar to how we\nlazily sync Lucene's files with the filesystem: I want to delay the cache->RAM\nwrite-through as much as possible, which increases the probability of getting\nthe sync for free! Still fleshing out the details, but I wanted to share these\ninfos with you guys already, because it might invalidate a lot of assumptions\nyou might have when developing the code. Some of this stuff was actually new\nto me, maybe you all know it already.  And if anything that I wrote here is\nincorrect, please let me know!\n\nBtw: IMO, if there's only one java book you can ever read, then read Goetz'\nbook! It's great. He also says in the book somewhere about lock-free\nalgorithms: \"Don't try this at home!\" - so, let's do it!  ",
+            "author": "Michael Busch",
+            "id": "comment-12845712"
+        },
+        {
+            "date": "2010-03-16T05:48:57+0000",
+            "content": "Just to clarify, I think Mike's referring to ParallelArray?\n\nhttp://gee.cs.oswego.edu/dl/jsr166/dist/extra166ydocs/extra166y/P\narallelArray.html\n\nThere's AtomicIntegerArray:\nhttp://www.melclub.net/java/_atomic_integer_array_8java_source.html \nwhich underneath uses the sun.Unsafe class for volatile array\naccess. Could this be reused for an AtomicByteArray class (why\nisn't there one of these already?).\n\nA quick and easy way to solve this is to use a read write lock\non the byte pool? Remember when we'd sync on each read bytes\ncall to the underlying random access file in FSDirectory (eg,\nnow we're using NIOFSDir which can be a good concurrent\nthroughput improvement). Lets try the RW lock and examine the\nresults? I guess the issue is we're not writing in blocks of\nbytes, we're actually writing byte by byte and need to read byte\nby byte concurrently? This sounds like a fairy typical thing to\ndo?  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845721"
+        },
+        {
+            "date": "2010-03-16T05:58:43+0000",
+            "content": "\nA quick and easy way to solve this is to use a read write lock\non the byte pool?\n\nIf you use a RW lock then the writer thread will block all reader threads while it's making changes.  The writer thread will be making changes all the time in a real-time search environment.  The contention will kill performance I'm sure.  RW lock is only faster than mutual exclusion lock if writes are infrequent, as mentioned in the javadocs of ReadWriteLock.java ",
+            "author": "Michael Busch",
+            "id": "comment-12845726"
+        },
+        {
+            "date": "2010-03-16T06:06:54+0000",
+            "content": "but my goal is it here to implement a non-blocking and\nlock-free algorithm. So my idea was it to make use of a very\nsubtle behavior of volatile variables. \n\nYou're talking about having a per thread write buffer byte\narray, that on search gets copied into a read only array, or\ngets transformed magically into a volatile byte array? (Do\nvolatile byte arrays work? I couldn't find a clear answer on the\nnet, maybe it's stated in the Goetz book). If volatile byte\narrays do work, an option to test would be a byte buffer pool\nthat uses volatile byte arrays? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845729"
+        },
+        {
+            "date": "2010-03-16T06:10:34+0000",
+            "content": "\nDo volatile byte arrays work\n\nI'm not sure what you mean by volatile byte arrays?\n\nDo you mean this?\n\nvolatile byte[] array;\n\n\n\nThis makes the reference to the array volatile, not the slots in the array. ",
+            "author": "Michael Busch",
+            "id": "comment-12845731"
+        },
+        {
+            "date": "2010-03-16T06:27:18+0000",
+            "content": "This makes the reference to the array volatile, not the\nslots in the array\n\nThat's no good! \n\nIf you use a RW lock then the writer thread will block\nall reader threads while it's making changes\n\nWe probably need to implement more fine grained locking, perhaps\nusing volatile booleans instead of RW locks. Fine grained\nmeaning on the byte array/block level. I think this would imply\nthat changes are not visible until a given byte block is more or\nless \"flushed\"? This is different than the design that's been\nimplicated, that we'd read from byte arrays as their being\nwritten to. We probably don't need to read from and write to the\nsame byte array concurrently (that might not be feasible?).\n\nThe performance win here is probably going to be the fact that\nwe avoid segment merges.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845735"
+        },
+        {
+            "date": "2010-03-16T06:50:53+0000",
+            "content": "The tricky part is to make sure that a reader always sees a consistent snapshot of the index.  At the same time a reader must not follow pointers to non-published locations (e.g. array blocks).\n\nI think I have a lock-free solution working, which only syncs (i.e. does volatile writes) in certain intervals to not prevent JVM optimizations - but I need more time for thinking about all the combinations and corner cases.\n\nIt's getting late now - need to sleep! ",
+            "author": "Michael Busch",
+            "id": "comment-12845745"
+        },
+        {
+            "date": "2010-03-16T09:45:16+0000",
+            "content": "The tricky part is to make sure that a reader always sees a consistent snapshot of the index. At the same time a reader must not follow pointers to non-published locations (e.g. array blocks).\n\nRight, I'm just not familiar specifically with what JMM says about one thread writing to a byte[] and another thread reading it.\n\nIn general, for our usage, the reader threads will never read into an area that has not yet been written to.  So that works in our favor (they can't cache those bytes if they didn't read them).  EXCEPT the CPU will have loaded the bytes on a word boundary and so if our reader thread reads only 1 byte, and no more (because this is now the end of the posting), the CPU may very well have pulled in the following 7 bytes (for example) and then illegally (according to our needs) cache them.\n\nWe better make some serious tests for this... including reader threads that just enum the postings for a single rarish term over and over while writer threads are indexing docs that occasionally have that term.  I think that's the worst case for JMM violation since the #bytes cached is small.\n\nIt's too bad there isn't higher level control on the CPU caching via java.  EG, in our usage, if we could call a System.flushCPUCache whenever a thread enters a newly reopened reader.... because, when accessing postings via a given Reader we want point-in-time searching anyway and so any bytes cached by the CPU are perfectly fine.  We only need CPU cache flush when a reader is reopened.... ",
+            "author": "Michael McCandless",
+            "id": "comment-12845777"
+        },
+        {
+            "date": "2010-03-16T09:46:51+0000",
+            "content": "\nThe prototype I'm experimenting with has a fixed length postings format for the in-memory representation (in TermsHash). Basically every posting has 4 bytes, so I can use int[] arrays (instead of the byte[] pools). The first 3 bytes are used for an absolute docID (not delta-encoded). This limits the max in-memory segment size to 2^24 docs. The 1 remaining byte is used for the position. With a max doc length of 140 characters you can fit every possible position in a byte - what a luxury!  If a term occurs multiple times in the same doc, then the TermDocs just skips multiple occurrences with the same docID and increments the freq. Again, the same term doesn't occur often in super short docs.\n\nThe int[] slices also don't have forward pointers, like in Lucene's TermsHash, but backwards pointers. In real-time search you often want a strongly time-biased ranking. A PostingList object has a pointer that points to the last posting (this statement is not 100% correct for visibility reasons across threads, but we can imagine it this way for now). A TermDocs can now traverse the postinglists in opposite order. Skipping can be done by following pointers to previous slices directly, or by binary search within a slice.\nThis sounds nice!\n\nThis would be a custom indexing chain for docs guaranteed not to be over 255 positions in length right? ",
+            "author": "Michael McCandless",
+            "id": "comment-12845778"
+        },
+        {
+            "date": "2010-03-16T09:48:18+0000",
+            "content": "In thinking about the terms dictionary, we're going to run into concurrency issues right if we just use TreeMap? \n\nRight, we need a concurrent data structure here.  It's OK if there've been changes to this shared data structure since a reader was opened \u2013 that reader knows its max doc id and so it can skip a term if the first doc id in that term is > that max. ",
+            "author": "Michael McCandless",
+            "id": "comment-12845780"
+        },
+        {
+            "date": "2010-03-16T15:45:54+0000",
+            "content": "I thought we're moving away from byte block pooling and we're\ngoing to try relying on garbage collection? Does a volatile\nobject[] publish changes to all threads? Probably not, again\nit'd just be the pointer.\n\nIn the case of posting/termdocs iteration, I'm more concerned\nthat the lastDocID be volatile than the with the byte array\ncontaining extra data. Extra docs is OK in the byte array\nbecause we'll simply stop iterating when we've reached the last\ndoc. Though with our system, we shouldn't even run into this\neither, meaning a byte array is copied and published, perhaps\nthe master byte array is still being written to and the same\nbyte array (by id or something) is published again? Then we'd\nhave multiple versions of byte arrays. That could be bad.\n\nBecause there is one DW per thread, there's only one document\nbeing indexed at a time. There's no writer concurrency. This\nleaves reader concurrency. However after each doc, we could\nsimply flush all bytes related to the doc. Any new docs must\nsimply start writing to new byte arrays? The problem with this\nis, unless the byte arrays are really small, we'll have a lot of\nextra data around, well, unless the byte arrays are trimmed\nbefore publication. Or we can simply RW lock (or some other\nanalogous thing) individual byte arrays, not publish them after\neach doc, then only publish them when get reader is called. To\nclarify, the RW lock (or flag) would only be per byte array, in\nfact, all writing to the byte array could necessarily cease on\nflush, and new byte arrays allocated. The published byte array\ncould point to the next byte array. \n\nI think we simply need a way to publish byte arrays to all\nthreads? Michael B. can you post something of what you have so\nwe can get an idea of how your system will work (ie, mainly what\nthe assumptions are)? \n\nWe do need to strive for correctness of data, and perhaps\nperformance will be slightly impacted (though compared with our\ncurrent NRT we'll have an overall win).  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845943"
+        },
+        {
+            "date": "2010-03-16T15:54:05+0000",
+            "content": "The tricky part is to make sure that a reader always sees\na consistent snapshot of the index. At the same time a reader\nmust not follow pointers to non-published locations (e.g. array\nblocks). \n\nRight. In what case in the term enum, term docs chain of doc\nscoring would a reader potentially try to follow a pointer to a\nbyte array that doesn't exist? I think we're strictly preventing\nit via last doc ids? Also, when we flush, I think we need to\nblock further doc writing (via an RW lock?) and wait for any\ncurrently writing docs to complete, then forcibly publish the\nbyte arrays, then release the write lock? This way we always\nhave published data that's consistent for readers (eg, the\ninverted index can be read completely, and there won't be any\nwild writes still occurring to a byte array that's been\npublished). ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845950"
+        },
+        {
+            "date": "2010-03-16T16:11:16+0000",
+            "content": "\nI thought we're moving away from byte block pooling and we're\ngoing to try relying on garbage collection? Does a volatile\nobject[] publish changes to all threads? Probably not, again\nit'd just be the pointer.\n\nWe were so far only considering moving away from pooling of (Raw)PostingList objects.  Pooling byte blocks might have more performance impact - they're more heavy-weight. ",
+            "author": "Michael Busch",
+            "id": "comment-12845969"
+        },
+        {
+            "date": "2010-03-16T16:17:11+0000",
+            "content": "To clarify the above comment, DW's update doc method would acquire a mutex.  The flush bytes method would also acquire that mutex when it copies existing writeable bytes over to the readable bytes thing (pool?). ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12845971"
+        },
+        {
+            "date": "2010-03-16T16:32:15+0000",
+            "content": "\nthink we simply need a way to publish byte arrays to all\nthreads? Michael B. can you post something of what you have so\nwe can get an idea of how your system will work (ie, mainly what\nthe assumptions are)?\n\nIt's kinda complicated to explain and currently differs from Lucene's TermHash classes a lot.  I'd prefer to wait a little bit until I have verified that my solution works.\n\nI think here we should really tackle LUCENE-2324 first - it's a prereq.  Wanna help with that, Jason? ",
+            "author": "Michael Busch",
+            "id": "comment-12845978"
+        },
+        {
+            "date": "2010-03-17T02:28:04+0000",
+            "content": "I think the easiest way to test out the concurrency is to add a\nflush method to ByteBlockPool. Then allocate a read only version\nof the buffers array (not copying the byte arrays, just the 1st\ndimension pointers). The only issue is to rework the code to\nread from the read only array, and write to the write only\narray...  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12846261"
+        },
+        {
+            "date": "2010-03-17T18:53:51+0000",
+            "content": "Mike, can you clarify why intUptos and intUptoStart are member\nvariables in TermsHashPerField? Can't the accessors simply refer\nto IntBlockPool for these? I'm asking because in IntBlockPool flush,\nfor now I'm simply calling nextBuffer to shuffle the current\nwritable array into a read only state (ie, all of the arrays\nbeing written to prior to flush will now be readonly). ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12846526"
+        },
+        {
+            "date": "2010-03-17T19:18:37+0000",
+            "content": "I think the DW index reader needs to create a new fields reader on demand if the field infos have changed since the last field reader instantiation. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12846540"
+        },
+        {
+            "date": "2010-03-17T19:34:15+0000",
+            "content": "intUptoStart is used in THPF.writeByte which is very much a hotspot when indexing, so I added it as a direct member in THPF to avoid an extra deref through the intPool.  Could be this is harmless in practice though... ",
+            "author": "Michael McCandless",
+            "id": "comment-12846546"
+        },
+        {
+            "date": "2010-03-17T21:31:59+0000",
+            "content": "Previously there was a discussion about DW index readers that\nstay open, but could refer to byte arrays that are\nrecycled? Can't we simply throw away the doc writer after a\nsuccessful segment flush (the IRs would refer to it, however\nonce they're closed, the DW would close as well)? Then start\nwith a new DW for the next batch of indexing for that thread? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12846604"
+        },
+        {
+            "date": "2010-03-18T09:17:56+0000",
+            "content": "\nCan't we simply throw away the doc writer after a\nsuccessful segment flush (the IRs would refer to it, however\nonce they're closed, the DW would close as well)?\n\nI think that should be our first approach.  It means no pooling whatsoever.  And it means that an app that doesn't aggressively close its old NRT readers will consume more RAM.\n\nThough... the NRT readers will be able to search an active DW right?  Ie, it's only when that DW needs to flush, when the NRT readers would be tying up the RAM.\n\nSo, when a flush happens, existing NRT readers will hold a reference to that now-flushed DW, but when they reopen they will cutover to the on-disk segment.\n\nI think this will be an OK limitation in practice.  Once NRT readers can search a live (still being written) DW, flushing of a DW will be a relatively rare event (unlike today where we must flush every time an NRT reader is opened). ",
+            "author": "Michael McCandless",
+            "id": "comment-12846804"
+        },
+        {
+            "date": "2010-03-18T21:32:50+0000",
+            "content": "For the skip list, we could reuse what we have (ie,\nDefaultSkipListReader), though, we'd need to choose a default\nnumber of docs, pulled out of thin air, as there's no way to\nguesstimate per term before hand. Or we can have a single level\nskip list (more like an index) and binary search to find the\nvalue (assuming we have an int array instead of storing vints)\nin the skip list we're looking for. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12847123"
+        },
+        {
+            "date": "2010-03-22T16:07:07+0000",
+            "content": "@JasonR: There is a good reason there is no AtomicByteArray.  Atomic classes require the underlying hardware to provide a CAS-like operation, and real-world hardware does not provide CAS on bytes.  So an AtomicByteArray class would almost certainly have to declare an underlying array of ints anyway.   ",
+            "author": "Brian Goetz",
+            "id": "comment-12848183"
+        },
+        {
+            "date": "2010-03-22T16:20:22+0000",
+            "content": "Brian, thanks for the explanation! ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12848188"
+        },
+        {
+            "date": "2010-03-22T16:30:28+0000",
+            "content": "Hi Brian - good to see you on this list!\n\nIn my previous comment I actually quoted some sections of the concurrency book:\nhttps://issues.apache.org/jira/browse/LUCENE-2312?focusedCommentId=12845712&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#action_12845712\n\nDid I understand correctly that a volatile write can be used to enforce a cache->RAM write-through of all updates a thread made that came before the volatile write in the thread's program order?\n\nMy idea here was to use this behavior to avoid volatile writes for every document, but instead to periodically do such a volatile write (say e.g. every 100 documents).  I implemented a class called MemoryBarrier, which keeps track of when the last volatile write happened.  A reader thread can ask the MemoryBarrier what the last successfully processed docID before crossing the barrier was.  The reader will then never attempt to read beyond that document.\n\nOf course there are tons of details regarding safe publication of all involved fields and objects.  I was just wondering if this general \"memory barrier\" approach seems right and if indeed performance gains can be expected compared to doing volatile writes for every document? ",
+            "author": "Michael Busch",
+            "id": "comment-12848198"
+        },
+        {
+            "date": "2010-03-22T16:34:29+0000",
+            "content": "So.. what does this mean for allowing an IR impl to directly search IW's RAM buffer? ",
+            "author": "Michael McCandless",
+            "id": "comment-12848201"
+        },
+        {
+            "date": "2010-03-22T16:59:06+0000",
+            "content": "So.. what does this mean for allowing an IR impl to directly search IW's RAM buffer?\n\nThe main idea is to have an approach that is lock-free.  Then write performance will not suffer no matter how big your query load is.\n\nWhen you open/reopen a RAMReader it would first ask the MemoryBarrier for the last sync'ed docID (volatile read).  This would be the maxDoc for that reader and it's safe for the reader to read up to that id, because it can be sure that all changes the writer thread made up to that maxDoc are visible to the reader.\n\nIf we called MemoryBarrier.sync() let's say every 100 docs, then the max. search latency would be the amount of time it takes to index 100 docs.  Doing no volatile/atomic writes and not going through explicit locks for 100 docs will allow the JVM to do all its nice optimizations.  I think this will work, but honestly I have not really a good feeling for how much performance this approach would gain compared to writing to volatile variables for every document. ",
+            "author": "Michael Busch",
+            "id": "comment-12848210"
+        },
+        {
+            "date": "2010-03-22T17:40:21+0000",
+            "content": "I think sync'ing after every doc is probably the better option.  We'll still avoid the need to make all variables downstream of DocumentsWriter volatile/atomic, which should be a nice performance gain.\n\nThe problem with the delayed sync'ing (after e.g. 100 docs) is that if you don't have a never-ending stream of twee... err documents, then you might want to force an explicit sync at some point.  But that's very hard, because you would have to force the writer thread to make e.g. a volatile write via an API call.  And if that's an IndexWriter writer API that has to trigger the sync on multiple DocumentsWriter instances (i.e. multiple writer threads) I don't see how that's possible unless Lucene manages it's own thread of pools. ",
+            "author": "Michael Busch",
+            "id": "comment-12848226"
+        },
+        {
+            "date": "2010-07-21T21:34:37+0000",
+            "content": "We need to fill in the blanks on the terms dictionary\nimplementation. Michael B. has some good ideas on implementing it\nusing parallel arrays and dynamically updating a linked list\nimplemented as a parallel AtomicIntegerArray. A question we have\nis regarding the use of a btree to quickly find the point of\ninsertion for a new term. The btree would replace the term index\nwhich is binary searched and the term dictionary linearly\nscanned. Perhaps there's a better data structure for concurrent\nupdate and lookups?\n\nAnother use of the AtomicIntegerArray could be the deletes\nsequence id int[]. However is it needed and would the lookup be\nfast enough?\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12890909"
+        },
+        {
+            "date": "2010-07-23T18:39:27+0000",
+            "content": "In regards to implementing the terms dictionary index using a btree, here is a useful link on lock-free btree/esque solutions.\n\nhttp://stackoverflow.com/questions/256511/skip-list-vs-binary-tree ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12891721"
+        },
+        {
+            "date": "2010-07-23T19:33:56+0000",
+            "content": "We could use ConcurrentSkipListMap however there's a bit of\noverhead for the node object pointers. Michael had mentioned\nimplementing the sorted terms using parallel arrays. Maybe for\nthe first implementation we can store a sorted parallel array of\nBytesRefs? Or flatten a concurrent skip list into parallel\narrays?  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12891756"
+        },
+        {
+            "date": "2010-07-23T19:47:26+0000",
+            "content": "This wikipedia article illustrates the use of parallel arrays we can use for the terms dictionary: http://en.wikipedia.org/wiki/Linked_list#Linked_lists_using_arrays_of_nodes\n\nWhere the next and previous arrays would be AtomicIntegerArrays for concurrency (we may not need to implement the previous array because the TermsEnum only goes forward).  If we can somehow implement the concurrent skip list on top of the concurrent linked list, we're probably good to go. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12891760"
+        },
+        {
+            "date": "2010-07-29T00:40:32+0000",
+            "content": "We need to figure out a way to concurrently read and write from the *BlockPool classes.  This will block implementing the reading of the primary index information (ie, postings). ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12893450"
+        },
+        {
+            "date": "2010-07-29T03:53:08+0000",
+            "content": "I think we can change the *BlockPool classes to not expose the\nunderlying array and instead hide the implementation, perhaps\neven implement a random access file like api. At the end of a\ndocument add, we'd flush the RAMRandomAccessFile like class, at\nwhich point the underlying data would become available for\nreading. Unless there's something I'm missing?  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12893490"
+        },
+        {
+            "date": "2010-07-29T10:09:00+0000",
+            "content": "Note that many queries don't need sorted terms (TermQuery, PhraseQuery, SpanTermQuery).  Others do (NumericRangeQuery, TermRangeQuery, AutomatonQuery (wildcard, fuzzy, regexp), PrefixQuery).  At flush time we also need the terms sorted. ",
+            "author": "Michael McCandless",
+            "id": "comment-12893570"
+        },
+        {
+            "date": "2010-07-29T13:56:38+0000",
+            "content": "Note that many queries don't need sorted terms \n\nRight, for starters we could offer a limited terms enum, terms docs API that only allows seeking to a specific term, without iteration of the terms dictionary, and iteration of the term's postings.  Then some of these basic queries could be enabled. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12893617"
+        },
+        {
+            "date": "2010-09-22T04:29:44+0000",
+            "content": "The patches I've been submitting to LUCENE-2575 probably should go here.  Once the new byte block pool that records the slice level at the beginning of the slice is finished, the skip list can be completed, and then the basic functionality for searching on the RAM buffer will be done.  At that point the concurrency and memory efficiency may be focused on and tested.  In addition the deletes must be implemented. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12913389"
+        },
+        {
+            "date": "2010-10-11T03:28:26+0000",
+            "content": "The term dictionary's sorted int[] term ids can periodically be merged to create larger arrays.  We can use a log merge policy like algorithm to merge the arrays, while the iteratively added terms will be placed into a concurrent skip list.  Once the terms CSL reaches a given threshold (ie, 10,000) then it'll be converted into an int[] and periodically merged using log level steps. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12919704"
+        },
+        {
+            "date": "2010-10-13T00:46:26+0000",
+            "content": "An interesting question for this issue is how will norms be handled?  It's an issue because norms requires the total number of terms, which we can compute per reader, however as we add readers, we can easily generate too much garbage (ie, a new norms byte[] per field per reader).  Perhaps we can relax the accuracy of the calculation for RT?\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12920408"
+        },
+        {
+            "date": "2010-10-13T17:31:35+0000",
+            "content": "I wanted to getting everything built to prove out some of the ideas.  We're ready to concurrency test this.  We're nearly memory efficient except for terms dict and term freqs.  \n\n\n\tA single pass test of most basic RAM reader functionality\n\n\n\n\n\tWorking deletes via sequence IDs\n\n\n\n\n\tWe're only copying the spine of the byte block buffers and the int pool buffers per reader.\n\n\n\n\n\tFlushing and loading of doc stores and term vectors\n\n\n\n\n\tWe're only making a fully copy per reader of the term freqs in FreqProxPostingsArray.  This'll need to used paged ints.\n\n\n\n\n\tIncorporated LUCENE-2575's slice allocation\n\n\n\n\n\tTerms dictionary using a CSL.  Each terms enum is unique to a reader.\n\n\n\n\n\tThe RAM reader implements all IndexReader methods except norms.\n\n\n\n\n\tNot committable\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12920678"
+        },
+        {
+            "date": "2010-10-17T04:06:18+0000",
+            "content": "We don't need to create a new spine array for the byte and int blocks per reader, these are append only spine arrays so we'll only copy a reference to them per reader.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12921786"
+        },
+        {
+            "date": "2010-10-19T15:47:19+0000",
+            "content": "FreqProxTermsWriterPerField writes the prox posting data as terms are seen, however for the freq data we wait until we're on to the next doc (to accurately record the doc freq), and seeing a previously analyzed term before writing to the freq stream.  Because the last doc code array in the posting array should not be copied per reader, when a document is finished, we need to flush the freq info out per term seen for that doc.  This way, on reader instigated flush, the reader may always read all necessary posting data from the byte slices, and not rely partially on the posting array.  I don't think this will affect indexing performance. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12922597"
+        },
+        {
+            "date": "2010-12-19T17:35:16+0000",
+            "content": "I think this can be implemented on the single DWPT case we have today. I'm not\nsure why it needs to wait on DWPT other than we thought DWPT would make the\nsynchronization easier. Given that we're simply making pointer references in\nsync'd blocks to achieve basic RT, the single DW in 3.x and trunk should work\nfine. \n\nI'll start by making this patch to apply cleanly to trunk. There are two issues\nwhich will prevent all tests from passing, field caches and norms. Field caches\nwill require custom dynamic growing of the field cache arrays, perhaps we'll\nneed to add a .grow method to them? We don't really have a good way to address\nnorms and for now I'll leave them faked. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973024"
+        },
+        {
+            "date": "2010-12-20T00:23:23+0000",
+            "content": "I thought about opening a separate issue for RT FieldCache. In trunk it looks\nlike we need to add a grow method to CachedArray. However this doesn't quite\nsolve the problem of filling in the field cache values either on demand or as\ndocuments are added. I'm not yet sure how the on-demand case'll work, which is\nprobably the most logical to implement. \n\nThe difficult use case is terms index, as it returns the term for a docid from\nan ord value. I don't think maintaining a terms index is possible on a rapidly\nchanging index, eg, efficiently keeping an ordered terms array. Additionally,\nwe can't easily tap into the CSML terms dictionary as it'll be changing and\ndoesn't offer ord access. \n\nPerhaps we'd need to hardcode the terms index to return the term for a docid,\nie, force calls to getTermsIndex to return DocTerms. The underlying doc terms\nfield cache can be iteratively built on-demand. I wonder if there are\ncompatibility issues with returning a DocTermsIndex that only effectively\nimplements DocTerms? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973060"
+        },
+        {
+            "date": "2010-12-20T05:09:27+0000",
+            "content": "After further thought, there really isn't a choice here, the field cache values\nmust be added as documents are added, or inefficiently generated from scratch\nper reader. The latter could be used to allow all tests to pass, however the\nexcessive garbage generated could even preclude that. \n\nI think this'll mean introspecting for existing RT field cache entries and add\nvalues to them as documents are added.  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973092"
+        },
+        {
+            "date": "2010-12-20T22:22:40+0000",
+            "content": "Simple patch that's added a new CachedArray setValue method.  It can be used to specify field cache values while indexing with RT turned on modally.  A potential problem is whether the public values variable needs to be volatile due to multithreaded access? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973386"
+        },
+        {
+            "date": "2010-12-20T22:52:02+0000",
+            "content": "For TermOrdValComparator we'll have an issue when comparing the other segment's DocTermsIndex against the RAM reader's DocTerms for a given field, eg, it's going to fail because we won't have the ordinal.  We could add a flag that forces TOVC to compare RAM reader(s)' field caches by value? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973396"
+        },
+        {
+            "date": "2010-12-21T11:53:07+0000",
+            "content": "We could add a flag that forces TOVC to compare RAM reader(s)' field caches by value?\n\nLooks like we'll have to do something like that.  It's sort of like mixing StringOrdValComp with StringValComp on a segment by segment basis.  Ie for flushed segments it can use ord but for still-in-RAM segments it cannot.  Maybe we add a supportsOrd() to the FC entry? ",
+            "author": "Michael McCandless",
+            "id": "comment-12973597"
+        },
+        {
+            "date": "2010-12-21T11:56:02+0000",
+            "content": "Simple patch that's added a new CachedArray setValue method\n\nHmmm \u2013 how will we incrementally update the FC entry on opening a new RT reader?  Don't we have to fully re-invert?\n\nMaybe... we only support comparators using docvalues on RT segments, instead?  DocValues are much easier to update incrementally since they are set during indexing.  (But: we still need to figure out how DocValues intersects w/ RT!). ",
+            "author": "Michael McCandless",
+            "id": "comment-12973598"
+        },
+        {
+            "date": "2010-12-21T15:11:25+0000",
+            "content": "how will we incrementally update the FC entry on opening a new RT reader? Don't we have to fully re-invert?\n\nRight, fully re-inverting is inefficient so we need to add field cache values as we're indexing, which itself could be inefficient in some other way, though I think this is somewhat unlikely, maybe the conversion from string -> numbers?\n\nDocValues are much easier to update incrementally since they are set during indexing. (But: we still need to figure out how DocValues intersects w/ RT!).\n\nWhat's wrong with incrementally adding to the FC?  Also where are DocValues set during indexing?  In trunk they're only referenced in the o.a.l.s.function package. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973696"
+        },
+        {
+            "date": "2010-12-21T16:14:49+0000",
+            "content": "Maybe we add a supportsOrd() to the FC entry?\n\nOr mark the reader as requiring ord only in the non-RAM reader case.  Either that or we'd have an instanceof in FieldCache which is perhaps ugly. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973732"
+        },
+        {
+            "date": "2010-12-21T16:27:57+0000",
+            "content": "We shouldn't put to much magic down in the guts of anything here.  Obtaining a normal fieldcache entry should work the same on an RT reader as any other reader.\n\nIf we want a hybrid that can work either over docvalues or a normal FieldCache entry, then that should be a different type of FieldComparatorSource.  TOVC should continue to work as it does today. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12973739"
+        },
+        {
+            "date": "2010-12-22T15:28:50+0000",
+            "content": "Obtaining a normal fieldcache entry should work the same on an RT reader as any other reader\n\nYes.  I'm still confused as to how DocValues fits into all of this.  \n\nTOVC should continue to work as it does today\n\nIt should, otherwise there'll be performance considerations.  The main proposal here is incrementally updating FC values and how to continue to use DocTermsIndex for non-RT readers mixed with DocTerms for RT readers, either in TOVC or somewhere else. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12974247"
+        },
+        {
+            "date": "2010-12-22T16:14:35+0000",
+            "content": "Yes. I'm still confused as to how DocValues fits into all of this.\nDocValues == column stride fields \n\ndoes that help ?\n\nsimon ",
+            "author": "Simon Willnauer",
+            "id": "comment-12974260"
+        },
+        {
+            "date": "2010-12-22T16:32:36+0000",
+            "content": "DocValues == column stride fields \n\nOk, that makes sense! \n\nI'm going to leave this alone for now, however I agree that ideally we'd leave\nTOVC alone and at a higher level intermix the ord and non-ord doc terms. It's\nhard to immediately determine how that'd work given the slot concept, which\nseems to be an ord or value per reader that's directly comparable? Is there an\nexample of mixing multiple comparators for a given field? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12974264"
+        },
+        {
+            "date": "2011-01-10T10:04:52+0000",
+            "content": "Some questions to align myself with impending reality.\n\nIs that right that future RT readers are no longer immutable snapshots (in a sense that they have variable maxDoc)?\nIf it is so, are you keeping current NRT mode, with fast turnaround, yet immutable readers? ",
+            "author": "Earwin Burrfoot",
+            "id": "comment-12979522"
+        },
+        {
+            "date": "2011-01-10T12:04:33+0000",
+            "content": "I believe the goal for RT readers is still \"point in time\" reader semantics. ",
+            "author": "Michael McCandless",
+            "id": "comment-12979554"
+        },
+        {
+            "date": "2011-01-10T16:37:53+0000",
+            "content": "Is that right that future RT readers are no longer immutable snapshots\n(in a sense that they have variable maxDoc)?\n\nThe RT readers'll be point-in-time. There are many mechanisms to make this\nhappen that mainly revolve around a static maxDoc per reader while allowing\nsome of the underlying data structures to change during indexing. There are two\noverall design issues right now and that is how to handle norms and the\nsystem.arraycopy per getReader to create static read only parallel upto arrays.\n\nI think system.arraycopy should be fast enough given it's a native instruction\non Intel. And for norms we may need to relax their accuracy in order to create\nless garbage. That would involve either using a byte[][] for point-in-timeness\nor a byte[] that is recalculated only as it's grown (meaning newer readers\ncreated since the last array growth may see a slightly inaccurate norm value).\nThe norm byte[] would essentially be grown every N docs.\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12979631"
+        },
+        {
+            "date": "2011-01-10T16:45:31+0000",
+            "content": "I believe the goal for RT readers is still \"point in time\" reader semantics.\n\nTrue.  At twitter our RT solution also guarantees point-in-time readers (with one exception; see below).  We have to provide at least a fixed macDoc per-query to guarantee consistency across terms (posting lists).  Eg.  imagine your query is 'a AND NOT b'. Say a occurs in doc 100. Now you don't find a posting in b's posting list for doc 100.  Did doc 100 not have term b, or is doc 100 still being processed and that particular posting hasn't been written yet?  If the reader's maxDoc however is set to 99 (the last completely indexed document) you can't get into this situation.\n\nBefore every query we reopen the readers, which effectively simply updates the maxDoc.\n\nThe one exception to point-in-time-ness are the df values in the dictionary, which for obvious reasons is tricky.  I think a straightforward way to solve this problem is to count the df by iterating the corresponding posting list when requested. We could add a special counting method that just uses the skip lists to perform this task. Here the term buffer becomes even more important, and also documenting that docFreq() can be expensive in RT mode, ie. not O(1) as in non-RT mode, but rather O(log indexSize) in case we can get multi-level skip lists working in RT. ",
+            "author": "Michael Busch",
+            "id": "comment-12979633"
+        },
+        {
+            "date": "2011-01-10T17:09:43+0000",
+            "content": "The one exception to point-in-time-ness are the df values in the\ndictionary, which for obvious reasons is tricky.\n\nRight, forgot about those. I think we'd planned on using a multi-dimensional\narray, eg int[][]. However we'd need to test how they'll affect indexing\nperformance. If that doesn't work then we'll need to think about other\nsolutions like building them on demand, which is offloading the problem\nsomewhere else. It looks like docFreq is used only for phrase queries? However\nI think paying a potentially small penalty during indexing (only when RT is on)\nis better than a somewhat random penalty during querying. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12979646"
+        },
+        {
+            "date": "2011-04-13T15:43:44+0000",
+            "content": "In the current patch, I'm copying the parallel array for the end of a term's postings per reader [re]open.  However in the case where we're opening a reader after each document is indexed, this is wasteful.  We can simply queue the term ids from the last indexed document, and only copy the newly updated values over to the 'read' only consistent parallel array. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13019391"
+        },
+        {
+            "date": "2011-07-13T18:22:52+0000",
+            "content": "I had been testing out an alternative skip list.  I think it's a bit too esoteric at this point.  I'm resuming work on this issue, using Java's CSLM for the terms dict.  There really isn't a good way to break up the patch, it's just going to be large, eg, we can't separate out the terms dict from the RT postings etc. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13064751"
+        },
+        {
+            "date": "2011-08-24T22:52:35+0000",
+            "content": "This is a revised version of the LUCENE-2312 patch.  The following are various and miscelaneous notes pertaining to the patch and where it needs to go to be committed.  \n\nFeel free to review the approach taken, eg, we're getting around non-realtime structures through the usage of array copies (of which the arrays can be pooled at some point).\n\n\n\tA copy of FreqProxPostingsArray.termFreqs is made per new reader.  That array can be pooled.  This is no different than the deleted docs BitVector which is created anew per-segment for any deletes that have occurred.\n\n\n\n\n\tFreqProxPostingsArray freqUptosRT, proxUptosRT, lastDocIDsRT, lastDocFreqsRT is copied into, per new reader (as opposed to an entirely new array instantiated for each new reader), this is a slight optimization in object allocation.\n\n\n\n\n\tFor deleting, a DWPT is clothed in an abstract class that exposes the necessary methods from segment info, so that deletes may be applied to the RT RAM reader.  The deleting is still performed in BufferedDeletesStream.  BitVectors are cloned as well.  There is room for improvement, eg, pooling the BV byte[]\u2019s.\n\n\n\n\n\tDocuments (FieldsWriter) and term vectors are flushed on each get reader call, so that reading will be able to load the data.  We will need to test if this is performant.  We are not creating new files so this way of doing things may well be efficient.\n\n\n\n\n\tWe need to measure the cost of the native system array copy.  It could very well be quite fast / enough.\n\n\n\n\n\tFull posting functionality should be working including payloads\n\n\n\n\n\tField caching may be implemented as a new field cache that is growable and enables lock\u2019d replacement of the underlying array\n\n\n\n\n\tString to string ordinal comparison caches needs to be figured out.  The RAM readers cannot maintain a sorted terms index the way statically sized segments do\n\n\n\n\n\tWhen a field cache value is first being created, it needs to obtain the indexing lock on the DWPT.  Otherwise documents will continue to be indexed, new values created, while the array will miss the new values.  The downside is that while the array is initially being created, indexing will stop.  This can probably be solved at some point by only locking during the creation of the field cache array, and then notifying the DWPT of the new array.  New values would then accumulate into the array from the point of the max doc of the reader the values creator is working from.\n\n\n\n\n\tThe terms dictionary is a ConcurrentSkipListMap.  We can periodically convert it into a sorted [by term] int[], that has an FST on top.\n\n\n\nHave fun reviewing!  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13090594"
+        },
+        {
+            "date": "2011-08-25T04:39:52+0000",
+            "content": "A benchmark plan is, compare the speed of NRT vs. RT.  \n\nIndex documents in a single thread, in a 2nd thread open a reader and perform a query.  It would be nice to synchronize the point / max doc at which RT and NRT open new readers to additionally verify the correctness of the directly comparable search results.  To make the test fair, concurrent merge scheduler should be turned off in the NRT test.\n\nThe hypothesis is that array copying, even on large [RT] indexes is no big deal compared with the excessive segment merging with NRT. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13090764"
+        },
+        {
+            "date": "2011-08-30T16:46:32+0000",
+            "content": "Here's a new patch that incrementally adds field cache and norms values.  Meaning that as documents are added / indexed, norms and field cache values are automatically created.  The field cache values are only added to if they have already been created.  \n\nThe field cache functionality needs to be completed for all types.\n\nWe probably need to get the indexing lock while the field cache value is initially being created (eg, the terms enumeration).\n\nWe're more or less feature complete now.  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13093884"
+        },
+        {
+            "date": "2011-08-31T08:06:59+0000",
+            "content": "jason, I will look at this patch soon I hope. Busy times here right now so gimme some time.\n\nthanks ",
+            "author": "Simon Willnauer",
+            "id": "comment-13094368"
+        },
+        {
+            "date": "2011-09-01T16:56:08+0000",
+            "content": "I'll post a new patch shortly that fixes bugs and adds a bit more to the\nfunctionality.\n\nThe benchmark results are interesting. Array copies are very fast, I don't see\nany problems with that, the median time is 2 ms. The concurrent skip list map\nis expensive to add numerous 10s of thousands of terms to. I think that is to\nbe expected. The strategy of amortizing that cost by creating sorted by term\nint[]s will probably be more performant than CSLM. \n\nThe sorted int[] terms can be merged just like segments, thus RT becomes a way\nto remove the [NRT] cost of merging [numerous] postings lists. The int[] terms\ncan be merged in the background so that raw indexing speed is not affected. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13095412"
+        },
+        {
+            "date": "2011-09-09T18:04:33+0000",
+            "content": "There are many important use cases for immediate / zero delay index readers.\n\nI'm not sure if people realize it, but one of the major gains from this issue, is the ability to obtain a reader after every indexed document.  \n\nIn this case, instead of performing an array copy of the RT data structures, we will queue the changes, and then apply to the new reader.  For arrays like term freqs, we will use a temp hash map of the changes made since the main array was created (when the hash map grows too large we can perform a full array copy).\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13101391"
+        }
+    ]
+}

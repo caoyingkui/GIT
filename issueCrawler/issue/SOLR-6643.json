@@ -1,0 +1,74 @@
+{
+    "id": "SOLR-6643",
+    "title": "Core load silently aborted if missing schema has depenencies - LinkageErrors swollowed",
+    "details": {
+        "components": [
+            "Schema and Analysis"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ],
+        "affect_versions": "4.10.1",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Minor"
+    },
+    "description": "How to reproduce\n\n\tStart with standard collection1 config\n\tAdd a field type to schema using the ICU contrib, no need for a field\n\n<fieldType name=\"text_icu\" class=\"solr.TextField\">\n  <analyzer><tokenizer class=\"solr.ICUTokenizerFactory\"/></analyzer>\n</fieldType>\n\n\n\tcd example\n\tmkdir solr/lib\n\tcp ../contrib/analysis-extras/lucene-libs/lucene-analyzers-icu-4.10.1.jar solr/lib/\n\tbin/solr -f\n\tCore is not loaded, and no messages in log after this line\n\n... INFO  org.apache.solr.schema.IndexSchema  \u2013 [collection1] Schema name=example\n\n\n\n\n\nNote that we did not add the dependency libs from analysis-extras/lib, so we'd expect a ClassNotFoundException, but some way the initialization of schema aborts silently. The ICUTokenizerFactory is instansiated by reflection and I suspect that some exception is swallowed in AbstractPluginLoader#create()",
+    "attachments": {
+        "SOLR-6643.patch": "https://issues.apache.org/jira/secure/attachment/12688475/SOLR-6643.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-11-12T08:51:44+0000",
+            "author": "Jan H\u00f8ydahl",
+            "content": "Any ideas for how to solve this? ",
+            "id": "comment-14207830"
+        },
+        {
+            "date": "2014-12-20T00:50:40+0000",
+            "author": "Hoss Man",
+            "content": "I was able to reproduce Jan's steps, and then while trying again using core CREATE instead of relying on startup, was able to get an error returned to the client indicating the root cause of the problem...\n\n\njava.lang.NoClassDefFoundError: com/ibm/icu/text/BreakIterator\n\tat java.lang.Class.getDeclaredConstructors0(Native Method)\n\tat java.lang.Class.privateGetDeclaredConstructors(Class.java:2663)\n\tat java.lang.Class.getConstructor0(Class.java:3067)\n\tat java.lang.Class.getConstructor(Class.java:1817)\n\tat org.apache.solr.core.SolrResourceLoader.newInstance(SolrResourceLoader.java:604)\n\tat org.apache.solr.schema.FieldTypePluginLoader$2.create(FieldTypePluginLoader.java:333)\n\tat org.apache.solr.schema.FieldTypePluginLoader$2.create(FieldTypePluginLoader.java:326)\n\tat org.apache.solr.util.plugin.AbstractPluginLoader.load(AbstractPluginLoader.java:151)\n\n\n\n...which kind of makes sense: nothing in the plugin architetcure does much in the way of \"catching\" LinkageError's like NoClassDefFoundError because in general trying ot catch Error's is usually a bad idea.\n\ni think however that it would make sense for SolrResourceLoader to at least catch+log+rethrow any error from newInstance\n\nthat still leaves a second question however: the NoClassDefFoundError should (currently) be bubbling all the way up to the CoreContainer which should then be recording it as an init failure for the core \u2013 but that isn't happening.  why?\n\nbased on my testing, if a java.lang.Error is thrown during init of something like RequestHandler, then that gets properly tracked as a coreInitFailure \u2013 but if something from the schema (ie: FieldType) throws a j.l.Error, that gets swallowed up. ",
+            "id": "comment-14254378"
+        },
+        {
+            "date": "2014-12-20T00:51:45+0000",
+            "author": "Hoss Man",
+            "content": "Here's a patch that does a few things:\n\n\tadds 2 tests to CoreContainerCoreInitFailuresTest\n\t\n\t\ttestJavaLangErrorFromHandlerOnStartup demonstrates that a new ThrowErrorOnInitRequestHandler causes a correctly tracked coreInitFailure\n\t\ttestJavaLangErrorFromSchemaOnStartup demonstrates that a new ThrowErrorOnInitFieldType causes a correctly tracked coreInitFailure\n\t\t\n\t\t\tthis test currently fails\n\t\t\n\t\t\n\t\n\t\n\tSolrResourceLoader...\n\t\n\t\tnow logs & re-throws any execptions\n\t\thas some refactoring to remove copy/paste code\n\t\t\n\t\t\tnocommits noted here until more agressive testing is done.\n\t\t\n\t\t\n\t\n\t\n\n\n\nI still don't understand why testJavaLangErrorFromSchemaOnStartup, and i won't have much time to work on it in the near future \u2013 but it may be a good idea to commit this patch as is with an @Ignore on that test linking to a new spin-off issue \u2013 so that we can at least get te SolrResourceLoader logging in place for people who run into problems like this .\n ",
+            "id": "comment-14254379"
+        },
+        {
+            "date": "2014-12-20T22:04:01+0000",
+            "author": "Alan Woodward",
+            "content": "but that isn't happening. why?\n\nI think it's because CoreContainer.create() is catching Exceptions, not Errors, when updating the coreInitFailure map.  Maybe the best solution is for SolrResourceLoader to try and catch LinkageErrors and rethrow it as a SolrException.  Catching classloader problems is I think within the resource loader's remit (unlike out of memory errors, etc). ",
+            "id": "comment-14254966"
+        },
+        {
+            "date": "2015-01-07T22:28:49+0000",
+            "author": "Hoss Man",
+            "content": "\nI think it's because CoreContainer.create() is catching Exceptions, not Errors, when updating the coreInitFailure map. \n\nSure - but the piece i couldn't make sense of is why/where testJavaLangErrorFromHandlerOnStartup passed (and those Errors ere in coreInitFailures) but testJavaLangErrorFromSchemaOnStartup didn't.\n\ndigging arround a bit more, it looks like this is because SolrCore() is wrapping some types of Throwable in SolrException (shudder) but the IndexSchema already exists before the SolreCore constructor is called, and any Errors that come from it don't get similar wrapping.\n\nMaybe the best solution is for SolrResourceLoader to try and catch LinkageErrors and rethrow it as a SolrException. Catching classloader problems is I think within the resource loader's remit (unlike out of memory errors, etc).\n\nmaybe - but that's a slippery slope i'd rather avoid \u2013 i'm catching & re-throwing Errors is one thing, wrapping Errors in Exceptions is something i'm very much not a fan of.\n\ni think a safer (and more all encompasing) fix would be for CoreContainer to handle wraping Errors in SolrException - not for the purpose of re-throwing, but just for tracking in coreInitFailures.  that way even for things like OOM or IOError during core init, we still have a note about it in coreInitFailures.\n\n\u2014\n\nAttaching an updated patch that goes this direction - still running tests, but review/comments appreciated ",
+            "id": "comment-14268399"
+        },
+        {
+            "date": "2015-01-08T18:38:58+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1650350 from hossman@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1650350 ]\n\nSOLR-6643: Fix error reporting & logging of low level JVM Errors that occur when loading/reloading a SolrCore ",
+            "id": "comment-14269834"
+        },
+        {
+            "date": "2015-01-08T19:52:58+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1650367 from hossman@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1650367 ]\n\nSOLR-6643: Fix error reporting & logging of low level JVM Errors that occur when loading/reloading a SolrCore (merge r1650350) ",
+            "id": "comment-14269951"
+        },
+        {
+            "date": "2015-02-23T05:02:04+0000",
+            "author": "Anshum Gupta",
+            "content": "Bulk close after 5.0 release. ",
+            "id": "comment-14332815"
+        }
+    ]
+}

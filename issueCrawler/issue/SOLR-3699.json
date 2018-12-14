@@ -1,0 +1,107 @@
+{
+    "id": "SOLR-3699",
+    "title": "SolrIndexWriter constructor leaks Directory if Exception creating IndexWriterConfig",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.0"
+        ],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "in LUCENE-4278 i had to add a hack to force SimpleFSDir for CoreContainerCoreInitFailuresTest, because it doesnt close its Directory on certain errors.\n\nThis might indicate a problem that leaks happen if certain errors happen (e.g. not handled in finally)",
+    "attachments": {
+        "SOLR-3699.patch": "https://issues.apache.org/jira/secure/attachment/12538920/SOLR-3699.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Hoss Man",
+            "id": "comment-13427429",
+            "date": "2012-08-02T16:34:27+0000",
+            "content": "Tracked the problem down to SolrIndexWriter ... attached patch demonstrates it in the simplest usecase: a SolrCore that constructs a SolrIndexWriter where the Directory is created fine, but then the IndexWriterConfig has a problem.\n\nUnfortunately there's no clear and easy route to a fix because of how this is all done inline in a call to super(...) ... as noted in the test comments...\n\n\n  public void testBogusMergePolicy() throws Exception {\n    // Directory is leaked because SolrIndexWriter constructor has inline \n    // calls to both DirectoryFactory (which succeeds) and \n    // Config.toIndexWriterConfig (which fails) -- but there is nothing to \n    // decref the DerectoryFactory when Config throws an Exception\n    // \n    // Not good to require the caller of \"new SolrIndexWriter(...)\" to decref \n    // the DirectoryFactory on exception, because they would have to be sure \n    // the exception didn't already come from the DirectoryFactory in the first place.\n    // I think we need to re-work the inline calls in SolrIndexWriter construct\n\n\n\n(Ironically: this \"bad-mp-config.xml\" i was using in CoreContainerCoreInitFailuresTest has existed for a while, but wasn't already being used in the \"TestBadConfig\" class that tries to create SolrCores with bad cofigs \u2013 if it had we would have caught this a long time ago.  It was only being used in SolrIndexConfigTest where it was micro testing the SolrIndexConfig and the DirectoryFactory wasn't used) "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13427612",
+            "date": "2012-08-02T21:09:57+0000",
+            "content": "My quick and dirty attempt to fix this by making SolrIndexWriter's constructor private and adding a static \"create\" method that deals with calling directoryFactory.release() if the private constructor fails.\n\nUnfortunately it's still not working ... not clear to me why, but i'm about to get on a plain and won't have a chance to dig into it anymore for another 3-4 days, so i wanted to get what i have into Jira in case anyone else wants to take a stab at it. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13429845",
+            "date": "2012-08-07T03:43:32+0000",
+            "content": "rmuir20120906-bulk-40-change "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13429904",
+            "date": "2012-08-07T03:51:53+0000",
+            "content": "Figured out the problem in my last patch: i was ignorant of the full DirectoryFactory API and didn't realize i should be calling doneWithDirectory().\n\nI think this new patch is good to go, but i don't want to commit w/o review from someone who understands the DirectoryFactory semantics better (already opened SOLR-3717 because something looks wonky about the API, don't want to mess up and just fix a symptom here instead of the real problem "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13429910",
+            "date": "2012-08-07T03:57:54+0000",
+            "content": "Mark: can you sanity check this patch for me? "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13444414",
+            "date": "2012-08-29T21:03:22+0000",
+            "content": "updated patch to trunk.\n\nDoing this helped uncover another (distinct) case where directories were not being closed that was exposed by the test SOLR-3746 added: if the updateHandler fails to init, then nothing in SolrCore was closing the directoryfactory.\n\nI'd asked miller to review this earlier, but i'm going to assume CTR soon unless i hear objections. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13444959",
+            "date": "2012-08-30T13:48:59+0000",
+            "content": "hmm...I have to look closer than just at the patch, but the setDirFactory method seems a little troubling - why do we do that instead of making it part of the constructor? What if you don't set it?\n\n\n+        if (null != directoryFactory) {\n+          // :HACK: normally we rely on updateHandler to do this, \n+          // but what if updateHandler failed to init?\n+          directoryFactory.close();\n+        }\n\n\n\nI don't think you want that? The dir factory should and will be closed by the DefaultSolrCoreState when it's ref count hits 0 - you don't actually want to close it when closing a core.\n\nOtherwise, the basic idea seems fine - if the IW fails, release it's dir. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13445009",
+            "date": "2012-08-30T15:19:05+0000",
+            "content": "the setDirFactory method seems a little troubling - why do we do that instead of making it part of the constructor? What if you don't set it?\n\nAre you asking about SolrIndexWriter.setDirectoryFactory ?\n\nit's private, and called from the (static) SolrIndexWriter.create \u2013 which as of this patch is the only way to get a new SolrIndexWRiter.\n\nI had to move it out of the SolrIndexWriter constructor, because we need to be able to pass the resulting directory to super() while also releasing the directory if the constructor throws an exception \u2013 this isn't possible within java's \"calls to super(...) must be the first line of the constructor\" constraints, so the static factory method was needed instead.\n\nThe dir factory should and will be closed by the DefaultSolrCoreState when it's ref count hits 0 - you don't actually want to close it when closing a core.\n\nBut the update handler is the only thing keeping track of the SolrCoreState \u2013 if the SolrCore has no UpdateHanlder (ie: because it failed to initialize) then something needs to close the DirectoryFactory that SolrCore.initDirectoryFactory() already created.\n\n(Go ahead and try to comment out that \"HACK\" directoryFactory.close() in the patch \u2013 you'll see TestBadConfig.testUpdateLogButNoVersionField start failing.  I added that call to ensure that the DirectoryFactory gets closed if any exceptions are thrown between a (successsful) call to initDirectoryFactory() ~L641 of SolrCore and (a success of failure of) createUpdateHandler() ~L707.  Don't get me wrong, it definitely feels like a hack (hence the comment) but something needs to account for this situation \u2013 and i wasn't comfortably completely re-writing/re-ordering the logic in the SolrCore constructor.\n "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13445047",
+            "date": "2012-08-30T15:57:06+0000",
+            "content": "it's private,\n\nAh, okay, did not catch that.\n\nsomething needs to close the DirectoryFactory that SolrCore.initDirectoryFactory() already created.\n\nYeah, brain murmur - for some reason I was thinking DirectoryFactory was used globally across cores.\n\nThis is probably fine then. Once I commit some stuff from my workspace, I'll actually apply the patch and try and consider this some more. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13445143",
+            "date": "2012-08-30T18:01:51+0000",
+            "content": "Yeah, brain murmur - for some reason I was thinking DirectoryFactory was used globally across cores.\n\nI think it's only shared between reloaded versions of the same SolrCore (ie: two differnet SolrCore's can use completley diff DirectoryFactory impls) but even then, it's only shared if the SolrCore was constructed using an existing UpdateHandler (ie: reload) if the SolrCore is the \"first\" SolrCore, then it creates the DirectoryFactory, thus if the UpdateHandler doesn't init properly, that SolrCore needs to close the DirectoryFactory.\n\nIdeally, a whole metric-shit-load of the SolrCore initialization would be reworked, so thta every type of object (like DirectoryFactory) was only ever inited by one other object (like UpdateHandler) regardless of wether it's the first create or reload state, ... but i wasn't really comfortable making that heavy of a change. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13451035",
+            "date": "2012-09-07T21:56:15+0000",
+            "content": "updated patch to trunk (incorporates the new IndexSplitter class yonik recently added)\n\nall tests pass, i'm going to press forward with committing so this can get more testing. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13451055",
+            "date": "2012-09-07T22:13:59+0000",
+            "content": "Committed revision 1382187. - trunk\nCommitted revision 1382192. - 4x "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13610896",
+            "date": "2013-03-22T16:42:53+0000",
+            "content": "[branch_4x commit] Chris M. Hostetter\nhttp://svn.apache.org/viewvc?view=revision&revision=1382192\n\nSOLR-3699: Fixed some Directory leaks when there were errors during SolrCore or SolrIndexWriter initialization (merge r1382187) "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13653973",
+            "date": "2013-05-10T10:33:36+0000",
+            "content": "Closed after release. "
+        }
+    ]
+}

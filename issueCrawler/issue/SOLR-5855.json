@@ -1,0 +1,129 @@
+{
+    "id": "SOLR-5855",
+    "title": "re-use document term-vector Fields instance across fields in the DefaultSolrHighlighter",
+    "details": {
+        "affect_versions": "6.0",
+        "status": "Closed",
+        "fix_versions": [
+            "5.2"
+        ],
+        "components": [
+            "highlighter"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Hi folks,\n\nwhile investigating possible performance bottlenecks in the highlight component i discovered two places where we can save some cpu cylces.\n\nBoth are in the class org.apache.solr.highlight.DefaultSolrHighlighter\n\nFirst in method doHighlighting (lines 411-417):\nIn the loop we try to highlight every field that has been resolved from the params on each document. Ok, but why not skip those fields that are not present on the current document? \nSo i changed the code from:\nfor (String fieldName : fieldNames) {\n  fieldName = fieldName.trim();\n  if( useFastVectorHighlighter( params, schema, fieldName ) )\n    doHighlightingByFastVectorHighlighter( fvh, fieldQuery, req, docSummaries, docId, doc, fieldName );\n  else\n    doHighlightingByHighlighter( query, req, docSummaries, docId, doc, fieldName );\n}\n\nto:\nfor (String fieldName : fieldNames) {\n  fieldName = fieldName.trim();\n  if (doc.get(fieldName) != null) \n{\n    if( useFastVectorHighlighter( params, schema, fieldName ) )\n      doHighlightingByFastVectorHighlighter( fvh, fieldQuery, req, docSummaries, docId, doc, fieldName );\n    else\n      doHighlightingByHighlighter( query, req, docSummaries, docId, doc, fieldName );\n  }\n}\n\nThe second place is where we try to retrieve the TokenStream from the document for a specific field.\nline 472:\nTokenStream tvStream = TokenSources.getTokenStreamWithOffsets(searcher.getIndexReader(), docId, fieldName);\nwhere..\npublic static TokenStream getTokenStreamWithOffsets(IndexReader reader, int docId, String field) throws IOException {\n  Fields vectors = reader.getTermVectors(docId);\n  if (vectors == null) \n{\n    return null;\n  }\n\n  Terms vector = vectors.terms(field);\n  if (vector == null) {    return null;  }\n\n  if (!vector.hasPositions() || !vector.hasOffsets()) \n{\n    return null;\n  }\n  return getTokenStream(vector);\n}\n\nkeep in mind that we currently hit the IndexReader n times where n = requested rows(documents) * requested amount of highlight fields.\nin my usecase reader.getTermVectors(docId) takes around 150.000~250.000ns on a warm solr and 1.100.000ns on a cold solr.\n\nIf we store the returning Fields vectors in a cache, this lookups only take 25000ns.\n\nI would suggest something like the following code in the doHighlightingByHighlighter method in the DefaultSolrHighlighter class (line 472):\nFields vectors = null;\nSolrCache termVectorCache = searcher.getCache(\"termVectorCache\");\nif (termVectorCache != null) {\n  vectors = (Fields) termVectorCache.get(Integer.valueOf(docId));\n  if (vectors == null) {\n    vectors = searcher.getIndexReader().getTermVectors(docId);\n    if (vectors != null) termVectorCache.put(Integer.valueOf(docId), vectors);\n  } \n} else {\n  vectors = searcher.getIndexReader().getTermVectors(docId);\n}\nTokenStream tvStream = TokenSources.getTokenStreamWithOffsets(vectors, fieldName);\n\nand TokenSources class:\npublic static TokenStream getTokenStreamWithOffsets(Fields vectors, String field) throws IOException {\n  if (vectors == null) {    return null;  }\n  Terms vector = vectors.terms(field);\n  if (vector == null) \n{\n    return null;\n  }\n  if (!vector.hasPositions() || !vector.hasOffsets()) {    return null;  }\n  return getTokenStream(vector);\n}\n\n4000ms on 1000 docs without cache\n639ms on 1000 docs with cache\n\n102ms on 30 docs without cache\n22ms on 30 docs with cache\n\non an index with 190.000 docs with a numFound of 32000 and 80 different highlight fields.\n\nI think querys with only one field to highlight on a document does not benefit that much from a cache like this, thats why i think an optional cache would be the best solution there. \n\nAs i saw the FastVectorHighlighter uses more or less the same approach and could also benefit from this cache.",
+    "attachments": {
+        "highlight.patch": "https://issues.apache.org/jira/secure/attachment/12634294/highlight.patch",
+        "SOLR-5855_with_FVH_support.patch": "https://issues.apache.org/jira/secure/attachment/12733850/SOLR-5855_with_FVH_support.patch",
+        "SOLR-5855-without-cache.patch": "https://issues.apache.org/jira/secure/attachment/12708697/SOLR-5855-without-cache.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13950265",
+            "date": "2014-03-28T01:47:13+0000",
+            "content": "Nice speed improvement.\nSo this adds a new type of cache?\nIs this cache also exposed via JMX and Admin like other caches? "
+        },
+        {
+            "author": "Daniel Debray",
+            "id": "comment-13950579",
+            "date": "2014-03-28T11:06:07+0000",
+            "content": "sure, this cache should be registered as other solr caches and therefore is exposed via jmx too. "
+        },
+        {
+            "author": "Daniel Debray",
+            "id": "comment-14049872",
+            "date": "2014-07-02T12:45:24+0000",
+            "content": "I did a fork on Github and added the changes + tests. The cache is used in our environment for ~3 months now without problems. The only thing is that this cache has the same limitations as the document cache. So no autowarming available. \n\nIf you think its fine i would like to create a pull request or update this the appended patch.\n\nhttps://github.com/DDebray/lucene-solr "
+        },
+        {
+            "author": "Thomas Champagne",
+            "id": "comment-14356911",
+            "date": "2015-03-11T14:14:59+0000",
+            "content": "I think this issue should be split in two issue. \n\nThe first optimization is very simple and can be integrated quickly. Create a new issue with this small patch. \n\nThe second optimization is more complicated but I think it is possible to solve the problem without cache. You tell that the problem is the call at searcher.getIndexReader().getTermVectors(docId) for each field. I think you can move this before the loop on the fields in the doHighlighting method and get \"term vectors\" only one time for each document.\n\nI'll try to create a patch but now I don't have time to do this.  "
+        },
+        {
+            "author": "Thomas Champagne",
+            "id": "comment-14390597",
+            "date": "2015-04-01T14:17:31+0000",
+            "content": "I create a patch with the two optimizations based on branch_5x.\n\nThis patch don't use a cache. I move the call of method searcher.getIndexReader().getTermVectors(docId) before the loop on the fields and get \"term vectors\" only one time for each document.\n\nHighlightingByFastVector doesn't benefit of the change but I think it will be possible to change this.\n\nIn the patch, there is a new unit test for testing this feature : Create 20 docs with 80 fields (1/2 null, 1/2 with a value) and 10 queries with hl.fl=*\nRunning test without patch : ~6 sec\nRunning test with patch : ~3 sec\n\nTell me your opinion about this small patch. I think it is easier than the patch with caching. "
+        },
+        {
+            "author": "Thomas Champagne",
+            "id": "comment-14392752",
+            "date": "2015-04-02T14:25:17+0000",
+            "content": "I test again the patch with 100 queries (Create 20 docs with 80 fields (1/2 null, 1/2 with a value) and 100 queries with hl.fl=*) : \nWithout patch : ~186 sec\nWith patch : ~72 sec "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14393308",
+            "date": "2015-04-02T20:18:56+0000",
+            "content": "Nice work!  I'll put some attention on this to try and get it in; not necessarily today/tomorrow but should make it for 5.2.  Ideally the FVH should be supported as well; it'd be a shame to do one but not the other.\n\nA SolrCache of term vectors should definitely be a separate issue. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14394454",
+            "date": "2015-04-03T14:07:02+0000",
+            "content": "Another thing that should be done is to figure out how to avoid grabbing the term vector Fields altogether if none of the fields to highlight have term vectors in the first place. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14550684",
+            "date": "2015-05-19T16:12:32+0000",
+            "content": "Attached is a patch addressing the issue, not just for the default/standard Highlighter but for FVH as well.  For the FVH case, I use a FilteredDirectoryReader/LeafReader that always returns a pre-fetched Fields instance.  What is not in this patch but I did see in the Daniel's patch is an optimization short-circuit for when the current document doesn't have a field value for the current doc.  I like the idea of that but it defeats the ability to subclass this highlighter to override getFieldValues that get the field values from some other source (e.g. from a different field).  I'm currently doing that in some client work.\n\nThe patch also includes a refactoring that isn't strictly related to this.  I changed the internal API contract of doHighlightingByHighlighter and doHighlightingByFastVectorHighlighter and alternateField to not be responsible for populating the NamedList of highlights for the document; instead they return an object and the caller places it on the NL.\n\nPlease let me know what you think Daniel. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14550722",
+            "date": "2015-05-19T16:31:44+0000",
+            "content": "This is an improvement over my past 30min ago.  This one uses a TermVector caching IndexReader wrapper for both the FVH and standard highlighter code paths, which is more congruent.  But it also means that the term vector fetch won't even happen if there are no text stored data to highlight, since both highlighters try to get the stored text first.\n\nI also tweaked some internal methods to be a little more consistent.  Tests pass. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14554272",
+            "date": "2015-05-21T13:30:23+0000",
+            "content": "Commit 1680871 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1680871 ]\n\nSOLR-5855:  Re-use the document's term vectors in DefaultSolrHighlighter.\nAlso refactored DefaultSolrHighlighter's methods to be a little nicer. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14554282",
+            "date": "2015-05-21T13:42:17+0000",
+            "content": "Commit 1680872 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1680872 ]\n\nSOLR-5855: Re-use the document's term vectors in DefaultSolrHighlighter. Also refactored DefaultSolrHighlighter's methods to be a little nicer. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14554297",
+            "date": "2015-05-21T13:54:41+0000",
+            "content": "Thanks for finding the problem and the initial patch, Daniel Debray.  It would be great if those who have benchmarked could try again with this patch (or by pulling from branch 5x since it's committed) \u2013 just to be sure it's working well.  The 5.2 release branch is going to be cut later today. "
+        },
+        {
+            "author": "Ere Maijala",
+            "id": "comment-14578437",
+            "date": "2015-06-09T06:51:37+0000",
+            "content": "I was hoping, perhaps naively, that this would help with the highlighter performance problems we're having with Solr 5. Unfortunately this doesn't seems to have made a difference. Using hl.usePhraseHighlighter=false has a significant effect, but obviously with downsides and still much slower than 4.10.2.\n\nFor what it's worth, here is some additional information:\n\nTiming from Solr 4.10.2 (42.5 million records):\n\n            \"process\": {\n                \"time\": 1711,\n                \"query\": \n{\n                    \"time\": 0\n                }\n,\n                \"facet\": \n{\n                    \"time\": 66\n                }\n,\n                \"mlt\": \n{\n                    \"time\": 0\n                }\n,\n                \"highlight\": \n{\n                    \"time\": 708\n                }\n,\n                \"stats\": \n{\n                    \"time\": 0\n                }\n,\n                \"expand\": \n{\n                    \"time\": 0\n                }\n,\n                \"spellcheck\": \n{\n                    \"time\": 433\n                }\n,\n                \"debug\": \n{\n                    \"time\": 503\n                }\n            }\n\nTiming from Solr 5.2.0 (38.8 million records):\n\n            \"process\": {\n                \"time\": 10172,\n                \"query\": \n{\n                    \"time\": 0\n                }\n,\n                \"facet\": \n{\n                    \"time\": 45\n                }\n,\n                \"facet_module\": \n{\n                    \"time\": 0\n                }\n,\n                \"mlt\": \n{\n                    \"time\": 0\n                }\n,\n                \"highlight\": \n{\n                    \"time\": 9310\n                }\n,\n                \"stats\": \n{\n                    \"time\": 0\n                }\n,\n                \"expand\": \n{\n                    \"time\": 0\n                }\n,\n                \"spellcheck\": \n{\n                    \"time\": 345\n                }\n,\n                \"debug\": \n{\n                    \"time\": 472\n                }\n            }\n\nA couple of jstack outputs during the query execution are here: http://pastebin.com/8FJiq5R3. The schema and solrconfig are at https://github.com/NatLibFi/NDL-VuFind-Solr/tree/master/vufind/biblio/conf.  "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14579443",
+            "date": "2015-06-09T19:26:41+0000",
+            "content": "I was initially skeptical the stack traces would show anything of interest but I am pleasantly mistaken.  Apparently, getting the FieldInfos from SlowCompositeReaderWrapper is a bottleneck.  We look this up to determine if there are payloads or not, so that we can then tell MemoryIndex to capture them as well.  FYI the call to get this was added recently in SOLR-6916 (Highlighting using payloads), its not related to term vectors \u2013 this issue.\n\nCan you please download the 5x branch, comment out the scorer.getUsePayloads(... line (or set it to true if you want), and see how it performs? "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14579480",
+            "date": "2015-06-09T19:51:30+0000",
+            "content": "Ere Maijala I created an issue for this; please discuss further there: SOLR-7655 "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14586767",
+            "date": "2015-06-15T21:42:15+0000",
+            "content": "Bulk close for 5.2.0. "
+        }
+    ]
+}

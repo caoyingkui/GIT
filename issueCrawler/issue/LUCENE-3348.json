@@ -1,0 +1,189 @@
+{
+    "id": "LUCENE-3348",
+    "title": "IndexWriter applies wrong deletes during concurrent flush-all",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Yonik uncovered this with the TestRealTimeGet test: if a flush-all is\nunderway, it is possible for an incoming update to pick a DWPT that is\nstale, ie, not yet pulled/marked for flushing, yet the DW has cutover\nto a new deletes queue.  If this happens, and the deleted term was\nalso updated in one of the non-stale DWPTs, then the wrong document is\ndeleted and the test fails by detecting the wrong value.\n\nThere's a 2nd failure mode that I haven't figured out yet, whereby 2\ndocs are returned when searching by id (there should only ever be 1\ndoc since the test uses updateDocument which is atomic wrt\ncommit/reopen).\n\nYonik verified the test passes pre-DWPT, so my guess is (but I\nhave yet to verify) this test also passes on 3.x.  I'll backport\nthe test to 3.x to be sure.",
+    "attachments": {
+        "LUCENE-3348.patch": "https://issues.apache.org/jira/secure/attachment/12488117/LUCENE-3348.patch",
+        "fail.txt.bz2": "https://issues.apache.org/jira/secure/attachment/12488469/fail.txt.bz2",
+        "fail2.txt.bz2": "https://issues.apache.org/jira/secure/attachment/12489357/fail2.txt.bz2"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2011-07-28T17:39:24+0000",
+            "content": "Initial patch, tons of nocommits still but tests pass.\n\nI moved the Lucene-only test over to oal.index, and added VERBOSE\nprints.\n\nI made an initial possible fix for the first failure, which seems to\nwork (I don't seem to hit that failure anymore).  I'm not sure I like\nthe fix... basically, after pulling the DWPT for indexing, I check if\nit's stale, and if so call a new method in DWFlushControl to move that\nDWPT into the toFlush list.  I think it'd be better to somehow, up\nfront in flush-all, mark all current DWPTs as stale, pull them out of\nrotation, so that the thread pool would never return such a stale\nDWPT.\n\nStill trying to understand the 2nd failure... ",
+            "author": "Michael McCandless",
+            "id": "comment-13072436"
+        },
+        {
+            "date": "2011-07-28T20:06:18+0000",
+            "content": "mike, patch looks good. one little think, you should check if the DWPT is already pending before calling #setFlushPending(DWPT).\n\n\nI think it'd be better to somehow, up\nfront in flush-all, mark all current DWPTs as stale, pull them out of\nrotation, so that the thread pool would never return such a stale\nDWPT.\nthe problem here is that you need to lock all the states that are selected for flushing. at the same time an indexing thread could lock such a DWPT and index a document which causes the problem this issues tries to solve. If you sync the thread pools getAndLock method this could work but in the non-blocking approach I think this is the only way to prevent this. ",
+            "author": "Simon Willnauer",
+            "id": "comment-13072509"
+        },
+        {
+            "date": "2011-07-28T20:44:55+0000",
+            "content": "OK I'll make sure it's not already pending.\n ",
+            "author": "Michael McCandless",
+            "id": "comment-13072523"
+        },
+        {
+            "date": "2011-07-28T23:28:42+0000",
+            "content": "The 2nd bug seems to be because a commit() is running concurrently with a getReader(), and the flush-all being done for the getReader() is making a newly flushed segment visible to the SegmentInfos just before commit clones the SegmentInfos, and the buffered deletes have not been fully processed yet at the point for that new segment (and for segments before it).\n\nYou can see it in IW.prepareCommit \u2013 we call flush(true, true) and then startCommit w/o any sync, so in there a concurrent getReader can sneak in a change to the segmentInfos so that an updateDocument appears non-atomic. ",
+            "author": "Michael McCandless",
+            "id": "comment-13072599"
+        },
+        {
+            "date": "2011-07-29T18:34:23+0000",
+            "content": "Sorry to add my opinion to this, however I think that while non-blocking deletes are quite fancy, it seems they are  open to various bugs such as this.  Is there a compelling reason non-locking is used, eg, performance? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13072962"
+        },
+        {
+            "date": "2011-07-29T18:49:50+0000",
+            "content": "Sorry to add my opinion to this, however I think that while non-blocking deletes are quite fancy, it seems they are open to various bugs such as this. Is there a compelling reason non-locking is used, eg, performance?\n\nJason, this issue is unrelated to non-blocking deletes. The bug here is in concurrent flush which is indeed the main performance factor in DWPT.  ",
+            "author": "Simon Willnauer",
+            "id": "comment-13072968"
+        },
+        {
+            "date": "2011-07-29T23:33:27+0000",
+            "content": "Another patch, I think fixing the 2nd issue by doing a custom flush\ninside prepareCommit, that clones & incRefs the flushed SegmentInfos\ninside a sync block so that we get a consistent point-in-time commit.\n\nI also fixed a test deadlock caused by the fix for the first issue \u2013\nhave to handle the case where the DWPT is null because close is in\nprocess.\n\nI also evil'd up the TestStressNRT by randomizing everything, and\nfixed RIW to sometimes pull an NRT reader after doing a commit just to\nmix that up.\n\nThe test seems to pass now; I think it's ready to commit... but I'll let it beast a while more... ",
+            "author": "Michael McCandless",
+            "id": "comment-13073071"
+        },
+        {
+            "date": "2011-07-31T08:08:48+0000",
+            "content": "mike, patch looks good. some thoughts:\n\n\n\tcan we factor out the while(true)\n{.. getAndLock(thread, DW) .. }\n to prevent this code duplication?\n\tyou throw a NPE if the DWPT is null, yet this is handled by ThreadState#isActive() and calls ensureOpen() to throw consistent exception when IW is closed like further down you see:\n\nif (!perThread.isActive()) {\n  ensureOpen();\n  assert false: \"perThread is not active but we are still open\";\n}\n\n\n\n\n\nI think this will also solve the deadlock issue you describing above, no?\n\nthanks for taking care of this, another proof that concurrency is not easy \n ",
+            "author": "Simon Willnauer",
+            "id": "comment-13073332"
+        },
+        {
+            "date": "2011-08-01T13:44:54+0000",
+            "content": "Thanks Simon; I'll make both of those fixes.\n\nUnfortunately there is still at least one more thread safety issue that I'm trying to track down... beasting uncovered a good seed. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073535"
+        },
+        {
+            "date": "2011-08-01T14:30:09+0000",
+            "content": "Unfortunately there is still at least one more thread safety issue that I'm trying to track down... beasting uncovered a good seed.\n\nargh! can you post it here?\n\nsimon ",
+            "author": "Simon Willnauer",
+            "id": "comment-13073556"
+        },
+        {
+            "date": "2011-08-01T16:02:07+0000",
+            "content": "Current patch, but still at least another concurrency issue. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073586"
+        },
+        {
+            "date": "2011-08-01T16:05:09+0000",
+            "content": "Here's what I run with the while1 tester in luceneutil: TestStressNRT -iters 3 -verbose -seed -6208047570437556381:-3138230871915238634\n\nI think what's special about the seed is maxBufferedDocs is 3, so we are doing tons of segment flushing.  I dumbed back the test somewhat (turned off merging entirely, only 1 reader thread, up to 5 writer threads, and it still fails. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073588"
+        },
+        {
+            "date": "2011-08-01T19:31:04+0000",
+            "content": "mike I can not reproduce this failure.. what exactly is failing there? maybe you can put the output in a text file and attache it?\n\nRegarding the latest patch, I think we can call DWFlushControl#addFlushableState() from DWFlushControl#markForFullFlush() and use a global list to collect the DWPT for the full flush. \n\nI think we should move the getAndLock call into DWFlushControl something like DWFlushControl#obtainAndLock(), this would allow us to make the check and the DWFlushControl#addFlushableState() method private to DWFC. Further we can also simplify the deleteQueue check a little since we already obtained a ThreadState we don't need to unlock the state again after calling addFlushableState(), something like this:\n\n\nThreadState obtainAndLock() {\n    final ThreadState perThread = perThreadPool.getAndLock(Thread\n        .currentThread(), documentsWriter);\n    if (perThread.isActive()\n        && perThread.perThread.deleteQueue != documentsWriter.deleteQueue) {\n      // There is a flush-all in process and this DWPT is\n      // now stale -- enroll it for flush and try for\n      // another DWPT:\n      addFlushableState(perThread);\n    }\n    return perThread;\n  }\n\n\n\nEventually we are spending too much time in full flush since we lock all ThreadStates at least once while some indexing threads might have already helped out with swapping out DWPT instances. I think we can collect already swapped out ThreadStates during a full flush and only check the ones that have not been processed?  ",
+            "author": "Simon Willnauer",
+            "id": "comment-13073678"
+        },
+        {
+            "date": "2011-08-01T21:42:09+0000",
+            "content": "Full output from a failure. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073802"
+        },
+        {
+            "date": "2011-08-01T21:43:33+0000",
+            "content": "OK I attached output of a failure \u2013 it's 400K lines.  Search for the AssertionError, where id:26 couldn't find a doc nor tombstone. ",
+            "author": "Michael McCandless",
+            "id": "comment-13073804"
+        },
+        {
+            "date": "2011-08-04T16:08:40+0000",
+            "content": "Simon found one case that could result in a delete becoming visible before a previous updateDocument.  I made that fix (to DW.applyAllDeletes) but unfortunately there's still a failure (see fail2.txt.bz2). ",
+            "author": "Michael McCandless",
+            "id": "comment-13079434"
+        },
+        {
+            "date": "2011-08-05T07:39:26+0000",
+            "content": "I think I now know what is causing the failure here. In IW#prepareCommit(Map) we release the full flush (docWriter.finishFullFlush(success) before we apply the deletes. This means that another thread can start flushing and freeze & push its global deletes into the BufferedDeleteStream before we call IW#maybeApplyDeletes(). if a flush is fast enough (small segment) and something else causes the committing thread to wait on the IW in order to apply the deletes a del-packet could sneak in not belonging to the commit. I IW#getReader this is already handled correctly. \n ",
+            "author": "Simon Willnauer",
+            "id": "comment-13079814"
+        },
+        {
+            "date": "2011-08-05T16:09:32+0000",
+            "content": "I think you are right!  I will fix prepareCommit to match getReader and re-beast. ",
+            "author": "Michael McCandless",
+            "id": "comment-13080045"
+        },
+        {
+            "date": "2011-08-05T19:48:58+0000",
+            "content": "Patch, incorporating Simon's last suggestion.  I think this fixes the concurrency bugs \u2013 beasting for 2703 iterations so far and no failure!\n\nNot quite committable \u2013 lots of added SOPs.  I'll be out next week so won't get to this until I'm back so feel free to clean it up and commit! ",
+            "author": "Michael McCandless",
+            "id": "comment-13080177"
+        },
+        {
+            "date": "2011-08-05T20:44:45+0000",
+            "content": "Patch, incorporating Simon's last suggestion. I think this fixes the concurrency bugs \u2013 beasting for 2703 iterations so far and no failure!\nawesome! \n\nNot quite committable \u2013 lots of added SOPs. I'll be out next week so won't get to this until I'm back so feel free to clean it up and commit!\n\nMike, I will assign this to me and get it committable next week. \n\nThanks, have a good time  ",
+            "author": "Simon Willnauer",
+            "id": "comment-13080210"
+        },
+        {
+            "date": "2011-08-05T21:04:41+0000",
+            "content": "Thanks Simon!  Also I didn't implement your suggestion above (putting the new code into DWTC.obtainAndLock), but I think we should! ",
+            "author": "Michael McCandless",
+            "id": "comment-13080226"
+        },
+        {
+            "date": "2011-08-08T13:30:35+0000",
+            "content": "here is a cleaned up patch with all the fixes. I beasted the seed for 3k times no failure and run 5k random iteration without a failure. I think we are good to go here. ",
+            "author": "Simon Willnauer",
+            "id": "comment-13080939"
+        },
+        {
+            "date": "2011-08-08T16:39:23+0000",
+            "content": "Tricky stuff... great job of tracking all these concurrency issues down!\nI tweaked the test (more variability in number of threads, etc) and it's been running for 2 hours w/ no failures. ",
+            "author": "Yonik Seeley",
+            "id": "comment-13081038"
+        },
+        {
+            "date": "2011-08-08T20:20:34+0000",
+            "content": "I am planning to commit this tomorrow if nobody objects ",
+            "author": "Simon Willnauer",
+            "id": "comment-13081166"
+        },
+        {
+            "date": "2011-08-08T20:54:47+0000",
+            "content": "+1 - thanks for ferreting these concurrency issues out! ",
+            "author": "Mark Miller",
+            "id": "comment-13081187"
+        },
+        {
+            "date": "2011-08-09T10:22:54+0000",
+            "content": "Committed to trunk in revision 1155278.\nI backported the test to 3.x and it failed. Maybe something is wrong with the test though, I will dig! Here is the failure: \n\n\n    [junit] ------------- Standard Output ---------------\n    [junit] FAIL: hits id:34 val=-38\n    [junit]   docID=43 id:-34 foundVal=38\n    [junit] READER3: FAILED: unexpected exception\n    [junit] java.lang.AssertionError: id=34 reader=ReadOnlyDirectoryReader(segments_q _2l(3.4):cv62/13 _2p(3.4):Cv6 _2o(3.4):cv47) totalHits=2\n    [junit] \tat org.junit.Assert.fail(Assert.java:91)\n    [junit] \tat org.apache.lucene.index.TestStressNRT$2.run(TestStressNRT.java:345)\n    [junit] FAIL: hits id:25 val=39\n    [junit]   docID=24 id:25 foundVal=39\n    [junit]   docID=85 id:25 foundVal=43\n    [junit] READER1: FAILED: unexpected exception\n    [junit] java.lang.AssertionError: id=25 reader=ReadOnlyDirectoryReader(segments_q _2l(3.4):cv62/13 _2p(3.4):Cv6 _2o(3.4):cv47) totalHits=2\n    [junit] \tat org.junit.Assert.fail(Assert.java:91)\n    [junit] \tat org.apache.lucene.index.TestStressNRT$2.run(TestStressNRT.java:345)\n    [junit] ------------- ---------------- ---------------\n    [junit] ------------- Standard Error -----------------\n    [junit] NOTE: reproduce with: ant test -Dtestcase=TestStressNRT -Dtestmethod=test -Dtests.seed=-78c35b20c01ed2f8:-292d76adf99900e2:3f7c8696906a10c7\n    [junit] NOTE: reproduce with: ant test -Dtestcase=TestStressNRT -Dtestmethod=test -Dtests.seed=-78c35b20c01ed2f8:-292d76adf99900e2:3f7c8696906a10c7\n    [junit] The following exceptions were thrown by threads:\n    [junit] *** Thread: READER3 ***\n    [junit] java.lang.RuntimeException: java.lang.AssertionError: id=34 reader=ReadOnlyDirectoryReader(segments_q _2l(3.4):cv62/13 _2p(3.4):Cv6 _2o(3.4):cv47) totalHits=2\n    [junit] \tat org.apache.lucene.index.TestStressNRT$2.run(TestStressNRT.java:360)\n    [junit] Caused by: java.lang.AssertionError: id=34 reader=ReadOnlyDirectoryReader(segments_q _2l(3.4):cv62/13 _2p(3.4):Cv6 _2o(3.4):cv47) totalHits=2\n    [junit] \tat org.junit.Assert.fail(Assert.java:91)\n    [junit] \tat org.apache.lucene.index.TestStressNRT$2.run(TestStressNRT.java:345)\n    [junit] *** Thread: READER1 ***\n    [junit] java.lang.RuntimeException: java.lang.AssertionError: id=25 reader=ReadOnlyDirectoryReader(segments_q _2l(3.4):cv62/13 _2p(3.4):Cv6 _2o(3.4):cv47) totalHits=2\n    [junit] \tat org.apache.lucene.index.TestStressNRT$2.run(TestStressNRT.java:360)\n    [junit] Caused by: java.lang.AssertionError: id=25 reader=ReadOnlyDirectoryReader(segments_q _2l(3.4):cv62/13 _2p(3.4):Cv6 _2o(3.4):cv47) totalHits=2\n    [junit] \tat org.junit.Assert.fail(Assert.java:91)\n    [junit] \tat org.apache.lucene.index.TestStressNRT$2.run(TestStressNRT.java:345)\n    [junit] NOTE: test params are: locale=fr_BE, timezone=EET\n    [junit] NOTE: all tests run in this JVM:\n    [junit] [TestCharFilter, TestClassicAnalyzer, TestKeywordAnalyzer, TestStandardAnalyzer, TestBinaryDocument, TestAtomicUpdate, TestConcurrentMergeScheduler, TestDeletionPolicy, TestDirectoryReader, TestDoc, TestLazyProxSkipping, TestMultiLevelSkipList, TestPerSegmentDeletes, TestSameTokenSamePosition, TestStressNRT]\n    [junit] NOTE: Linux 2.6.35-30-generic amd64/Sun Microsystems Inc. 1.6.0_26 (64-bit)/cpus=12,threads=1,free=286656336,total=352714752\n    [junit] ------------- ---------------- ---------------\n\n\n ",
+            "author": "Simon Willnauer",
+            "id": "comment-13081553"
+        },
+        {
+            "date": "2011-08-10T07:43:53+0000",
+            "content": "FYI - I opened LUCENE-3368 to track the failures in 3.x and backported the test together with the fix. ",
+            "author": "Simon Willnauer",
+            "id": "comment-13082213"
+        }
+    ]
+}

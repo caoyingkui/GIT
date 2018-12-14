@@ -1,0 +1,378 @@
+{
+    "id": "SOLR-8914",
+    "title": "ZkStateReader's refreshLiveNodes(Watcher) is not thread safe",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.5.1",
+            "5.6",
+            "6.0.1",
+            "6.1",
+            "7.0"
+        ],
+        "affect_versions": "5.4.1,                                            5.5,                                            6.0",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Jenkin's encountered a failure in TestTolerantUpdateProcessorCloud over the weekend....\n\n\nhttp://jenkins.thetaphi.de/job/Lucene-Solr-6.x-Solaris/32/consoleText\nChecking out Revision c46d7686643e7503304cb35dfe546bce9c6684e7 (refs/remotes/origin/branch_6x)\nUsing Java: 64bit/jdk1.8.0 -XX:+UseCompressedOops -XX:+UseG1GC\n\n\n\nThe failure happened during the static setup of the test, when a MiniSolrCloudCluster & several clients are initialized \u2013 before any code related to TolerantUpdateProcessor is ever used.\n\nI can't reproduce this, or really make sense of what i'm (not) seeing here in the logs, so i'm filing this jira with my analysis in the hopes that someone else can help make sense of it.",
+    "attachments": {
+        "SOLR-8914.patch": "https://issues.apache.org/jira/secure/attachment/12795960/SOLR-8914.patch",
+        "live_nodes_mentions.log.txt": "https://issues.apache.org/jira/secure/attachment/12795754/live_nodes_mentions.log.txt",
+        "jenkins.thetaphi.de_Lucene-Solr-6.x-Solaris_32.log.txt": "https://issues.apache.org/jira/secure/attachment/12795668/jenkins.thetaphi.de_Lucene-Solr-6.x-Solaris_32.log.txt",
+        "live_node_mentions_port56361_with_threadIds.log.txt": "https://issues.apache.org/jira/secure/attachment/12795946/live_node_mentions_port56361_with_threadIds.log.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-03-28T18:15:38+0000",
+            "author": "Hoss Man",
+            "content": "\nThe specific assertion that failed had to do with a sanity checking query for 2 docs that are added to ensure that some compositId routing prefixes used throughout the tests do actually corrispond to the expected shard names \u2013 but for the purpose of discussing this particular jenkins failure, the key things to know about this test failure are...\n\n\n\tthere are 2 shards w/ repfactor=2 which are inited successfully & not undergoing recovery\n\t2 docs are (successful) added, with prefixes such that one is located on each shard\n\ta hard commit is (sucessfully) executed from the perspective of the CloudSolrClient\n\t\n\t\tbut only shard1 logs the commit & newSearcher\n\t\n\t\n\ta *:* query is executed...\n\t\n\t\tonly 1 doc is found by this query\n\t\tan error is logged by a shard1 node that no servers hosting shard: shard2\n\t\ta shard2 node does in fact log that it was consulted as part of this query\n\t\n\t\n\n\n\n\nWhich raises 2 key questions I can't make sense of...\n\n\n\tWhy didn't either shard2 node ever log (and execute) the commit & opening of a new searcher?\n\tWhy did a shard1 node log an error that \"no servers hosting shard: shard2\" even though the shard2's core_node2 clearly received the first phase of the distributed request & responded with a success?\n\n\n\n\nI've attached the full log file, and provided my detailed notes, line by line (of both the relevant code & the log file) below - NOTE: all \"Lxx\" line numbers refer to GIT SHA c46d768 since that's what jenkins was testing)\n\n\n\n\n\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster...\n\t\n\t\tbegins by creating a MiniSolrCloudCluster & initializes a collection of 5 nodes with 2 shards and refactor=2\n\t\n\t\n\ttimestamp #1302667 - #1302668\n\t\n\t\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster @ L129\n\t\tcall to AbstractDistribZkTestBase.waitForRecoveriesToFinish\n\t\tcan see from the log that all 4 nodes are good to go...\n\n1302667 INFO  (SUITE-TestTolerantUpdateProcessorCloud-seed#[F0FBD4E7705C29B5]-worker) [    ] o.a.s.c.AbstractDistribZkTestBase Wait for recoveries to finish - collection: test_col failOnTimeout:true timeout (sec):330\n-\nreplica:core_node1 rstate:active live:true\nreplica:core_node4 rstate:active live:true\nreplica:core_node2 rstate:active live:true\nreplica:core_node3 rstate:active live:true\nno one is recoverying\n1302668 INFO  (SUITE-TestTolerantUpdateProcessorCloud-seed#[F0FBD4E7705C29B5]-worker) [    ] o.a.s.c.AbstractDistribZkTestBase Recoveries finished - collection: test_col\n\n\n\t\n\t\n\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster @ L132 - L183\n\t\n\t\ttest is inspecting ZK state to init some HTTP SolrClients pointed at the URLs for specific leaders & replicas (these are used to test all possible forwarding situations in the various test methods)\n\t\ttimestamp #1302671 shows ZkStateReader used refreshing it's live nodes info for this purpose (L141)\n\t\n\t\n\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster @ L184 - L188\n\t\n\t\tadding 2 docs with specific routing prefixes\n\t\tultimate goal is to sanity check that the route prefixes match to the expected shards so other parts of test can assume this.\n\t\ttimestamp #1302696 - #1302719 record these 2 docs being added to both replicas of shard1 & shard2...\n\n1302696 INFO  (qtp1904355206-7333) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard1_replica2]  webapp=/solr path=/update params={update.distrib=FROMLEADER&distrib.from=http://127.0.0.1:56361/solr/test_col_shard1_replica1/&wt=javabin&version=2}{add=[abc!447049285 (1529857595576156160)]} 0 4\n1302697 INFO  (qtp1409631559-7341) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard1_replica1]  webapp=/solr path=/update params={wt=javabin&version=2}{add=[abc!447049285 (1529857595576156160)]} 0 14\n1302719 INFO  (qtp797763926-7371) [n:127.0.0.1:51144_solr c:test_col s:shard2 r:core_node3 x:test_col_shard2_replica1] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard2_replica1]  webapp=/solr path=/update params={update.distrib=FROMLEADER&distrib.from=http://127.0.0.1:33616/solr/test_col_shard2_replica2/&wt=javabin&version=2}{add=[XYZ!701047101 (1529857595596079104)]} 0 7\n1302719 INFO  (qtp316491708-7355) [n:127.0.0.1:33616_solr c:test_col s:shard2 r:core_node2 x:test_col_shard2_replica2] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard2_replica2]  webapp=/solr path=/update params={wt=javabin&version=2}{add=[XYZ!701047101 (1529857595596079104)]} 0 18\n\n\n\t\n\t\n\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster @ L189\n\t\n\t\tdo a commit using the CloudSolrClient\n\t\ttimestamps #1302724 - #1302733 show both replicas of shard1 acting on this commit & opening new searchers...\n\n1302724 INFO  (qtp1409631559-7343) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.u.DirectUpdateHandler2 start commit{,optimize=false,openSearcher=true,waitSearcher=true,expungeDeletes=false,softCommit=false,prepareCommit=false}\n1302724 INFO  (qtp1904355206-7330) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.u.DirectUpdateHandler2 start commit{,optimize=false,openSearcher=true,waitSearcher=true,expungeDeletes=false,softCommit=false,prepareCommit=false}\n1302727 INFO  (qtp1904355206-7330) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.c.SolrDeletionPolicy SolrDeletionPolicy.onCommit: commits: num=2\n\tcommit{dir=MockDirectoryWrapper(RAMDirectory@21c6a821 lockFactory=org.apache.lucene.store.SingleInstanceLockFactory@26734241),segFN=segments_1,generation=1}\n\tcommit{dir=MockDirectoryWrapper(RAMDirectory@21c6a821 lockFactory=org.apache.lucene.store.SingleInstanceLockFactory@26734241),segFN=segments_2,generation=2}\n1302727 INFO  (qtp1409631559-7343) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.c.SolrDeletionPolicy SolrDeletionPolicy.onCommit: commits: num=2\n\tcommit{dir=MockDirectoryWrapper(RAMDirectory@5616141f lockFactory=org.apache.lucene.store.SingleInstanceLockFactory@6180bc4c),segFN=segments_1,generation=1}\n\tcommit{dir=MockDirectoryWrapper(RAMDirectory@5616141f lockFactory=org.apache.lucene.store.SingleInstanceLockFactory@6180bc4c),segFN=segments_2,generation=2}\n1302728 INFO  (qtp1904355206-7330) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.c.SolrDeletionPolicy newest commit generation = 2\n1302729 INFO  (qtp1409631559-7343) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.c.SolrDeletionPolicy newest commit generation = 2\n1302730 INFO  (qtp1409631559-7343) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.s.SolrIndexSearcher Opening [Searcher@f331408[test_col_shard1_replica1] main]\n1302730 INFO  (qtp1904355206-7330) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.s.SolrIndexSearcher Opening [Searcher@5d1967dd[test_col_shard1_replica2] main]\n1302730 INFO  (qtp1409631559-7343) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.u.DirectUpdateHandler2 end_commit_flush\n1302730 INFO  (qtp1904355206-7330) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.u.DirectUpdateHandler2 end_commit_flush\n1302731 INFO  (searcherExecutor-3283-thread-1-processing-n:127.0.0.1:56361_solr x:test_col_shard1_replica1 s:shard1 c:test_col r:core_node1) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.c.SolrCore [test_col_shard1_replica1] Registered new searcher Searcher@f331408[test_col_shard1_replica1] main{ExitableDirectoryReader(UninvertingDirectoryReader(Uninverting(_0(6.1.0):c1)))}\n1302732 INFO  (qtp1409631559-7343) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard1_replica1]  webapp=/solr path=/update params={update.distrib=FROMLEADER&waitSearcher=true&openSearcher=true&commit=true&softCommit=false&distrib.from=http://127.0.0.1:56361/solr/test_col_shard1_replica1/&commit_end_point=true&wt=javabin&version=2&expungeDeletes=false}{commit=} 0 7\n1302732 INFO  (searcherExecutor-3284-thread-1-processing-n:127.0.0.1:34275_solr x:test_col_shard1_replica2 s:shard1 c:test_col r:core_node4) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.c.SolrCore [test_col_shard1_replica2] Registered new searcher Searcher@5d1967dd[test_col_shard1_replica2] main{ExitableDirectoryReader(UninvertingDirectoryReader(Uninverting(_0(6.1.0):c1)))}\n1302732 INFO  (qtp1904355206-7330) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard1_replica2]  webapp=/solr path=/update params={update.distrib=FROMLEADER&waitSearcher=true&openSearcher=true&commit=true&softCommit=false&distrib.from=http://127.0.0.1:56361/solr/test_col_shard1_replica1/&commit_end_point=true&wt=javabin&version=2&expungeDeletes=false}{commit=} 0 8\n1302733 INFO  (qtp1409631559-7345) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.u.p.LogUpdateProcessorFactory [test_col_shard1_replica1]  webapp=/solr path=/update params={_stateVer_=test_col:7&waitSearcher=true&commit=true&softCommit=false&wt=javabin&version=2}{commit=} 0 11\n\n\n\t\tWhat the hell hapened to shard2 ?! why isn't shard#2 logging anything here?!\n\t\n\t\n\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster @ L190\n\t\n\t\tdo a *:* query using the CloudSolrClient\n\t\tgoal is to assert that the [shard] value for each of our doc (prefixes) matches the expectation the rest of the test will have\n\t\ttimestamp #1302737 shows an error log from a shard1 node indicating that both replicas of shard2 have just vanished completley...\n\n1302737 ERROR (qtp1409631559-7347) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.h.RequestHandlerBase org.apache.solr.common.SolrException: no servers hosting shard: shard2\n\tat org.apache.solr.handler.component.HttpShardHandler.prepDistributed(HttpShardHandler.java:451)\n\tat org.apache.solr.handler.component.SearchHandler.getAndPrepShardHandler(SearchHandler.java:224)\n\tat org.apache.solr.handler.component.SearchHandler.handleRequestBody(SearchHandler.java:262)\n\tat org.apache.solr.handler.RequestHandlerBase.handleRequest(RequestHandlerBase.java:155)\n\tat org.apache.solr.core.SolrCore.execute(SolrCore.java:2033)\n\tat org.apache.solr.servlet.HttpSolrCall.execute(HttpSolrCall.java:652)\n\tat org.apache.solr.servlet.HttpSolrCall.call(HttpSolrCall.java:460)\n\tat org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:229)\n\tat org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:184)\n\tat org.eclipse.jetty.servlet.ServletHandler$CachedChain.doFilter(ServletHandler.java:1676)\n\tat org.apache.solr.client.solrj.embedded.JettySolrRunner$DebugFilter.doFilter(JettySolrRunner.java:109)\n\tat org.eclipse.jetty.servlet.ServletHandler$CachedChain.doFilter(ServletHandler.java:1676)\n\tat org.eclipse.jetty.servlet.ServletHandler.doHandle(ServletHandler.java:581)\n\tat org.eclipse.jetty.server.session.SessionHandler.doHandle(SessionHandler.java:224)\n\tat org.eclipse.jetty.server.handler.ContextHandler.doHandle(ContextHandler.java:1160)\n\tat org.eclipse.jetty.servlet.ServletHandler.doScope(ServletHandler.java:511)\n\tat org.eclipse.jetty.server.session.SessionHandler.doScope(SessionHandler.java:185)\n\tat org.eclipse.jetty.server.handler.ContextHandler.doScope(ContextHandler.java:1092)\n\tat org.eclipse.jetty.server.handler.ScopedHandler.handle(ScopedHandler.java:141)\n\tat org.eclipse.jetty.server.handler.gzip.GzipHandler.handle(GzipHandler.java:462)\n\tat org.eclipse.jetty.server.handler.HandlerWrapper.handle(HandlerWrapper.java:134)\n\tat org.eclipse.jetty.server.Server.handle(Server.java:518)\n\tat org.eclipse.jetty.server.HttpChannel.handle(HttpChannel.java:308)\n\tat org.eclipse.jetty.server.HttpConnection.onFillable(HttpConnection.java:244)\n\tat org.eclipse.jetty.io.AbstractConnection$ReadCallback.succeeded(AbstractConnection.java:273)\n\tat org.eclipse.jetty.io.FillInterest.fillable(FillInterest.java:95)\n\tat org.eclipse.jetty.io.SelectChannelEndPoint$2.run(SelectChannelEndPoint.java:93)\n\tat org.eclipse.jetty.util.thread.strategy.ExecuteProduceConsume.produceAndRun(ExecuteProduceConsume.java:246)\n\tat org.eclipse.jetty.util.thread.strategy.ExecuteProduceConsume.run(ExecuteProduceConsume.java:156)\n\tat org.eclipse.jetty.util.thread.QueuedThreadPool.runJob(QueuedThreadPool.java:654)\n\tat org.eclipse.jetty.util.thread.QueuedThreadPool$3.run(QueuedThreadPool.java:572)\n\tat java.lang.Thread.run(Thread.java:745)\n\n1302737 INFO  (qtp1409631559-7347) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.c.S.Request [test_col_shard1_replica1]  webapp=/solr path=/select params={q=*:*&_stateVer_=test_col:7&fl=id,expected_shard_s,[shard]&wt=javabin&version=2} status=503 QTime=0\n\n\n\t\tbut 5ms latter, timestamp #1302742 shows shard2's core_node2 logging it's successful response to the initial phase of the distributed query (although with hits=0 since it never processed the commit or opened a new searcher after the documents where added) ...\n\n1302742 INFO  (qtp316491708-7357) [n:127.0.0.1:33616_solr c:test_col s:shard2 r:core_node2 x:test_col_shard2_replica2] o.a.s.c.S.Request [test_col_shard2_replica2]  webapp=/solr path=/select params={distrib=false&_stateVer_=test_col:7&fl=id&fl=score&shards.purpose=4&start=0&fsv=true&shard.url=http://127.0.0.1:33616/solr/test_col_shard2_replica2/|http://127.0.0.1:51144/solr/test_col_shard2_replica1/&rows=10&version=2&q=*:*&NOW=1458985896717&isShard=true&wt=javabin} hits=0 status=0 QTime=0\n\n\n\t\n\t\n\tThe test ultimately fails at because the *:* sanity check of numDocs=2 fails\n\t\n\t\tTestTolerantUpdateProcessorCloud.createMiniSolrCloudCluster @ L192\n\t\n\t\n\tother then the hits=0 logging mentioned above (#1302742), there is no logging from either of the shard2 nodes between timestamp #1302719 when both replicas accept the doc add, and #1302758 when the test starts shutting down nodes and closing cores.\n\n\n ",
+            "id": "comment-15214609"
+        },
+        {
+            "date": "2016-03-28T23:31:36+0000",
+            "author": "Scott Blum",
+            "content": "I see something weird in there:\n\n\n   [junit4]   2> 1301674 INFO  (zkCallback-1136-thread-2-processing-n:127.0.0.1:34275_solr) [n:127.0.0.1:34275_solr    ] o.a.s.c.c.ZkStateReader A cluster state change: [WatchedEvent state:SyncConnected type:NodeDataChanged path:/collections/test_col/state.json] for collection [test_col] has occurred - updating... (live nodes size: [5])\n   [junit4]   2> 1301674 INFO  (zkCallback-1143-thread-1-processing-n:127.0.0.1:33616_solr) [n:127.0.0.1:33616_solr    ] o.a.s.c.c.ZkStateReader A cluster state change: [WatchedEvent state:SyncConnected type:NodeDataChanged path:/collections/test_col/state.json] for collection [test_col] has occurred - updating... (live nodes size: [5])\n   [junit4]   2> 1301674 INFO  (zkCallback-1135-thread-2-processing-n:127.0.0.1:56361_solr) [n:127.0.0.1:56361_solr    ] o.a.s.c.c.ZkStateReader A cluster state change: [WatchedEvent state:SyncConnected type:NodeDataChanged path:/collections/test_col/state.json] for collection [test_col] has occurred - updating... (live nodes size: [3])\n   [junit4]   2> 1301675 INFO  (zkCallback-1142-thread-2-processing-n:127.0.0.1:51144_solr) [n:127.0.0.1:51144_solr    ] o.a.s.c.c.ZkStateReader A cluster state change: [WatchedEvent state:SyncConnected type:NodeDataChanged path:/collections/test_col/state.json] for collection [test_col] has occurred - updating... (live nodes size: [5])\n\n\n\nWhy is one node seeing a live_nodes size 3, and the others seeing size 5? How many are there supposed to be?  I've suspected for a while there's some weirdness involving live_nodes tracking, but I haven't been able to pin it down. ",
+            "id": "comment-15215090"
+        },
+        {
+            "date": "2016-03-29T01:53:08+0000",
+            "author": "Hoss Man",
+            "content": "Nice catch Scott!\n\nFWIW, here's a one liner that pulls out all the \"live nodes size\" messages from the log and distills it down to just the timeestamp, threadIds (showing the port# of the jetty instance) and the current live node count...\n\n\ngrep \"live nodes size\" jenkins.thetaphi.de_Lucene-Solr-6.x-Solaris_32.log.txt | perl -ple 's/.*2> (\\d+).*?\\((.*?)\\).*?o.a.s.c.c.ZkStateReader.*?live nodes size: (\\[\\d+\\]).*/$1 $2 $3/'\n\n\n\nusing the output from that command as a refrence point, we can revist some of my earlier observations...\n\n\n\tNOTE: there are 5 nodes in this cluster, but only 2 shards x 2 replicas\n\tL122: collection creation\n\t\n\t\twhen the 4 cores for the collection are created, the jetty node that does NOT recieve any core is port #63099...\n\n1291030 INFO  (OverseerThreadFactory-3272-thread-1-processing-n:127.0.0.1:34275_solr) [n:127.0.0.1:34275_solr    ] o.a.s.c.OverseerCollectionMessageHandler Creating core test_col_shard1_replica1 as part of shard shard1 of collection test_col on 127.0.0.1:56361_solr\n1291031 INFO  (OverseerThreadFactory-3272-thread-1-processing-n:127.0.0.1:34275_solr) [n:127.0.0.1:34275_solr    ] o.a.s.c.OverseerCollectionMessageHandler Creating core test_col_shard2_replica2 as part of shard shard2 of collection test_col on 127.0.0.1:33616_solr\n1291038 INFO  (OverseerThreadFactory-3272-thread-1-processing-n:127.0.0.1:34275_solr) [n:127.0.0.1:34275_solr    ] o.a.s.c.OverseerCollectionMessageHandler Creating core test_col_shard2_replica1 as part of shard shard2 of collection test_col on 127.0.0.1:51144_solr\n1291041 INFO  (OverseerThreadFactory-3272-thread-1-processing-n:127.0.0.1:34275_solr) [n:127.0.0.1:34275_solr    ] o.a.s.c.OverseerCollectionMessageHandler Creating core test_col_shard1_replica2 as part of shard shard1 of collection test_col on 127.0.0.1:34275_solr\n\n\n\t\n\t\n\tL129: call to AbstractDistribZkTestBase.waitForRecoveriesToFinish\n\t\n\t\tthis happens between timestamp #1302667 - #1302668\n\t\tthe most recent flurry of log messages mentioning \"live nodes size\" prior to this timestamp window are...\n\n1301787 zkCallback-1136-thread-1-processing-n:127.0.0.1:34275_solr [5]\n1301788 zkCallback-1142-thread-2-processing-n:127.0.0.1:51144_solr [5]\n1301791 zkCallback-1143-thread-1-processing-n:127.0.0.1:33616_solr [5]\n1301791 zkCallback-1135-thread-2-processing-n:127.0.0.1:56361_solr [3]\n\n\n\t\tNOTE: these log messages are watches on path:/collections/test_col/state.json which port#63099 has no reason to watch (since it's not hosting any shards of test_col so it's not unusual that it's not logging anything around these times\n\t\twhy does port #56361 think at this point that there are only 3 live nodes?\n\t\n\t\n\tL184 - L188: adding docs\n\t\n\t\tthis is done with CloudSolrClient, so each doc goes to it's respective leader regardless of wether any 1 node has a broken view of live_nodes\n\t\tport #56361 hosts test_col_shard1_replica1 which is aparently the leader of shard1 at this moment\n\t\tthe shard1 doc is forwarded correctly to test_col_shard1_replica2 (on port #34275)\n\t\t\n\t\t\tso #34275 is evidently in port #56361's \"view\" of live_nodes, and not one of the \"missing\" live_nodes\n\t\t\n\t\t\n\t\n\t\n\tL189: commit\n\t\n\t\thappens during timestamps #1302724 - #1302733\n\t\t(no new \"live nodes size\" log messages prior to this time window since the ones mentioned previously)\n\t\tIIUC CloudSolrClient correctly, this is considered a \"non routable\" update, so it will be sent to a (leader) node picked at random\n\t\tfrom the logs, it looks like CloudSolrClient picked port #56361\n\t\tport #56361's test_col_shard1_replica1 forwarded to it's replica test_col_shard1_replica2 on port #34275\n\t\tas mentioned before shard2 never got the update - aparently because port #56361 didn't think that shard2's leader was in live_nodes\n\t\n\t\n\tL190: the {{*:*} query\n\t\n\t\ttimestamp #1302737 is when port #56361 (who we know has a bogus view of live_nodes) logs that no servesr are hosting shard2, and returns a 503 error code\n\t\t(there are still no new \"live nodes size\" log messages prior to this error since the ones mentioned previously)\n\t\tSomething that didn't occur to me before, is that IIRC CloudSolrServertimestamp will retry some error codes \u2013 i'm guessing 503 is one of them, because that would explain the subsequent log messages 5ms later...\n\t\ttimestamps #1302742 - 1302746, it appears that port #34275 was queried by CloudSolrClient on retry, and it did know that both replicas of shard2 were alive and queried them (but since they never got the commit, they had numFound=0)\n\n1302742 INFO  (qtp316491708-7357) [n:127.0.0.1:33616_solr c:test_col s:shard2 r:core_node2 x:test_col_shard2_replica2] o.a.s.c.S.Request [test_col_shard2_replica2]  webapp=/solr path=/select params={distrib=false&_stateVer_=test_col:7&fl=id&fl=score&shards.purpose=4&start=0&fsv=true&shard.url=http://127.0.0.1:33616/solr/test_col_shard2_replica2/|http://127.0.0.1:51144/solr/test_col_shard2_replica1/&rows=10&version=2&q=*:*&NOW=1458985896717&isShard=true&wt=javabin} hits=0 status=0 QTime=0\n1302742 INFO  (qtp1409631559-7346) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.c.S.Request [test_col_shard1_replica1]  webapp=/solr path=/select params={distrib=false&_stateVer_=test_col:7&fl=id&fl=score&shards.purpose=4&start=0&fsv=true&shard.url=http://127.0.0.1:56361/solr/test_col_shard1_replica1/|http://127.0.0.1:34275/solr/test_col_shard1_replica2/&rows=10&version=2&q=*:*&NOW=1458985896717&isShard=true&wt=javabin} hits=1 status=0 QTime=0\n1302745 INFO  (qtp1409631559-7344) [n:127.0.0.1:56361_solr c:test_col s:shard1 r:core_node1 x:test_col_shard1_replica1] o.a.s.c.S.Request [test_col_shard1_replica1]  webapp=/solr path=/select params={q=*:*&distrib=false&_stateVer_=test_col:7&fl=id,expected_shard_s,[shard]&shards.purpose=64&NOW=1458985896717&ids=abc!447049285&isShard=true&shard.url=http://127.0.0.1:56361/solr/test_col_shard1_replica1/|http://127.0.0.1:34275/solr/test_col_shard1_replica2/&wt=javabin&version=2} status=0 QTime=0\n1302746 INFO  (qtp1904355206-7332) [n:127.0.0.1:34275_solr c:test_col s:shard1 r:core_node4 x:test_col_shard1_replica2] o.a.s.c.S.Request [test_col_shard1_replica2]  webapp=/solr path=/select params={q=*:*&_stateVer_=test_col:7&fl=id,expected_shard_s,[shard]&wt=javabin&version=2} hits=1 status=0 QTime=7\n\n\n\t\n\t\n\n\n\n\nSo to sum up: it appears everything i noted before would be easily explained by a some broken code regarding live nodes that only affected port #56361 while all other nodes had a perfecly accurate view of the world. ",
+            "id": "comment-15215237"
+        },
+        {
+            "date": "2016-03-29T02:12:41+0000",
+            "author": "Hoss Man",
+            "content": "Attaching another interesting view: live_nodes_mentions.log.txt...\n\nThis is every log entry from ZkStateReader mentioning \"live nodes\" (not just \"live nodes size\", so \"Updated live nodes from ZooKeeper...\" msgs also show up) distilled down to only the timestamp port# (or TEST if it's from the main testing thread via MiniSolrCloudCluster or waitForRecoveries) and log message.\n\nGenerated via...\n\ngrep -i \"live nodes\" jenkins.thetaphi.de_Lucene-Solr-6.x-Solaris_32.log.txt | perl -ple 's/.*2> (\\d+).*?(\\[[^\\]]*? \\]) o.a.s.c.c.ZkStateReader(.*)/$1 $2 $3/; s/\\[n:127.0.0.1:(\\d+)_solr\\s*?\\]/port $1/; s/\\[\\s+\\]/     TEST /' > live_nodes_mentions.log.txt\n\n\n... use grep -v \"port 63099\" if you want to only focus on the nodes that host a piece of the collection. ",
+            "id": "comment-15215271"
+        },
+        {
+            "date": "2016-03-29T22:26:38+0000",
+            "author": "Hoss Man",
+            "content": "\nHaving read more of ZkStateReader, and understanding a bit better when/why these various log messages are written, it now seems certain to me that ZkStateReader's callbacks to watching live_nodes and updating that information in the (local) ClusterState is absolutely not thread safe.\n\nKey things to note about the ZkStateReader code related to live nodes and live nodes log msgs...\n\n\n\tThe following are examples of log message formats that occur when a ZK Watcher's process method is triggered - in all of these cases the # of live nodes logged is the current number, according to local state, prior to processing the Watcher event...\n\t\n\t\tLegacyClusterStateWatcher (old multi-collections state.json)\n\t\t\n\t\t\t\"A cluster state change: [{}] for collection [{}] has occurred - updating... (live nodes size: [{}])\"\n\t\t\tNOTE: this is the current (local) liveNodes.size(), w/ no attempt to refresh liveNodes from ZK\n\t\t\n\t\t\n\t\tStateWatcher (per collection state.json)\n\t\t\n\t\t\t\"A cluster state change: [{}] for collection [{}] has occurred - updating... (live nodes size: [{}])\"\n\t\t\tNOTE: this is the current (local) liveNodes.size(), w/ no attempt to refresh liveNodes from ZK\n\t\t\n\t\t\n\t\tLiveNodeWatcher\n\t\t\n\t\t\t\"A live node change: [{}], has occurred - updating... (live nodes size: [{}])\"\n\t\t\tNOTE: This the \"old\" value when a LiveNodesWatcher is triggered, prior to refreshing from ZK\n\t\t\n\t\t\n\t\n\t\n\tThe following is what gets logged after the local cache of the live nodes data has been updated (either by an explicit method call to fetch the data from ZK on startup, or because a LiveNodeWatcher was triggered by ZK)\n\t\n\t\t\"Updated live nodes from ZooKeeper... ({}) -> ({})\"\n\t\n\t\n\tThe full code for how the local cache of liveNode is refreshed from ZK (either by an explifit method call on startup or because a LiveNodeWatcher was triggered) is...\n\ntry {\n  List<String> nodeList = zkClient.getChildren(LIVE_NODES_ZKNODE, watcher, true);\n  newLiveNodes = new HashSet<>(nodeList);\n} catch (KeeperException.NoNodeException e) {\n  newLiveNodes = emptySet();\n}\nSet<String> oldLiveNodes;\nsynchronized (getUpdateLock()) {\n  oldLiveNodes = this.liveNodes;\n  this.liveNodes = newLiveNodes;\n  if (clusterState != null) {\n    clusterState.setLiveNodes(newLiveNodes);\n  }\n}\nLOG.info(\"Updated live nodes from ZooKeeper... ({}) -> ({})\", oldLiveNodes.size(), newLiveNodes.size());\n\n\n\n\n\n\nWith all of that info in mind if we revisi the log file, and focus on the threadIds that log each message for a single port we know is problematic (56361)...\n\n\ngrep -i \"live nodes\" jenkins.thetaphi.de_Lucene-Solr-6.x-Solaris_32.log.txt | grep 127.0.0.1:56361_solr | perl -ple 's/.*2> (\\d+).*?\\((.*?-\\d+)(?:-processing-n:127.*?)?\\).*o.a.s.c.c.ZkStateReader(.*)/$1 $2 $3/' > live_node_mentions_port56361_with_threadIds.log.txt\n\n\n\n...it becomes really easy to spot the problem...\n\n\n1290004 jetty-launcher-1118-thread-5  Updated live nodes from ZooKeeper... (0) -> (0)\n1290033 zkCallback-1135-thread-1  A live node change: [WatchedEvent state:SyncConnected type:NodeChildrenChanged path:/live_nodes], has occurred - updating... (live nodes size: [0])\n1290047 zkCallback-1135-thread-2  A live node change: [WatchedEvent state:SyncConnected type:NodeChildrenChanged path:/live_nodes], has occurred - updating... (live nodes size: [0])\n1290052 zkCallback-1135-thread-3  A live node change: [WatchedEvent state:SyncConnected type:NodeChildrenChanged path:/live_nodes], has occurred - updating... (live nodes size: [0])\n1290070 zkCallback-1135-thread-3  Updated live nodes from ZooKeeper... (0) -> (4)\n1290071 zkCallback-1135-thread-3  A live node change: [WatchedEvent state:SyncConnected type:NodeChildrenChanged path:/live_nodes], has occurred - updating... (live nodes size: [4])\n1290071 zkCallback-1135-thread-3  Updated live nodes from ZooKeeper... (4) -> (5)\n1290075 zkCallback-1135-thread-1  Updated live nodes from ZooKeeper... (5) -> (1)\n1290076 zkCallback-1135-thread-2  Updated live nodes from ZooKeeper... (1) -> (3)\n\n\n\n\n\ttimestamp #1290004 is when jetty is first starting up, and forcibly asks ZK for the list of live nodes.\n\twe then see 3 threads being spun up in numeric sequence order, to (start) processing LiveNodeWatcher events\n\tthread-3 finishes and updates the live nodes to a list of size \"4\"\n\tthread-3 is then re-used to (start) processing another LiveNodeWatcher event\n\tthread-3 finishes again and updates the live nodes to a list of size \"5\"\n\tthread-1 now finally finishes, and overwrites the live node list with a list of size \"1\" even though it's data is almost certainly old\n\tthread-1 now finally finishes, and also overwrites the live node list with a list of size \"3\" even though this data is almost certainly also old\n\n\n\nFilling in the blanks, a valid sequence of events that fits the code and matches the logs could have been (colors matchg T# thread id)...\n\n\n\tT1 process() called, logs \"A live node change: ...\"\n\tT1 zkClient.getChildren(...) returns a list of 1 live nodes\n\tT2 process() called, logs \"A live node change: ...\"\n\tT3 process() called, logs \"A live node change: ...\"\n\tT2 zkClient.getChildren(...) returns a list of 3 live nodes\n\tT3 zkClient.getChildren(...) returns a list of 4 live nodes\n\tT3 clusterState.setLiveNodes(\"4\") called, logs \"Updated live nodes...\"\n\tT3 process() is now finished, thread is free for re-use\n\tT3 process() called, logs \"A live node change: ...\"\n\tT3 zkClient.getChildren(...) returns a list of 5 live nodes\n\tT3 clusterState.setLiveNodes(\"5\") called, logs \"Updated live nodes...\"\n\tT3 process() is now finished, thread is free for re-use\n\tT1 clusterState.setLiveNodes(\"1\") called, logs \"Updated live nodes...\"\n\tT1 process() is now finished, thread is free for re-use\n\tT2 clusterState.setLiveNodes(\"3\") called, logs \"Updated live nodes...\"\n\tT2 process() is now finished, thread is free for re-use\n\n\n\n(NOTE: one thing i'm not clear on is why there are only 4 live_nodes NodeChildrenChanged WatchedEvents triggered - i would expect 5 total unless ZK doesn't garuntee a unique event for each new child node, does it send a single event if 2 children are added very close together in time?)\n\nAfter the sequence of events above, port #56361 is hozed. In a real world situation, it will never update it's local state to match the real list of live nodes in ZK unless some other node goes up/down triggering the LiveNodesWatcher.\n\nThe rest of the \"live node\" log messages in our log file are either passively reporting the local cached data during other ZK events (specifically: collection creation trigging the state.json watcher) or they are the triggers to the LiveNodeWatcher when MiniSolrCloudCluster starts shutting down nodes after the test has failed.\n\n\n\n\n ",
+            "id": "comment-15216972"
+        },
+        {
+            "date": "2016-03-29T22:30:03+0000",
+            "author": "Hoss Man",
+            "content": "Updating summary.\n\nI suspect we either need to move the zkClient.getChildren(...) call inside the existing synchronized (getUpdateLock()) block, or the entire refreshLiveNodes(Watcher watcher) method needs to synchronize on some new \"liveNodesLock\". ",
+            "id": "comment-15216977"
+        },
+        {
+            "date": "2016-03-29T22:31:31+0000",
+            "author": "Scott Blum",
+            "content": "This is super troubling....\n\n1290071 port 56361  Updated live nodes from ZooKeeper... (4) -> (5)\n1290075 port 56361  Updated live nodes from ZooKeeper... (5) -> (1)\n1290076 port 56361  Updated live nodes from ZooKeeper... (1) -> (3)\n\nWTF? ",
+            "id": "comment-15216979"
+        },
+        {
+            "date": "2016-03-29T22:35:14+0000",
+            "author": "Hoss Man",
+            "content": "WTF?\n\nour comments seem to have the same problem as refreshLiveNodes \u2013 concurrent updates.  see the additional analysis i just posted ",
+            "id": "comment-15216989"
+        },
+        {
+            "date": "2016-03-29T22:55:24+0000",
+            "author": "Scott Blum",
+            "content": "Hoss-- great analysis!  I was just looking at this code myself.  The part I don't understand is why this watcher is getting fired multiple times on different threads.  I (re)wrote some of this code, and one of my implicit assumptions that was that any given watcher would not get re-fired until the previous watcher invocation had returned.  But maybe that was a really bad assumption that I carried over from Curator, or perhaps the thread model in ZK has changed?\n\nEither way, I completely agree that this is broken if we can get multiple concurrent ZK callbacks on the same watcher.\n\ngetUpdateLock() is an overly broad lock, we should not try to hold that lock while calling ZK.\n\nI have a few proposals on how to fix:\n\n1) Add a getChildren() variant that returns a Stat object, and use version tracking.  I could make an argument that this is the most sane way to break any versioning ties, since it completely eliminates client-side concurrency issues in the ZK framework code.  If we don't do this, we're always implicitly depending on our ability to linearly sequence getChildren calls.\n\n2) Make the various Watcher objects lock themselves for the duration of process(WatchedEvent event).  That way, subsequent callbacks will have to linearize.\n\n3) Similar idea, but put that same set of locks as top-level fields in ZkStateReader.  This is like #2, but also protects against a multiple-watchers scenario.  I've tried to avoid situations of multiple watchers, there's no real guard against multiple calls to createClusterStateWatchersAndUpdate(). ",
+            "id": "comment-15217011"
+        },
+        {
+            "date": "2016-03-29T23:08:15+0000",
+            "author": "Scott Blum",
+            "content": "Here's a pretty simple patch that I believe should fix.  I think #3 is probably the safest option here. ",
+            "id": "comment-15217032"
+        },
+        {
+            "date": "2016-03-29T23:09:35+0000",
+            "author": "Hoss Man",
+            "content": "\nThe part I don't understand is why this watcher is getting fired multiple times on different threads. I (re)wrote some of this code, and one of my implicit assumptions that was that any given watcher would not get re-fired until the previous watcher invocation had returned. But maybe that was a really bad assumption that I carried over from Curator, or perhaps the thread model in ZK has changed?\n\nI have no idea what the thread model for ZK is, but let's assume your implicit assumption was correct...\n\nThat would still match the observed behavior, and a hypothetical sequence of events very similar to the one i outlined, since the zkClient.getChildren(...) calls are passing the LiveNodeWatcher back to ZK.  so T1's call to zkClient.getChildren(...) call adds the LiveNodeWatcher back, but before T1 has a chance to write it's local state that watcher fires and triggers T2, and T2's zkClient.getChildren(...) call adds the LiveNodeWatcher backm but before either T1 or T2 can write to the local state that watcher fires and triggers T3, ... after T3 writes the local state, T1 and T2 overwrite it with their stale data.\n\nYour implicit assumption would alos explain the part i was confused about: why there are only 4 live_nodes child events triggered instead of 5.  2 nodes must have come online add added themselves to live_nodes/ between the time T2's watch even was triggered and when T2 added a new watcher via the zkClient.getChildren(...) call (explaining the jump from \"1\" to \"3\") ",
+            "id": "comment-15217033"
+        },
+        {
+            "date": "2016-03-29T23:11:22+0000",
+            "author": "Scott Blum",
+            "content": "BTW, a million thanks to Hoss for digging into this.  We've seen this in production in certain circumstances, I think it's triggered when we have multiple nodes experiencing long GC pauses at the same time, enough to drop ZK sessions.  The cluster can get into a state where it never fully recovers; but we've found that if we perform a \"live_nodes tickle\" but dropping a dummy child into \"live_nodes\" then deleting it, things fix themselves.  I'm so thankful to finally have an explanation, even if the root cause is my fault! ",
+            "id": "comment-15217036"
+        },
+        {
+            "date": "2016-03-29T23:14:29+0000",
+            "author": "Scott Blum",
+            "content": "Yeah, one of the things about ZK is it's impossible to view all changes as a strict linear sequence using the client-facing watcher protocol, because the watch events don't contain the data you want; by the time you can fetch the data in response to the event, it's already stale, so you can absolutely miss transient states. I assume that if you spoke ZK server replication protocol, then you could get a linearized change sequence. ",
+            "id": "comment-15217043"
+        },
+        {
+            "date": "2016-03-30T04:41:42+0000",
+            "author": "Hoss Man",
+            "content": "I wrote up a stress test to demonstrate the bug.  I've added it to the patch Scott already worked up & attached.\n\nScott: Prior to incorporating your changes, hammering on this stress test would fail within the first 20 attempts.  But with your changes I'm seeing deadlocks within the first 5 attempts every time i hammer on it...\n\n\nFound one Java-level deadlock:\n=============================\n\"zkCallback-7-thread-2-processing-n:127.0.0.1:48312_solr\":\n  waiting to lock monitor 0x00007f82d40076b8 (object 0x00000000ff3b5b38, a java.lang.Object),\n  which is held by \"zkCallback-7-thread-1-processing-n:127.0.0.1:48312_solr\"\n\"zkCallback-7-thread-1-processing-n:127.0.0.1:48312_solr\":\n  waiting to lock monitor 0x00007f82d400be38 (object 0x00000000ff3b5800, a org.apache.solr.common.cloud.ZkStateReader),\n  which is held by \"OverseerStateUpdate-95637266046386179-127.0.0.1:48312_solr-n_0000000000\"\n\"OverseerStateUpdate-95637266046386179-127.0.0.1:48312_solr-n_0000000000\":\n  waiting to lock monitor 0x00007f82d40076b8 (object 0x00000000ff3b5b38, a java.lang.Object),\n  which is held by \"zkCallback-7-thread-1-processing-n:127.0.0.1:48312_solr\"\n\n ",
+            "id": "comment-15217370"
+        },
+        {
+            "date": "2016-03-30T04:58:05+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I'm still digesting the discussions in this thread but..\n\n...and one of my implicit assumptions that was that any given watcher would not get re-fired until the previous watcher invocation had returned. But maybe that was a really bad assumption that I carried over from Curator, or perhaps the thread model in ZK has changed?\n\nI guess that's not true anymore because the watcher invocations are done asynchronously via a thread pool in Solr. So the original guarantees made by ZK don't apply anymore? ",
+            "id": "comment-15217379"
+        },
+        {
+            "date": "2016-03-30T05:18:53+0000",
+            "author": "Noble Paul",
+            "content": "I guess that's not true anymore because the watcher invocations are done asynchronously via a thread pool in Solr. So the original guarantees made by ZK don't apply anymore?\n\n+1 shalin. Even if ZK does the event loop in a single thread, it fires the callback into SolrZkClient.zkCallbackExecutor threadpool . So that single thread is free to fire more callbacks. So, we cannot guarantee thread safety in any watcher callback functions ",
+            "id": "comment-15217413"
+        },
+        {
+            "date": "2016-03-30T06:10:23+0000",
+            "author": "Noble Paul",
+            "content": "hoss, what I would like to know is what if it is not threadsafe? The live nodes set is expected to change all the time. So, what if multiple threads update the Set one after other?  ",
+            "id": "comment-15217464"
+        },
+        {
+            "date": "2016-03-30T06:29:52+0000",
+            "author": "Scott Blum",
+            "content": "The problem is inherently that if you getChildren() three times and get 3 different answers, there's currently no guarantee about which of those invocations and answers will ultimately populate the live_nodes var.  At that point, if no more server side changes happen, the watcher never re-fires and you're stuck with stale data. ",
+            "id": "comment-15217494"
+        },
+        {
+            "date": "2016-03-30T06:31:53+0000",
+            "author": "Scott Blum",
+            "content": "Should be easy enough to debug the deadlock.  I'll take a look tomorrow.  Thanks! ",
+            "id": "comment-15217497"
+        },
+        {
+            "date": "2016-03-30T06:41:56+0000",
+            "author": "Noble Paul",
+            "content": "OK , That is understandable. It makes sense to make the whole LiveNodeWatcher.process() synchronized. The current updateLock object is common for the entire cluster state. Should we not have  a separate lock for just livenodes, because live nodes are updated independently of the rest and it changes often.\n ",
+            "id": "comment-15217507"
+        },
+        {
+            "date": "2016-03-30T07:32:13+0000",
+            "author": "Scott Blum",
+            "content": "Yep, that's what my patch does.  I just have to debug the deadlock. ",
+            "id": "comment-15217585"
+        },
+        {
+            "date": "2016-03-30T07:39:58+0000",
+            "author": "Scott Blum",
+            "content": "Oh.. I can see by inspection.  It's because createClusterStateWatchersAndUpdate() and updateClusterState() hold the update lock before calling the e.g. refreshLiveNodes().  Perhaps those two big methods should hold a more high-level lock instead of the update lock. ",
+            "id": "comment-15217597"
+        },
+        {
+            "date": "2016-03-30T07:48:17+0000",
+            "author": "Scott Blum",
+            "content": "Alternatively I could imagine a more golang channel style formulation like this..\n\n\n  // We don't get a Stat or track versions on getChildren() calls, so force linearization.\n  private final Object refreshLiveNodesLock = new Object();\n  private final Queue<Set<String>> newLiveNodesQueue = new ConcurrentLinkedQueue<>();\n\n  /**\n   * Refresh live_nodes.\n   */\n  private void refreshLiveNodes(Watcher watcher) throws KeeperException, InterruptedException {\n    synchronized (refreshLiveNodesLock) {\n      try {\n        List<String> nodeList = zkClient.getChildren(LIVE_NODES_ZKNODE, watcher, true);\n        newLiveNodesQueue.add(new HashSet<>(nodeList));\n      } catch (KeeperException.NoNodeException e) {\n        newLiveNodesQueue.add(emptySet());\n      }\n    }\n    Set<String> oldLiveNodes;\n    synchronized (getUpdateLock()) {\n      Set<String> newLiveNodes = newLiveNodesQueue.remove();\n      oldLiveNodes = this.liveNodes;\n      this.liveNodes = newLiveNodes;\n      if (clusterState != null) {\n        clusterState.setLiveNodes(newLiveNodes);\n      }\n      LOG.info(\"Updated live nodes from ZooKeeper... ({}) -> ({})\", oldLiveNodes.size(), newLiveNodes.size());\n      if (LOG.isDebugEnabled()) {\n        LOG.debug(\"Updated live nodes from ZooKeeper... {} -> {}\", new TreeSet<>(oldLiveNodes), new TreeSet<>(newLiveNodes));\n      }\n    }\n  }\n\n\n\nTo avoid the updateLock -> liveNodesLock -> updateLock cycle, but still linearize the results of successive invocations. ",
+            "id": "comment-15217612"
+        },
+        {
+            "date": "2016-03-30T15:57:45+0000",
+            "author": "Scott Blum",
+            "content": "Updated patch, with a refinement of the channel formulation.  NOTE: I could not get TestStressLiveNodes to fail for me locally, but I believe this should fix the deadlock. ",
+            "id": "comment-15218204"
+        },
+        {
+            "date": "2016-03-30T16:44:31+0000",
+            "author": "Noble Paul",
+            "content": "looked at the patch .The block \n\n\n  synchronized (refreshLiveNodesLock) {\n      Set<String> newLiveNodes;\n      try {\n        List<String> nodeList = zkClient.getChildren(LIVE_NODES_ZKNODE, watcher, true);\n        newLiveNodes = new HashSet<>(nodeList);\n      } catch (KeeperException.NoNodeException e) {\n        newLiveNodes = emptySet();\n      }\n      lastFetchedLiveNodes.set(newLiveNodes);\n    }\n\n    // Can't lock getUpdateLock() until we release the other, it would cause deadlock.\n    Set<String> oldLiveNodes, newLiveNodes;\n    synchronized (getUpdateLock()) {\n      newLiveNodes = lastFetchedLiveNodes.getAndSet(null);\n      if (newLiveNodes == null) {\n        // Someone else won the race to apply the last update, just exit.\n        return;\n      }\n\n      oldLiveNodes = this.liveNodes;\n      this.liveNodes = newLiveNodes;\n      if (clusterState != null) {\n        clusterState.setLiveNodes(newLiveNodes);\n      }\n    }\n\n\n\nWhy can't  the synchronized (refreshLiveNodesLock) block be applied on the entire method and make the code simpler and avoid the race condition altogether.   ",
+            "id": "comment-15218286"
+        },
+        {
+            "date": "2016-03-30T16:52:31+0000",
+            "author": "Hoss Man",
+            "content": "Scott: i'm hammering on your updated patch now, so far 60 runs w/o failure of deadlock (3 times as long as i've ever seen it go w/o failure, 10 times longer then your previous patch went w/o deadlocks)\n\nAs someone unfamiliar with most of the ZkStateReader code, some of the changes are clearly relevant as far as the current bug goes (the lastFetchedLiveNodes AtomicRef and associated refreshLiveNodesLock) but it's not immediately obvious to me what the other changes (refreshCollectionListLock etc..) in your patch are for .. are these unrelated to the live nodes bug? \n\nIs this a similar bug pattern in watching the list of collections? (ie: two COLLECTIONS_ZKNODE, watchers may fire in rapid succession and updating the local collection states might happen out of order)\n ",
+            "id": "comment-15218306"
+        },
+        {
+            "date": "2016-03-30T17:42:58+0000",
+            "author": "Erick Erickson",
+            "content": "I'm beasting your latest patch too, I'll report anything that comes up. Just to make sure, I should be beasting StressTestLiveNodes, right? ",
+            "id": "comment-15218423"
+        },
+        {
+            "date": "2016-03-30T18:15:49+0000",
+            "author": "Hoss Man",
+            "content": "i've updated the patch to cleanup the test a bit \u2013 besdies some cosmetic stuff it now does more iterations of smaller \"bursts\" with more variability in the number of threads used in each burst (which should increase the odds of it failing, eventually, on diff machines regardless of CPU count.\n\nI'm beasting your latest patch too, I'll report anything that comes up. Just to make sure, I should be beasting StressTestLiveNodes, right?\n\nTestStressLiveNodes, but otherwise yes.\n\nIt would also be helpful to know if (and how quickly) you can get TestStressLiveNodes to fail on your machine when beasting w/o the rest of the patch (so far i'm the only one that's been able to confirm the bug in practice w/o Scott's patch - hopefully these changes increase those odds) ",
+            "id": "comment-15218497"
+        },
+        {
+            "date": "2016-03-30T18:23:24+0000",
+            "author": "Scott Blum",
+            "content": "That was actually my first formulation, but that causes deadlock, see previous comments. ",
+            "id": "comment-15218518"
+        },
+        {
+            "date": "2016-03-30T18:28:24+0000",
+            "author": "Scott Blum",
+            "content": "Correct, the refreshCollectionListLock solves the same class of bug for the collections list as we needed to solve for live_nodes.  However, the implementation is simpler since we don't need to hold getUpdateLock() and therefore there's no deadlock potential.\n\nThe code to check this.legacyClusterStateVersion >= stat.getVersion() solves that class of bug for clusterstate.json; we already have version guarding code for stateformat 2 collections, it was an oversight not to have it for this also.\n\nNet-net: my intent (hope?) is this patch should fix this category of race condition for all the major pieces of ZkStateReader. ",
+            "id": "comment-15218529"
+        },
+        {
+            "date": "2016-03-30T19:47:20+0000",
+            "author": "Steve Rowe",
+            "content": "TestStressLiveNodes w/o the rest of the patch failed 84/100 iterations on my server. ",
+            "id": "comment-15218692"
+        },
+        {
+            "date": "2016-03-30T21:55:56+0000",
+            "author": "Steve Rowe",
+            "content": "With the full patch 0/100 iterations failed.  I'll beast another 100 iterations. ",
+            "id": "comment-15218949"
+        },
+        {
+            "date": "2016-03-31T00:29:00+0000",
+            "author": "Erick Erickson",
+            "content": "I had 4/100 iterations fail. Let me try it all again to insure that I applied the right patch, saved the file and all that etc. ",
+            "id": "comment-15219119"
+        },
+        {
+            "date": "2016-03-31T01:12:08+0000",
+            "author": "Erick Erickson",
+            "content": "Nope, completely re-did the test and got another failure on run 31. Here are the failure snippets\n\n[junit4] FAILURE 94.1s | TestStressLiveNodes.testStress <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: iter1263: [127.0.0.1:53372_solr, thrasher-T1262_0-0] expected:<1> but was:<2>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([3E42073F9773C752:2B597AFE14843F29]:0)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.testStress(TestStressLiveNodes.java:137)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n\n   ***********************\n\n      [junit4] FAILURE 75.7s | TestStressLiveNodes.testStress <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: iter2373 6 != 1 expected:<[127.0.0.1:61240_solr, thrasher-T2373_0-0, thrasher-T2373_1-0, thrasher-T2373_2-0, thrasher-T2373_3-0, thrasher-T2373_4-0]> but was:<[127.0.0.1:61240_solr]>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([20645E3B72A746D3:357F23FAF150BEA8]:0)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.testStress(TestStressLiveNodes.java:200)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n\n**************************\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestStressLiveNodes -Dtests.method=testStress -Dtests.seed=E803236A2774DE4C -Dtests.nightly=true -Dtests.slow=true -Dtests.locale=sr-RS -Dtests.timezone=Pacific/Majuro -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   62.7s | TestStressLiveNodes.testStress <<<\n   [junit4]    > Throwable #1: org.apache.solr.common.SolrException: java.util.concurrent.TimeoutException: Could not connect to ZooKeeper 127.0.0.1:62845/solr within 30000 ms\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([E803236A2774DE4C:FD185EABA4832637]:0)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:181)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:115)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:110)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:97)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.newSolrZkClient(TestStressLiveNodes.java:87)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.access$000(TestStressLiveNodes.java:54)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes$LiveNodeTrasher.<init>(TestStressLiveNodes.java:225)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.testStress(TestStressLiveNodes.java:174)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]    > Caused by: java.util.concurrent.TimeoutException: Could not connect to ZooKeeper 127.0.0.1:62845/solr within 30000 ms\n   [junit4]    > \tat org.apache.solr.common.cloud.ConnectionManager.waitForConnected(ConnectionManager.java:228)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:173)\n   [junit4]    > \t... 46 more\n   [ju\n\n   ***********************************\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestStressLiveNodes -Dtests.method=testStress -Dtests.seed=6B315674F529C1E2 -Dtests.nightly=true -Dtests.slow=true -Dtests.locale=ar-IQ -Dtests.timezone=Europe/Bratislava -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR    113s | TestStressLiveNodes.testStress <<<\n   [junit4]    > Throwable #1: org.apache.solr.common.SolrException: java.util.concurrent.TimeoutException: Could not connect to ZooKeeper 127.0.0.1:62849/solr within 30000 ms\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([6B315674F529C1E2:7E2A2BB576DE3999]:0)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:181)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:115)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:110)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:97)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.newSolrZkClient(TestStressLiveNodes.java:87)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.access$000(TestStressLiveNodes.java:54)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes$LiveNodeTrasher.<init>(TestStressLiveNodes.java:225)\n   [junit4]    > \tat org.apache.solr.cloud.TestStressLiveNodes.testStress(TestStressLiveNodes.java:174)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]    > Caused by: java.util.concurrent.TimeoutException: Could not connect to ZooKeeper 127.0.0.1:62849/solr within 30000 ms\n   [junit4]    > \tat org.apache.solr.common.cloud.ConnectionManager.waitForConnected(ConnectionManager.java:228)\n   [junit4]    > \tat org.apache.solr.common.cloud.SolrZkClient.<init>(SolrZkClient.java:173)\n   [junit4]    > \t... 46 more\n   [junit4]   2> 116534 INFO  (jetty-launcher-1-thread-2) [    ] o.e.j.s.ServerConnector Stopped ServerConnector@5aa5196c\n{HTTP/1.1,[http/1.1]}\n{127.0.0.1:0}\n   [juni ",
+            "id": "comment-15219154"
+        },
+        {
+            "date": "2016-03-31T03:53:22+0000",
+            "author": "Steve Rowe",
+            "content": "Zero failures on second 100 iterations. ",
+            "id": "comment-15219286"
+        },
+        {
+            "date": "2016-03-31T17:37:48+0000",
+            "author": "Erick Erickson",
+            "content": "Just chatting with Steve and there's a bit of confusion here. The mini-traces I pasted above are with the latest patch AFAIK, not with the fixes reverted.\n\nWe're trying to figure out why my results are different. ",
+            "id": "comment-15220288"
+        },
+        {
+            "date": "2016-03-31T18:42:51+0000",
+            "author": "Scott Blum",
+            "content": "Erick, if all the errors you're seeing are related to Zookeeper errors, then I'm not sure you're actually running into any of the issues we fixed.  ZkStateReader is meant to be fault tolerant with respect to ZK connectivity, but there's no reason to the think that the particular test expectations in TestStressLiveNodes would always hold true in the face of ZK connectivity loss; I would expect that TestStressLiveNodes assumes that the ZkStateReader -> ZK connection is always up.\n\nIf you're seeing a either a deadlock problem, or a data problem in the absence of any ZK errors, then that would be a problem. ",
+            "id": "comment-15220429"
+        },
+        {
+            "date": "2016-04-01T21:43:17+0000",
+            "author": "Scott Blum",
+            "content": "What's the next step here?  I really think, despite the minority report, that this patch should be a drastic improvement on the current situation, and fix a real production bug. ",
+            "id": "comment-15222382"
+        },
+        {
+            "date": "2016-04-01T21:43:54+0000",
+            "author": "Scott Blum",
+            "content": "Maybe Shalin Shekhar Mangar or Noble Paul would be willing to review/commit? ",
+            "id": "comment-15222384"
+        },
+        {
+            "date": "2016-04-04T16:58:55+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I'll take a look this week if no one beats me to it. ",
+            "id": "comment-15224511"
+        },
+        {
+            "date": "2016-04-04T17:15:59+0000",
+            "author": "Erick Erickson",
+            "content": "Scott Blum OK, aside from some connectivity issues, the only thing I see that may be important is two cases that fail on TestStressLiveNodex[200], these lines:\n        // verify our local client knows the correct set of live nodes\n        cachedLiveNodes = getCachedLiveNodesFromLocalState(actualLiveNodes.size());\n        assertEquals(\"iter\"iter\" \" + actualLiveNodes.size() + \" != \" + cachedLiveNodes.size(),\n                     actualLiveNodes, cachedLiveNodes);\n\n16 != 1 on one test (seeds below) and 13 != 1.\n\nI tried the first one and it doesn't reliably fail, so I'm not quite sure what to do next or if this test failure is even important to this JIRA, and I really can't pursue it more ATM.\n\nant test  -Dtestcase=TestStressLiveNodes -Dtests.method=testStress -Dtests.seed=AAD31DA7247CE323 -Dtests.nightly=true -Dtests.slow=true -Dtests.locale=ar-AE -Dtests.timezone=America/Santo_Domingo -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n\nant test  -Dtestcase=TestStressLiveNodes -Dtests.method=testStress -Dtests.seed=B4786108141B49BD -Dtests.nightly=true -Dtests.slow=true -Dtests.locale=sr-Latn-BA -Dtests.timezone=Europe/Budapest -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1 ",
+            "id": "comment-15224542"
+        },
+        {
+            "date": "2016-04-11T17:44:04+0000",
+            "author": "Scott Blum",
+            "content": "Thanks Erick!  I'll give this a shot myself.\n\nI'm going to venture to say, however, that we should move forward on committing this patch.  Whether or not there are any lingering race conditions that could manifest in rare cases, the patch for sure fixes some race conditions that we can both see from inspection and reproduce with a lot of reliability.  So I think this patch makes things much better regardless of whether we've ironed out every last race condition. ",
+            "id": "comment-15235573"
+        },
+        {
+            "date": "2016-04-11T17:58:21+0000",
+            "author": "Scott Blum",
+            "content": "FWIW these both passed for me. ",
+            "id": "comment-15235604"
+        },
+        {
+            "date": "2016-04-13T13:31:35+0000",
+            "author": "Mark Miller",
+            "content": "I'll take it. I set my test beasting script on it, and it comes out solid for me. ",
+            "id": "comment-15239231"
+        },
+        {
+            "date": "2016-04-13T13:39:08+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Okay, I've been beasting it since morning. No fails yet. ",
+            "id": "comment-15239245"
+        },
+        {
+            "date": "2016-04-13T13:55:11+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 744b419b42a5797700c0a3a5f859d86ae9d05325 in lucene-solr's branch refs/heads/master from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=744b419 ]\n\nSOLR-8914: ZkStateReader's refreshLiveNodes(Watcher) is not thread safe. ",
+            "id": "comment-15239276"
+        },
+        {
+            "date": "2016-04-13T14:24:37+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit fe858858686ba7e2738367bf4b7ef8c621987df9 in lucene-solr's branch refs/heads/branch_6x from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fe85885 ]\n\nSOLR-8914: ZkStateReader's refreshLiveNodes(Watcher) is not thread safe. ",
+            "id": "comment-15239328"
+        },
+        {
+            "date": "2016-04-13T20:19:06+0000",
+            "author": "Scott Blum",
+            "content": "Yay!  Thanks guys! ",
+            "id": "comment-15239957"
+        },
+        {
+            "date": "2016-04-19T16:28:47+0000",
+            "author": "Hoss Man",
+            "content": "Mark Miller - is this resolved?\n\nis it targeting 6.1 only, or are you thinking it's safe/good to backport for 6.0.1 and or 5.5.1 ? ",
+            "id": "comment-15248103"
+        },
+        {
+            "date": "2016-04-19T18:08:27+0000",
+            "author": "Scott Blum",
+            "content": "I think it's definitely work backporting, and I'm happy to do it.  I already backported it to our own 5.4.1 fork; the live code merges pretty clean but I had to do a little work on the test code as some test infra has changed.\n\nMark Miller Should I just do the backports and push commits? ",
+            "id": "comment-15248325"
+        },
+        {
+            "date": "2016-04-20T00:15:28+0000",
+            "author": "Scott Blum",
+            "content": "Anshum Gupta I think we should backport this to 5.5.1.  Happy to push a commit (i've already done the work locally to backport the test code.) ",
+            "id": "comment-15249004"
+        },
+        {
+            "date": "2016-04-20T00:23:24+0000",
+            "author": "Anshum Gupta",
+            "content": "+1 for back porting this and thanks for volunteering  ",
+            "id": "comment-15249021"
+        },
+        {
+            "date": "2016-04-20T22:46:44+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit b93cb2714b7a2ea43ae200d31cc5b04a0b0ecc7c in lucene-solr's branch refs/heads/SOLR-8914-6_0 from Scott Blum\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b93cb27 ]\n\nSOLR-8914: ZkStateReader's refreshLiveNodes(Watcher) is not thread safe. ",
+            "id": "comment-15250879"
+        },
+        {
+            "date": "2016-04-20T22:47:10+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit b93cb2714b7a2ea43ae200d31cc5b04a0b0ecc7c in lucene-solr's branch refs/heads/branch_6_0 from Scott Blum\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b93cb27 ]\n\nSOLR-8914: ZkStateReader's refreshLiveNodes(Watcher) is not thread safe. ",
+            "id": "comment-15250882"
+        },
+        {
+            "date": "2016-04-20T22:48:37+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 58f77fed2c45b8ce7da1831954f941dde39d98f9 in lucene-solr's branch refs/heads/branch_5x from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=58f77fe ]\n\nSOLR-8914: ZkStateReader's refreshLiveNodes(Watcher) is not thread safe. ",
+            "id": "comment-15250886"
+        },
+        {
+            "date": "2016-04-20T23:13:42+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit f45fae5c81e68763c99826524bec8b9273dfefd4 in lucene-solr's branch refs/heads/branch_5_5 from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f45fae5 ]\n\nSOLR-8914: ZkStateReader's refreshLiveNodes(Watcher) is not thread safe. ",
+            "id": "comment-15250912"
+        },
+        {
+            "date": "2016-05-09T22:54:01+0000",
+            "author": "Hoss Man",
+            "content": "\nManually correcting fixVersion per Step #S5 of LUCENE-7271 ",
+            "id": "comment-15277242"
+        },
+        {
+            "date": "2016-05-28T13:38:22+0000",
+            "author": "Steve Rowe",
+            "content": "Bulk close issues included in the 6.0.1 release. ",
+            "id": "comment-15305356"
+        }
+    ]
+}

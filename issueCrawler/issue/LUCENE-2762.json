@@ -1,0 +1,110 @@
+{
+    "id": "LUCENE-2762",
+    "title": "Don't leak deleted open file handles with pooled readers",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [
+            "2.9.4",
+            "3.0.3",
+            "3.1",
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "2.9.4,                                            3.0.3,                                            3.1,                                            4.0-ALPHA",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "If you have CFS enabled today, and pooling is enabled (either directly\nor because you've pulled an NRT reader), IndexWriter will hold open\nSegmentReaders against the non-CFS format of each merged segment.\n\nSo even if you close all NRT readers you've pulled from the writer,\nyou'll still see file handles open against files that have been\ndeleted.\n\nThis count will not grow unbounded, since it's limited by the number\nof segments in the index, but it's still a serious problem since the\napp had turned off CFS in the first place presumably to avoid risk of\ntoo-many-open-files.  It's also bad because it ties up disk space\nsince these files would otherwise be deleted.",
+    "attachments": {
+        "LUCENE-2762.patch": "https://issues.apache.org/jira/secure/attachment/12459624/LUCENE-2762.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-11-15T18:12:52+0000",
+            "content": "Patch.\n\nI made a new test case showing the problem (and also modified a\npre-existing test case to also show the problem).  Patch includes the\nfix (I don't commit the merged segment until after the CFS is built)\nand both tests now pass.\n\nI also added a new core test utility class (LineFileDocs) that's able\nto read line files produced by contrib/benchmark, and the new test\nuses this to index the line for Wikipedia.  I think we should somehow\nmark this test to run only at night on hudson eg with a new @nightly\ntag or something... it's already disabled if it can't find the line\nfile, though it's now hardwired to the line file location in my env.\n\nIn general I think our tests should sometimes use \"real\" data so if we\ncan get this wikipedia line file in a standard place on hudson then\nlonger-running @nightly tests can use it... ",
+            "author": "Michael McCandless",
+            "id": "comment-12932131"
+        },
+        {
+            "date": "2010-11-17T17:50:58+0000",
+            "content": "\nSo with this patch, we now build the CFS for a merged segment before\nadding that segment to the segment infos.\n\nThis is important, to prevent an NRT reader from opening the pre-CFS\nversion, thus tying open the files, using up extra disk space, and\nleaking deleted-but-open files even once all NRT readers are closed.\n\nBut, unfortunately, this means the worst-case temporary peak free disk\nspace required when using CFS has gone up... this worst case is hit if\nyou 1) open an existing index, 2) call optimize on it, 3) the index\nneeds more than 1 merge to become optimized, and 4) on the final merge\nof that optimize just after it's built the CFS but hasn't yet\ncommitted it to the segment infos.  At that point you have 1X due to\nstarting segments (which cannot be deleted until commit), another 1X\ndue to the segments created by the prior merge (now being merged),\nanother 1X by the newly merged single segment, and a final 1X from the\nfinal CFS.  In this worst case that means we require 3X of your index\nsize in temporary space.\n\nIn other cases we use less disk space (the NRT case).\n\nAnd of course if CFS is off there's no change to the temp disk space.\n\nI've noted this in the javadocs and will add to CHANGES...\n\nBut... I think we should improve our default MP.  First, maybe we\nshould set a maxMergeMB by default?  Because immense merges cause all\nsorts of problems, and, likely are not going to impact search perf.\nSecond, I think if a newly merged segment will be more than X% of the\nindex, I think we should leave it in non-compound-file format even if\n\"useCompoundFile\" is enabled... I think there's a separate issue open\nsomewhere for that 2nd one. ",
+            "author": "Michael McCandless",
+            "id": "comment-12933051"
+        },
+        {
+            "date": "2010-11-17T18:32:05+0000",
+            "content": "I think we should improve our default MP.  First, maybe we should set a maxMergeMB by default?\n\nThat's a good idea, however would we set an absolute size or a size relative to the aggregate size of the index?  I'm using 5 GB in production as otherwise I'm not sure the merge cost is worth the potential performance improvement, ie, long merges adversely affects indexing performance. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12933070"
+        },
+        {
+            "date": "2010-11-20T14:19:38+0000",
+            "content": "Fixed.\n\nI'll open a new issue to make cfs selection dependent on segment size... ",
+            "author": "Michael McCandless",
+            "id": "comment-12934144"
+        },
+        {
+            "date": "2011-05-24T12:56:04+0000",
+            "content": "Since I am still observing file references on deleted index files, I have a quick question regarding this issue:\n\nWe are using Lucene 3.0.3 with standard configuration and near real-time reader, as the following pseudo code shows:\n\n\n...\n        // initially obtaining and referencing a near-real time searcher\n        IndexSearcher currentSearcher = new IndexSearcher(writer.getReader())\n...\n\n\t// subsequently obtaining a new near-real time searcher if necessary\n\tif (!currentSearcher.getIndexReader().isCurrent()) {\n\t    IndexReader newReader = currentSearcher.getIndexReader().reopen();\n\t    IndexSearcher newSearcher = new IndexSearcher(newReader);\n\t    \n\t    // release old searcher (by decreasing reference)\n\t    currentSearcher.getIndexReader().decRef();\n\t    \n\t    currentSearcher = newSearcher;\n\t}\n...\n\n\n\nAfter running the application for a while with index updates and doing new searcher using the newly obtained IndexSearcher, we noticed that JVM still holds references to already deleted index files.\nFor example:\n\njava    20742 xxx  394r   REG                8,6      366 3412376 /home/xxx/Desktop/mp.home/dev/index/Artist/_fc.cfs (deleted)\njava    20742 xxx  398r   REG                8,6      366 3412375 /home/xxx/Desktop/mp.home/dev/index/Artist/_fq.cfs\njava    20742 xxx  401uw  REG                8,6        0 3412333 /home/xxx/Desktop/mp.home/dev/index/Artist/write.lock\njava    20742 xxx  415r   REG                8,6      128 3412349 /home/xxx/Desktop/mp.home/dev/index/Artist/_fp.tis\njava    20742 xxx  416r   REG                8,6      366 3412341 /home/xxx/Desktop/mp.home/dev/index/Artist/_fd.cfs (deleted)\njava    20742 xxx  417r   REG                8,6      366 3412344 /home/xxx/Desktop/mp.home/dev/index/Artist/_fe.cfs (deleted)\njava    20742 xxx  418r   REG                8,6       71 3412356 /home/xxx/Desktop/mp.home/dev/index/Artist/_fb.tis (deleted)\njava    20742 xxx  424r   REG                8,6        7 3412362 /home/xxx/Desktop/mp.home/dev/index/Artist/_fb.frq (deleted)\njava    20742 xxx  425r   REG                8,6        7 3412363 /home/xxx/Desktop/mp.home/dev/index/Artist/_fb.prx (deleted)\njava    20742 xxx  426r   REG                8,6       23 3412351 /home/xxx/Desktop/mp.home/dev/index/Artist/_fb.fdt (deleted)\njava    20742 xxx  427r   REG                8,6       12 3412352 /home/xxx/Desktop/mp.home/dev/index/Artist/_fb.fdx (deleted)\njava    20742 xxx  428r   REG                8,6       10 3412365 /home/xxx/Desktop/mp.home/dev/index/Artist/_fb.nrm (deleted)\njava    20742 xxx  429r   REG                8,6       21 3412357 /home/xxx/Desktop/mp.home/dev/index/Artist/_fp.frq\njava    20742 xxx  432r   REG                8,6       21 3412358 /home/xxx/Desktop/mp.home/dev/index/Artist/_fp.prx\njava    20742 xxx  433r   REG                8,6       61 3412347 /home/xxx/Desktop/mp.home/dev/index/Artist/_fp.fdt\njava    20742 xxx  434r   REG                8,6       28 3412348 /home/xxx/Desktop/mp.home/dev/index/Artist/_fp.fdx\njava    20742 xxx  445r   REG                8,6       22 3412360 /home/xxx/Desktop/mp.home/dev/index/Artist/_fp.nrm\n\n\n\nThe application reaches the limit of maximum number of open files and then stops. \n\nAre we doing anything wrong here or does the bug still exist in version 3.0.3? \nAny advice is welcome.\nThanks! ",
+            "author": "Josef",
+            "id": "comment-13038533"
+        },
+        {
+            "date": "2011-05-24T15:31:14+0000",
+            "content": "Hmmm... the fix here was backported to 3.0.x, so it should be fixed in 3.0.3.\n\nThe code fragment looks correct, but your usage of decRef (not close) likely means you have other places that also incRef the reader?  Are you sure all incRefs are balanced by a decRef?\n\nAre you sure you really have leaking file handles and not just too many open files?  EG what mergeFactor are you using...? ",
+            "author": "Michael McCandless",
+            "id": "comment-13038629"
+        },
+        {
+            "date": "2011-05-24T17:10:43+0000",
+            "content": "Thanks for the quick response.\n\nYou are right, we just increase the reference for the current Searcher when it is obtained and used. Decreasing it again is part of a finally block. I have triple checked this code to make sure, we are not doing anything wrong and I am very sure, we correctly decrease the reference in any case.\n\nThe output of the 'lsof' command above shows handles to files already marked deleted. The number of files marked deleted increases over time until we get a Java 'IOException: Too many open files'. \nIf we don't hold the reference to the reader contained in our searcher, who is?\n\nRegarding merge factor etc: we are using standard configurations, i.e. no tweaking (yet).\nBesides, we do not call IndexWriter.optimize() in our code yet. ",
+            "author": "Josef",
+            "id": "comment-13038668"
+        },
+        {
+            "date": "2011-05-24T22:03:07+0000",
+            "content": "We have a test, TestNRTThreads, that stress-tests NRT to try to catch issues like this.\n\nI've backported to 3.0.x, and was able to run it for 30 minutes with max 1024 file handles, successfully... so if there is a file handle leak, this test failed to uncover it.\n\nNot sure what's up... can you try to boil down your test case to a small test showing the problem?\n\nNote that when you incRef the searcher you have to do that sync'd somehow with your reopen logic to prevent the final decRef from running at the same time.  (I don't think that's related to the file handle issue but it's important to get right else you have a thread hazard). ",
+            "author": "Michael McCandless",
+            "id": "comment-13038847"
+        },
+        {
+            "date": "2011-05-25T07:31:46+0000",
+            "content": "Thanks for your response.\nI'll try to extract a small test mimicking the behavior.\n\nAnd thanks for pointing out incRef / decRef and threading issue. I am aware of that and the relevant code is synchronized ",
+            "author": "Josef",
+            "id": "comment-13038998"
+        },
+        {
+            "date": "2011-05-25T14:12:43+0000",
+            "content": "I have extracted the relevant code into a small Java application, but I am not able to reproduce the observed behavior with it. \n\nIt might have to do with our integration and usage of Lucene in the Glassfish application server.\nI'll go hunting there no.\nAny advice with such integration?\n\nThanks for your help anyway! ",
+            "author": "Josef",
+            "id": "comment-13039139"
+        },
+        {
+            "date": "2011-05-25T15:57:03+0000",
+            "content": "Hmm I don't know anything about Glassfish... but it's interesting your separate tool couldn't repro the problem.  Maybe re-scrutinize to verify your standalone tool truly matches how the app is using Lucene? ",
+            "author": "Michael McCandless",
+            "id": "comment-13039174"
+        },
+        {
+            "date": "2011-05-29T11:44:24+0000",
+            "content": "Could this be related to all the leaked handles we fixed at LUCENE-3147? ",
+            "author": "Shai Erera",
+            "id": "comment-13040789"
+        },
+        {
+            "date": "2011-05-29T12:13:18+0000",
+            "content": "Could this be related to all the leaked handles we fixed at LUCENE-3147?\n\nI think that's unlikely?  Ie, the leaks we are fixing in LUCENE-3147 are all cases where an exception was hit at some point?\n\nUnless: Josef, are you regularly hitting exceptions somewhere....? ",
+            "author": "Michael McCandless",
+            "id": "comment-13040795"
+        },
+        {
+            "date": "2011-05-30T10:25:33+0000",
+            "content": "\nUnless: Josef, are you regularly hitting exceptions somewhere....? \n\nNo, we don't get any exceptions. I'll do some testing with our Glassfish integration and also make sure, my test scenario matches the concrete application integration. Hope this will isolate our problem. I'll report back here. ",
+            "author": "Josef",
+            "id": "comment-13041075"
+        }
+    ]
+}

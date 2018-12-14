@@ -1,0 +1,51 @@
+{
+    "id": "SOLR-6888",
+    "title": "Decompressing documents on first-pass distributed queries to get docId is inefficient, use indexed values instead?",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "5.0,                                            6.0",
+        "status": "Resolved",
+        "resolution": "Duplicate",
+        "priority": "Major"
+    },
+    "description": "Assigning this to myself to just not lose track of it, but I won't be working on this in the near term; anyone feeling ambitious should feel free to grab it.\n\nNote, docId used here is whatever is defined for <uniqueKey>...\n\nSince Solr 4.1, the compression/decompression process is based on 16K blocks and is automatic, and not configurable. So, to get a single stored value one must decompress an entire 16K block. At least.\n\nFor SolrCloud (and distributed processing in general), we make two trips, one to get the doc id and score (or other sort criteria) and one to return the actual data.\n\nThe first pass here requires that we return the top N docIDs and sort criteria, which means that each and every sub-request has to unpack at least one 16K block (and sometimes more) to get just the doc ID. So if we have 20 shards and only want 20 rows, 95% of the decompression cycles will be wasted. Not to mention all the disk reads.\n\nIt seems like we should be able to do better than that. Can we argue that doc ids are 'special' and should be cached somehow? Let's discuss what this would look like. I can think of a couple of approaches:\n\n1> Since doc IDs are \"special\", can we say that for this purpose returning the indexed version is OK? We'd need to return the actual stored value when the full doc was requested, but for the sub-request only what about returning the indexed value instead of the stored one? On the surface I don't see a problem here, but what do I know? Storing these as DocValues seems useful in this case.\n\n1a> A variant is treating numeric docIds specially since the indexed value and the stored value should be identical. And DocValues here would be useful it seems. But this seems an unnecessary specialization if <1> is implemented well.\n\n2> We could cache individual doc IDs, although I'm not sure what use that really is. Would maintaining the cache overwhelm the savings of not decompressing? I really don't like this idea, but am throwing it out there. Doing this from stored data up front would essentially mean decompressing every doc so that seems untenable to try up-front.\n\n3> We could maintain an array[maxDoc] that held document IDs, perhaps lazily initializing it. I'm not particularly a fan of this either, doesn't seem like a Good Thing. I can see lazy loading being almost, but not quite totally, useless, i.e. a hit ratio near 0, especially since it'd be thrown out on every openSearcher.\n\n\nReally, the only one of these that seems viable is <1>/<1a>. The others would all involve decompressing the docs anyway to get the ID, and I suspect that caching would be of very limited usefulness. I guess <1>'s viability hinges on whether, for internal use, the indexed form of DocId is interchangeable with the stored value.\n\nOr are there other ways to approach this? Or isn't it something to really worry about?",
+    "attachments": {
+        "SOLR-6888-hacktiming.patch": "https://issues.apache.org/jira/secure/attachment/12689197/SOLR-6888-hacktiming.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-12-26T21:03:00+0000",
+            "author": "Erick Erickson",
+            "content": "I did some crude hacking to get timings and it may cost a node about 10% [1] of its processing time to decompress in order to get the ID for the first pass of a distributed response. Pretty much driving my system at max CPU.\n\ntl;dr\n\nThis isn't even a sketch of a patch, just a crude hack that allowed me to collect some timings. Preserving here for posterity, it shows where I think we'd need to start looking if we change this.\n\nI used DocValues for the <uniqueKey> field here just to make it easy to pull the values from the index rather than the stored value, certainly not something we'd want to require. Not to mention that I figured out whether to load from the index or the stored value based on whether the only two fields being requested were \"id\" and \"score\"........ Like I said, not even the sketch of a patch.\n\nAnyway, details:\nRan tests on my macbook pro with an SSD. 4 shards, 11+M Wikipedia docs. Created about 10K queries that are just 5 random terms collected during indexing and OR'd together. Divided these amongst 5 threads running from SolrJ to collect some stats for 2 minutes. I create 5 lists of 2K queries each and pass one list to each worker thread. The algorithm is deterministic in that list 1 during run 1 will have the same queries as list 1 during run 2. list1 will be different from list2 (or 3 or 4 or 5) within a single run.\n\nThe numbers below are from the 2nd run to get past low-level cache filling and the like.\n\nI did record the total number of hits in each thread for the first 1K queries, and they're identical for both spoofing and not spoofing so I'm encouraged that this approach isn't totally insane.\n\ndocumentCache, filterCache and queryResultCache all have size==0\n\nThe interesting things I think are the nano times recorded for decompressing as opposed to spoofing by getting the ID from the index.\n\nWhen spoofing, my 2 minute run (4 shards remember) spent about 15B nanoseconds decompressing and about 4B nanoseconds filling in from the indexed ids. [1]\n\nWhen running normally, the time spent in decompressing was about 71B nanoseconds and, of course, 0 filling in from indexed IDs. [1]\n\nSo in round numbers, on this test decompressing for reading just the ID on the first pass cost each of my shards about 13 (52/4) seconds of a 2 minute run, or roughly 10%. My CPUs are pretty well pegged during querying...\n\nAll this within the usual caveats about how much you can trust System.nanoTime() and whether I collected the right things.\n\nAdditional notes:\n\n1) This was probably best-case decompression, as I think each and every document fits in a 16K buffer, so only one buffer needs to be decompressed.\n\n2) I didn't pursue it very thoroughly, but the mechanics of this might be accomplished by abusing the \"onlyPseudoFields\" bits of the code and treating index lookups as \"super-extra-special pseudo fields\".\n\n3) I only used this for the \"id\" field. Could a similar argument be made for all the field-based sort criteria since there's only supposed to be 1 per doc? \n\n[1] Just noticed that my log files roll over every 4M, and I don't particularly want to untangle that now. But on a quick glance, it looks like they have about 90 of 120 seconds of data, so these numbers may be low by about 1/3, i.e. it may be costing the shards 17-18 seconds of a 120 second run or approx. 14%.\n\nAnyway, I'm not going to pursue this in the near term but thought it was worth preserving what I think I'm seeing.\n\nOh, the times above don't include loading the DocValues, but a quick measure shows < 1 second per shard spent loading them, and I'm loading them pretty inefficiently. ",
+            "id": "comment-14259214"
+        },
+        {
+            "date": "2014-12-29T02:01:30+0000",
+            "author": "David Smiley",
+            "content": "Erick,\nI enjoyed reading what you have here.  I think this issue duplicates SOLR-5478, for which I have a patch in fact. I encourage you to review it and kick the tires on it! ",
+            "id": "comment-14259787"
+        },
+        {
+            "date": "2014-12-29T16:32:54+0000",
+            "author": "Erick Erickson",
+            "content": "David Smiley You're absolutely right, this is the same as SOLR-5478. I'll look over 5478 Real Soon Now.\n\nClosing this one as it's not even, really, anything except a way to try to quantify the problem (and that crudely).\n\nSo many JIRAs, so few stick in my head.... ",
+            "id": "comment-14260195"
+        },
+        {
+            "date": "2014-12-29T16:38:07+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Also note that SOLR-6810 will make this a non-issue. I am quite certain we're going to land it on trunk soon. ",
+            "id": "comment-14260203"
+        },
+        {
+            "date": "2014-12-29T17:41:21+0000",
+            "author": "Erick Erickson",
+            "content": "Right, thanks! ",
+            "id": "comment-14260257"
+        }
+    ]
+}

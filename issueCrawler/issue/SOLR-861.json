@@ -1,0 +1,115 @@
+{
+    "id": "SOLR-861",
+    "title": "SOLRJ Client does not release connections 'nicely' by default",
+    "details": {
+        "affect_versions": "1.3",
+        "status": "Closed",
+        "fix_versions": [
+            "4.0-BETA"
+        ],
+        "components": [
+            "clients - java"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "as-is the SolrJ Commons HttpServer uses the multi-threaded http connection manager. This manager seems to keep the connection alive for the client and does not close it when the object is dereferenced.\n\nWhen you keep on opening new CommonsHttpSolrServer instances it results in a socket that is stuck in the CLOSE_WAIT state. Eventually this will use up all your available file handles, causing your client to die a painful death.\n\nThe solution I propose is that it uses a 'Simple' HttpConnectionManager which is set to not reuse connections if you don't specify a HttpClient.",
+    "attachments": {
+        "SimpleClient.patch": "https://issues.apache.org/jira/secure/attachment/12393976/SimpleClient.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Ian Holsman",
+            "id": "comment-12647800",
+            "date": "2008-11-15T05:16:29+0000",
+            "content": "patch to change the default HttpClient SolrJ uses to be a more conservative option "
+        },
+        {
+            "author": "Andrzej Rusin",
+            "id": "comment-12661971",
+            "date": "2009-01-08T13:55:29+0000",
+            "content": "Alternatively, the problem can be solved in client code by reusing the HttpClient across the CommonsHttpSolrServers like this:\n\nif (httpClient == null) {\n\tserver = new CommonsHttpSolrServer(url);\n\thttpClient = server.getHttpClient();\n} else {\n\tserver = new CommonsHttpSolrServer(url, httpClient);\n}\n\nIt has the advantage of pooling the HTTP connections inside the HttpClient's  MultiThreadedHttpConnectionManager.\n\nI am using this approach in production with good results. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12661979",
+            "date": "2009-01-08T14:39:33+0000",
+            "content": "Although the best option is for the application to reuse a client, I agree that simple usage of SolrJ should not eat up connections like that.\nBut if we used the simple connection manager, multiple threads would no longer be able to effectively use a single SolrJ instance.  Is there another way to clean up connections?  If so, perhaps we could provide a method on SolrJ to expose that. "
+        },
+        {
+            "author": "Ian Holsman",
+            "id": "comment-12662166",
+            "date": "2009-01-08T23:24:53+0000",
+            "content": "Hi Yonik.\nall that this bug is asking for is to change the default behavior. \nThere is another constructor available that you can pass the connection manager through, so that more complex uses of SolrJ can still be used. \n\nThe base problem if I read it correctly is that the MultiThreadedHttpConnectionManager doesn't expose a method to close/kill itself nicely. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12662222",
+            "date": "2009-01-09T02:05:25+0000",
+            "content": "Would HttpConnectionManager.closeIdleConnections() work? "
+        },
+        {
+            "author": "Jilles van Gurp",
+            "id": "comment-12877006",
+            "date": "2010-06-09T09:27:28+0000",
+            "content": "I noticed CommonsHttpSolrServer still depends on httpclient 3.x. You can easily solve this issue by migrating to 4.0 and using the new response handler interface to handle responses with a callback. HttpClient does all the right things after the callback method exits. In any case a variant of this class based on httpclient 4.0 would be preferable for me since our project currently depends on both 3.x and 4.0 (for all our own stuff) and I'd like to get rid of all 3.x dependencies. \n\nIf needed I can help provide some code (though at this point I don't have a solr build environment set up at all). "
+        },
+        {
+            "author": "Simon Willnauer",
+            "id": "comment-12877064",
+            "date": "2010-06-09T12:47:30+0000",
+            "content": "Jiles, how would HTTP Client 4.0 solve this problem if you use the correspondent ConnectionManager HTTPClient will still try to keep connections open to reuse them per route. Connection being in the TCP close_wait state are totally valid while the application keeps the connection open. Anyway this problem should be solved either with a SolrJ API or with by makeing a HttpClient instance mandatory.\nI would rather ask the user to maintain the HTTPClient instance rather than trying to be smart about a 3rd party library.  You always have that problem with a connection manager which keeps connections open though.\n\nI would guess if we stick to a default ctor we should use the patch Ian is proposing as a default. "
+        },
+        {
+            "author": "Jilles van Gurp",
+            "id": "comment-12877430",
+            "date": "2010-06-10T14:24:32+0000",
+            "content": "We ran into exactly this issue with resteasy, which was not releasing connections properly (a problem that has since been addressed as far as I know). Eventually your pool will stop providing new connections and nothing short of killing the process will resolve this. Basically the connections are kept open while httpclient has lost track of them.\n\nHttpclient 4.0 has a nice ResponseHandler interface that you use like this:\n\nhttpClient.execute(request, new ResponseHandler<Integer>() {\n\n                    @Override\n                    public Integer handleResponse(HttpResponse response) throws ClientProtocolException, IOException \n{                        \n                        return response.getStatusLine().getStatusCode();\n                    }\n                });\n\nhttpclient basically takes care of cleaning up after you return from handleResponse. Additionally, you can/should configure a cleanup thread.\n\n    public static class IdleConnectionMonitor implements Runnable {\n\n        private final ClientConnectionManager connMgr;\n\n        public IdleConnectionMonitor(final ClientConnectionManager connMgr) \n{\n            this.connMgr = connMgr;\n        }\n\n        @Override\n        public final void run() \n{\n            // Close expired connections\n            this.connMgr.closeExpiredConnections();\n            // Optionally, close connections\n            // that have been idle longer than 120 sec\n            this.connMgr.closeIdleConnections(120, TimeUnit.SECONDS);\n        }\n    }\n\nScheduledExecutorService idleConnectionMonitorExecutor = Executors.newSingleThreadScheduledExecutor()\nIdleConnectionMonitor idleConnectionMonitor = new IdleConnectionMonitor(connectionManager);\nidleConnectionMonitorExecutor.scheduleWithFixedDelay(idleConnectionMonitor, 5, 5, TimeUnit.MINUTES);\n\nFinally, you need to take care about defaults for socket and connection timeouts:\n\n        HttpParams params = new BasicHttpParams();\n\n        ConnManagerParams.setTimeout(params, 1000);\n        params.setIntParameter(CoreConnectionPNames.SO_TIMEOUT, 1000);\n        params.setIntParameter(CoreConnectionPNames.CONNECTION_TIMEOUT, 1000);\n\nIn httpclient 3, the solution is to guarantee releaseConnection gets called in a finally block. We had servers hanging in production because of connections in the close wait state so I did a lot of digging around in the code. Basically any place where this is not done in a finally block is a problem waiting to happen. If you consistently call releaseConnection, you should not be seeing this issue.\n\nWhat I propose is that you offer both httpclient 3 and 4 implementation (so people can choose) and make sure they do the right thing by using release connection / a response handler. As mentioned, I'm willing to help here. "
+        },
+        {
+            "author": "tommy chheng",
+            "id": "comment-13165619",
+            "date": "2011-12-08T22:08:14+0000",
+            "content": "I'm seeing this problem with solrj not releasing connections properly. Incorporating Jilles van Gurp's suggestiong would be greatly appreciated. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13291328",
+            "date": "2012-06-07T21:39:19+0000",
+            "content": "Sami: it's not clear to me if this has already been addressed by the new client in SOLR-2020 - can you please triage for 4.0? "
+        },
+        {
+            "author": "Sami Siren",
+            "id": "comment-13291678",
+            "date": "2012-06-08T10:48:21+0000",
+            "content": "it's not clear to me if this has already been addressed by the new client in SOLR-2020 - can you please triage for 4.0?\n\nI have not done anything specific to address this issue. Since opening this issue a shutdown() method was added in HttpSolrServer that should take care of releasing the resources, if that's not working then there's a bug. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13412200",
+            "date": "2012-07-11T22:26:19+0000",
+            "content": "bulk fixing the version info for 4.0-ALPHA and 4.0 all affected issues have \"hoss20120711-bulk-40-change\" in comment "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13429777",
+            "date": "2012-08-07T03:42:56+0000",
+            "content": "rmuir20120906-bulk-40-change "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13452207",
+            "date": "2012-09-10T17:41:58+0000",
+            "content": "moving all 4.0 issues not touched in a month to 4.1 "
+        },
+        {
+            "author": "Sami Siren",
+            "id": "comment-13458501",
+            "date": "2012-09-19T08:33:49+0000",
+            "content": "I have not heard back anything that suggests that the shutdown() does not do it's job. resolving this one as fixed (the work was done in SOLR-2020, SOLR-3532). "
+        }
+    ]
+}

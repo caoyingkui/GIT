@@ -1,0 +1,283 @@
+{
+    "id": "LUCENE-2293",
+    "title": "IndexWriter has hard limit on max concurrency",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "DocumentsWriter has this nasty hardwired constant:\n\n\nprivate final static int MAX_THREAD_STATE = 5;\n\n\n\nwhich probably I should have attached a //nocommit to the moment I\nwrote it \n\nThat constant sets the max number of thread states to 5.  This means,\nif more than 5 threads enter IndexWriter at once, they will \"share\"\nonly 5 thread states, meaning we gate CPU concurrency to 5 running\nthreads inside IW (each thread must first wait for the last thread to\nfinish using the thread state before grabbing it).\n\nThis is bad because modern hardware can make use of more than 5\nthreads.  So I think an immediate fix is to make this settable\n(expert), and increase the default (8?).\n\nIt's tricky, though, because the more thread states, the less RAM\nefficiency you have, meaning the worse indexing throughput.  So you\nshouldn't up and set this to 50: you'll be flushing too often.\n\nBut... I think a better fix is to re-think how threads write state\ninto DocumentsWriter.  Today, a single docID stream is assigned across\nthreads (eg one thread gets docID=0, next one docID=1, etc.), and each\nthread writes to a private RAM buffer (living in the thread state),\nand then on flush we do a merge sort.  The merge sort is inefficient\n(does not currently use a PQ)... and, wasteful because we must\nre-decode every posting byte.\n\nI think we could change this, so that threads write to private RAM\nbuffers, with a private docID stream, but then instead of merging on\nflush, we directly flush each thread as its own segment (and, allocate\nprivate docIDs to each thread).  We can then leave merging to CMS\nwhich can already run merges in the BG without blocking ongoing\nindexing (unlike the merge we do in flush, today).\n\nThis would also allow us to separately flush thread states.  Ie, we\nneed not flush all thread states at once \u2013 we can flush one when it\ngets too big, and then let the others keep running.  This should be a\ngood concurrency gain since is uses IO & CPU resources \"throughout\"\nindexing instead of \"big burst of CPU only\" then \"big burst of IO\nonly\" that we have today (flush today \"stops the world\").\n\nOne downside I can think of is... docIDs would now be \"less\nmonotonic\", meaning if N threads are indexing, you'll roughly get\nin-time-order assignment of docIDs.  But with this change, all of one\nthread state would get 0..N docIDs, the next thread state'd get\nN+1...M docIDs, etc.  However, a single thread would still get\nmonotonic assignment of docIDs.",
+    "attachments": {
+        "LUCENE-2293.patch": "https://issues.apache.org/jira/secure/attachment/12438683/LUCENE-2293.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-03-03T22:02:12+0000",
+            "content": "Good timing - a couple days ago I was thinking about how threading could be changed in the indexer.\n\nThe other downside is that you would have to buffer deleted docs and queries separately for each thread state, because you have to keep the private docID? So that would nee a bit more memory.\n\nCouldn't we make the DocumentsWriter and all related down-stream classes single-threaded then? The IndexWriter (or a new class) would have the doc queue, basically a load balancer, that multiple DocumentsWriter instances would pull from as soon as they are done inverting the previous document?\n\nThis would allow us to simplify the indexer chain a lot - we could get rid of all the *PerThread classes. We'd also have to separate then the docstores from the DocumentsWriter, so that multiple DocumentsWriter instances could share it. (what I'd like to do anyway for LUCENE-2026 anyway). ",
+            "author": "Michael Busch",
+            "id": "comment-12840911"
+        },
+        {
+            "date": "2010-03-03T22:21:19+0000",
+            "content": "Mike, good one!  Would having a doc id stream per thread make implementing a searchable RAM buffer easier? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12840918"
+        },
+        {
+            "date": "2010-03-03T23:35:51+0000",
+            "content": "The IndexWriter (or a new class) would have the doc queue, basically a load balancer, that multiple DocumentsWriter instances would pull from as soon as they are done inverting the previous document?\nI hope we won't lose monotonic docIDs for a singlethreaded indexation somewhere along that path. ",
+            "author": "Earwin Burrfoot",
+            "id": "comment-12840949"
+        },
+        {
+            "date": "2010-03-03T23:48:29+0000",
+            "content": "I hope we won't lose monotonic docIDs for a singlethreaded indexation somewhere along that path.\n\nNo. The order in the single threaded case won't be different from today with the changes Mike is proposing. ",
+            "author": "Michael Busch",
+            "id": "comment-12840952"
+        },
+        {
+            "date": "2010-03-04T07:25:21+0000",
+            "content": "The IndexWriter (or a new class) would have the doc queue, basically a load balancer, that multiple DocumentsWriter instances would pull from as soon as they are done inverting the previous document?\n\nToday, DW enforces thread binding - the same thread will always receive the same ThreadState. This allows applications who distribute the documents between threads based on some criteria, to get a locality of Documents indexed by each thread. I can't think of why an application would rely on that, but still that's something that happens.\n\nAlso, in the pull approach, Lucene would introduce another place where it allocates threads. Not only would we need to allow setting that concurrency level, we'd also need to allow overriding how a thread is instantiated. That will change the way applications are written today - I assume lots of applications that are multi-threaded rely on the multiple threads to index the documents. But now those threads won't do anything besides register a document in a queue. Therefore such applications will need to move to single-threaded indexing (because multi-threaded gives them nothing), and control the threads IW allocates.\n\nI personally prefer to leave multi-threaded indexing to the application. If it anyway contains a queue of incoming documents (from the outside) and allocates threads to process them in parallel (for example to parse rich text documents, fetch content from remote machines etc.), we wouldn't want them to do all this just to waste those threads at the end and let IW control another level of concurrency.\n\nAnother downside of such approach is that it breaks backward compatibility in a new way we've never considered. If the application allocates threads from a pool, and we introduce a new IW/DW w/ concurrency level=3 (for example), then the application will suddenly spawn more threads that it intended to. Perhaps it chose to use SMS, or overrode CMS to handle the threads allocation, but it's definitely not ready to handle another thread allocator.\n\nAnother thing is that the queue cannot be of just Document objects, but a DocAndOp objects to account for add/delete/updates ... another complication.\n\nMy preference is to keep the queue to the application.\n\nThe other downside is that you would have to buffer deleted docs and queries separately for each thread state\n\nJust for clarity - you'll need to do it with the queue approach as well, right? I mean, a DW which pulled an operation from the queue, which is a DELETE op, will need to cache that DELETE so that it will be executed on all documents that were indexed up until flush. So that does not save anything vs. if we change DW to flush by ThreadState.\n\nInstead, I prefer to take advantage of the application's concurrency level in the following way:\n\n\tEach thread will continue to write documents to a ThreadState. We'll allow changing the MAX_LEVEL, so if an app wants to get more concurrency, it can.\n\t\n\t\tMAX_LEVEL will set the number of ThreadState objects available.\n\t\n\t\n\tAll threads will obtain memory buffers from a pull which will be limited by IW's RAM limit.\n\tWhen a thread finishes indexing a document and realizes the pool has been exhausted, it flushes its ThreadState.\n\t\n\t\tAt that moment, that ThreadState is pulled out of the 'active' list and is flushed. When it's done, it reclaims its used buffers and being put again in the active list.\n\t\tNew threads that come in will simply pick a ThreadState from the pool (but we'll bind them to that instance until it's flushed) and add documents to them.\n\t\tThat way, we hijack an application thread to do the flushing, which is anyway what happens today.\n\t\n\t\n\n\n\nThat way we are less likely to reach a state like Mike described - \"big burst of CPU only\" then \"big burst of IO only\" - and more likely to balance the two.\n\nIf the application wants to be single threaded, we allow it to be like that all the way through, not introducing more thread allocations. Otherwise, we let it control its concurrency level and use it to our needs. ",
+            "author": "Shai Erera",
+            "id": "comment-12841106"
+        },
+        {
+            "date": "2010-03-04T08:18:43+0000",
+            "content": "\nAlso, in the pull approach, Lucene would introduce another place where it allocates threads.\n\nWhat I described is not much different from what's happening today. DocumentsWriter has already a WaitQueue, that ensures that the docs are written in the right order.\n\nI simply tried to suggest a way to refactor our classes... functionally the same as what Mike suggested. I shouldn't have said \"pulled from\" (the queue). ",
+            "author": "Michael Busch",
+            "id": "comment-12841120"
+        },
+        {
+            "date": "2010-03-04T08:48:12+0000",
+            "content": "What I described is not much different from what's happening today.\n\nMaybe I didn't understand then:\n\nbasically a load balancer, that multiple DocumentsWriter instances would pull from as soon as they are done inverting the previous document?\n\nWho adds documents to that queue and what are the DW instances? The way I read it, I understood those are different threads than the application threads. If I misunderstood that, could you please clarify?\n\nAlso, I thought that each thread writes to different ThreadState does not ensure documents are written in order, but that finally when DW flushes, the different ThreadStates are merged together and one segment is written, somehow restores the orderness ...\n\nIf only WaitQueue was documented .\n\nI obviously don't know that part of the code as well as you. So if I misunderstood your meaning, I'd appreciate if you clarify it for me. What I would like to avoid is having Lucene allocate indexing threads on its own.\n\nAlso, is my proposal above different than what you suggest? ",
+            "author": "Shai Erera",
+            "id": "comment-12841127"
+        },
+        {
+            "date": "2010-03-04T09:11:47+0000",
+            "content": "Sorry - after reading my comment again I can see why it was confusing. Loadbalancer wasn't a very good analogy.\n\nI totally agree that Lucene should still piggyback on the application's threads and not start its own thread for document inversion.\n\nToday, as you said, does the DocumentsWriter manage a certain number of thread states, has the WaitQueue, and its own memory management.\n\nWhat I was thinking was that it would be simpler if the DocumentsWriter was only used by a single thread. The IndexWriter would have multiple DocumentsWriters and do the thread binding (+waitqueue). This would make the code in DocumentsWriter and the downstream classes simpler. The side-effect is that each DocumentsWriter would manage its own memory. \n\n\nAlso, I thought that each thread writes to different ThreadState does not ensure documents are written in order, but that finally when DW flushes, the different ThreadStates are merged together and one segment is written, somehow restores the orderness ...\n\nStored fields are written to an on-disk stream (docstore) in order. The WaitQueue takes care of finishing the docs in the right order. \nThe postings are written into TermHashes per threadstate in parallel. The doc ids are in increasing order, but can have gaps. E.g. Threadstate 1 inverts doc 1 and 3, Threadstate 2 inverts doc 2. When it's time to flush the whole buffer these different TermHash postingslists get interleaved. ",
+            "author": "Michael Busch",
+            "id": "comment-12841135"
+        },
+        {
+            "date": "2010-03-04T09:22:48+0000",
+            "content": "Ok so I think I understand now. You propose to change IW to bind a Thread to a DW, instead of that being done inside DW. And therefore it will simplify DW's code ... I wonder if that won't complicate IW code in return? Perhaps we'll gain a lot of simplification on DW, so a bit of complexity on IW will be ok.\n\nIf we do that .. why not renaming DW to SegmentWriter? If each DW will eventually flush its own Segment, the name would make more sense?\n\nBTW, I was thinking that an application can emulate this sort of thing even today (well ... to some extent - w/o deletes). It can create an IW for each indexing thread and at the end call addIndexes. What we'd need to introduce on IW to make it efficient though is something like addRawIndexes, which will just update the segments file about the new segments, but won't attempt to merge them and clean deletes out of them.\nI think I want this API anyway for being able to add segments faster to an index, if e.g. you don't care about the merges at the moment ... but that is separate issue.\n\nThen I think what I proposed is more or less the same as you propose, therefore I'm fine with that approach. When a DW/SW realizes it exhausted its memory pool, it just flushes and new threads will bind to other DW/SW.\n\nThanks for the explanation on WaitQueue. ",
+            "author": "Shai Erera",
+            "id": "comment-12841140"
+        },
+        {
+            "date": "2010-03-04T11:24:51+0000",
+            "content": "I wonder if that won't complicate IW code in return? Perhaps we'll gain a lot of simplification on DW, so a bit of complexity on IW will be ok.\nThat will get rid of all that *PerThread insanity for each DW component, if I'm getting it right. That's -13 classes. Yay for the issue!\n\nOn a random sidenote, can we group things like these into subpackages? Having 132 files in oal.index is somewhat intimidating when trying to read/understand things. ",
+            "author": "Earwin Burrfoot",
+            "id": "comment-12841193"
+        },
+        {
+            "date": "2010-03-04T12:58:07+0000",
+            "content": "I agree IW should not spawn its own threads.  It should piggy back on\nincoming threads.\n\nOn whether we can remove the \"perThread\" layer throughout the chain \u2013\nthat would be compelling.  But, we should scrutinize what that layer\ndoes throughout the current chain to assess what we might lose.\n\nBut, I was proposing a bigger change (call it \"private RAM segments\"):\nthere would be multiple DWs, each one writing to its own private RAM\nsegment (each one getting private docID assignment) and its own doc\nstores.\n\nThere would be no more WaitQueue in IW.\n\nEach DW would flush its own segment privately.  They would not all\nflush at once (merging their postings) like we must do today because\nthey \"share\" a single docID space.\n\nAs I understand it, this would be step towards how Lucy handles\nconcurrency during indexing.  Ie, it'd make the DWs nearly fully\nindependent from one another, and then IW is just there to dispatch/do\nmerging/etc.  (In Lucy each writer is a separate process, I think \u2013\nVERY independent).\n\nWe could do both changes, too (remove the \"perThread\" layer of\nindexing chaing and switch to private RAM segments) \u2013 I think they\nare actually orthogonal.\n\nThe other downside is that you would have to buffer deleted docs and queries separately for each thread state, because you have to keep the private docID? So that would nee a bit more memory.\n\nRight.\n\nMike, good one! Would having a doc id stream per thread make implementing a searchable RAM buffer easier?\n\nYes \u2013 they would just appear like sub segments.\n\nI hope we won't lose monotonic docIDs for a singlethreaded indexation somewhere along that path.\n\nWe won't.\n\n\nInstead, I prefer to take advantage of the application's concurrency level in the following way:\n\n\n\tEach thread will continue to write documents to a ThreadState. We'll allow changing the MAX_LEVEL, so if an app wants to get more concurrency, it can.\n\n\n\tMAX_LEVEL will set the number of ThreadState objects available.\n\n\n\tAll threads will obtain memory buffers from a pull which will be limited by IW's RAM limit.\n\tWhen a thread finishes indexing a document and realizes the pool has been exhausted, it flushes its ThreadState.\n\n\n\tAt that moment, that ThreadState is pulled out of the 'active' list and is flushed. When it's done, it reclaims its used buffers and being put again in the active list.\n\tNew threads that come in will simply pick a ThreadState from the pool (but we'll bind them to that instance until it's flushed) and add documents to them.\n\tThat way, we hijack an application thread to do the flushing, which is anyway what happens today.\n\n\n\n+1 \u2013 this I think matches what I was thinking.\n\nIf only WaitQueue was documented\n\nSorry \n\nBut WaitQueue would go away with this change.  We would no longer have\nshared doc stores! ",
+            "author": "Michael McCandless",
+            "id": "comment-12841225"
+        },
+        {
+            "date": "2010-03-04T13:21:37+0000",
+            "content": "Perhaps instead of buffering the delete Terms/Queries somewhere central, when a delete by term is performed by a certain DW, it can register it immediately on all existing DWs. Each DW will record the doc ID up until which this term delete should be executed, and when it's its time to flush, will apply all the deletes that were accumulated on itself. It'll be like doing a Parallel segment deletes (but maybe I'm too into Parallel Indexing ).\n\nThis should not affect any documents that were added to any DW after the delete happened, and if we simply do it (sycned) across all active DWs, I think we should be fine? ",
+            "author": "Shai Erera",
+            "id": "comment-12841235"
+        },
+        {
+            "date": "2010-03-04T15:44:02+0000",
+            "content": "But WaitQueue would go away with this change.  We would no longer have shared doc stores!\n\nCool, most of the DW code is intuitive except the shared doc stores because it's hard to when see when a doc store ends.  Also the interleaving is a bit difficult to visualize.  I look forward to checking out DW after this change.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12841342"
+        },
+        {
+            "date": "2010-03-04T15:50:54+0000",
+            "content": "Yes, I think each DW will have to record its own buffered delete Term/Query, mapping to its docID at the time the delete arrived.\n\nSyncing across all of them would work but may be overkill.  I think we could instead have a lock free collection (need not even be FIFO \u2013 the order doesn't matter) into which we add all Term/Query that are deleted.  Then, any time a thread hits that DW to add a document, it must first service that queue, by popping out all Term/Query stored in it and enrolling them the un-synchronized map of Term/Query -> docID). ",
+            "author": "Michael McCandless",
+            "id": "comment-12841347"
+        },
+        {
+            "date": "2010-03-04T17:06:58+0000",
+            "content": "\nBut, I was proposing a bigger change (call it \"private RAM segments\"):\nthere would be multiple DWs, each one writing to its own private RAM\nsegment (each one getting private docID assignment) and its own doc\nstores.\n\nCool! I wasn't sure if you wanted to give them private doc stores too. +1, I like it.\n ",
+            "author": "Michael Busch",
+            "id": "comment-12841388"
+        },
+        {
+            "date": "2010-03-04T17:31:13+0000",
+            "content": "Cool! I wasn't sure if you wanted to give them private doc stores too. +1, I like it.\n\nI wasn't sure either   Ie, I forgot about that aspect of my proposal until it was raised in the discussion... but I think that'd be necessary.\n\nThis will be a perf hit, when building up a big new index.  But since doc stores now merge by bulk copy (when there are no deletions) hopefully the impact isn't too much.  And, hopefully it's more than made up for by the improvement in IO/CPU interleaved concurrency.\n\nI'll work out a patch to at least make the hardwired 5 configurable... but does anyone out there wanna work out the \"private RAM segments\"? ",
+            "author": "Michael McCandless",
+            "id": "comment-12841395"
+        },
+        {
+            "date": "2010-03-04T17:47:35+0000",
+            "content": "Yes, I think each DW will have to record its own buffered delete Term/Query, mapping to its docID at the time the delete arrived. \n\nI think in the future deletes in DW could work like this:\n\n\tDW keeps of course track of a private sequence id, which gets incremented in the add, delete, update calls\n\ta DW has a getReader() call, the reader can search the ram buffer\n\twhen DW.gerReader() gets called, then the new reader remembers the current seqID at the time it was opened - let's call it RAMReader.seqID; if such a reader gets reopened, simply its seqID gets updated.\n\twe keep an growing int array with the size of DW's maxDoc, which replaces the usual deletes bitset\n\twhen DW.updateDocument() or .deleteDocument() needs to delete a doc we do that right away, before inverting the new doc. We can do that by running a query using a RAMReader to find all docs that must be deleted. Instead of flipping a bit in a bitset, for each hit we now keep track of when it was deleted:\n\n\n\n\n// init each slot in deletes array with -1\nstatic final int NOT_DELETED = Integer.MAX_INT;\n...\nArrays.fill(deletes, NOT_DELETED);\n\n...\n\npublic void deleteDocument(Query q) {\n  reopen RAMReader\n  run query q using RAMReader\n  for each hit {\n    int hitDocId = ...\n    if (deletes[hitDocId] == NOT_DELETED) {\n      deletes[hitDocId] = DW.seqID;\n    }\n  }\n...\n  DW.seqID++;\n}\n\n\n\nNow no matter of how often you (re)open RAMReaders, they can share the deletes array. No cloning like with the BitSet approach would be necessary:\n\nWhen the RAMReader iterates posting lists it's as simple as this to treat deletes docs correctly. Instead of doing this in RAMTermDocs.next():\n\n  if (deletedDocsBitSet.get(doc)) {\n    skip this doc\n }\n\n\n\nwe can now do:\n\n\n  if (deletes[doc] < ramReader.seqID) {\n    skip this doc\n  }\n\n\n\nHere is an example:\n1. Add 3 docs with DW.addDocument() \n2. User opens ramReader_a\n3. Delete doc 1\n4. User opens ramReader_b\n\n\nAfter 1: DW.seqID = 2; deletes[]=\n{MAX_INT, MAX_INT, MAX_INT}\nAfter 2: ramReader_a.seqID = 2\nAfter 3: DW.seqID = 3; deletes[]=\n{MAX_INT, 2, MAX_INT}\nAfter 3: ramReader_b.seqID = 3\n\nNote that both ramReader_a and ramReader_b share the same deletes[] array. Now when ramReader_a is used to read posting lists, it will not treat doc 1 as deleted, because (deletes[1] < ramReader_a.seqID) = (2 < 2) = false; But ramReader_b will see it as deleted, because (deletes[1] < ramReader_b.seqID) = (2 < 3) = true.\n\nWhat do you think about this approach for the future when we have a searchable DW buffer? ",
+            "author": "Michael Busch",
+            "id": "comment-12841407"
+        },
+        {
+            "date": "2010-03-04T19:24:18+0000",
+            "content": "What about the following scenario:\n\n\tA document is added w/ term A to DW1\n\tA document is added w/ term A to DW2 (by another thread)\n\tA deleteDocuments(Term-A) is issued against DW1 (could be even 3, where A does not exist)\n\n\n\nI thought that when (3) happens, the delete-by-term needs to be issued against all DWs, so that later when they apply their deletes they'll remember to do so. Issuing that against all DWs will record the docID of each DW up until which the delete should apply.\n\nWe could move to doing the delete right-away, by reopening a DW reader, and we could move to storing deletes in int[] rather than bit set. But I'm not sure I understand how your proposal will handle the scenario I've described.\n\nAlso, I don't see the advantage of moving to store the deletes in int[] rather than bitset ... is it just to avoid calling the get(doc)? ",
+            "author": "Shai Erera",
+            "id": "comment-12841463"
+        },
+        {
+            "date": "2010-03-04T21:43:50+0000",
+            "content": "\nI thought that when (3) happens, the delete-by-term needs to be issued against all DWs, so that later when they apply their deletes they'll remember to do so. Issuing that against all DWs will record the docID of each DW up until which the delete should apply.\n\nYes, you still need to apply deletes on all DWs. My approach is not different in that regard.\n\n\nAlso, I don't see the advantage of moving to store the deletes in int[] rather than bitset ... is it just to avoid calling the get(doc)?\n\nThe big advantage is that all (re)opened readers can share the single int[] array. If you use a bitset you need to clone it for each reader. With the int[] reopening becomes basically free from a deletes perspective. ",
+            "author": "Michael Busch",
+            "id": "comment-12841545"
+        },
+        {
+            "date": "2010-03-04T23:49:58+0000",
+            "content": "The big advantage is that all (re)opened readers can share the single int[] array.\n\nDirty reads will be a problem with sharing the array. An AtomicIntegerArray could be used. We need to experiment how expensive that would be.  ",
+            "author": "Michael Busch",
+            "id": "comment-12841617"
+        },
+        {
+            "date": "2010-03-05T04:13:07+0000",
+            "content": "But if each DW maintains its own doc IDs, separately from the others, what will be stored in the int[]? DW1 deleted docID 0 (its 0) and DW4 deleted the same. The two documents are not the same one ... no?\n\nWon't this complicate the entire solution? What I liked about keeping each DW separate (and call it SegmentWriter) is that it really operates on its own. When a delete happens on IW, it is synced so that it could be registered on all DWs. But besides that, the DWs don't know about each other nor care. Code should be really simple that way - the only thing that will be shared is the pool of buffers.\n\nI guess I'm missing something, because you're far more knowledgeable in this code than I am ...  ",
+            "author": "Shai Erera",
+            "id": "comment-12841697"
+        },
+        {
+            "date": "2010-03-05T08:18:44+0000",
+            "content": "\nBut if each DW maintains its own doc IDs, separately from the others, what will be stored in the int[]? DW1 deleted docID 0 (its 0) and DW4 deleted the same. The two documents are not the same one ... no? \n\nIn DW you don't delete by docID. You can only delete by term or query. You have to run the (term)query in all DWs to determine if any of the DWs have one or more matching docs that have to be deleted.\n\nToday the queries and/or terms are buffered, along with the maxDocID at the time the delete or update was called. They are applied just after the DW buffer was flushed to a segment, be cause that's the first time the docs are searchable and the delete queries can be executed.\n\nIn the future, when we can search the DW buffer(s), you can apply the deletes right away. Using this int[] approach for deletes will avoid the need of cloning bitsets in each reopen.  ",
+            "author": "Michael Busch",
+            "id": "comment-12841744"
+        },
+        {
+            "date": "2010-03-05T08:27:21+0000",
+            "content": "\nWon't this complicate the entire solution? What I liked about keeping each DW separate (and call it SegmentWriter) is that it really operates on its own. When a delete happens on IW, it is synced so that it could be registered on all DWs. But besides that, the DWs don't know about each other nor care. Code should be really simple that way - the only thing that will be shared is the pool of buffers.\n\nWhat I'm proposing is not different or makes it more complicated. Either way, you have to apply all deletes on all DWs, because you delete by query or term.\n\nThis might not be the right time for this proposal, because it'll only work with searchable DW buffers. But I wanted to mention this idea already, so that we can keep it in mind. And hopefully we can work on searchable DW buffers soon.\n\n\nbut does anyone out there wanna work out the \"private RAM segments\"?\n\nI would like to try to help, but I'm likely not going to have enough time right now to write an entire patch for this big change myself. ",
+            "author": "Michael Busch",
+            "id": "comment-12841745"
+        },
+        {
+            "date": "2010-03-05T10:23:16+0000",
+            "content": "I think in the future deletes in DW could work like this: \n\nThis approach looks great Michael! Allows you to efficiently share a single int[] for deletions across many reopened RAM segment readers. \n\nHow will we handle flushing? Ie, when a RAM segment is flushed to disk, it'd have to remain alive so long as a reader is still using it? Which means we can't recycle its buffers until all open readers using it are closed? Or... we could forcefully somehow cut it over to the identical now-on-disk segment? \n\nThis is a great approach for speeding up NRT \u2013 NRT readers will no longer have to flush. It's similar in spirit to LUCENE-1313, but that issue is still flushing segments (but, into an intermediate RAMDir). ",
+            "author": "Michael McCandless",
+            "id": "comment-12841800"
+        },
+        {
+            "date": "2010-03-05T11:34:15+0000",
+            "content": "Michael - I see that we were on the same page. Probably I misread your description. I know that in IW deletes are applied by Term/Query and I thought that that delete should be registered on all DWs so they can apply it later. I'm glad that you think like that as well.\n\nSo about the int[], would that be of the size of the index (flushed and unflushed) segments? Suppose that:\n\n\tI've indexed 5 documents, flushed. (IDs 0-4)\n\tIndexed 2 on DW1. (IDs 0,1)\n\tIndexed 2 on DW2. (IDs 0,1)\n\tDelete by term which affects: flushed IDs 1, 4, DW1-0, DW2 - 0, 1\n\n\n\nWould the int[] be of size 9, and the deleted IDs be 1, 4, 5, 7, 8? How would DW1- be mapped to 5, and DW2-0,1 be mapped to 7 and 8? Will the int[] be initially of size 5 and after DW1 flushes expand to 7, and ID=5 will be set (and afterwards expand to 9 with IDs 7,8)? If so then I understand.\n\nWhy would using an int[] be any better than sharing a bitset? ",
+            "author": "Shai Erera",
+            "id": "comment-12841821"
+        },
+        {
+            "date": "2010-03-05T16:30:06+0000",
+            "content": "\nThis is a great approach for speeding up NRT - NRT readers will no longer have to flush. It's similar in spirit to LUCENE-1313, but that issue is still flushing segments (but, into an intermediate RAMDir).\n\nI agree! Thinking further about this: Each (re)opened RAM segment reader needs to also remember the maxDoc of the corresponding DW at the time it was (re)opened. This way we can prevent a RAM reader to read postinglists beyond that maxDoc, even if the writer thread keeps building the lists in parallel. This allows us to guarantee the point-in-time requirements.\n\nAlso, the PostingList objects we store in the TermHash already contain a lastDocID (if I remember correctly). So when a RAM reader termEnum iterates the dictionary it can skip all terms where term.lastDocID > RAMReader.maxDoc.\n\nIt's quite neat that all we have to do in reopen then is to update ramReader.maxDoc and ramReader.seqID.\n\nOf course one big thing is still missing: keeping the term dictionary sorted. In order to implement the full IndexReader interface, specifically TermEnum, it's necessary to give each RAM reader a point-in-time sorted dictionary. At least in one direction, as a TermEnum only seeks forward.\n\nI think we have two options here: Either we try to keep the dictionary always sorted, whenever a term is added. I guess then we'd have to implement a b-tree or something similar?\n\nThe second option I can think of is to add a \"nextTerm\" pointer to TermHash.Postinglist. This allows us to build up a linked list across all terms. When a ramReader is opened we would sort all terms, but not by changing their position in the hash - instead by building the single-linked list in sorted order.\n\nWhen a new reader gets (re)opened we need to mergesort the new terms into the linked list. I guess it's easy to get this implemented lock-free. E.g. if you have the linked list a->c, and you want to add b in the middle, you set b->c before changing a->c. Then it's undefined if an in-flight older reader would see term b. The old reader must not return b, since b was added after the old reader was (re)opened. So either case is fine: either it doesn't see b cause the link wasn't updated yet, or it sees it but doesn't return it, because b.lastDocID>ramReader.maxDoc.\n\nThe downside is that we will have to pay the price of sorting in reader.reopen, which however should be cheap if readers are reopened frequently. Not sure though if this linkedlist approach is more or less compelling than something like a btree?\n\nBtw: Shall we open a new \"searchable DW buffer\" issue or continue using this issue for these discussions? ",
+            "author": "Michael Busch",
+            "id": "comment-12841915"
+        },
+        {
+            "date": "2010-03-05T16:40:28+0000",
+            "content": "So about the int[], would that be of the size of the index (flushed and unflushed) segments? Suppose that:\n\nEach DW would have its own int[]. The size would correspond to the number of docs the DW has in its buffer.\n\n\nI've indexed 5 documents, flushed. (IDs 0-4)\nIndexed 2 on DW1. (IDs 0,1)\nIndexed 2 on DW2. (IDs 0,1)\nDelete by term which affects: flushed IDs 1, 4, DW1-0, DW2 - 0, 1\nWould the int[] be of size 9, and the deleted IDs be 1, 4, 5, 7, 8? How would DW1- be mapped to 5, and DW2-0,1 be mapped to 7 and 8? Will the int[] be initially of size 5 and after DW1 flushes expand to 7, and ID=5 will be set (and afterwards expand to 9 with IDs 7,8)? If so then I understand.\n\nDW1 will have an int[] of size 2, and DW2 will also have a separate int[] of size 2.\n\nI think you were thinking of one big int[] across the entire index? I believe you will understand the whole approach now when you think of the int[]s as per ram segment. ",
+            "author": "Michael Busch",
+            "id": "comment-12841923"
+        },
+        {
+            "date": "2010-03-05T17:31:26+0000",
+            "content": "Thanks Michael. If the int[] are per DW then it's starting to make sense . I will read this issue again, especially the last several posts.\n\nI wanted to propose earlier to move the discussion to a seperate issue and close this one by allowing better control over the concurrency level. So a +1 from me on that. ",
+            "author": "Shai Erera",
+            "id": "comment-12841942"
+        },
+        {
+            "date": "2010-03-05T18:05:02+0000",
+            "content": "I think we have two options here: Either we try to keep the dictionary always sorted, whenever a term is added. I guess then we'd have to implement a b-tree or something similar?\n\nThe int[] for deletes makes sense, I guess because we're assuming the number of docs in the RAM buffer won't be too large.  Can't we simply instantiate a new terms array (merging in the new terms) for each reopen?  \n\nWon't we need to wait for flex and this issue to be completed before tackling this? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12841960"
+        },
+        {
+            "date": "2010-03-12T13:36:01+0000",
+            "content": "We'll add this (max internal concurrency, now hardwired to 5) to IWC once it's in... ",
+            "author": "Michael McCandless",
+            "id": "comment-12844495"
+        },
+        {
+            "date": "2010-03-13T07:45:58+0000",
+            "content": "but does anyone out there wanna work out the \"private RAM\nsegments\"?\n\nI didn't see this before, I figured private RAM segments was on\nthe roadmap for this issue, it sounds like it'll be a different\none? \n\nMike, can you outline what would need to change? It seems like\nlarge amounts of code could be removed (i.e.\nFreqProxFieldMergeState)? The *PerThread classes? If so, I think\nit would go over my head (because I don't have a mental mapping\nof how all the classes tie together).  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12844828"
+        },
+        {
+            "date": "2010-03-13T10:25:15+0000",
+            "content": "I think this issue has these steps:\n\n\n\tAllow the 5 to be changed (trivial first step) \u2013 I'll do this\n    after LUCENE-2294 is in\n\n\n\n\n\tChange the approach for how we buffer in RAM to a more isolated\n    approach, whereby IW has N fully independent RAM segments\n    in-process and when a doc needs to be indexed it's added to one of\n    them.  Each segment would also write its own doc stores and\n    \"normal\" segment merging (not the inefficient merge we now do on\n    flush) would merge them.  This should be a good simplification in\n    the chain (eg maybe we can remove the *PerThread classes).  The\n    segments can flush independently, letting us make much better\n    concurrent use of IO & CPU.\n\n\n\n\n\tEnable NRT readers to directly search these RAM segments.  This\n    entails recording deletes on the RAM segments as an int[].  We\n    need to solve the Term sorting issue... (b-tree, or, simply\n    sort-on-demand the first time a query needs it, though that cost\n    increases the larger your RAM segments get, ie, not incremental to\n    the # docs you just added).  Also, we have to solve what happens\n    to a reader using a RAM segment that's been flushed.  Perhaps we\n    don't reuse RAM at that point, ie, rely on GC to reclaim once all\n    readers using that RAM segmeent have closed.  We should do this\n    part under a separate issue (LUCENE-2312).\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12844848"
+        },
+        {
+            "date": "2010-03-13T15:04:45+0000",
+            "content": "Change the approach for how we buffer in RAM to a more\nisolated approach\n\nWould we reuse the DocumentsWriter class, and assign one to each\nthread? Then start to rework DW on down in the code tree,\nremoving the per thread logic? Or do we need to do something\nmore dramatic? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12844893"
+        },
+        {
+            "date": "2010-03-13T15:20:56+0000",
+            "content": "Probably one DW instance per thread?  Seems like that'd work?\n\nAnd possibly remove *PerThread throughout the default indexing chain? ",
+            "author": "Michael McCandless",
+            "id": "comment-12844900"
+        },
+        {
+            "date": "2010-03-13T16:04:43+0000",
+            "content": "Simple patch, just adds maxThreadStates setting to IndexWriterConfig. ",
+            "author": "Michael McCandless",
+            "id": "comment-12844911"
+        },
+        {
+            "date": "2010-03-13T17:35:53+0000",
+            "content": "Probably one DW instance per thread? Seems like that'd work? \n\nOk\n\nAnd possibly remove *PerThread throughout the default indexing chain?\n\nI like removing this as there's many loops per thread right now, it's not easy to glance at and know what's going on.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12844926"
+        },
+        {
+            "date": "2010-03-14T08:19:29+0000",
+            "content": "\nbut does anyone out there wanna work out the \"private RAM segments\"?\n\nShall we use this issue for the private RAM segments? Or do you want to commit the simple patch, close this one and open a new issue? ",
+            "author": "Michael Busch",
+            "id": "comment-12845047"
+        },
+        {
+            "date": "2010-03-14T08:24:58+0000",
+            "content": "I'm tempted to get rid of the pooling for PostingLIst objects.  The objects are very small and Java does a good job since 1.5 with object creation and gc.  I even read that the JVM guys think that pooling can be slower than not-pooling.\n\nAlso, I've mostly seen gc performance problems so far if there were a big number of long-living objects - it makes the mark time of the garbage collection very long.  Pooling of course exactly gets you in such a situation.\n\nSo what do you think about removing the pooling of the PostingList objects?   ",
+            "author": "Michael Busch",
+            "id": "comment-12845048"
+        },
+        {
+            "date": "2010-03-14T09:44:28+0000",
+            "content": "Or do you want to commit the simple patch, close this one and open a new issue?\n\nHow about a new issue?\n\nAlso, I've mostly seen gc performance problems so far if there were a big number of long-living objects - So what do you think about removing the pooling of the PostingList objects?\n\nIt's not only the GC cost, it's also the cost of init'ing these objects.  EG filling in 0s for all the fields, when we're gonna overwrite them anyway.\n\nBut, let's test on modern JREs to confirm this?  I do agree pooling adds code complexity, so, if it's not buying us anything (or very little) we should remove it.\n\nThe worst case should be docs with many unique terms...  Though... to reduce our per-unique-term RAM cost, we may want to move away from separate postings object per term to parallel arrays.  We also could do something different for singleton terms vs the rest (if Zipf's law is applying, half the terms should be singletons; if it's not, you could have many more singleton terms...).  I'd do this as an experimental indexing chain  ",
+            "author": "Michael McCandless",
+            "id": "comment-12845056"
+        },
+        {
+            "date": "2010-03-14T23:33:37+0000",
+            "content": "How about a new issue?\n\nOK, will open one.\n\n(if Zipf's law is applying, half the terms should be singletons; if it's not, you could have many more singleton terms...)\n\nYeah we should utilize our knowledge of term distribution to optimize in-memory postings.  For example, currently a nice optimization would be to store the first posting in the PostingList object and only allocate slices once you see the second occurrence (similar to the pulsing codec)?\n\nThough... to reduce our per-unique-term RAM cost, we may want to move away from separate postings object per term to parallel arrays.\n\nWhat exactly do you mean with parallel arrays? Parallel to the termHash array?  Then the termsHash array would not be an array of PostingList objects anymore, but an array of pointers into the char[] array?  And you'd have e.g. a parallel int[] array for df, another int[] for pointers into the postings byte pool, etc? Something like that? ",
+            "author": "Michael Busch",
+            "id": "comment-12845159"
+        },
+        {
+            "date": "2010-03-15T05:43:13+0000",
+            "content": "OK I opened LUCENE-2324.  We can close this one after you committed your patch, Mike. ",
+            "author": "Michael Busch",
+            "id": "comment-12845190"
+        },
+        {
+            "date": "2010-03-15T09:58:07+0000",
+            "content": "For example, currently a nice optimization would be to store the first posting in the PostingList object and only allocate slices once you see the second occurrence (similar to the pulsing codec)?\n\nI think we can do even better, ie, that class wastes RAM for the single posting case (intStart, byteStart, lastDocID, docFreq, lastDocCode, lastDocPosition are not needed).\n\nEG we could have a separate class dedicated to the singleton case.  When term is first encountered it's enrolled there.  We'd probably need a separate hash to store these (though not necessarily?).  If it's seen again it's switched to the full posting.\n\nWhat exactly do you mean with parallel arrays? Parallel to the termHash array? Then the termsHash array would not be an array of PostingList objects anymore, but an array of pointers into the char[] array? And you'd have e.g. a parallel int[] array for df, another int[] for pointers into the postings byte pool, etc? Something like that?\n\nI mean instead of allocating an instance per unique term, we assign an integer ID (dense, ie, 0, 1, 2...).\n\nAnd then we have an array for each member now in FreqProxTermsWriter.PostingList, ie int[] docFreqs, int [] lastDocIDs, etc.  Then to look up say the lastDocID for a given postingID you just get lastDocIDs[postingID].  If we're worried about oversize allocation overhead, we can make these arrays paged... but that'd slow down each access. ",
+            "author": "Michael McCandless",
+            "id": "comment-12845263"
+        },
+        {
+            "date": "2010-03-15T16:14:33+0000",
+            "content": "I'll reply on LUCENE-2324. ",
+            "author": "Michael Busch",
+            "id": "comment-12845391"
+        }
+    ]
+}

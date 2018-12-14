@@ -1,0 +1,39 @@
+{
+    "id": "LUCENE-856",
+    "title": "Optimize segment merging",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "2.1",
+        "resolution": "Not A Problem",
+        "status": "Resolved"
+    },
+    "description": "With LUCENE-843, the time spent indexing documents has been\nsubstantially reduced and now the time spent merging is a sizable\nportion of indexing time.\n\nI ran a test using the patch for LUCENE-843, building an index of 10\nmillion docs, each with ~5,500 byte plain text, with term vectors\n(positions + offsets) on and with 2 small stored fields per document.\nRAM buffer size was 32 MB.  I didn't optimize the index in the end,\nthough optimize speed would also improve if we optimize segment\nmerging.  Index size is 86 GB.\n\nTotal time to build the index was 8 hrs 38 minutes, 5 hrs 40 minutes\nof which was spent merging.  That's 65.6% of the time!\n\nMost of this time is presumably IO which probably can't be reduced\nmuch unless we improve overall merge policy and experiment with values\nfor mergeFactor / buffer size.\n\nThese tests were run on a Mac Pro with 2 dual-core Intel CPUs.  The IO\nsystem is RAID 0 of 4 drives, so, these times are probably better than\nthe more common case of a single hard drive which would likely be\nslower IO.\n\nI think there are some simple things we could do to speed up merging:\n\n\n\tExperiment with buffer sizes \u2013 maybe larger buffers for the\n    IndexInputs used during merging could help?  Because at a default\n    mergeFactor of 10, the disk heads must do alot of seeking back and\n    forth between these 10 files (and then to the 11th file where we\n    are writing).\n\n\n\n\n\tUse byte copying when possible, eg if there are no deletions on a\n    segment we can almost (I think?) just copy things like prox\n    postings, stored fields, term vectors, instead of full parsing to\n    Jave objects and then re-serializing them.\n\n\n\n\n\tExperiment with mergeFactor / different merge policies.  For\n    example I think LUCENE-854 would reduce time spend merging for a\n    given index size.\n\n\n\nThis is currently just a place to list ideas for optimizing segment\nmerges.  I don't plan on working on this until after LUCENE-843.\n\nNote that for \"autoCommit=false\", this optimization is somewhat less\nimportant, depending on how often you actually close/open a new\nIndexWriter.  In the extreme case, if you open a writer, add 100 MM\ndocs, close the writer, then no segment merges happen at all.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2007-04-05T16:42:06+0000",
+            "content": "OK I re-ran the above test (10 MM docs @ ~5,500 bytes plain text each)\nwith autoCommit=false: this time it took 5 hrs 7 minutes, which is\n40.7% faster than the autoCommit=true test above.\n\nBoth of these tests were run with the patch from LUCENE-843.\n\nSo this means, if all you need to do is build a massive index with\nterm vector positions & offsets, the fastest way to do so is with the\npatch from LUCENE-843 and with autoCommit=false with your writer.\n\nBasically LUCENE-843 makes autoCommit=false quite a bit faster for a\nvery large index, assuming you are storing term vectors / stored\nfields.\n\nStill, I think optimizing segment merging is important because for\nmany uses of Lucene, the \"interactivity\" (how quickly a searcher sees\nthe recently indexed documents) is very important.  For such cases you\nshould open a writer with autoCommit=false and then periodically close\n& re-open it to publish the indexed documents to the searchers.  With\nthat model, segment merging will still be a factor slowing down indexing\n(though how much of a factor depends on how often you close/open\nyour writers). ",
+            "author": "Michael McCandless",
+            "id": "comment-12487049"
+        },
+        {
+            "date": "2007-07-02T14:16:04+0000",
+            "content": "\nI ran a new performance comparison here to test the merging cost of\nautoCommit false vs true, this time using Wikipedia content and\ncontrib/benchmark.\n\nI indexed all of Wikipedia using the patch from LUCENE-843 and the\npatch from LUCENE-947, once with autoCommit=true and once with\nautoCommit=false.  I used this alg (and just changed autocommit=true\nto false for the second test):\n\n    max.field.length=2147483647\n    compound=false\n\n    analyzer=org.apache.lucene.analysis.SimpleAnalyzer\n    directory=FSDirectory\n    ram.flush.mb=32\n    max.buffered=20000\n    autocommit=true\n    doc.stored=true\n    doc.tokenized=true\n    doc.term.vector=true\n    doc.term.vector.offsets=true\n    doc.term.vector.positions=true\n    doc.add.log.step=500\n\n    docs.dir=enwiki\n\n    doc.maker=org.apache.lucene.benchmark.byTask.feeds.DirDocMaker\n\n    doc.maker.forever=false\n\n    ResetSystemErase\n    CreateIndex\n    [\n{AddDoc}\n: *] : 4\n    CloseIndex\n\n    RepSumByPref AddDoc\n\nWhich means: use 4 threads to index all text from each of the 3.2\nmillion wikipedia docs, with stored fields & term vectors turned on,\nusing SimpleAnalyzer, flushing when RAM usage hits 32 MB.\n\nThe index size is 20 GB.\n\nReport from autoCommit=true:\n\n    ------------> Report Sum By Prefix (AddDoc) (1 about 3204066 out of 3204073)\n    Operation   round   runCnt   recsPerRun        rec/s  elapsedSec    avgUsedMem    avgTotalMem\n    AddDoc          0  3204066            1        226.3   14,159.22   282,843,296    373,480,960\n\n    Net elapsed time = 87 minutes 18 seconds\n\nReport from autoCommit=false:\n\n    ------------> Report Sum By Prefix (AddDoc) (1 about 3204066 out of 3204073)\n    Operation   round   runCnt   recsPerRun        rec/s  elapsedSec    avgUsedMem    avgTotalMem\n    AddDoc          0  3204066            1        407.6    7,860.63   252,046,000    329,962,048\n\n    Net elapsed time = 60 minutes 5 seconds\n\n\nSome comments:\n\n\n\tAccording to net elapsed time, autoCommit=false is 31% faster than\n    autoCommit=true.\n\n\n\n\n\tAccording to \"rec/s\" it's actually 44% faster; this is because\n    rec/s only measures the actual addDocument time and not eg the IO\n    cost of retrieving the document contents.\n\n\n\n\n\tThe speedup is due entirely to the fact that the \"doc stores\"\n    (vectors & stored fields) do not need to be merged when\n    autoCommit=false.  This is a major win because these files are\n    enormous if you turn on stored fields & term vectors with offsets\n    & positions.\n\n\n\n\n\tThe basic conclusion is the same as before: if you want to build\n    up a large index, and, it's not necessary to be searching this\n    index while you are building it, the fastest way to do so is with\n    LUCENE-843 patch and with autoCommit=false.\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12509576"
+        },
+        {
+            "date": "2011-01-25T15:10:24+0000",
+            "content": "We've already made good improvements here, with stored fields & term vectors being bulk merged.\n\nPostings are still costly to merge \u2013 even on a fast machine I see merging CPU bound.  It's possible a codec could bulk-copy the postings, if eg there are no (or, not too many) deletions.  I think we can open separate issues in the future for that... ",
+            "author": "Michael McCandless",
+            "id": "comment-12986421"
+        }
+    ]
+}

@@ -1,0 +1,130 @@
+{
+    "id": "SOLR-10006",
+    "title": "Cannot do a full sync (fetchindex) if the replica can't open a searcher",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "5.3.1,                                            6.4",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "Doing a full sync or fetchindex requires an open searcher and if you can't open the searcher those operations fail.\n\nFor discussion. I've seen a situation in the field where a replica's index became corrupt. When the node was restarted, the replica tried to do a full sync but fails because the core can't open a searcher. The replica went into an endless sync/fail/sync cycle.\n\nI couldn't reproduce that exact scenario, but it's easy enough to get into a similar situation. Create a 2x2 collection and index some docs. Then stop one of the instances and go in and remove a couple of segments files and restart.\n\nThe replica stays in the \"down\" state, fine so far.\n\nManually issue a fetchindex. That fails because the replica can't open a searcher. Sure, issuing a fetchindex is abusive.... but I think it's the same underlying issue: why should we care about the state of a replica's current index when we're going to completely replace it anyway?",
+    "attachments": {
+        "SOLR-10006.patch": "https://issues.apache.org/jira/secure/attachment/12848631/SOLR-10006.patch",
+        "solr.log": "https://issues.apache.org/jira/secure/attachment/12849356/solr.log"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-19T22:30:47+0000",
+            "content": "is this fixed by SOLR-9836? ",
+            "author": "Hoss Man",
+            "id": "comment-15830721"
+        },
+        {
+            "date": "2017-01-19T23:12:35+0000",
+            "content": "No, SOLR-9836 doesn't fix this one I'm afraid. The error is:\n\n 'eoe_shard1_replica1' is not available due to init failure: Error opening new searcher\n.\n.\n.\nNoSuchFileException: /blahblahblah\n\nThe core admin APi REQUESTRECOVERY call fails with: \"Could not find core to call recovery...\"\n\nNot sure this fixable without major surgery though. And it should be rare enough that manually fixing things like this up isn't onerous. ",
+            "author": "Erick Erickson",
+            "id": "comment-15830798"
+        },
+        {
+            "date": "2017-01-19T23:43:34+0000",
+            "content": "Yeah, we should address this case.  ",
+            "author": "Mark Miller",
+            "id": "comment-15830837"
+        },
+        {
+            "date": "2017-01-20T21:46:54+0000",
+            "content": "I have a unit test that can reproduce this. I think the proper fix will be to have rethrow NoSuchFileException as CorruptIndexException (similar LUCENE-7592) and that would let the same logic from SOLR-9836 apply. ",
+            "author": "Mike Drob",
+            "id": "comment-15832454"
+        },
+        {
+            "date": "2017-01-20T21:59:34+0000",
+            "content": "Patch that adds FNFE and NSFE to rethrow as CorruptIndexException.\n\nThere might be an argument to be made for pushing the try/catch down to the various implementations of SegmentInfoFormat::read but I don't think that will be maintainable going forward.\n\nAnother option is to catch all IOExceptions in SegmentInfos::readCommit but that's a pretty wide net to include and would mask and IndexTooOldExceptions, unless we specifically exclude them. ",
+            "author": "Mike Drob",
+            "id": "comment-15832471"
+        },
+        {
+            "date": "2017-01-21T16:19:30+0000",
+            "content": "Thanks, Mike. I'll give it a spin over the weekend and report back. ",
+            "author": "Erick Erickson",
+            "id": "comment-15833046"
+        },
+        {
+            "date": "2017-01-22T04:35:36+0000",
+            "content": "This doesn't seem to handle my case. The problem is that the core is not there after restart due to core init failure. Once the failure is in the coreInitFailures, I don't think we can get back to doing much of anything with the core. It certainly doesn't recover on its own.\n\nAs a side-note, CoreAdminOperation has several operations that silently swallow exceptions, so in the situation I described where the core has an init failure, issuing a REQUESTRECOVERY fails silently. I'll raise a separate JIRA about that. ",
+            "author": "Erick Erickson",
+            "id": "comment-15833285"
+        },
+        {
+            "date": "2017-01-23T16:02:21+0000",
+            "content": "Erick - can you get me a better stack trace to work from than the one you posted earlier? If my fix doesn't take care of your issue, then I'm not sure what the problem is.\n\nSOLR-9836 needs a sysprop set to take action, -DCoreInitFailedAction=fromleader - did you make sure to set that? I will go make sure that this is on the reference guide somewhere. ",
+            "author": "Mike Drob",
+            "id": "comment-15834803"
+        },
+        {
+            "date": "2017-01-25T20:05:20+0000",
+            "content": "Mike:\n\nFirst of all thanks for looking. This is the full log file after starting, fresh trunk pull this AM. Since it's pretty short I decided to upload the whole thing.\n\nHere's what I did to make this happen:\n1> set up a 2x2 collection\n2> indexed a bunch of docs. Stupid-simple indexing, just wanted to get more than one segment. I'm not sure having more than one segment is relevant actually....\n3> shut down a follower\n4> removed a few of the segment files. Not an entire segment, just 3 files at random from a single segment. \n5> removed all the logs from the log directory.\n6> tried to start the replica. ",
+            "author": "Erick Erickson",
+            "id": "comment-15838482"
+        },
+        {
+            "date": "2017-01-25T20:30:24+0000",
+            "content": "Apparently .doc files are read at a different point than the segments and .ti files, so that's causing your exception. I can reproduce this locally and will work on a fix. ",
+            "author": "Mike Drob",
+            "id": "comment-15838523"
+        },
+        {
+            "date": "2017-01-25T21:20:10+0000",
+            "content": "New patch that fixes your specific issue, however it probably still needs a little work.\n\nFirst, we would probably want to catch EOF and FileNotFound in addition to NoSuchFile in IndexWriter.\nSecond, do we actually want to catch that at IndexWriter? There's a wide range of where we can catch and rethrow, and one could reasonably make an argument for any of them:\n\n\n\tat org.apache.lucene.store.MMapDirectory.openInput(MMapDirectory.java:238)\n\tat org.apache.lucene.store.NRTCachingDirectory.openInput(NRTCachingDirectory.java:192)\n\tat org.apache.solr.core.MetricsDirectoryFactory$MetricsDirectory.openInput(MetricsDirectoryFactory.java:334)\n\tat org.apache.lucene.codecs.lucene50.Lucene50PostingsReader.<init>(Lucene50PostingsReader.java:81)\n\tat org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat.fieldsProducer(Lucene50PostingsFormat.java:442)\n\tat org.apache.lucene.codecs.perfield.PerFieldPostingsFormat$FieldsReader.<init>(PerFieldPostingsFormat.java:292)\n\tat org.apache.lucene.codecs.perfield.PerFieldPostingsFormat.fieldsProducer(PerFieldPostingsFormat.java:372)\n\tat org.apache.lucene.index.SegmentCoreReaders.<init>(SegmentCoreReaders.java:109)\n\tat org.apache.lucene.index.SegmentReader.<init>(SegmentReader.java:74)\n\tat org.apache.lucene.index.ReadersAndUpdates.getReader(ReadersAndUpdates.java:143)\n\tat org.apache.lucene.index.ReadersAndUpdates.getReadOnlyClone(ReadersAndUpdates.java:195)\n\tat org.apache.lucene.index.StandardDirectoryReader.open(StandardDirectoryReader.java:103)\n\tat org.apache.lucene.index.IndexWriter.getReader(IndexWriter.java:473)\n\tat org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:103)\n\tat org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:79)\n\tat org.apache.solr.core.StandardIndexReaderFactory.newReader(StandardIndexReaderFactory.java:39)\n\tat org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:1958)\n\n\n\nThat might be better as a lucene discussion though? ",
+            "author": "Mike Drob",
+            "id": "comment-15838606"
+        },
+        {
+            "date": "2017-01-27T19:40:41+0000",
+            "content": "This may be funny. I claimed I \"removed random segment files\". Probably habitually removed the doc file. Siiiggggh.\n\nI suppose to be thorough I should remove one file at a time....\n\nErick ",
+            "author": "Erick Erickson",
+            "id": "comment-15843380"
+        },
+        {
+            "date": "2017-02-13T18:15:27+0000",
+            "content": "Erick - can you check this again with whatever test you ran before? I think LUCENE-7662 takes care of this with no Solr changes necessary, and my local tests pass, but want to get your confirmation before closing this out. ",
+            "author": "Mike Drob",
+            "id": "comment-15864134"
+        },
+        {
+            "date": "2017-02-13T18:47:39+0000",
+            "content": "Still fails, see the attached log for everything after I restarted the solr node that I had removed some index files from one of the cores on. This is on a fresh 6x pull in the last hour.\n\nThe take-away here is that the solr core must be restarted so there is never an open searcher on that core, perhaps your stress test isn't doing that? In this state commands appear to succeed.\n\nSo I poked a little more, here are a couple of observations:\n\n> for this scenario to fail you must restart Solr. I suspect the pre-condition here is that the searcher has never been successfully opened.\n\n> reloading the core from the admin UI silently fails with a .doc file removed. By that I mean the UI doesn't show any problems even though the log file has exceptions.\n\n> The core admin API correctly reports an error  for action=RELOAD though (curl or the like)\n\n> the admin UI still thinks the replica is active.\n\n> a search on the replica with distrib=false also succeeds, even when I set a very large start parameter, but I suspect this is a function there still being an open file handle on the file I deleted so it's \"kinda there\" until restart.\n\n> At this point (the searcher is working even thought the doc file is missing), a fetchindex doesn't think there's any work to do so \"succeeds\", i.e. it doesn't fetch from the masterUrl, here's the log messages:\n\nINFO  - 2017-02-13 18:50:57.434; [c:eoe s:shard1 r:core_node2 x:eoe_shard1_replica2] org.apache.solr.core.SolrCore; [eoe_shard1_replica2]  webapp=/solr path=/replication params=\n{masterUrl=http://localhost:8982/solr/eoe_shard1_replica1&command=fetchindex}\n status=0 QTime=0\nINFO  - 2017-02-13 18:50:57.439; [c:eoe s:shard1 r:core_node2 x:eoe_shard1_replica2] org.apache.solr.handler.IndexFetcher; Master's generation: 4\nINFO  - 2017-02-13 18:50:57.439; [c:eoe s:shard1 r:core_node2 x:eoe_shard1_replica2] org.apache.solr.handler.IndexFetcher; Master's version: 1487010762766\nINFO  - 2017-02-13 18:50:57.439; [c:eoe s:shard1 r:core_node2 x:eoe_shard1_replica2] org.apache.solr.handler.IndexFetcher; Slave's generation: 4\nINFO  - 2017-02-13 18:50:57.439; [c:eoe s:shard1 r:core_node2 x:eoe_shard1_replica2] org.apache.solr.handler.IndexFetcher; Slave's version: 1487010762766\nINFO  - 2017-02-13 18:50:57.439; [c:eoe s:shard1 r:core_node2 x:eoe_shard1_replica2] org.apache.solr.handler.IndexFetcher; Slave in sync with master. ",
+            "author": "Erick Erickson",
+            "id": "comment-15864195"
+        },
+        {
+            "date": "2017-02-14T14:39:07+0000",
+            "content": "The take-away here is that the solr core must be restarted so there is never an open searcher on that core, perhaps your stress test isn't doing that?\nGuilty.\n\nreloading the core from the admin UI silently fails with a .doc file removed. By that I mean the UI doesn't show any problems even though the log file has exceptions.\nthis might be best as a separate issue. i don't feel nearly comfortable enough with the ui to even begin to attempt to fix this.\n\nThe core admin API correctly reports an error for action=RELOAD though (curl or the like)\nGood.\n\nthe admin UI still thinks the replica is active.\na search on the replica with distrib=false also succeeds, even when I set a very large start parameter, but I suspect this is a function there still being an open file handle on the file I deleted so it's \"kinda there\" until restart.\nI'm not sure this is wrong, based on your next points. If everything is in memory, and the core can serve requests, then from the system perspective it is active. It's either the phantom file handle or everything is sitting in a cache.\n\nAt this point (the searcher is working even thought the doc file is missing), a fetchindex doesn't think there's any work to do so \"succeeds\", i.e. it doesn't fetch from the masterUrl\nmaybe we need a force=true option here? I'm not sure there is another way to do a robust check that wouldn't be incredibly slow. maybe fetchindex is a rare enough command that it's ok to be slow? ",
+            "author": "Mike Drob",
+            "id": "comment-15865865"
+        },
+        {
+            "date": "2017-02-14T15:45:28+0000",
+            "content": "MIke:\n\nAs for the admin UI, I agree that's a separate issue. No good reason to let this JIRA sprawl.\n\nAs far as the force option. I'm a little fuzzy on when it'd apply. I completely agree that adding expense to fetchindex (and by implication polling?) to handle this case isn't a good tradeoff.\n\nAre you thinking that the force would bypass the necessity of having an open searcher? Well, if it works \n\nThe scenario here is that somehow the index got corrupt and the instance got restarted. There's no way to recover the replica without bouncing the server again, and usually that would mean going into the file system and deleting the data directory. Which for some installations is prohibitively expensive, and/or requires filling out forms and the like  If we can force the fetchindex to happen on a core that's never successfully opened a searcher that's the end point I'm looking for. The rest is gravy.\n\nThanks!\nErick ",
+            "author": "Erick Erickson",
+            "id": "comment-15865990"
+        },
+        {
+            "date": "2017-02-14T16:01:08+0000",
+            "content": "Yea, I'm imagining the force option to indicate the operator saying \"yes, I know your checksums match and you think this is an unnecessary action, but do it anyway.\" Maybe bypass the searcher, not totally clear on implementation myself yet either.\n\nThe other open question to verify is whether you remembered to set the SOLR-9836 property the latest time you ran the test. If not, maybe we should have made that the default, I don't know. Regardless, we should still be able to handle things gracefully. ",
+            "author": "Mike Drob",
+            "id": "comment-15866013"
+        },
+        {
+            "date": "2018-01-08T04:04:51+0000",
+            "content": " Bah, wrong JIRA. ",
+            "author": "Erick Erickson",
+            "id": "comment-16315644"
+        }
+    ]
+}

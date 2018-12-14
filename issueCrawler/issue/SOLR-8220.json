@@ -1,0 +1,807 @@
+{
+    "id": "SOLR-8220",
+    "title": "Read field from docValues for non stored fields",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "5.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "useDocValuesAsStored\n\nMany times a value will be both stored=\"true\" and docValues=\"true\" which requires redundant data to be stored on disk. Since reading from docValues is both efficient and a common practice (facets, analytics, streaming, etc), reading values from docValues when a stored version of the field does not exist would be a valuable disk usage optimization.\n\nThe only caveat with this that I can see would be for multiValued fields as they would always be returned sorted in the docValues approach. I believe this is a fair compromise.\n\nI've done a rough implementation for this as a field transform, but I think it should live closer to where stored fields are loaded in the SolrIndexSearcher.\n\nTwo open questions/observations:\n\n1) There doesn't seem to be a standard way to read values for docValues, facets, analytics, streaming, etc, all seem to be doing their own ways, perhaps some of this logic should be centralized.\n\n2) What will the API behavior be? (Below is my proposed implementation)\n Parameters for fl:\n\n\tfl=\"docValueField\"\n\t\n\t\treturn field from docValue if the field is not stored and in docValues, if the field is stored return it from stored fields\n\t\n\t\n\tfl=\"*\"\n\t\n\t\treturn only stored fields\n\t\n\t\n\tfl=\"+\"\n\t\n\t\treturn stored fields and docValue fields\n\t\n\t\n\n\n\n2a - would be easiest implementation and might be sufficient for a first pass. 2b - is current behavior",
+    "attachments": {
+        "SOLR-8220-5x.patch": "https://issues.apache.org/jira/secure/attachment/12777612/SOLR-8220-5x.patch",
+        "SOLR-8220.patch": "https://issues.apache.org/jira/secure/attachment/12772443/SOLR-8220.patch",
+        "SOLR-8220-branch_5x.patch": "https://issues.apache.org/jira/secure/attachment/12779586/SOLR-8220-branch_5x.patch",
+        "SOLR-8220-ishan.patch": "https://issues.apache.org/jira/secure/attachment/12772654/SOLR-8220-ishan.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-10-28T01:33:38+0000",
+            "author": "Erick Erickson",
+            "content": "The only surprising behavior I see with this approach is that indexing 2.0 would return different values when returned from docValues and when returned from stored, the DV return might be something like 1.9999999999999999 or even 2.0000000000000 would be a \"surprise\".\n\nI'm not against the idea, just want this out there.\n\nAnd one side benefit that's not entirely obvious. In sharded situations, the first pass returns the candidate list ID and \"sort criteria\". The way it's written last I knew was it returned stored values, which required decompression because it gets the stored field. If all the sort fields were DV, then we wouldn't have to do this.\n\nThis can't be the complete story since you can index but not store a sort field and distributed works, but it's one path I believe I've seen. It's an open question how to wire that in to standard search for a field that's stored, and a DV field. ",
+            "id": "comment-14977537"
+        },
+        {
+            "date": "2015-10-28T02:11:52+0000",
+            "author": "Yonik Seeley",
+            "content": "reading values from docValues when a stored version of the field does not exist would be a valuable disk usage optimization.\n\n+1, and I've heard a number of users request this.\n\n1) There doesn't seem to be a standard way to read values for docValues, facets, analytics, streaming, etc, all seem to be doing their own ways, perhaps some of this logic should be centralized.\n\nSee ReturnFields / ResultContext, that's currently where stored field handling is centralized, and handles anywhere a field list (or pseudo-fields / transformers) is specified.\n\n+1 for 2a as a first pass.\nFor bonus points, prevent stored fields from being loaded at all when not needed.  This gets us a big step closer to having the normal request handler have the same performance as \"/export\".\n\nLooking beyond the first pass, it might be nice to use docValues as more of a first-class alternate \"stored\" mechanism, and consider them part of \"*\".  If for some reason it's desirable to treat some docValues fields as stored, and others not, we could introduce a flag on <field> in the schema.\n\nThe only caveat with this that I can see would be for multiValued fields as they would always be returned sorted in the docValues approach. I believe this is a fair compromise.\n\nThis shouldn't be much of a concern for approach 2a, but another future option would be to add explicit set types, and also implement list-type multi-valued docValues fields... prob using binary docValues under the covers). ",
+            "id": "comment-14977575"
+        },
+        {
+            "date": "2015-10-28T02:17:16+0000",
+            "author": "Yonik Seeley",
+            "content": "The way it's written last I knew was it returned stored values, which required decompression because it gets the stored field.\nRight, we should change this (and this issue may handle that out-of-the-box, if we chose not to store the \"id\" field).\n\nIf all the sort fields were DV, then we wouldn't have to do this.\n\nThe sort field values returned in the first phase of distributed search aren't obtained from stored field values. ",
+            "id": "comment-14977591"
+        },
+        {
+            "date": "2015-10-28T02:17:47+0000",
+            "author": "Erick Erickson",
+            "content": "I'm not talking about sorting here. The sorting during scoring certainly uses DV values.\n\nHere's the sequence (two shards, no followers, rows=10, illustrating with just the action on shard2)\n1> shard1 gets the incoming request\n2> shard1 sends a sub-request for candidate top 10 to shard2\n3> shard2 returns its candidate top 10 to shard1. This return packet has the top 10 doc IDs and sort criteria.\n4>  shard1 combines the lists of candidate top 10 docs and picks the true top 10\n5> shard1 asks shard2 for the docs that came from shard2 and made it into the sorted top 10 list.\n\nWhat I'm talking about is step <3>. Last I knew, this did not use the DV fields, but pulled the stored value thus decompressing. \n\nI'm not sure how this is resolved for fields that aren't stored, there must be a fallback. Or I'm missing something here, wouldn't be the first time. Maybe Yonik's idea of making DV fields more \"first class citizens\" would just take care of the issue entirely. ",
+            "id": "comment-14977592"
+        },
+        {
+            "date": "2015-10-28T02:26:54+0000",
+            "author": "Erick Erickson",
+            "content": "bq: The sort field values returned in the first phase of distributed search aren't obtained from stored field values.\n\nThanks, I suspect I was inappropriately generalizing from the <uniqueKey>..... Which answers how sort values get returned from non-stored fields....\n\nI suspect that practically it doesn't matter since to get a single field you have to decompress a 16K block, so getting the ID to be fetched from the DV field should be a win... ",
+            "id": "comment-14977601"
+        },
+        {
+            "date": "2015-10-28T02:27:33+0000",
+            "author": "Yonik Seeley",
+            "content": "3> shard2 returns its candidate top 10 to shard1. This return packet has the top 10 doc IDs and sort criteria.\n\nWe currently pull the sort criteria from the field comparators implementing the sort:\nhttps://github.com/apache/lucene-solr/blob/trunk/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java#L638 ",
+            "id": "comment-14977602"
+        },
+        {
+            "date": "2015-10-29T05:22:50+0000",
+            "author": "David Smiley",
+            "content": "FYI I have a patch in SOLR-5478, and I've done it without patching Solr as well using a different technique. ",
+            "id": "comment-14979837"
+        },
+        {
+            "date": "2015-10-29T13:50:01+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "+1 to doing this. I think this will be useful for SOLR-5944, and was anyway planning to split this functionality out into its own issue. Also, if we go forward with _version_ field as docvalues field, then this becomes important. In current Solr, the way to read non-stored docValues fields is to use a function query, field(mydvfield). \n\nKeith Laban Are you planning to work on this / have a patch for this? If not, then I can give it a try and have SOLR-5944 depend on it. ",
+            "id": "comment-14980449"
+        },
+        {
+            "date": "2015-10-29T14:10:05+0000",
+            "author": "Yonik Seeley",
+            "content": "+1 to doing this. I think this will be useful for SOLR-5944, and was anyway planning to split this functionality out into its own issue.\n\nAh, right, atomic updates needs this functionality as well if we are to allow docValues fields that aren't stored.\nIn that case I'll amend my previous comments around ResultContext... that's appropriate for decorating documents as they are being returned, but perhaps not low enough level for other use cases.\n\nedit: I'm basically agreeing with Keith's original observation - \"I think it should live closer to where stored fields are loaded in the SolrIndexSearcher.\" ",
+            "id": "comment-14980479"
+        },
+        {
+            "date": "2015-10-29T16:34:05+0000",
+            "author": "Keith Laban",
+            "content": "There are two approaches I can see:\n\n1) implement a new type of StoredFieldReader which is aware of field type (i.e. does it have docValues, is it stored). This reader would delegate between reading from docValues or the stored fields\n\n2) in the SolrIndexSearcher.doc function do two passes. first pass to get stored fields, a second pass to get docValues. This can go a step further to make the SetNonLazyFieldSelector aware of docValues fields and instruct the the reader to not load fields which are known to be in docValues.\n\n\nthoughts?\n\nedit: Would approach number 2 effect how fields are loaded lazyily (LazyDocument)? ",
+            "id": "comment-14980731"
+        },
+        {
+            "date": "2015-11-16T04:16:49+0000",
+            "author": "Keith Laban",
+            "content": "adding an initial attempt at this patch. What does everyone think about taking an approach like this?\n\nThis patch will decorate a document with docValue values after the stored values have been read. For now it skips multivalued fields and only reads from docValues if FL is specified and the field is not stored.\n\nSome problems I noticed with this approach are:\n\n1) LazyDocument doesn't support a notion of loading from docValues, without\nmucking around in there I can't see a way apply the docValues before caching\nbecause of various FLs.\n\n2) There is no metadata (that I can find) stored for each document that says\nwhether it has an unstored docValue field, so efficiently loading docValues\nfields based on FL=* would be difficult. The only possibly way right now is to\niterate over all schema fields looking for the viable docValue fields for each\nmatched document.\n\n3) More of a question: What kind of FieldType should be created when adding\nthese docValues to the document?\n\n\nI have an alternate patch that attempts to preload stored values from docValues\nbefore handing over to the IndexReader.  Those fields are then skipped later\non.  It passes tests, but it's not a very elegent approach. And also has\nits limitations; it only works when FL is specified and it wouldn't\nwork on the cached hit of the document if a field is loaded with LazyDocument. ",
+            "id": "comment-15006212"
+        },
+        {
+            "date": "2015-11-16T11:18:59+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Thanks for the patch, Keith. \nI couldn't apply the patch. Is this based on trunk? I saw that SolrIndexSearcher.doc() method returns StoredDocument on trunk, but it seems your patch assumes a Document.\nIf this isn't based on trunk, can you please re-work the patch and update it to trunk? Also, an SVN patch would be easier for most developers to work with. ",
+            "id": "comment-15006538"
+        },
+        {
+            "date": "2015-11-16T11:33:52+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updated your patch to trunk (svn) with no changes to your logic. I'll review it soon. ",
+            "id": "comment-15006551"
+        },
+        {
+            "date": "2015-11-16T13:44:06+0000",
+            "author": "Yonik Seeley",
+            "content": "\n2) There is no metadata (that I can find) stored for each document that says\nwhether it has an unstored docValue field, so efficiently loading docValues\nfields based on FL=* would be difficult.\n\nIn SolrIndexSearcher there is\n\n  private final FieldInfos fieldInfos;\n  private final Collection<String> fieldNames;\n\n\n\nThat gives you the full set of fields actually in-use by the index.  Useful for dealing with dynamicFields, where the names aren't explicitly listed in the schema.\n\nIn the future, perhaps we should have some meta-data about what fields each document contains. ",
+            "id": "comment-15006669"
+        },
+        {
+            "date": "2015-11-16T18:29:04+0000",
+            "author": "Keith Laban",
+            "content": "Thanks Ishan Chattopadhyaya, this is my first time submitting a patch. This was originally done against 5.3.1 in the future i'll submit it based on trunk. \n\nI also noticed that there is a bug in the patch I submited. \n\nThe line which reads \n\nif(null == sf){\n  return doc;\n}\n\n\n\nshould be\n\nif(null == sf){\n  continue;\n}\n\n\n\nYonik Seeley I think that we definitely need something like that. Currently CompressingStoredFieldsReader.visitDocument needs to visit the whole document in stored field to know which fields there are. Ideally we would 1) be able to avoid doing any work in stored fields if they can instead by read out of docValues. 2) have a mechanism for LazyDocument to know to read the lazy field from docValues instead of from stored fields. 3) know about values which aren't stored but should be read from docValues. ",
+            "id": "comment-15007068"
+        },
+        {
+            "date": "2015-11-16T18:41:30+0000",
+            "author": "Yonik Seeley",
+            "content": "1) be able to avoid doing any work in stored fields if they can instead by read out of docValues.\n\nWe should be able to do this optimization regardless?  For the fields requested, we can check the schema to see if they have docValues. ",
+            "id": "comment-15007091"
+        },
+        {
+            "date": "2015-11-16T18:43:15+0000",
+            "author": "Keith Laban",
+            "content": "I'm talking more specifically about the \"FL=*\" scenario  ",
+            "id": "comment-15007093"
+        },
+        {
+            "date": "2015-11-16T18:52:07+0000",
+            "author": "Keith Laban",
+            "content": "And for the specified FL scenario, LazyDocument assumes all the possible fields have been accounted for in the document and the not yet loaded fields have a bit offset for quick access in the future. Right now there's no way to cache a partially loaded document unless the whole stored document is visited to pre populate the lazy field with the required information.  ",
+            "id": "comment-15007107"
+        },
+        {
+            "date": "2015-11-17T05:06:46+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Here's an alternate patch (SOLR-8220-ishan.patch) for this functionality. Uses the same hooks that you've created, i.e. decorateDocValueFields(), and uses your unit tests.\n\n\tChanged the handling of single valued dv fields to have less code,\n\tAdds support for multivalued dv fields support,\n\tIn your patch, fl=*,mydvfield wasn't working. Fixed this.\n\tAdded a ~ glob, similar to *. fl= here means: return all conventional stored fields and all non stored docvalues.\n\n\n\nSome cleanup / refactoring and a few tests might be needed.\n\n1) be able to avoid doing any work in stored fields if they can instead by read out of docValues.\nGood point, this optimization would be useful. Not done in this patch, though. ",
+            "id": "comment-15008058"
+        },
+        {
+            "date": "2015-11-17T05:37:21+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updated last patch to use FieldInfos, since searcher.getSchema().getFields() doesn't have the dynamic fields. Modified the test to randomly test the fl parameter with ~ or the dv field name itself. ",
+            "id": "comment-15008090"
+        },
+        {
+            "date": "2015-11-17T08:55:09+0000",
+            "author": "Jan H\u00f8ydahl",
+            "content": "How about using fl=** as glob instead of ~? In Lucene, ~ normally indicates fuzziness of some kind, while ** in ant lingo means all items recursively... Not important though  ",
+            "id": "comment-15008302"
+        },
+        {
+            "date": "2015-11-17T09:41:58+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "** seems like a better idea than ~. I couldn't get + to work, as Keith suggested, I guess it was getting confused with a positive sign. ",
+            "id": "comment-15008382"
+        },
+        {
+            "date": "2015-11-17T17:38:33+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "My patch causes a regression with score fields, I'll look into it in a while. ",
+            "id": "comment-15009100"
+        },
+        {
+            "date": "2015-11-17T18:29:35+0000",
+            "author": "Keith Laban",
+            "content": "I see some potential issues here, mostly performance concerns:\n\n1)\n\n  if (wantsAllNonStoredDocValues) {\n    Set<String> dvFields = new HashSet<>();\n    for (int i=0; i<fieldInfos.size(); i++) {\n      if (fieldInfos.fieldInfo(i) != null && fieldInfos.fieldInfo(i).getDocValuesType() != DocValuesType.NONE) {\n        dvFields.add(fieldInfos.fieldInfo(i).name);\n      }\n    }\n    fields = dvFields;\n  }\n\n\n\nThis could potentially be very expensive to compute for every singe field for ever single document and also add unnecessary GC pressure by creating new HashSet for all the fields for every single document.\n\n2) \n\ndoc.getField(fieldName)==null\n\n \n\nthe doc fields are a list so this will be O( n ) for each lookup.\n\n3) Re multivalued fields: doing introspection for every single value for field for every document is not fast.\n\n4) \n\nSchemaField schemaField = schema.getField(fieldName);\n\n\nthis throws an exception if the field name is not in the schema (think typos in FL)\n\n5)\n\nFunctionValues values = schemaField.getType().getValueSource(schemaField, null).getValues(null, getLeafReader().getContext());\n\n\n\nThis creates a whole bunch of new objects which could be slow and cause a lot of GC pressure, although it may not be an issue.\n\n\n ",
+            "id": "comment-15009192"
+        },
+        {
+            "date": "2015-11-18T18:12:32+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Thanks for the review, Keith.\n\n1. [...] This could potentially be very expensive to compute for every singe field for ever single document and also add unnecessary GC pressure by creating new HashSet for all the fields for every single document.\n\nI was aware of this, and wanted to fix this as part of the \"cleanup / refactoring\" I promised.\n\ndoc.getField(fieldName)==null the doc fields are a list so this will be O( n ) for each lookup.\n\nI used that to ensure we're not re-adding unstored docvalues a second time to the same document. This is necessary here so that we don't re-add such fields to a document was obtained from the documentCache and already has all unstored docvalues in it. I can create a set of fields inside the StoredDocument class so that a hasField lookup can be speeded up. However, given that it is a Lucene class, I have left this be. Any suggestions?\n\n3) Re multivalued fields: doing introspection for every single value for field for every document is not fast.\n\nI think it shouldn't be a problem. In modern JVMs, the instanceof has negligible cost. However, I will do it once per multivalued field in my next patch.\n\n4) SchemaField schemaField = schema.getField(fieldName); this throws an exception if the field name is not in the schema (think typos in FL)\nIf it is a dynamic field, it will still work; a wrong field name won't work here. Shouldn't a wrong field name throw an exception, rather than silently dropping it? I am split either ways.\n\nThis creates a whole bunch of new objects which could be slow and cause a lot of GC pressure, although it may not be an issue.\nI think this creates at most only the value source object, which isn't too bad. Internally, it uses the docvalues API. ",
+            "id": "comment-15011570"
+        },
+        {
+            "date": "2015-11-18T19:29:49+0000",
+            "author": "Keith Laban",
+            "content": "I used that to ensure we're not re-adding unstored docvalues a second time to the same document. This is necessary here so that we don't re-add such fields to a document was obtained from the documentCache and already has all unstored docvalues in it. I can create a set of fields inside the StoredDocument class so that a hasField lookup can be speeded up. However, given that it is a Lucene class, I have left this be. Any suggestions?\n\nThis shouldn't be an issue since the hook is called after caching is done. This could get really expensive if you are getting a few thousand documents that have hundreds of fields. I think the real issue is how do we cache this efficiently. I think that will require modifying LazyDocument, (see my comments above)\n\nIf it is a dynamic field, it will still work; a wrong field name won't work here. Shouldn't a wrong field name throw an exception, rather than silently dropping it? I am split either ways.\n\nThis is more a backwards compat thing. What is current behavior for stored fields?\n\nI think this creates at most only the value source object, which isn't too bad. Internally, it uses the docvalues API.\n\nfor a string field, getValueSource creates a new StrFieldSource and getValues creates a new DocTermsIndexDocValues. Both of these closures add overhead especially if you're doing this hundreds of times for thousands of documents\n ",
+            "id": "comment-15011760"
+        },
+        {
+            "date": "2015-11-18T20:01:29+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "This shouldn't be an issue since the hook is called after caching is done.\nEven if this is called after the document has been added to the cache, this decorate() method changes the same doc object that has been added to the cache. And hence, next time the document is fetched from the cache, it will contain the previously decorated docvalues as part of the stored doc from the cache. \n\nI'll look at what it will take to modify the LazyDocument to make this work differently. Are you already looking into it, or have some thoughts around it?\n\nBoth of these closures add overhead especially if you're doing this hundreds of times for thousands of documents\nYes, that makes sense; I hadn't noticed the second object getting created. We should avoid this overhead if possible. ",
+            "id": "comment-15011854"
+        },
+        {
+            "date": "2015-11-18T20:26:34+0000",
+            "author": "Yonik Seeley",
+            "content": "Added a ~ glob, similar to *. fl= here means: return all conventional stored fields and all non stored docvalues.\n\nPurely from an interface perspective (I haven't looked at the code), it feels like this should be transparent.\nIt would be nice to be able to transition from an indexed+stored field to an indexed+docValues field and not have any of the clients know/care.\n\n\nfl=myfield  // returns from either stored or docValues\nfl=*_i         // returns all stored or docValues fields ending in _i\nfl=*            // returns all stored fields and all docValues fields that are not stored\n\n\n\nIf there is a need to distinguish between docValues as an alternative to a stored field, and docValues as an implementation detail that you don't want to return to the user (say you transitioned from an indexed-only field to an indexed+docValues field  or docValues-only field), then we could introduce a field flag for the schema.\nSomething like includeInStored=true/false or asStored=true/false ",
+            "id": "comment-15011884"
+        },
+        {
+            "date": "2015-11-18T20:45:23+0000",
+            "author": "Keith Laban",
+            "content": "If there is a need to distinguish between docValues as an alternative to a stored field\n\nI think this would be the case only for multi valued fields at least until we had an alternative version of docValue multi valued preserving the original field (i.e. not sorted, not set) using something like BinaryDocValues underneath as you mentioned earlier. \n\nI'll look at what it will take to modify the LazyDocument to make this work differently. Are you already looking into it, or have some thoughts around it?\n\nDoing this properly requires us to be able to know all the possibly docValue fields on a document upfront and a way for LazyDocument to be able to load the lazy field from doc values. \n\nA large goal of this should be to have the ability to skip reading stored fields altogether if the field requirement is fully satisfied by docValues. However I'm not sure if using docValues would be more efficient than stored fields when all the fields are being returned.  ",
+            "id": "comment-15011925"
+        },
+        {
+            "date": "2015-11-18T20:57:14+0000",
+            "author": "Yonik Seeley",
+            "content": "I think this would be the case only for multi valued fields at least until we had an alternative version of docValue multi valued preserving the original field (i.e. not sorted, not set) using something like BinaryDocValues underneath as you mentioned earlier.\n\nYup, I agree.  I think this is just a case of us having incomplete type support.  We need to distinguish between multiValued and setValued in general. ",
+            "id": "comment-15011950"
+        },
+        {
+            "date": "2015-11-18T21:15:48+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updated patch. This has:\n\n\tNow uses ** for returning all non-stored docvalues fields.\n\tUsing docvalues API directly for single valued fields (instead of valuesource api)\n\tFew cleanups here and there.\n\n\n ",
+            "id": "comment-15011981"
+        },
+        {
+            "date": "2015-11-18T21:34:30+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Purely from an interface perspective (I haven't looked at the code), it feels like this should be transparent.\nThat makes sense, having * return all stored and non-stored docvalues.  ",
+            "id": "comment-15012035"
+        },
+        {
+            "date": "2015-11-18T21:51:01+0000",
+            "author": "Yonik Seeley",
+            "content": "The set of fields that have docValues and are not stored can be computed once per index snapshot (from the FieldInfos+schema).\nThere should be no performance impact if there are no un-stored docValues fields in use. ",
+            "id": "comment-15012076"
+        },
+        {
+            "date": "2015-11-18T21:55:56+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "The set of fields that have docValues and are not stored can be computed once per index snapshot (from the FieldInfos+schema).\nThat is what I have done at the time of searcher creation (in SolrIndexSearcher's constructor) in my last patch. Does that sound fine? ",
+            "id": "comment-15012103"
+        },
+        {
+            "date": "2015-11-19T01:45:14+0000",
+            "author": "Yonik Seeley",
+            "content": "Does that sound fine?\n\nYep.  Seems like we will only have a perf issue when we have many sparse un-stored docValue fields.  At that point it might make sense to have a separate docValues field that contains the list of fields for the document.  That can be saved for a future optimization though. ",
+            "id": "comment-15012580"
+        },
+        {
+            "date": "2015-11-19T02:14:02+0000",
+            "author": "Erick Erickson",
+            "content": "Given that stored values are compressed in 16k blocks and to return a single field from the stored data requires decompressing 16K, how much effect do LazyDocuments really have any more? I don't know, just askin'\n\nSince docValues avoids decompressing 16k per doc, disk seeks and the like I strongly suspect that it is vastly more efficient than getting the stored values. That's how Streaming Aggregation can return on 200k-400k docs/second.\n\nAll that said, I suspect that there are negligible savings (or perhaps even costs) in mixing the two, i.e. if any field to be returned is not DV, you might as well return all the fields from the stored data.\n\nTesting would tell though. ",
+            "id": "comment-15012633"
+        },
+        {
+            "date": "2015-11-19T04:11:23+0000",
+            "author": "Keith Laban",
+            "content": "Added a patch based on Ishan Chattopadhyaya latest patch.\nneeds to be perf tested.\n\nTheoretical optimization, will skip reading from stored fields if all the requested fields are available in docValues. (changes mostly to DocStreamer)\nCaveats being:\n\n\tCannot optimize if any fields are multi valued.\n\tCannot optimize for * queries.\n\tDoes not cache the document (slower in the long run?)\n\t\n\t\tHow can we cache? using doc.getField, perhaps? or LazyDocument?\n\t\n\t\n\n ",
+            "id": "comment-15012754"
+        },
+        {
+            "date": "2015-11-19T04:34:20+0000",
+            "author": "Keith Laban",
+            "content": "reformatted patch to be svn style and cleaned up code from last update ",
+            "id": "comment-15012778"
+        },
+        {
+            "date": "2015-11-19T04:55:22+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Caveats being:\nI think we can live with those caveats for now, and optimize later. A docValues fields containing list of other docValues fields sounds nice for a later optimization. Given that this is a functional improvement, as is, over what we have today (i.e. no ability to return nonstored docValues), we should carry on with it and optimize later to address those caveats.\n\nTheoretical optimization, will skip reading from stored fields if all the requested fields are available in docValues. (changes mostly to DocStreamer)\nSounds good. It would be interesting to perf test this to measure the performance gains with doing this. ",
+            "id": "comment-15012795"
+        },
+        {
+            "date": "2015-11-19T05:24:48+0000",
+            "author": "Yonik Seeley",
+            "content": "Back in the day, LazyField actually had a pointer directly into the index where the field value could be read.\nThat got remove from Lucene at some point, and was replaced with something just for compat sake IIRC that had an N^2 bug... doc was loaded on each lazy-field access, which Hoss found/fixed.  But that leaves less performance benefit to using LazyDocument.  On a quick look, it seems to load all lazy fields at once when the first lazy field is touched.  I guess these days it's more of a memory optimization than a performance one.\n\nMight be worth considering new approaches (we can break back compat in trunk for 6.0).\nOr maybe subclass LazyDocument and do something different for docValues fields. ",
+            "id": "comment-15012826"
+        },
+        {
+            "date": "2015-11-19T11:14:53+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updated the patch with a minor one line fix in the multi-valued string field case:\n\n             doc.add(schemaField.getType().createField(schemaField, values.lookupOrd(i).utf8ToString(), 1f));\n\n\n\nFyi, since I had already copied over the multivalued fields support from SOLR-8276 patch to this patch earlier, I've made SOLR-8276 depend on this issue. So, if we fix this issue now, we'll be able to fix (a) search results with non stored docvalues, (b) RTG of documents containing non stored docvalues, (c) atomic updates of documents containing non stored docvalues (for updates to both regular fields as well as non stored docvalues). I will make SOLR-5944 depend on this now, and update the patch there. ",
+            "id": "comment-15013356"
+        },
+        {
+            "date": "2015-11-19T13:33:16+0000",
+            "author": "Keith Laban",
+            "content": "I'm not sure how this should be handled. \n\nhttps://github.com/apache/lucene-solr/blob/trunk/lucene/core/src/java/org/apache/lucene/document/Field.java#L241\n\nneeds to be modified to\n\n    if (!type.stored() && type.indexOptions() == IndexOptions.NONE && type.docValuesType() != DocValuesType.NONE) {\n      throw new IllegalArgumentException(\"it doesn't make sense to have a field that \"\n        + \"is neither indexed nor stored nor docValues\");\n    }\n\n ",
+            "id": "comment-15013542"
+        },
+        {
+            "date": "2015-11-19T13:44:03+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I think you meant a type.docValuesType() == DocValuesType.NONE. I agree, we should make the change. ",
+            "id": "comment-15013555"
+        },
+        {
+            "date": "2015-11-19T14:51:15+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\n\nfl=myfield  // returns from either stored or docValues\nfl=*_i         // returns all stored or docValues fields ending in _i\nfl=*            // returns all stored fields and all docValues fields that are not stored\n\n\nThis is a TODO. Also, need to add more tests around multivalued fields (here and in SOLR-8276).\nAs for LazyFields for non stored docvalues, I think it is an optimization that we can deal with later in a separate issue. Doing what we have in this patch itself is progress. If some committer can please take this forward, can we get this in for 5.4?\nKeith, do you wish to tackle the above TODO (and other todo items)? If so, I will focus on SOLR-5944 for now. ",
+            "id": "comment-15013633"
+        },
+        {
+            "date": "2015-11-19T15:28:52+0000",
+            "author": "Keith Laban",
+            "content": "Yonik Seeley: re. * vs **\n\nI'm all for using just one glob pattern * for both doc values and stored, however I think its worth it to consider the philosophical implications on backwards compat. While it won't break anything it does introduce some unexpected behavior without much warning or a way to disable it.\n\nI propose we add a fl.wildcardDV=true option to turn on this behavior in Solr 5x but enable it by default in 6. We can optionally later add a field type option where you can use docValues but not have the field returned in your result set. \n\n\nIshan I can tackle those.\n\nRegarding my earlier update about modifying Field, its doesn't seem as trivial as I originally thought as createField doesn't set DocValuesType there is a separate field that gets created for doc values after createField is called for the first time. I'm not sure what the implications of modifying this behavior would be. I think it's ok to leave this limitation in for now. ",
+            "id": "comment-15013699"
+        },
+        {
+            "date": "2015-11-19T16:38:52+0000",
+            "author": "Keith Laban",
+            "content": "Created SOLR-8316 for my last point ",
+            "id": "comment-15013814"
+        },
+        {
+            "date": "2015-11-19T17:08:31+0000",
+            "author": "Yonik Seeley",
+            "content": "I think you meant a type.docValuesType() == DocValuesType.NONE. I agree, we should make the change.\n\nI don't think some of the Lucene folks want docValues modeled as stored fields at the Lucene level.\n\nOne possible option is just move to something higher lievel like SolrDocument.\n\nI propose we add a fl.wildcardDV=true option to turn on this behavior in Solr 5x but enable it by default in 6.\nWe could bump the schema number to change the default, and that would enable the folks on 5x to get transparent migration from stored fields to docValues if they want w/o having to change clients / query params.\n\nAnd if finer grained control is desirable, a schema field flag actAsStored=true (or whatever better name people come up with) could have it's default set differently based on the schema version.\n ",
+            "id": "comment-15013915"
+        },
+        {
+            "date": "2015-11-20T18:42:01+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\n We are adding fields retrieved from docValues by doing the following:\n\ndoc.add(schemaField.getType().createField(schemaField, sdv.get(docid).utf8ToString(), 1.0f));\n\n\n\nthis createField call is returning null based on the code I wrote above. Perhaps we need to create fields differently, or change how createField works.\n[Referencing this comment from SOLR-8316]. Can we \"decorate\" the SolrDocument in DocStreamer instead of trying to do that with the StoredDocument from lucene? That will give us the benefits: (a) we won't need to fix SOLR-8316 (although I still don't understand how it affects the work here, since I thought the createField was doing its job and consequently the tests were passing. Maybe I'm missing something), (b) we can leave the StoredDocument as is, and not change it from under the document cache (which is probably an awkward thing with the current patch), (c) it has efficient containsKey(), if needed, so the linear O(n) cost can be avoided. Though, point b will mean we won't need containsKey() anyway.\nThis also means that SOLR-8276 will have to change, and there we will have to decorate a SolrInputDocument instead of a SolrDocument. \nKeith, Yonik, what do you think? ",
+            "id": "comment-15018489"
+        },
+        {
+            "date": "2015-11-20T20:50:40+0000",
+            "author": "Keith Laban",
+            "content": "It looks like calling createFields instead actually creates both the fields we need. \n\nI was able to change decoration to something like this\n\nSortedDocValues sdv = leafReader.getSortedDocValues(fieldName);\nfor(StorableField s: schemaField.getType().createFields(schemaField, sdv.get(docid).utf8ToString(), 1.0f)) {\n  if(s != null) doc.add(s);\n}\n\n\n\nwhich makes the the SortedDocValueField get added to the document properly, but when trying to write the string value later on it doesn't write anything because the implementation in Field doesn't know how to write a BytesRef. We can override this is in SortedDocValueField but all of that stuff is in lucene code. It looks like StrField#createFields converts the string value to a BytesRef for the constructors of the doc values fields.\n\n\nI'm still a bit confused how SOLR-8276 works for you, i get a NPE when trying pull back the non-indexed/non-stored field in the current impl. ",
+            "id": "comment-15018760"
+        },
+        {
+            "date": "2015-11-20T21:14:08+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I'm still a bit confused how SOLR-8276 works for you, i get a NPE when trying pull back the non-indexed/non-stored field in the current impl.\nI added another document (id=4) to the test at SOLR-8276. I see no problems whatsoever with string dv fields (single valued), which internally uses SortedDocValues. The test passes fine. Also, the test at BasicFunctionalityTest works fine with the test_s_dvo field. Both SOLR-8276 and the latter test use the latest patch here. So, as per the tests, the createField seems to do its job. Am I missing something?\n\nHowever, beyond this point, should we avoid using the schemaField.getType().createField() for fields in the StoredDocument (lucene) and instead do this decoration on the SolrDocument which is created from this StoredDocument? (See my comment before this one). I can try to put together a strawman patch for this approach, if you suggest, to see if it works. ",
+            "id": "comment-15018805"
+        },
+        {
+            "date": "2015-11-23T01:32:04+0000",
+            "author": "Keith Laban",
+            "content": "I changed decorateDocValueFields to operate based on a SolrDocument instead of a lucene StoredDocument and no longer relies on createField (and it now works on non-stored/non-indexed fields). Also includes a test for the non-stored/non-indexed field type.\n\nIn this patch I also removed code related to ** in favor of * for docValue related fields. Still TODO is to make this behavior only apply to a new schema version. ",
+            "id": "comment-15021333"
+        },
+        {
+            "date": "2015-11-24T22:31:34+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updating the patch with the following changes:\n\n\tSince this decorate method would be used from the RealTimeGetComponent as well, and there it will have to decorate a SolrInputDocument, I've changed the method to handle both a SolrDocument and SolrInputDocument, depending on what is sent in.\n\tThe BasicFunctionalityTest was failing for me since it depended on a field \"test_s_dv\", which didn't exist in the schema. I've added that to the schema.xml.\n\tAdded a javadoc for the decorate method.\n\n\n\nKeith, please review. If you think these changes make sense, then I'll base SOLR-8276 on this one. As you mentioned, the schema version check is still a TODO. ",
+            "id": "comment-15025584"
+        },
+        {
+            "date": "2015-11-24T23:06:41+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Just noticed, EnumFieldTest.testEnumSort() fails with the last patch (and the one before it) when the severity_dv is chosen as the enum field. I think we're handling the enum dv fields incorrectly. ",
+            "id": "comment-15025652"
+        },
+        {
+            "date": "2015-11-24T23:21:45+0000",
+            "author": "Keith Laban",
+            "content": "I'm working on a separate patch which fixes EnumField, it also adds support for \"*_dv\" type queries. I'll take a look at merging your change in too. Do you think it would be worth adding an interface for SolrDocument and SolrInputDocument to implement which includes containsKey} and {{addField ",
+            "id": "comment-15025686"
+        },
+        {
+            "date": "2015-11-25T00:06:42+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I was thinking of doing exactly that! SOLR-8339 ",
+            "id": "comment-15025770"
+        },
+        {
+            "date": "2015-11-26T15:11:35+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Guys, sorry for not paying attention to this earlier but on a quick reading through the comments and an offline conversation with Ishan, I want to point out a few things.\n\nTheoretical optimization, will skip reading from stored fields if all the requested fields are available in docValues\n\nI don't think some of the Lucene folks want docValues modeled as stored fields at the Lucene level.\n\nFrom a performance perspective, reading values from DocValues always (if they exist) can be horrible because each field access in docvalues may need a random disk seek, whereas, all stored fields for a document are kept together and need only 1 random seek and a sequential block read. That, and the fact that docvalues aren't in the document cache makes me think that we should not model docvalues as a stored field and treat them equivalently. At least not without supporting benchmarks.\n\nSo my suggestion is that we not mix the two issues i.e. keep this issue focused on adding syntactic sugar to read field from doc values for non-stored fields in whatever ways proposed. By the way, this is already possible using the 'field' DocTransformer e.g. fl=field(my_dv_field) ",
+            "id": "comment-15028962"
+        },
+        {
+            "date": "2015-11-26T16:32:36+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "So my suggestion is that we not mix the two issues\nI've created SOLR-8344 to deal with that optimization of reading stored valued fields from docvalues, so that we can focus only on the non-stored dv case (which is a functionality improvement/new feature, as opposed to an optimization).\n\nBy the way, this is already possible using the 'field' DocTransformer e.g. fl=field(my_dv_field)\nIndeed. This currently doesn't work for multivalued fields.\n\nOn a different note, if we are going to tackle only the non-stored docValues fields for now in this issue, does it now make sense to do this, performance wise, at the DocTransformer instead of the SolrIndexSearcher? If done that way, the RTG and atomic updates for such non-stored dv fields will work if we also use a doctransformer after the searcher has returned the docs. Yonik Seeley, Erick Erickson, Shalin Shekhar Mangar do you have any thoughts/recommendation, please? ",
+            "id": "comment-15029079"
+        },
+        {
+            "date": "2015-11-30T03:34:14+0000",
+            "author": "Keith Laban",
+            "content": "From a performance perspective, reading values from DocValues always (if they exist) can be horrible because each field access in docvalues may need a random disk seek, whereas, all stored fields for a document are kept together and need only 1 random seek and a sequential block read.\n\nI agree that reading values from DocValues always can be horrible, my line of thinking was that if you are asking for one or two fields from a large document and they are both dv and stored reading from dv would likely be much more efficient. It might make more sense to be able to get those values explicitly from docValues using the the transformer, or have some logic that can determine when it is more efficient. That should be discussed further in SOLR-8344.\n\nAt this point the question that remains; should we move forward with these patches and move logic for retrieving dv fields to SolrIndexSearcher, leaving out *, *_foo and other optimizations for now? i.e. retrieve fields by name, if they exist in dv, but are not stored. ",
+            "id": "comment-15031289"
+        },
+        {
+            "date": "2015-11-30T15:07:49+0000",
+            "author": "Yonik Seeley",
+            "content": "From a performance perspective, reading values from DocValues always (if they exist) can be horrible because each field access in docvalues may need a random disk seek, whereas, all stored fields for a document are kept together and need only 1 random seek and a sequential block read.\n\nA few points:\n\n\tstored fields also require decompression (more overhead)\n\tuse of stored fields and docvalues at the same time is less memory efficient - the stored fields will also take up needed disk cache (although hopefully the OS will figure out which it should cache more aggressively\n\tpresumably one has docvalues because they need to be used, and they need to be fast... i.e. they already need to be cached.\n\tif one as a small set of fields that are normally retrieved, it seems like a win again.\n\ta very common case these days is that the entire index fits in memory.\n\twe're in the SSD era, and multiple \"seeks\" will still be more expensive if not cached, but much less so (and less so over time as non-volatile storage keeps improving)\n\n\n\nIt seems like this should be a big win for the common case, and the ability to reindex your data or change config and not have to change the clients is important IMO.  It's like being able to reindex a date to a trie-date and have the clients not care.  We can already reindex a field as docValues, and sort, facet, do analytics, without changing client requests.  Optimizations to field value retrieval (or optionally removing redundantly stored data) should be the same. ",
+            "id": "comment-15031910"
+        },
+        {
+            "date": "2015-11-30T15:16:52+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "It seems like this should be a big win for the common case, and the ability to reindex your data or change config and not have to change the clients is important IMO.\n\nIt sounds like you are arguing for a common way to access docvalues and stored fields using the 'fl' parameter. I'm +1 to that.\n\nBut are you also arguing for always loading fields from docvalues even if they are stored? ",
+            "id": "comment-15031935"
+        },
+        {
+            "date": "2015-11-30T18:40:47+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "On a different note, if we are going to tackle only the non-stored docValues fields for now in this issue, does it now make sense to do this, performance wise, at the DocTransformer instead of the SolrIndexSearcher?\n\nI don't think there's any difference performance-wise. Changes to DocStreamer should be enough as it is called only for writing the response and not the entire result-set.\n\nAt this point the question that remains; should we move forward with these patches and move logic for retrieving dv fields to SolrIndexSearcher, leaving out *, *_foo and other optimizations for now? i.e. retrieve fields by name, if they exist in dv, but are not stored.\n\n+1 let's create a patch to retrieve fields by name, if they exist in dv, but are not stored. I also like Yonik's idea of bumping the schema version to have fl=* return all fields (stored + non-stored docvalues) in 5.x and to include both by default in trunk (6.x). So +1 to that as well.\n\na very common case these days is that the entire index fits in memory.\n\nI propose a middle ground. Let's use Lucene's spinning disk utility method and prefer docvalues if we detect a SSD and fallback to reading from stored fields otherwise. Let's discuss this optimization in SOLR-8344 and keep the two issues separate. ",
+            "id": "comment-15032230"
+        },
+        {
+            "date": "2015-12-01T15:29:52+0000",
+            "author": "Yonik Seeley",
+            "content": "It sounds like you are arguing for a common way to access docvalues and stored fields using the 'fl' parameter. I'm +1 to that.\n\nAh, ok... I mis-read your previous comment of \"i.e. keep this issue focused on adding syntactic sugar to read field from doc values for non-stored fields\" as advocating for new syntax for \"fl\" to load from non-stored docValue fields.\n\nLet's discuss this optimization in SOLR-8344 and keep the two issues separate.\n\nI didn't really see it as separate (it depends on how you look at it),  I see it more as, we have a new feature that treats docValues as \"column-stored\".  What should the default behavior be when all requested fields are both column-stored and row-stored? I think we can make progress + commit this issue separately, but should still come at SOLR-8344 \"fresh\" (i.e. not put the burden of proof on one default more than the other). ",
+            "id": "comment-15033868"
+        },
+        {
+            "date": "2015-12-01T15:46:04+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Agreed. Let's wrap this up. Ishan Chattopadhyaya or Keith Laban, can one of you put up an updated patch? I can review and commit. ",
+            "id": "comment-15033899"
+        },
+        {
+            "date": "2015-12-01T15:46:55+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updating the patch.\n\n\tOnly tackles non-stored docvalues.\n\tDepends on the refactoring performed at SOLR-8339.\n\n ",
+            "id": "comment-15033903"
+        },
+        {
+            "date": "2015-12-01T15:54:16+0000",
+            "author": "Keith Laban",
+            "content": "I found some issues with the way this patch works and have some updated tests in separate patch which I haven't uploaded, I need to clean it up a bit and can submit it tonight.\n\nOne issues I found is that if a document doesn't have a field value for a dv field it will get an empty value in the response, we should probably check with in the doc value api for docs with field, to make sure that that document had a value.  ",
+            "id": "comment-15033926"
+        },
+        {
+            "date": "2015-12-01T16:18:39+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Afaik, there's no way to discern if a singly valued non-stored dv field was added to the document or not, since a singly valued dv field either gets the value provided during the indexing or it picks up the default. Any suggestions how to deal with that? ",
+            "id": "comment-15033973"
+        },
+        {
+            "date": "2015-12-01T16:36:08+0000",
+            "author": "Erick Erickson",
+            "content": "Deleting, see discussion at SOLR-8344 ",
+            "id": "comment-15034013"
+        },
+        {
+            "date": "2015-12-01T16:36:57+0000",
+            "author": "Yonik Seeley",
+            "content": "For strings, an ord of -1 is \"missing\"\nFor numerics, you can use DocValues.getDocsWithField(); ",
+            "id": "comment-15034017"
+        },
+        {
+            "date": "2015-12-01T16:53:35+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "have some updated tests in separate patch which I haven't uploaded, I need to clean it up a bit and can submit it tonight.\nI've fixed the issue in this updated patch, thanks to Yonik's suggestion. Keith, looking forward to the tests. ",
+            "id": "comment-15034055"
+        },
+        {
+            "date": "2015-12-02T04:13:47+0000",
+            "author": "Keith Laban",
+            "content": "\n\tRemoved leaked in SolrBaseDocument references\n\tFixed support for EnumField (single and multi valued)\n\tFixed support for *_i type globs\n\tRemoved tests from BasicFuntionalityTests and moved them to a new test class along with its own test schema.\n\tAdded more robust testing including multivalued field testing\n\n ",
+            "id": "comment-15035235"
+        },
+        {
+            "date": "2015-12-02T04:15:55+0000",
+            "author": "Keith Laban",
+            "content": "This still needs work around bumping the schema version, this impl changes the default behavior for globs ",
+            "id": "comment-15035238"
+        },
+        {
+            "date": "2015-12-02T04:42:42+0000",
+            "author": "Keith Laban",
+            "content": "Crushed one more bug with multivalued fields being added on docs without that value and a test for it ",
+            "id": "comment-15035256"
+        },
+        {
+            "date": "2015-12-02T05:13:01+0000",
+            "author": "Keith Laban",
+            "content": "One more patch.. It looks like at some point the logic for onlyPseudoFields was modified to something that may not work, so reverting that line back to the original. ",
+            "id": "comment-15035288"
+        },
+        {
+            "date": "2015-12-02T12:14:42+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Looks good, Keith. I was wondering why you chose to name the test file and the schema file as \"TestStoredDocValues\" and \"schema-stored-docvalues.xml\", whereas we are dealing with only non-stored docvalues in this issue?\n\nI've updated the patch to now check for the schema version to be >=1.6. Please review, and feel free to refactor further. We'll have to add a test (using a schema version < 1.6) to ensure backcompat behaviour is not broken. ",
+            "id": "comment-15035704"
+        },
+        {
+            "date": "2015-12-02T12:21:16+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Removed leaked in SolrBaseDocument references\nThe intention of using SolrDocumentBase, instead of SolrDocument, was so that SOLR-8276 can use the same decorate method on a SolrInputDocument. I've re-added the SolrDocumentBase reference, which is implemented in SOLR-8339. Please apply SOLR-8339 first, and then apply/work with this patch. ",
+            "id": "comment-15035712"
+        },
+        {
+            "date": "2015-12-02T17:16:04+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I've updated the patch to now check for the schema version to be >=1.6\nIn the patch, I did some clumsy >= check for a float. Would've been better to just check for > 1.5. I'll fix it with the next patch.\nI'm working on bumping up the version of the schema for the out of the box configsets. ",
+            "id": "comment-15036165"
+        },
+        {
+            "date": "2015-12-02T17:38:17+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I've updated the patch to now check for the schema version to be >=1.6\nAs per an offline discussion with Hoss Man, he mentioned that in the past we've never tied runtime behaviour with specific schema versions. He suggested, as did Yonik above I think, that we use some attribute like docValueAsIfStored=true/false (with a default of false for previous schema versions).\nI'll try to tackle this and update the patch, and drop the naive check for schema version. ",
+            "id": "comment-15036219"
+        },
+        {
+            "date": "2015-12-03T00:48:12+0000",
+            "author": "Keith Laban",
+            "content": "My only concern is that we may have to add a flag for this and for whatever we decide in SOLR-8344 which is just going to add to he confusion. Thoughts? ",
+            "id": "comment-15036972"
+        },
+        {
+            "date": "2015-12-14T05:37:27+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updating the patch to bump the version up to 1.6.\n\n\tRenamed Keith's TestStoredDocValues to TestNonStoredDocValues. Renamed the corresponding schema file too.\n\tAdds useDocValuesAsStored parameter (true/false) to schema file. It defaults to true >= 1.6 version of schema.\n\tChanging all 1.5 version schema files (test and examples) to 1.6. This will help catch bugs/unexpected behaviour.\n\n\n\nThe patch is failing a few tests with very poor error reporting. Here's a reproducible failure after applying this patch:\nTest suite: TestManagedSchemaDynamicFieldResource, Seed: -Dtests.seed=C0DE559FF2A0799\nLooking into the failure. ",
+            "id": "comment-15055436"
+        },
+        {
+            "date": "2015-12-14T06:48:25+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\nThe patch is failing a few tests with very poor error reporting. Here's a reproducible failure after applying this patch:\nTest suite: TestManagedSchemaDynamicFieldResource, Seed: -Dtests.seed=C0DE559FF2A0799\nLooking into the failure.\nIt seems this test fails even without the patch. Filed SOLR-8411 for this. However, with this patch, still 5-6 tests fail. But I've so far been unable to reproduce any of them. ",
+            "id": "comment-15055523"
+        },
+        {
+            "date": "2015-12-14T23:32:07+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "It seems the failures on trunk were unrelated to this patch, and possibly related to the Jetty upgrade to 9.3. To verify this, I ported the patch to branch5x (attached the patch) and it passes all tests.\n\nTODO: Make sure managed schema can handle the newly added useDocValuesAsStored parameter in the schema (test for persistence across edits to managed schema).\n\nApart from the TODO item, can Keith Laban and Shalin Shekhar Mangar please review the patch (the trunk one)?\n\nMy only concern is that we may have to add a flag for this and for whatever we decide in SOLR-8344 which is just going to add to he confusion. Thoughts?\nI think the useDocValuesAsStored parameter in the schema is generically named enough to be reused for SOLR-8344, if needed. For more fine-grained per-field control, we can introduce another parameter if needed. We can discuss that in SOLR-8344 itself. ",
+            "id": "comment-15056973"
+        },
+        {
+            "date": "2015-12-15T04:07:04+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updated the patch.\n\nTODO: Make sure managed schema can handle the newly added useDocValuesAsStored parameter in the schema (test for persistence across edits to managed schema).\n\nAdded support for writing back (persisting) of this flag when used with managed schema. ",
+            "id": "comment-15057310"
+        },
+        {
+            "date": "2015-12-15T15:01:10+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Hi Ishan, you have misunderstood the \"useDocValuesAsStored\" parameter. It is supposed to be per-field and not on the entire schema so that you can selectively disable it on fields that you don't want to be treated as if they were stored. ",
+            "id": "comment-15058168"
+        },
+        {
+            "date": "2015-12-17T01:49:51+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updated the patch to have the useDocValuesAsStored attribute on a per field basis (instead of being at schema's top level). ",
+            "id": "comment-15061305"
+        },
+        {
+            "date": "2015-12-17T06:36:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Ishan.\n\n\n\tThe SolrIndexSearcher.decorateDocValueFields method has a honourUseDVsAsStoredFlag which is always true. We can remove it?\n\tSame for SolrIndexSearcher.getNonStoredDocValuesFieldNames?\n\tThe wantsAllFields flag added to SolrIndexSearcher.doc doesn't seem necessary. I guess it was added because the patch adds non stored doc values fields to the 'fnames' but if we can separate out stored fnames from the non-stored doc values to be returned then we can remove this param from both SolrIndexSearcher.doc and SolrIndexSearcher.getNonStoredDocValuesFieldNames\n\tThe pattern matching in the DocStreamer constructor makes a bit nervous. Where is the pattern matching done for current stored fields?\n\tThe conditional logic in SolrIndexSearcher.decorateDocValueFields for multi-valued fields is too complicated! Can we please simplify this?\n\n ",
+            "id": "comment-15061581"
+        },
+        {
+            "date": "2015-12-18T09:01:09+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Thanks for your review, Shalin. I've updated the patch to address your suggestions.\n\nThe SolrIndexSearcher.decorateDocValueFields method has a honourUseDVsAsStoredFlag which is always true. We can remove it?\nSame for SolrIndexSearcher.getNonStoredDocValuesFieldNames?\n\nRefactored the decorateDocValues() a bit to not send in wantsAllFields flag to the method and to handle it at the DocsStreamer itself. Hence, now, the decorateDocValues() method takes in only the field names it needs to do anything about; the filtering for non-stored dvs is taken care of at DocsStreamer.next() itself. \n\nSince, for the fl=* case, we need all non-stored DVs that have useDocValuesAsStored=true, but for the general filtering case of fl=dv1,dv2 we need to filter using all non-stored DVs (irrespective of the useDocValuesAsStored flag), I've retained this true/false logic in the getNonStoredDocValuesFieldNames() method. Renamed that method, however, to call it getNonStoredDVs(boolean onlyUseDocValuesAsStored) and added a clear javadoc to this effect.\n\n\nThe wantsAllFields flag added to SolrIndexSearcher.doc doesn't seem necessary. I guess it was added because the patch adds non stored doc values fields to the 'fnames' but if we can separate out stored fnames from the non-stored doc values to be returned then we can remove this param from both SolrIndexSearcher.doc and SolrIndexSearcher.getNonStoredDocValuesFieldNames\nI think the original motivation was to deal with cases fl=*,nonstoredDv1. Here, the idea initially was that * returns all stored fields, and nonstoredDv1 is added to it. But now, since * takes care of all stored and non-stored dvs, this logic isn't needed. So, this wantsAllFields flag was a left over from a previous patch which I've now removed.\n\nThe pattern matching in the DocStreamer constructor makes a bit nervous. Where is the pattern matching done for current stored fields?\nKeith can weigh in on this better. However, I had a look, and found that responseWriters (e.g. JSONResponseWriter) get the whole SolrDocument at the writeSolrDocument() method, from where it does the following call to drop fields it doesn't need:\n\n    for (String fname : doc.getFieldNames()) {\n      if (returnFields!= null && !returnFields.wantsField(fname)) {\n        continue;\n      }\n\n\nThis wantsField() call uses wildcard handling.\nSo, reviewing this information, it seems like our handling of this at the DocsStreamer is fine here. It doesn't look costly to me, since it is performed only when fl has a pattern, and that pattern is checked against only non-stored DVs. Do you think there's something better that can be done which I'm missing?\n\nThe conditional logic in SolrIndexSearcher.decorateDocValueFields for multi-valued fields is too complicated! Can we please simplify this?\nMade it simpler.  ",
+            "id": "comment-15063717"
+        },
+        {
+            "date": "2015-12-18T09:16:23+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Btw, just found out that not all query paths actually use a DocsStreamer. I am checking as to what this could be down to.\nEDIT: Sorry, I was seeing ghosts. Was trying this from the admin UI, but I hadn't set the breakpoint properly. ",
+            "id": "comment-15063741"
+        },
+        {
+            "date": "2015-12-22T05:14:50+0000",
+            "author": "Erick Erickson",
+            "content": "WARNING: I'm stealing this code and back-porting to 4.x for my own purposes so this may not pertain to 5x. And I'm not very up on the low-level details.\n\nBut this loop for reading multiValued fields puts all the multivalued fields for all the docs on the shard into each doc:\n\n\nif (values != null && DocValues.getDocsWithField(atomicReader, fieldName).get(docid)) {\n    values.setDocument(docid);\n    if (values.getValueCount() > 0) {\n              List<Object> outValues = new LinkedList<Object>();\n              for (int i = 0; i < values.getValueCount(); i++) { // Iterates more than just this doc, I think all of them!\n        \n\n\n\nI had more luck with \n\n          if (values != null) {\n            values.setDocument(docid);\n            List<Object> outValues = new LinkedList<Object>();\n            for (int ord = (int) values.nextOrd(); ord != SortedSetDocValues.NO_MORE_ORDS; ord = (int) values.nextOrd()) {\n\n\n\nNote that I also think this is unnecessary in the if test, the loop above doesn't do anything bad if there are docs with empty fields: \n\nDocValues.getDocsWithField(atomicReader, fieldName).get(docid)\n\n\n\nI changed it to just if (values != null). But I did have to test outValues.size() > 0  before doing the addField after the loop or I got empty braces in the output doc.\n\nAgain let me emphasize that \n1> I don't know this code well, so take this with a grain of salt\n2> I needed this for a one-off on the 4.x code line and this may work with 5x just fine as-is. Needless to say what I'm doing will never make into the official project....\n\nBut this saved me a TON of work, glad you're tackling this! ",
+            "id": "comment-15067566"
+        },
+        {
+            "date": "2015-12-22T12:07:50+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Ishan.\n\nSince, for the fl=* case, we need all non-stored DVs that have useDocValuesAsStored=true, but for the general filtering case of fl=dv1,dv2 we need to filter using all non-stored DVs (irrespective of the useDocValuesAsStored flag)\n\nOkay I see what you are saying. The useDocValuesAsStored=true default applies when you request all fields but if you are explicitly asking for a field then we can return it from DVs even if it was marked as useDocValuesAsStored=false. I have mixed feelings about this but I can see where it can be useful e.g. 1st phase of distributed search.\n\n. However, I had a look, and found that responseWriters (e.g. JSONResponseWriter) get the whole SolrDocument at the writeSolrDocument() method, from where it does the following call to drop fields it doesn't need\n\nHmm, yeah, we can't do that with doc values, it'd be too expensive.\n\nIs there a test which creates a new field with useDocValuesAsStored as true and separately as false using the schema API? I'm assuming you will address Erick's concern above about multi-valued fields. ",
+            "id": "comment-15068027"
+        },
+        {
+            "date": "2015-12-22T12:59:21+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Is there a test which creates a new field with useDocValuesAsStored as true and separately as false using the schema API?\nI had added SchemaVersionSpecificBehaviorTest to test for these various true/false cases. However, there is no useDocValuesAsStored=false case with checking of output. I'll add such a test.\n\nI'm assuming you will address Erick's concern above about multi-valued fields.\nI'm working through them. So far as I can see, both the current loop with values.getValueCount() and what Erick suggested as a loop are running identically, i.e values.getValueCount() is indeed returning the count of values per document. But I am adding a test to prove it.\n\nFor the DocValues.getDocsWithField(atomicReader, fieldName).get(docid), not having it was resulting in empty fields being returned for documents that weren't supposed to have an docValue (the user never added a docValue for that document during indexing). Again, I think I should add a specific test for that, testing for the number of fields returned (maybe there already is one from Keith, but I'll check again). ",
+            "id": "comment-15068075"
+        },
+        {
+            "date": "2015-12-22T16:10:29+0000",
+            "author": "Erick Erickson",
+            "content": "bq: For the DocValues.getDocsWithField(atomicReader, fieldName).get(docid), not having it was resulting in empty fields being returned for documents that weren't supposed to have an docValue (the user never added a docValue for that document during indexing).\n\nRight, I had to add a test at the end to avoid that. I didn't track the code thoroughly, but does the DocValues.getDocsWithField allocate a BitSet or just return a pre-existing instance? Or even cache the BitSet somewhere? If it allocates a new BitSet (or even fills up a cache entry), the test at the end might be much less expensive. I didn't track it down though, and if it returns a reference to a cached bitset that will be created anyway, then it's just a style thing....\n\n\n if (outValues.size() > 0) {\n   sdoc.addField()....\n}\n\n\n\nAs for whether the loop returns all values in the field, I saw this \"by inspection\" on the techproducts example (with a few mods for adding docValues=\"true\" to the schema). Again, though, this is 4.x after I hacked a backport and put it in an entirely different place in the code, specifically NOT a visitor pattern. So it's entirely possible that the semantics have changed or hacking it into a different part of the code base has a different context.  A test would settle it for all time though. ",
+            "id": "comment-15068319"
+        },
+        {
+            "date": "2015-12-23T15:02:23+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Added tests for the previous two scenarios.\n@Erick, thanks for the catch, the values.getValueCount() wasn't working indeed, and only after adding the test for it could I catch it.\n\nShalin, Erick, please review this latest patch. Thanks. ",
+            "id": "comment-15069706"
+        },
+        {
+            "date": "2015-12-23T19:06:35+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "does the DocValues.getDocsWithField allocate a BitSet or just return a pre-existing instance\nWhile I tried to track it down, I thought it is backed by a pre-existing bitset instance, as created at the leaf reader level. I didn't think it was a performance concern. Could someone confirm this understanding, please? Moreover, since Yonik suggested its use, I was more confident about using it. ",
+            "id": "comment-15070052"
+        },
+        {
+            "date": "2015-12-24T04:46:01+0000",
+            "author": "Erick Erickson",
+            "content": "LGTM as far as not returning all the DV values with each doc.\n ",
+            "id": "comment-15070581"
+        },
+        {
+            "date": "2015-12-24T14:12:32+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Changes:\n\n\tDocStreamer calculates dv fields to return in the constructor for every scenario instead of doing conditional logic and set intersection in next(). Also uses HashSet instead of Treeset (we don't care about order)\n\tRenamed nonStoredDVs in SolrIndexSearcher to allNonStoredDVs\n\tAdded simple javadocs describing allNonStoredDVs and nonStoredDVsUsedAsStored\n\tReformatted new code according to the project code style\n\tFixed formatting in schema-nonstored-docvalues.xml which failed precommit (tabs instead of spaces)\n\tAdded a basic sanity test in TestUseDocValuesAsStored.testNonStoredDocValueFieldsOnEmptyIndex to assert that no exceptions are thrown on unknown fields with various fl combinations.\n\n\n\nIshan, can you please add a test which uses the schema API to add/modify a field with the useDocValuesAsStored parameter set to true (default), explicitly false and then true again? ",
+            "id": "comment-15071044"
+        },
+        {
+            "date": "2015-12-24T14:13:21+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "With the right patch this time. ",
+            "id": "comment-15071046"
+        },
+        {
+            "date": "2015-12-24T14:33:49+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tAdded a null check in DocStreamer so that we do not try to decorate dv fields if none are required\n\tDeletes all docs in testNonStoredDocValueFieldsOnEmptyIndex before running any test\n\n ",
+            "id": "comment-15071059"
+        },
+        {
+            "date": "2015-12-24T19:09:32+0000",
+            "author": "Erick Erickson",
+            "content": "When we do the docs, we do need to include a warning about ordering. multiValued fields are returned in sorted order when returned from DV fields, not the original order, right?\n\nUp until now, we've promised that multiValued fields are returned in the same order they were inserted into the document so two MV fields can be treated like parallel arrays. This will not be true of DV fields that are multiValued, correct?\n\nSuggested text would be something like:\n\n\"Returning stored fields from docValues (default in schema versions 1.6+) returns multiValued fields in sorted order. If you require the older behavior of multiValued fields being returned in the original insertion order, set useDocValuesAsStored=\"false\" for the individual fields or make sure your schema version is < 1.6. This does not require re-indexing.\"\n ",
+            "id": "comment-15071193"
+        },
+        {
+            "date": "2015-12-25T07:26:08+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Ishan, can you please add a test which uses the schema API to add/modify a field with the useDocValuesAsStored parameter set to true (default), explicitly false and then true again?\n\nAdded two extra tests:\n\n\tTestUseDocValuesAsStored.testManagedSchema() for testing with managed schema.\n\tTestUseDocValuesAsStored2 suite for testing with Schema API.\n\n\n\nAlso, renamed the test methods in TestUseDocValuesAsStored to shorter/simpler names. ",
+            "id": "comment-15071393"
+        },
+        {
+            "date": "2015-12-25T07:35:44+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Erick, this patch (8220) returns DVs only for non-stored fields. So, before this change, the users had no way of returning their multivalued non-stored fields (even field() didn't work). However, your suggested text (as is) is spot on once we have this and 8344 in. \n\nFor this issue, I think we should document this caveat to suggest that if insertion order for multivalued fields is important for you, then have your field stored=true (and that this work is not for you). ",
+            "id": "comment-15071395"
+        },
+        {
+            "date": "2015-12-25T08:25:58+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Improved Ishan's new managed schema test to actually add documents and assert query responses in different scenarios.\n\nJust to recap, following is the behavior of \"fl\" with doc value fields with the latest patch:\n\n\tAll doc value fields in schema version 1.6 are useDocValuesAsStored=true by default\n\tfl=`*` will return all stored=true and useDocValuesAsStored=true fields\n\tfl=`,a1` will return all stored=true and useDocValuesAsStored=true fields. If the 'a1' field is useDocValuesAsStored=false then it will *NOT be returned even though it was explicitly asked for.\n\tfl=`a*` will match the specified pattern against only stored=true and useDocValuesAsStored=true fields.\n\tfl=`a1` will return a1 as long as it is stored=true or docValues=true (i.e. useDocValuesAsStored does not matter if a field is explicitly requested)\n\n ",
+            "id": "comment-15071421"
+        },
+        {
+            "date": "2015-12-25T09:53:43+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Updating the patch:\n\n\tSolrIndexSearcher's getNonStoredDVs() method now returns unmodifiable sets of field names\n\tAdded another method in ReturnFields and SolrReturnFields which returns the additionally requested field names, irrespective of a wantsAll (*) being present in the fl=. This is an overloaded getLuceneFieldNames() with a boolean parameter to \"ignoreWantsAll\". Is there something better we can name it to?\n\tNow fl=*,a3 case also returns a3, irrespective of whether a3 has useDocValuesAsStored. (This change was made in DocsStreamer's constructor, under:\n\n    // add non-stored DV fields that may have been requested\n    if (rctx.getReturnFields().wantsAllFields())  {\n\n\n\n\n\nShalin Shekhar Mangar Please feel free to drop changes for points 2, 3, if you think this doesn't make sense from a usecase point of view. ",
+            "id": "comment-15071474"
+        },
+        {
+            "date": "2015-12-25T10:34:54+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Added a code comment to the previous patch. Plus very minor cleanup at DocsStreamer's constructor. ",
+            "id": "comment-15071496"
+        },
+        {
+            "date": "2015-12-27T08:33:41+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Ishan.\n\nChanges:\n\n\tCreate unmodifiable map in SolrIndexSearcher's constructor so that we don't create unmodifiable instances on every call to SolrIndexSearcher.getNonStoredDVs\n\tFixed javadocs for ReturnFields.getLuceneFieldNames to note that it can return null even if ignoreWantsAll=true\n\tOptimized field selection in DocsStreamer to create fewer objects. We iterate over requested field names and do intersection in the loop.\n\n ",
+            "id": "comment-15072092"
+        },
+        {
+            "date": "2015-12-27T09:00:18+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tRemoved extra license header in schema-non-stored-docvalues.xml which failed the parsing\n\tFixed the code comment in TestUseDocValuesAsStored2.java that is no longer valid now that we return useDocValuesAsStored=false field if they are explicitly requested in addition to all fields.\n\n\n\nI'll commit this shortly. ",
+            "id": "comment-15072094"
+        },
+        {
+            "date": "2015-12-27T10:04:42+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "+1, LGTM. ",
+            "id": "comment-15072112"
+        },
+        {
+            "date": "2015-12-27T10:27:02+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1721795 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1721795 ]\n\nSOLR-8220: Read field from DocValues for non stored fields ",
+            "id": "comment-15072115"
+        },
+        {
+            "date": "2015-12-27T10:49:13+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Thanks Shalin Shekhar Mangar for your commit, and Keith, Yonik and Erick for your inputs.\n\nI suggest we change:\n\n\n+  Also note that returning stored fields from docValues (default in schema versions 1.6+) returns multiValued\n+  fields in sorted order. If you require the older behavior of multiValued fields being returned in the\n+  original insertion order, set useDocValuesAsStored=\"false\" for the individual fields or make\n+  sure your schema version is < 1.6. This does not require re-indexing.\n+  See SOLR-8220 for more details.\n\n\n\nto \n\n\n+  Also note that while returning non-stored fields from docValues (default in schema versions 1.6+, unless useDocValuesAsStored is false), the values of a multi-valued\n+  field are returned in sorted order. If you require the multi-valued fields to be returned in the\n+  original insertion order, then make your multi-valued field as stored. This requires re-indexing.\n+  See SOLR-8220 for more details.\n \n\n\nI think the first text block is relevant once SOLR-8344 goes in. In this issue, we're just introducing new behaviour of returning non-stored values from DVs. ",
+            "id": "comment-15072116"
+        },
+        {
+            "date": "2015-12-27T12:35:31+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1721808 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1721808 ]\n\nSOLR-8220: Improve upgrade notes in CHANGES.txt ",
+            "id": "comment-15072140"
+        },
+        {
+            "date": "2015-12-27T16:11:46+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Patch for branch_5x. ",
+            "id": "comment-15072178"
+        },
+        {
+            "date": "2015-12-27T16:25:38+0000",
+            "author": "David Smiley",
+            "content": "I've been following this since inception with passing interest and wish I had the time this holiday to comment before Shalin committing.  Based on Shalin's summary a couple days ago, fl=* will return these doc-values only fields that have useDocValuesAsStored=true, and it will be true by default going forward.  My only concern with this is that it's common-place to index an original input value of text 2 ways \u2013 one for keyword search (marked stored as well), and another copyField target that isn't stored, isn't indexed, but has docValues for faceting or sorting.  Now, this value will be returned twice from fl=*.  Granted the user could set useDocValuesAsStored=false on these fields, and that's not a big deal to do so nor a big deal to forget to do so.  Is this not lost on Ishan & Shalin who are putting the work into this issue or is this just a recognized trade-off?  It didn't have to be this way.  It could have designed such that fl=* is only for stored fields and those explicitly setting useDocValuesAsStored=true. ",
+            "id": "comment-15072182"
+        },
+        {
+            "date": "2015-12-27T16:46:33+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "David, do you think having the copyField targets to have useDocValuesAsStored as false in our example schemas partly alleviates the problem? \n\nIn fact, I was planning to open another issue to add a few more dynamic field types that have stored=false, docValues=true in the example schemas. I can add this change to copyFields too, if it makes sense.\n\nOr, rather, do you prefer useDocValuesAsStored to be false by default and turned on on-demand? I think that will make adoption harder, and make it harder for us (or iow more of an abrupt change for user) to get rid of stored fields (even if it makes sense performance wise some day). Having this as the default now (i.e. useDocValuesAsStored=true) would make the transition less abrupt. What do you think? ",
+            "id": "comment-15072185"
+        },
+        {
+            "date": "2015-12-27T20:31:45+0000",
+            "author": "David Smiley",
+            "content": "Rule #5 is very surprising to me, as it seems to conflict with #3 in that it ignores useDocValuesAsStored. What is the rationale?  If the field is both Stored And DV then from where is it returned?  I REALLY hope not DV since it then wouldn't respect value ordering.  ",
+            "id": "comment-15072233"
+        },
+        {
+            "date": "2015-12-27T20:39:43+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "The idea is that if you have explicitly asked for that field then we find a way to return it, if possible. If it is both stored and DV then it returns from stored. ",
+            "id": "comment-15072234"
+        },
+        {
+            "date": "2015-12-27T20:48:00+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "It didn't have to be this way. It could have designed such that fl=* is only for stored fields and those explicitly setting useDocValuesAsStored=true.\n\nLet me take a step back. The way I think about useDocValuesAsStored is that it gives a hint to Solr that this field can be retrieved from DocValues. But that doesn't necessarily mean that we will always retrieve it from DocValues. Later, in SOLR-8344 we will implement some heuristics to choose whether to retrieve from stored or from DV if both are enabled.\n\nSo, by making useDocValuesAsStored=true as default, we don't tie our hands in SOLR-8344 and we'd be free to choose as we desire. But if the user wants a field to never be automatically retrieved from DocValues then he can set useDocValuesAsStored=false. Keep in mind that this is only for automatic selection and if the user wants to explicitly retrieve a field by specifying its full name (no globbing) in the 'fl' parameter then we respect his/her wishes and retrieve from DV if necessary.\n\nMaybe useDocValuesAsStored is a bad name and 'autoDocValuesAsStored' conveys the meaning better? ",
+            "id": "comment-15072241"
+        },
+        {
+            "date": "2015-12-27T20:52:47+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1721844 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1721844 ]\n\nSOLR-8220: Read field from DocValues for non stored fields ",
+            "id": "comment-15072243"
+        },
+        {
+            "date": "2015-12-27T20:58:31+0000",
+            "author": "David Smiley",
+            "content": "Ok then Rule #5 makes perfect sense to me. #3 is questionable to me; hard to clearly explain the rules to someone.  So useDocValuesAsStored is only considered when FL contains an asterisk?  If so, I wonder if it should be named to reflect that somehow. Like \"flWildcard\". With a name like that, it would be useful to set to false on a stored field.  ",
+            "id": "comment-15072244"
+        },
+        {
+            "date": "2015-12-27T21:14:43+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "#3 was fixed in later patches. In the committed code, if you request a field explicitly then it will be returned either from stored or from DV. ",
+            "id": "comment-15072246"
+        },
+        {
+            "date": "2015-12-27T21:23:32+0000",
+            "author": "David Smiley",
+            "content": "How about two Boolean settings:\n\n\tmatchesFlGlob defaults to whatever stored is. Very straight forward to describe; no special exceptions. Useful to set to either true or false in different circumstances depending if it's stored or DV. This would be a separate issue.\n\tautoDocValuesAsStored defaults to whatever docValues is.  I'm not sure how to define it honestly other than to say it doesn't have to do with fl globbing. Maybe it could prevent fl choosing the field even if explicitly ?\n\n ",
+            "id": "comment-15072249"
+        },
+        {
+            "date": "2015-12-27T23:10:03+0000",
+            "author": "Yonik Seeley",
+            "content": "copyField target that isn't stored, isn't indexed, but has docValues for faceting or sorting.\n\nGoing forward, why wouldn't one just use docValues on the original field?\nAnyway the copyField thing presents ambiguities for atomic updates as well... it's not specific to \"fl\".  Whatever we support for that can be used for \"fl\" as well (for instance, determinging that the copyField target isn't a \"real\" field because the source is already stored/docValued or something).\n\nIt seems like going forward, people will benefit by adjusting their mental model to \"it's just a different way of storing... row stored or column stored.\"  To a new user, why would one not get all stored fields back?  If column stored option had been present in Lucene from the start, that's probably how it would have been implemented in Solr from the start. ",
+            "id": "comment-15072281"
+        },
+        {
+            "date": "2015-12-28T02:38:48+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "matchesFlGlob defaults to whatever stored is. Very straight forward to describe; no special exceptions. Useful to set to either true or false in different circumstances depending if it's stored or DV. This would be a separate issue.\n\nI don't think we need that level of configurability? Keep in mind that every parameter that we add also needs to be explained to a new user. Having trained people on Solr, explaining the difference between stored/indexed/docvalues is confusing enough. We should avoid adding more complexity if we can. This is another reason why I wanted useDocValuesAsStored to be true by default and un-specified/hidden in all default schemas.\n\nAlso I don't really understand your reasons for adding such a parameter. Globbing is allowed on doc values field as long as useDocValuesAsStored=true. In the committed patch, you can do fl=a,b,c,d* and have d* match all docvalues fields which are useDocValuesAsStored=true. But if you set useDocValuesAsStored=false then globbing will not work. What am I missing? ",
+            "id": "comment-15072357"
+        },
+        {
+            "date": "2015-12-28T04:05:43+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Right, in the last patch from me (and maybe the second last too) [0], I introduced returning any additional fields with * even if those additional fields are non-stored DVs with useDocValuesAsStored=false. Hence, Shalin's point 3 now should read something like:\n\n\n3. fl=*,a1 will return all stored=true fields and useDocValuesAsStored=true DV fields. If the 'a1' field is a stored=false DV field with useDocValuesAsStored=false then it will also be returned because it was explicitly asked for.\n\n[0] - https://issues.apache.org/jira/browse/SOLR-8220?focusedCommentId=15071474&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15071474 ",
+            "id": "comment-15072397"
+        },
+        {
+            "date": "2015-12-28T05:11:33+0000",
+            "author": "David Smiley",
+            "content": "(Yonik) Going forward, why wouldn't one just use docValues on the original field?\n\nThe main reason is that for returning the top-X docs with more than a few fields, row storage will probably be faster than columnar storage, performance-wise.  So at index time you can pay for both if you need columnar for other reasons (sorting/faceting).  Another reason is to retain a particular ordering for multi-valued fields.  Another reason is that Solr's highlighters don't read from docValues (solvable).\n\n(Ishan) David, do you think having the copyField targets to have useDocValuesAsStored as false in our example schemas partly alleviates the problem?\n\nYes, we should do that.  Ideally most users wouldn't want to monkey with such parameters (IMO).  But most schemas I've seen have at least one occurrence of an original input string indexed two ways for search & sorting/faceting.  And if our example schemas do, thus motivating us to set it to false for these fields, it just re-confirms my point.\n\nShalin: I very much care about ease of documenting/explaining this; I thought my comments showed I care.  I guess we just see this issue differently.  I'm coming around to a new interpretation of what useDocValuesAsStored is, as it was committed and today clarified by you and Ishan.  It basically means will a 'fl' glob match the DV field or not.  If my understanding is true, then I think this is evidence I'm on to something with my \"matchesFlGlob\" suggestion.  You are free to disagree but I think it's extremely easy to document/describe/teach etc. what matchesFlGlob means, particularly if it's scope is expanded to apply to stored fields too.\n\nFWIW I'll be on IRC.  My attempts to ping you haven't received a response. ",
+            "id": "comment-15072425"
+        },
+        {
+            "date": "2015-12-28T13:21:56+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I had a chat with David on IRC. In summary, his objections are:\n\n\tThe primary is the default \u2014 are stored=false & docValues=true returned from globs by default (whatever we name the field/fieldtype attributes). It would be set to false often, assuming  many schemas index text both ways?\n\tGlobs only match a DV field if useDocValuesAsStored=true and so the property name should be indicative of that\n\tPerhaps if we have a matchesFlGlob parameter we would then have no need for useDocValuesAsStored?\n\n\n\nI was of the opinion that matchesFlGlob=true is not a great name because what if we use JSON request API in future and there's no \"fl\" so to speak. David then also suggested an alternate name e.g. matchesReturnGlob: whether a glob (asterisk) pattern in an \u2018fl\u2019 parameter (or equivalent) will match this field.  Applies to stored or docValues fields.  Defaults to what stored is set to.\n\nI'm still not sure about this, David. What does stored=true, matchesReturnGlob=false mean? Should that even be allowed?\n\nReplying to some of your earlier points:\nThe main reason is that for returning the top-X docs with more than a few fields, row storage will probably be faster than columnar storage, performance-wise.\n\nAgreed, and that's why we need to figure out the specifics in SOLR-8344 so that we choose the right way of retrieval.\n\nAnother reason is to retain a particular ordering for multi-valued fields\n\nWe can make always try to use stored values for multi-valued fields in SOLR-8344.\n\nAnother reason is that Solr's highlighters don't read from docValues (solvable).\n\nWhy is this a reason for not using DocValues on the original field?\n\nIdeally most users wouldn't want to monkey with such parameters (IMO). But most schemas I've seen have at least one occurrence of an original input string indexed two ways for search & sorting/faceting. And if our example schemas do, thus motivating us to set it to false for these fields, it just re-confirms my point.\n\nThe thing is the  copy fields you refer to are deliberately added and I think it should be okay to expect that users will choose the value for useDocValuesAsStored according to their use-cases for such fields. It is also common for people to have docValues=true and stored=true together just because they believe that it isn't possible to retrieve doc values. \n\nWhat do you think? ",
+            "id": "comment-15072712"
+        },
+        {
+            "date": "2015-12-28T15:02:31+0000",
+            "author": "Yonik Seeley",
+            "content": "\n> (Yonik) Going forward, why wouldn't one just use docValues on the original field [ rather than a copyField ] ?\nThe main reason is that for returning the top-X docs with more than a few fields, row storage will probably be faster than columnar storage, performance-wise.\n\nIf one still wants to use row-stored for performance tweaks (the exact cross-over point will hopefully be determined by SOLR-8344), then they can still do that, and it makes sense to do both row-stored and column-stored on the original field.  Sorry if it wasn't clear, but that was my original point.\n\nIt [ useDocValuesAsStored ] basically means will a 'fl' glob match the DV field or not.\nThat's only one aspect.  Every place that \"uses\" stored fields should treat DV field as a stored field.  It also affects streaming expressions / SQL, highlighting, partial updates, etc.\n\nAlthough I can see why you might think that at first - the fact that the current implementation does return fl=exact_field_name even when useDocValuesAsStored=false was a surprise to me as well.  I don't see it as a big deal though (more like a minor syntactic shortcut for a pseudo field).\n\nTo me, useDocValuesAsStored=false means \"this isn't really a stored field... it's just an implementation artifact for some query-time feature we need\". ",
+            "id": "comment-15072789"
+        },
+        {
+            "date": "2015-12-28T15:59:38+0000",
+            "author": "David Smiley",
+            "content": "To be clear I'm not -1 on this; just -0.\n\nI get the gist of the intent with what is committed.  Thanks for clarifying guys.\n\nI think what may reduce the need for users to know about / touch useDocValuesAsStored (what I hope for) is if conventionally, stored & doc-values fields are the same field, and then we put tokenized text into some other field, indexed=true stored=false docValues=false if we also need keyword search on the field in question.  I think this is what Yonik is suggesting.  The only annoyance with this is highlighting \u2013 the highlighters expect the stored text to be at the same field name as both the query & index.  hl.requireFieldMatch could be set to false but that's a blunt instrument and isn't even supported by the postings highlighter.  Nonetheless I think this could be solved in another issue.\n\nCan and should the default/example schemas be adjusted to fit the aforementioned conventions?  Then we wouldn't have any want to set useDocValuesAsStored in them. ",
+            "id": "comment-15072846"
+        },
+        {
+            "date": "2016-01-11T19:03:42+0000",
+            "author": "Erick Erickson",
+            "content": "Hmmm, one implication that I just realized (yeah, I'm slow sometimes). In addition to the output from a DV field being reordered, identical values are collapsed since it's a SortedSet under the covers, right? So if I have a MultiValued DocValues field and put in \"memory\", \"memory\", \"memory\", then all I get back from the DV field is one copy of \"memory\".\n\nSince the guarantee that multiValued fields return data in the same order inserted when returning the Stored value is not true of returning DV values, this is perhaps no biggie. IMO it does deserve a comment when we do the docs for this though. ",
+            "id": "comment-15092491"
+        },
+        {
+            "date": "2016-01-11T19:09:30+0000",
+            "author": "Yonik Seeley",
+            "content": "Yep... I commented earlier that we should prob add an explicit \"set\" type/flag in the future.  It can make sense to have a field that preserves order/instances and one that doesn't. ",
+            "id": "comment-15092500"
+        },
+        {
+            "date": "2016-02-19T16:27:17+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Notes for the reference guide:\n\nPage: https://cwiki.apache.org/confluence/display/solr/Defining+Fields\n\nProperty=useDocValuesAsStored\nDescription=If the field has docValues enabled, setting this to true would allow the field to be treated as regular stored fields (even if it has stored=false). This means that this field would be returned alongside regular stored fields that are returned using the fl parameter.\nValues=true or false\nImplicit default=false for schema versions <1.6, true for schema versions >=1.6\n\n\n\n\nPage: https://cwiki.apache.org/confluence/display/solr/DocValues\n\n<New section> Retrieving docValues during search:\n\nField values retrieved during search queries are typically returned from stored values. However, starting with schema version 1.6, all non-stored docValues fields will be also returned along with other stored fields when all fields (or pattern matching globs) are specified to be returned (e.g. fl=*) for search queries. This behavior can be turned on and off by setting useDocValuesAsStored parameter for a field or a field type to true (implicit default since schema version 1.6) or false (implicit default till schema version 1.5). See https://cwiki.apache.org/confluence/display/solr/Defining+Fields\n\nNote that enabling this property has performance implications because DocValues are column-oriented and may therefore incur additional cost to retrieve for each returned document. Also note that while returning non-stored fields from docValues (default in schema versions 1.6+, unless useDocValuesAsStored is false), the values of a multi-valued field are returned in sorted order (and not insertion order). If you require the multi-valued fields to be returned in the original insertion order, then make your multi-valued field as stored (such a change requires re-indexing).\n\n\n\nPage: https://cwiki.apache.org/confluence/display/solr/Common+Query+Parameters#CommonQueryParameters-Thefl%28FieldList%29Parameter\n\nNote: Starting with schema version 1.6, if there are non-stored fields with docValues enabled in the index, then a pattern glob like * in the fl parameter will retrieve those fields. This is not the case if those fields have explicitly useDocValuesAsStored as false in their field definition (see https://cwiki.apache.org/confluence/display/solr/Defining+Fields) or the schema version is <1.6. However, something like fl=dvfield or fl=*,dvfield (say dvfield is a non-stored field with docValues enabled) would retrieve the dvfield irrespective of the useDocValuesAsStored value. (See SOLR-8220 for more details)\n\n\n\nCould someone please review and update the ref guide with the above information? And please feel free to reorganize, modify, drop, or rephrase any of this. ",
+            "id": "comment-15154456"
+        },
+        {
+            "date": "2016-02-27T08:31:56+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This was released in 5.5 so I am resolving this.\n\nDavid Smiley \u2013 please open new issues if you want to change this feature for 6.0 in any way. ",
+            "id": "comment-15170463"
+        }
+    ]
+}

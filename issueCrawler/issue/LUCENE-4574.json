@@ -1,0 +1,156 @@
+{
+    "id": "LUCENE-4574",
+    "title": "FunctionQuery ValueSource value computed twice per document",
+    "details": {
+        "components": [
+            "core/search"
+        ],
+        "fix_versions": [],
+        "affect_versions": "4.0,                                            4.1",
+        "priority": "Major",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I was working on a custom ValueSource and did some basic profiling and debugging to see if it was being used optimally.  To my surprise, the value was being fetched twice per document in a row.  This computation isn't exactly cheap to calculate so this is a big problem.  I was able to work-around this problem trivially on my end by caching the last value with corresponding docid in my FunctionValues implementation.\n\nHere is an excerpt of the code path to the first execution:\n\n\n\t  at org.apache.lucene.queries.function.docvalues.DoubleDocValues.floatVal(DoubleDocValues.java:48)\n\t  at org.apache.lucene.queries.function.FunctionQuery$AllScorer.score(FunctionQuery.java:153)\n\t  at org.apache.lucene.search.TopFieldCollector$OneComparatorScoringMaxScoreCollector.collect(TopFieldCollector.java:291)\n\t  at org.apache.lucene.search.Scorer.score(Scorer.java:62)\n\t  at org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:588)\n\t  at org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:280)\n\n\n\nAnd here is the 2nd call:\n\n\n\t  at org.apache.lucene.queries.function.docvalues.DoubleDocValues.floatVal(DoubleDocValues.java:48)\n\t  at org.apache.lucene.queries.function.FunctionQuery$AllScorer.score(FunctionQuery.java:153)\n\t  at org.apache.lucene.search.ScoreCachingWrappingScorer.score(ScoreCachingWrappingScorer.java:56)\n\t  at org.apache.lucene.search.FieldComparator$RelevanceComparator.copy(FieldComparator.java:951)\n\t  at org.apache.lucene.search.TopFieldCollector$OneComparatorScoringMaxScoreCollector.collect(TopFieldCollector.java:312)\n\t  at org.apache.lucene.search.Scorer.score(Scorer.java:62)\n\t  at org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:588)\n\t  at org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:280)\n\n\n\nThe 2nd call appears to use some score caching mechanism, which is all well and good, but that same mechanism wasn't used in the first call so there's no cached value to retrieve.",
+    "attachments": {
+        "Test_for_LUCENE-4574.patch": "https://issues.apache.org/jira/secure/attachment/12554805/Test_for_LUCENE-4574.patch",
+        "LUCENE-4574.patch": "https://issues.apache.org/jira/secure/attachment/12555078/LUCENE-4574.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-11-25T14:14:28+0000",
+            "content": "FunctionValues isn't the right place to solve this... that would cause caching/checking at every level of a function.\n\nIf scorers are supposed to cache their scores, then the right place would be the scorer used for function queries and the function query comparator.\nIf not, then the issue is more with the TopFieldCollector implementations.\n\nWhat was the actual value for \"sort\" that caused OneComparatorScoringMaxScoreCollector to be used? ",
+            "author": "Yonik Seeley",
+            "id": "comment-13503497"
+        },
+        {
+            "date": "2012-11-25T19:06:52+0000",
+            "content": "The attached test augments an existing test, TestFunctionQuerySort, to verify that the ValueSource's value is only fetched once.  It fails, showing that it's value was called for twice as many documents as are used in the test.  The problem does seem related to TopFieldCollector \u2013 the collector Solr chose to use in my app.  I developed this on trunk so trunk is in error too. ",
+            "author": "David Smiley",
+            "id": "comment-13503532"
+        },
+        {
+            "date": "2012-11-25T19:09:05+0000",
+            "content": "To answer your question, Yonik, sort is to sort on score (relevancy).  It doesn't seem to matter wether it's ascending or descending. ",
+            "author": "David Smiley",
+            "id": "comment-13503533"
+        },
+        {
+            "date": "2012-11-27T22:33:43+0000",
+            "content": "I did some more debugging.  It appears the problem will only occur when RelevanceComparator is involved, as it is the only FieldComparator that overrides setScorer().  It wraps the scorer with the caching scorer, however ideally the passed-in scorer should already be wrapped as such (that is not the case).  Even if this comparator is the only one in Lucene that overrides this method, there's nothing stopping an app with a custom FieldComparator to do the same.  I think the right place to inject the cache is TopFieldCollector's subclasses of which there are two, each of which each override setScorer() to store a copy of the scorer onto a field.  Each should now look like:\n\n\n    @Override\n    public void setScorer(Scorer scorer) throws IOException {\n      scorer = ScoreCachingWrappingScorer.wrap(scorer);\n      this.scorer = scorer;\n      comparator.setScorer(scorer);\n    }\n\n\n(the .wrap() method is a convenience I added)\n\nSound good?  See the attached patch. ",
+            "author": "David Smiley",
+            "id": "comment-13505029"
+        },
+        {
+            "date": "2012-11-27T22:37:45+0000",
+            "content": "I don't think we should do this.\n\nIf you are sorting by score, use TopDocsCollector! ",
+            "author": "Robert Muir",
+            "id": "comment-13505034"
+        },
+        {
+            "date": "2012-11-27T22:50:42+0000",
+            "content": "Ok, then SolrIndexSearcher.getDocListNC() should use TopDocsCollector when suitable.\n\np.s. my patch contained a small bug \"scorer = ...\" vs \"this.scorer = ...\" in FieldComparator.java line 970. ",
+            "author": "David Smiley",
+            "id": "comment-13505041"
+        },
+        {
+            "date": "2012-11-27T22:55:39+0000",
+            "content": "Yes: thats the correct fix... already documented in this RelevanceComparator  ",
+            "author": "Robert Muir",
+            "id": "comment-13505044"
+        },
+        {
+            "date": "2012-11-28T15:18:23+0000",
+            "content": "But Robert, if I simply change the scenario slightly such that there is more than one sort field, TopScoreDocCollector (the specific collector I think you actually meant to suggest) is no longer suitable.\n\nIs your concern that the overhead might be too much?  It seems so small to me; it only caches the last docid & score pair.\n\nMy patch only did the score caching at for OneComparatorScoreing[No]MaxScoreCollector but after further experimentation by modifying the test to sort on an additional field, it appears that all subclasses of TopFieldCollector are affected. ",
+            "author": "David Smiley",
+            "id": "comment-13505528"
+        },
+        {
+            "date": "2012-11-28T15:33:35+0000",
+            "content": "Right, there is more \"fixing\" needed for the other collectors and other situations.\nBut I think solr should still be fixed for the common sort-by-score case.\n\nI don't like the duplicate calls to score. I feel like the API should not support this. But i don't think caching is the correct solution.\nIt already frustrates me that there are caches everywhere, for example BooleanScorer2 has a super-secret score cache just like this.\nI have plans to hunt down and kill all such little caches in lucene. Its not the right solution.\n\nThe questions for this one is: \nIf the user adds relevance as a sort but then also asks to track doc scores/max scores, how should the collector work?\nI definitely don't like the idea of more specialized collectors: god knows there are already too many, but maybe we can avoid this. \n\nAlso: can we speed up this particular query? why is its score so costly? ",
+            "author": "Robert Muir",
+            "id": "comment-13505548"
+        },
+        {
+            "date": "2012-11-28T15:54:00+0000",
+            "content": "I don't have any conviction on what the right answer should be; this area of Lucene is not one I've explored before.  If scorer.score() is cheap in general (is it?), then I can see your reservations.  Perhaps the solution is to only cache specific Scorers that are or could be expensive.  So for me this means adding the cache at FunctionQuery$AllScorer.  This cache is as lightweight as a cache can possibly be, remember; no hashtable lookup, just a docid comparison with branch.\n\nAlso: can we speed up this particular query? why is its score so costly?\n\nIt's a FunctionQuery tied to a ValueSource doing spatial distance.  Applying this very simple cache on my custom ValueSource cut my response time in nearly a half! ",
+            "author": "David Smiley",
+            "id": "comment-13505582"
+        },
+        {
+            "date": "2012-11-28T16:26:50+0000",
+            "content": "I think its generally cheap. like today its already cached in BooleanScorer2 (which solr always gets for a booleanquery), and for\na term query its typically like a multiply and so on. So i think caching in general is only useless and would hurt here. in these \nsilly cases (sorting with relevance but also asking for filling scores versus etc), cheaper to just call it twice rather than try to do \nsomething funkier in the collector: we would have to benchmark this.\n\n\nSo for me this means adding the cache at FunctionQuery$AllScorer. \n\nI think I like this idea better than adding caching in general to these collectors. Is the score() method typically expensive\nfor function queries?\n\nYet another possibility is, instead of asking to track scores when sorting by relevance, to ask to fill sort fields (the default anyway right?).\nIts sorta redundant to ask for both. If you do this, i dont think it calls score() twice.\n\nFinally, we could also consider something like your patch, except more honed in these particular silly situations. so thats something like,\nup-front setting a boolean in these collectors ctors if one of the comparators is relevance and also its asked to track scores/max scores. \nthen in setscorer, we could do like your patch only if this boolean is set. i feel like we wouldnt have to add 87 more specialized collectors to do this. I just havent looked at the code to try to figure out what all the situations can be (all those booleans etc to indexsearcher) where \nscore() can currently be called twice. ",
+            "author": "Robert Muir",
+            "id": "comment-13505619"
+        },
+        {
+            "date": "2012-11-28T17:00:52+0000",
+            "content": "Rob, FunctionQuery$AllScorer.score() is pretty simple and innocent enough so perhaps that is not the right place to add the cache either.  Some ValueSources might have a trivial value e.g. a constant, some might be expensive.\n\nYonik Seeley, your first comment was:\nFunctionValues isn't the right place to solve this... that would cause caching/checking at every level of a function.\n\nDo you mean it's wrong for a custom ValueSource I wrote to have its FunctionValues, which I know to be expensive because I wrote it, cache its previous value?  That's hard to believe so perhaps you don't mean that.\n\nHere's a proposal.  Add a ValueSource method boolean nonTrivial(), defaulting to true to be safe but overriding in many subclasses to use false as appropriate.  Then, FunctionQuery$AllScorer's constructor (called only per-segment) can check and wrap in a to-be-developed FunctionValues caching wrapper for floatVal().  Unlike my previous proposal in the collector, this proposal targets cases that self-declare themselves to have non-trivial implementations and so are worth caching. ",
+            "author": "David Smiley",
+            "id": "comment-13505650"
+        },
+        {
+            "date": "2012-11-28T17:31:50+0000",
+            "content": "Add a ValueSource method boolean nonTrivial()\n\nCould we move this logic to a upper level and expect callers of FunctionQuery(ValueSource) to provide a ValueSource impl that returns FunctionValues impls that cache their values when the computation is expensive?\n\nThen Solr could wrap costly value sources when its function values get* methods are likely to be called several times per document? ",
+            "author": "Adrien Grand",
+            "id": "comment-13505676"
+        },
+        {
+            "date": "2012-11-29T23:00:52+0000",
+            "content": "I've thought about this some more and chatted with with Yonik & Adrien in IRC.\n\nAttached is a new patch.  In a nutshell, the caching is done via ScoreCachingWrappingScorer and is applied by TopFieldCollector but only when one of the comparators is a RelevancyComparator.  I believe this is the only case when the score could be retrieved more than once per document.\n\nTo implement this patch, I did a little refactoring.  I pulled a Scorer field that was common to all subclasses of TopFieldCollector into TFC, and I added a getFieldComparators() abstract method that is implemented trivially by all its subclasses.  setScorer() is now implemented only at TFC and none of its subclasses.\n\nIf this seems reasonable, perhaps it would be good to make a further refactoring such that FieldComparator.setScorer() doesn't exist; leave it specific to RelevanceComparator or introduce an abstract class FieldComparatorNeedsScorer.  After all, in Lucene only RelevanceComparator needs it. ",
+            "author": "David Smiley",
+            "id": "comment-13506915"
+        },
+        {
+            "date": "2012-11-30T02:22:12+0000",
+            "content": "Just to bold what I said before, as I feel its important here:\n\n\nFinally, we could also consider something like your patch, except more honed in these particular silly situations. so thats something like,\nup-front setting a boolean in these collectors ctors if one of the comparators is relevance and also its asked to track scores/max scores. \n\nSeems like we are doing it always if there is a relevance comparator? I feel like the caching (which i hate) should be contained exactly to whats minimal and necessary to prevent score from being called twice. ",
+            "author": "Robert Muir",
+            "id": "comment-13507045"
+        },
+        {
+            "date": "2012-11-30T08:21:06+0000",
+            "content": "one of the comparators is relevance and also its asked to track scores/max scores\n\nHere is a new patch that adds such a flag; I had to rejigger my logic somewhat.  There is no wrapping now for OneComparatorNonScoringCollector.setScorer().\n\nWhat I also did this time, is I removed RelevanceComparator.setScorer()'s attempt at wrapping the comparator if it wasn't already wrapped.  Because after all we're trying to only wrap when we need to, and the collector is now in charge of that.  I added assertions that detect if this comparator is about to get the score for the same doc as it last got, and it isn't already a cached scorer.  Well; guess what?  Those assertions failed.\n\nTestShardSearching.testSimple() failed this assertion, and it uses OneComparatorNonScoringCollector with the RelevanceComparator. ",
+            "author": "David Smiley",
+            "id": "comment-13507189"
+        },
+        {
+            "date": "2012-11-30T14:41:17+0000",
+            "content": "one thing that made it hard for me to review:\n\nboolean nonScoring;//nonScoring AND not out of order\n\n\n\nIs there some way we could invert this (e.g. so its boolean collectsScores or something?). \n\nCan we simplify the out-of-orderness somehow, by fixing this CachingWrapper to support out of order collectors (note I havent thought about this at all, but I feel like Uwe did some cool trick in constant-scorer along these lines...)\n\nthe (NOT AND NOT) is hard on the brain cells  ",
+            "author": "Robert Muir",
+            "id": "comment-13507355"
+        },
+        {
+            "date": "2012-11-30T15:04:53+0000",
+            "content": "this is getting a little complicated.\n\nhere's an alternative patch (I just hacked it up quickly).\n\nin the case where you have relevance comparator and also track scores/maxScores, we just return a \"ScoresTwiceCollector\".\n\nI think this approach might be less dangerous, so we don't break common cases for a special case.\n\nSomething to think about: your test passes (I didnt even run other tests) ",
+            "author": "Robert Muir",
+            "id": "comment-13507367"
+        },
+        {
+            "date": "2012-11-30T17:31:42+0000",
+            "content": "Indeed this is complicated.  It's par for the course in the part of Lucene I figure.\n\nIs there some way we could invert this (e.g. so its boolean collectsScores or something?).\n\nI hear ya; it was getting late and when I originally named the variable it was appropriate since it was only for the nonScoring collectors.\n\nRE ScoringTwiceCollector, I'll just trust you that this approach makes sense as I'm not familiar with the distinguishing details between the half-dozen collectors to know that ScoringTwiceCollector can always be used in leu of those.\n\nI applied your patch.  Then I applied the part of my patch for RelevanceComparator to detect when a score for the same doc is fetched twice in a row.  I recognized a small bug there in which I forgot to re-initialize _lastDocId to -1 on setScorer(), so I fixed that trivially.\n\nBut TestShardSearching.testSimple() still fails.  So I took a closer at the Collector calling it to see why.  OneComparatorNonScoringCollector.collect() opens up with this:\n\n    public void collect(int doc) throws IOException {\n      ++totalHits;\n      if (queueFull) {\n        if ((reverseMul * comparator.compareBottom(doc)) <= 0) {\n          // since docs are visited in doc Id order, if compare is 0, it means\n          // this document is larger than anything else in the queue, and\n          // therefore not competitive.\n          return;\n        }\n        \n        // This hit is competitive - replace bottom element in queue & adjustTop\n        comparator.copy(bottom.slot, doc);\n...\n\n \n\nNotice that there is a call to comparator.compareBottom() and comparator.copy() here.  Both of these for RelevanceComparator fetch the score.\n\nSo maybe RelevanceComparator.setScorer still needs to wrap its scorer with the caching one for such cases.\n\nSo why do you hate this very simple cache so much?  Figuring out exactly when to do it but not otherwise has the adverse effect of complicating further already complicated code and as a consequence increases the risk that at some point after future changes the conditions become wrong and triggers a query to take twice as long.  But this cache is so light-weight that it is probably too hard to measure the appreciable difference of doing unnecessary caching. ",
+            "author": "David Smiley",
+            "id": "comment-13507476"
+        },
+        {
+            "date": "2012-11-30T17:53:27+0000",
+            "content": "\nSo why do you hate this very simple cache so much? \n\nI want things fixed correctly, the way I see it there is a lot of bogusness:\n\n\tWhen solr is only sorting by score, it should call IS.search without a Sort to get faster behavior. The relevance comparator documents that its the slow way.\n\tits especially stupid someone can ask for fillFields=true and trackDocScores=true if you have a relevance comparator.\n\ti'm not sure trackMaxScore=true is really useful at all except when relevance is the only sort, in which case you should be using IS.search without a sort anyway. If someone really needs this combination, i think its ok to make them impl their own collector\n\ti don't like wrapping the scorer with this cache in this relevance comparator. I feel like the comparator can probably do this in a cleaner way.\n\ti don't like all this caching just added on a whim everywhere. I see it here, I see BooleanScorer2 has a cache, I see block-join query has a cache, and I see PositivesScoreOnlyCollector has a cache. there are already cachingvaluesources at the valuesource level too: look at CachingDoubleValueSource in spatial .Some of these are senseless. If there is a real reason, its not documented. We should instead fix the APIs and so on instead of just adding all this caching everywhere.\n\ti think calling score() twice is bogus, but we should be fixing this correctly instead of hacking something in to speed up a slow functionquery.\n\n\n\nSo yeah, clearly adding caches everywhere isn't the right solution to this stuff. I feel like I'm drowning in caches and bug reports like this one still exist.\n\nWe shouldnt rush anything in because of a particularly slow function query. Trust me, I think its bogus we call score() twice: but if something is put in rather quickly on this issue (e.g. more caching) then i prefer if its more contained so it can easily be ripped out later, when the problem is ultimately solved correctly. ",
+            "author": "Robert Muir",
+            "id": "comment-13507499"
+        },
+        {
+            "date": "2012-11-30T17:54:13+0000",
+            "content": "I love those asserts \n\nI think Robert's patch is somewhat simpler, because we don't have to add getFieldComparators and the new boolean nonScoring/collectsScores to all the specialized collector impls?\n\nShouldn't we just always use ScoresTwiceCollector whenever we see RelevanceCollector?  (Ie, remove the check for trackMax/DocScores).  Then TestShardSearching.testSimple should pass?\n\nMaybe just name it ScoreCachingCollector?  (It may call .score() more than twice!?  I can't tell....). ",
+            "author": "Michael McCandless",
+            "id": "comment-13507500"
+        },
+        {
+            "date": "2018-08-09T01:01:28+0000",
+            "content": "Move issue from deprecated 'In  Progress' back to 'Open' ",
+            "author": "Gavin",
+            "id": "comment-16574115"
+        }
+    ]
+}

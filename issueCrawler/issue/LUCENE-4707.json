@@ -1,0 +1,57 @@
+{
+    "id": "LUCENE-4707",
+    "title": "Track file reference kept by readers that are opened through the writer",
+    "details": {
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [],
+        "affect_versions": "4.0",
+        "priority": "Major",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "We ran into a bug where files (mostly CFS) that are still referred to by our NRT reader/searcher are deleted by IndexFileDeleter. As far as I can see from the verbose logging and reading the code, it seems that the problem is the creation and merging of these CFS files between hard commits. The files referred to by hard commits are incRef\u2019ed at commit checkpoints, so these files won\u2019t be deleted until they are decRef\u2019ed when the commit is deleted according to the DeletionPolicy (good). However, intermediate files that are created and merged between the hard commits only have refs through the regular checkpoints, so as soon as a new checkpoint no longer includes those files, they are immediately deleted by the deleter. See the abridged verbose log lines that illustrate this behavior:\n\nIW 11 [Mon Jan 21 17:30:35 PST 2013; commitScheduler]: create compound file _8.cfs\n\nIFD 7 [Mon Jan 21 17:23:41 PST 2013; commitScheduler]: now checkpoint \"_0(4.0.0.2):C3_1(4.0.0.2):C7 _2(4.0.0.2):C16 _3(4.0.0.2):C21 _4(4.0.0.2):C5 _5(4.0.0.2):C5_6(4.0.0.2):C5 _7(4.0.0.2):C7 _8(4.0.0.2):c6\" [9 segments ; isCommit = false]\n\nIFD 7 [Mon Jan 21 17:23:41 PST 2013; commitScheduler]:   IncRef \"_8.cfs\": pre-incr count is 0\n\nIFD 7 [Mon Jan 21 17:23:42 PST 2013; commitScheduler]: now checkpoint \"_0(4.0.0.2):C3_1(4.0.0.2):C7 _2(4.0.0.2):C16 _3(4.0.0.2):C21 _4(4.0.0.2):C5 _5(4.0.0.2):C5 _6(4.0.0.2):C5 _7(4.0.0.2):C7 _8(4.0.0.2):c6 _9(4.0.0.2):c6\" [10 segments ; isCommit = false]\n\nIFD 7 [Mon Jan 21 17:23:42 PST 2013; commitScheduler]:   IncRef \"_8.cfs\": pre-incr count is 1\n\nIFD 7 [Mon Jan 21 17:23:42 PST 2013; commitScheduler]:   DecRef \"_8.cfs\": pre-decr count is 2\n\nIFD 7 Mon Jan 21 17:23:42 PST 2013; Lucene Merge Thread #0: now checkpoint \"_b(4.0.0.2):C81\" [1 segments ; isCommit = false]\n\nIFD 7 Mon Jan 21 17:23:42 PST 2013; Lucene Merge Thread #0:   DecRef \"_8.cfs\": pre-decr count is 1\n\nIFD 7 Mon Jan 21 17:23:42 PST 2013; Lucene Merge Thread #0: delete \"_8.cfs\"\n\nWith this behavior, it seems no matter how frequently we refresh the reader (unless we do it at every read), we\u2019d run into the race where the reader still holds a reference to the file that\u2019s just been deleted by the deleter. My proposal is to count the file reference handed out to the NRT reader/searcher when writer.getReader(boolean) is called and decRef the files only when the said reader is closed.\n\nPlease take a look and evaluate if my observations are correct and if the proposal makes sense. Thanks!",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-01-22T21:04:37+0000",
+            "content": "This is normal/expected behavior: the readers will hold open the files then need, and even though the writer has deleted them, the reader can continue to use them.  Once the reader is closed the files will be deleted \"for real\".\n\nOr, is there some end problem/exception you're seeing? ",
+            "author": "Michael McCandless",
+            "id": "comment-13560019"
+        },
+        {
+            "date": "2013-01-22T21:45:06+0000",
+            "content": "Hi Michael,\n\nThanks for the quick response!\n\nOur use is atypical--we implemented Directory on top of Cassandra, so we don't have the OS-level file protection that normal user would have. We basically see exception when the reader tries to load the file from Cassandra and it's not there anymore because it's been deleted.\n\nI suppose that most \"abnormal\" uses are unsupported, but it seems like this would be a simple/small (without understanding further lucene complexity) change, so maybe it can be considered? Alternatively, if there's any way to expose the deleter incRef and decRef through the API (with strong \"use it at your own risk\"), we can also manage the reader refs ourselves.\n\nThanks! ",
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13560062"
+        },
+        {
+            "date": "2013-01-23T17:33:01+0000",
+            "content": "we implemented Directory on top of Cassandra,\n\nAhh.. ok.\n\nNFS has the same problem, and the usual answer is to create a custom\nIndexDeletionPolicy, but you're right that the IndexDeletionPolicy is\nonly invoked for commits, not for the snapshot that each\nnear-real-time reader uses ...\n\nOne possible workaround would be to track the referenced files by the\nNRT readers yourself?  Ie, in your Directory impl, after opening /\nclosing an NRT reader, you'd call\nreader.getIndexCommit().getFileNames() on each still-open NRT reader\nand accumulate all of those files into a set, and then when deleteFile\nis called, if the name is still in use (in the set) then throw an\nIOException (IndexWriter will catch that to mean the file cannot be\ndeleted now and will retry later...). ",
+            "author": "Michael McCandless",
+            "id": "comment-13560851"
+        },
+        {
+            "date": "2013-03-15T19:30:17+0000",
+            "content": "Hi Michael,\n\nI did what you suggested, but I ran into a related problem involving a race between the merge and the reader being returned so that I can protect the reference. In the log trace below, the thread that's executing IndexWriter.getReader gets stalled when maybeMerge is called, at which point the Lucene Merge Thread came in and deleted the files referred to the segmentInfos that the getReader call has already cloned, but since getReader has not returned yet, those files were not protected (incRef'ed) yet and the Lucene Merge Thread was able to delete the files. (I'm guessing in this case the file was created and merged within a softCommit cycle so the previous NRT reader/searcher never had a reference to it.)\n\nQuestions:\n1. What's my best way to get around that?\n2. How does the OS-level file protection help in this case since the segmentInfos are just clone()ed in getReader and the call seems to just copy around references and never registered in any way with the directory?\n\nThanks so much for your help again.\n\nLog:\nBD 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]: applyDeletes: infos=[_41(4.1):C2006, _9p(4.1):C17686, _3s(4.1):C1163, _4d(4.1):c313, _3y(4.1):c365, _4b(4.1):c423, _4a(4.1):C881, _4c(4.1):c54, _4f(4.1):c186, _4e(4.1):c30, _4g(4.1):c3, _ao(4.1):C3734, _ch(4.1):C3464, _d1(4.1):c708, _dk(4.1):c269, _dh(4.1):c36, _di(4.1):c4, _dj(4.1):c47, _dm(4.1):c3, _dl(4.1):c1, _dn(4.1):c1, _do(4.1):c1, _dp(4.1):c1, _dq(4.1):c49, _dr(4.1):c15, _ds(4.1):c1, _du(4.1):c101, _dv(4.1):c27, _dw(4.1):c3, _dx(4.1):c1, _dy(4.1):c1, _e0(4.1):c1, _dz(4.1):c1] packetCount=1\\\n...\nBD 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]: seg=_d1(4.1):c708 segGen=763 coalesced deletes=[CoalescedDeletes(termSets=1,queries=0)] newDelCount=0\\\n...\nIW 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]: return reader version=1013 reader=StandardDirectoryReader(segments_3:1013:nrt _41(4.1):C2006 _9p(4.1):C17686 _3s(4.1):C1163 _4d(4.1):c313 _3y(4.1):c365 _4b(4.1):c423 _4a(4.1):C881 _4c(4.1):c54 _4f(4.1):c186 _4e(4.1):c30 _4g(4.1):c3 _ao(4.1):C3734 _ch(4.1):C3464 _d1(4.1):c708 _dk(4.1):c269 _dh(4.1):c36 _di(4.1):c4 _dj(4.1):c47 _dm(4.1):c3 _dl(4.1):c1 _dn(4.1):c1 _do(4.1):c1 _dp(4.1):c1 _dq(4.1):c49 _dr(4.1):c15 _ds(4.1):c1 _du(4.1):c101 _dv(4.1):c27 _dw(4.1):c3 _dx(4.1):c1 _dy(4.1):c1 _e0(4.1):c1 _dz(4.1):c1)\\\nDW 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]: commitScheduler-333 finishFullFlush success=true\\\nTMP 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]: findMerges: 33 segments\\\n...\nTMP 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]:   seg=_d1(4.1):c708 size=1.144 MB [merging] [floored]\\\n\u2026\nIW 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]: registerMerge merging= [_4c, _do, _dl, _4f, _41, _dn, _4g, _4d, _di, _4a, _4b, _dh, _3y, _dp\n, _4e, _dk, _dj, _d1, _dm, _3s, ]\\\n...\nCMS 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]:   index: _41(4.1):C2006 _9p(4.1):C17686 _3s(4.1):C1163 _4d(4.1):c313 _3y(4.1):c365 _4b(4.1):c423 _4a(4.1):C881 _4c(4.1):c54 _4f(4.1):c186 _4e(4.1):c30 _4g(4.1):c3 _ao(4.1):C3734 _ch(4.1):C3464 _d1(4.1):c708 _dk(4.1):c269 _dh(4.1):c36 _di(4.1):c4 _dj(4.1):c47 _dm(4.1):c3 _dl(4.1):c1 _dn(4.1):c1 _do(4.1):c1 _dp(4.1):c1 _dq(4.1):c49 _dr(4.1):c15 _ds(4.1):c1 _du(4.1):c101 _dv(4.1):c27 _dw(4.1):c3 _dx(4.1):c1 _dy(4.1):c1 _e0(4.1):c1 _dz(4.1):c1\\\nCMS 129 [Thu Mar 14 17:41:23 PDT 2013; commitScheduler-333]:     too many merges; stalling...\\\nIFD 129 Thu Mar 14 17:41:24 PDT 2013; Lucene Merge Thread #20:   DecRef \"_d1.cfs\": pre-decr count is 1\\\nIFD 129 Thu Mar 14 17:41:24 PDT 2013; Lucene Merge Thread #20: delete \"_d1.cfs\"\\\n...\n...at this point commitScheduler-333 tries to incRef _d1.cfs but it's too late. ",
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13603737"
+        },
+        {
+            "date": "2013-03-15T20:11:07+0000",
+            "content": "Hi Jessica,\n\nHow about changing the approach in your Directory wrapper.  Instead of incRef'ing when you get an NRTReader, incRef whenever openInput is called, and refuse to delete the file is it's still held open by anything (throw an IOException in .deleteFile: IndexWriter catches this and will retry the deletion later).\n\nThis will make Unix behave like Windows, ie still-open files cannot be deleted.\n\nI think that should fix this race condition, because the NRT reader must first .openFile all files it uses ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13603787"
+        },
+        {
+            "date": "2013-03-16T00:24:55+0000",
+            "content": "Thanks for the quick response and the suggestion. I will try it out. ",
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13604034"
+        }
+    ]
+}

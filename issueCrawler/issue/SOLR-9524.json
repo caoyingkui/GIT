@@ -1,0 +1,204 @@
+{
+    "id": "SOLR-9524",
+    "title": "SolrIndexSearcher.getIndexFingerprint uses dubious sunchronization",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.3",
+            "7.0"
+        ],
+        "affect_versions": "6.3",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "In SOLR-9310 we added more code that does some fingerprint caching in SolrIndexSearcher. However, the synchronization looks like it could be made more efficient and may have issues with correctness.\n\nhttps://github.com/apache/lucene-solr/blob/branch_6x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java#L2371-L2385\n\nSome of the issues:\n\n\tDouble checked locking needs use of volatile variables to ensure proper memory semantics.\n\tsync on a ConcurrentHashMap is usually a code smell",
+    "attachments": {
+        "SOLR-9524.patch": "https://issues.apache.org/jira/secure/attachment/12828894/SOLR-9524.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-09-16T16:06:35+0000",
+            "author": "Mike Drob",
+            "content": "Might not actually be DCL because we do reload the value. I still think this method can be cleaned up though. ",
+            "id": "comment-15496673"
+        },
+        {
+            "date": "2016-09-16T16:11:47+0000",
+            "author": "Yonik Seeley",
+            "content": "It wouldn't be a DCL anti-pattern (i.e. not thread safe) in either case because the underlying cache is thread safe. ",
+            "id": "comment-15496691"
+        },
+        {
+            "date": "2016-09-16T16:22:34+0000",
+            "author": "Michael Braun",
+            "content": "maxVersionFingerprintCache.computeIfAbsent seems a good replacement for this functionality but there is a comment about the operation being possibly expensive such that one may want to actually block on multiple threads calculating the same value, which computeIfAbsent will not do.  ",
+            "id": "comment-15496722"
+        },
+        {
+            "date": "2016-09-16T16:27:01+0000",
+            "author": "Michael Braun",
+            "content": "The existing code actually seems to have a bug in a different way:\n\n      fingerprint = maxVersionFingerprintCache.get(maxVersionFingerprintCache);\n\n\nIt's looking its own reference up instead of the maxVersion long, which it checks earlier (and puts as).  ",
+            "id": "comment-15496733"
+        },
+        {
+            "date": "2016-09-16T16:29:11+0000",
+            "author": "Yonik Seeley",
+            "content": "Ha - nice catch! ",
+            "id": "comment-15496737"
+        },
+        {
+            "date": "2016-09-16T18:21:32+0000",
+            "author": "Yonik Seeley",
+            "content": "Since SOLR-9310 has already been released (5.5.3?), we can't re-open it to fix.  Might as well just use this JIRA? ",
+            "id": "comment-15497002"
+        },
+        {
+            "date": "2016-09-16T19:53:02+0000",
+            "author": "Mike Drob",
+            "content": "Chatted with Michael Braun about this a bit...\n\nI think computeIfAbsent is close to what we want, but it doesn't let us easily preserve the current behaviour to throw IOException - we'd have to wrap it as an RTE. I'm also a little sceptical of the claim that multiple threads would be attempting to calculate the same fingerprint, since this is only called when we open a new searcher.\n\nI'll agree that it may be expensive, but I don't what code paths we are trying to protect against. And I think we'd get much better gains by doing the optimizations at the lower level... There's a note in IndexFingerprint that // TODO: this could be parallelized, or even cached per-segment if performance becomes an issue, which I think is where we should look instead of trying to ensure that a fingerprint is only calculated once.\n\nIf we do need to ensure that each fingerprint is only calculated once for performance issues, then we should switch to a more granular locking mechanism. Possibly something like striped locking, or a parallel Map<Long, Lock>. This is a lot more complexity. ",
+            "id": "comment-15497213"
+        },
+        {
+            "date": "2016-09-16T20:14:51+0000",
+            "author": "Michael Braun",
+            "content": "Mike Drob it's not as pretty as computeifAbsent but it probably make sense from an exception point of view to keep it as is and possibly change the synchronization. ",
+            "id": "comment-15497247"
+        },
+        {
+            "date": "2016-09-16T20:18:21+0000",
+            "author": "Mike Drob",
+            "content": "According to ConcurrentHashMap.computeIfAbsent javadoc though, \"the entire method invocation is performed atomically, so the function is applied at most once per key.\"\n\nSo if we're willing to live with the clunky exception handling it requires, then I'm back on board with that approach. ",
+            "id": "comment-15497252"
+        },
+        {
+            "date": "2016-09-16T20:21:18+0000",
+            "author": "Mike Drob",
+            "content": "And looking at the Oracle JDK 8 implementation, I'm reasonably convinced that this is the correct way to go. ",
+            "id": "comment-15497259"
+        },
+        {
+            "date": "2016-09-16T20:21:39+0000",
+            "author": "Michael Braun",
+            "content": "Whoops sorry Mike Drob I was looking at the wrong function! Ignore my previous comment re: not preferring computeIfAbsent. ",
+            "id": "comment-15497260"
+        },
+        {
+            "date": "2016-09-16T20:33:09+0000",
+            "author": "Mike Drob",
+            "content": "Attaching a patch for master branch.\n\nYonik Seeley, Noble Paul - you've been in this code most recently, what do you think? ",
+            "id": "comment-15497285"
+        },
+        {
+            "date": "2016-09-16T20:41:41+0000",
+            "author": "Yonik Seeley",
+            "content": "I'm also a little sceptical of the claim that multiple threads would be attempting to calculate the same fingerprint\n\nWhen a new leader is elected, I think everyone peersyncs to that leader.\nWhen I originally wrote the code it was just a single fingerprint value (no max rolled in), and so it made sense to cache (since the common case is multiple replicas asking for the same info around the same time).  After the code was modified to use maxversion, it's less clear what the overlap will be, but if everyone is already in sync, it should still be high.\n\n> There's a note in IndexFingerprint that // TODO: this could be parallelized, or even cached per-segment if performance becomes an issue, which I think is where we should look instead of trying to ensure that a fingerprint is only calculated once.\n\nI don't see those as exclusive... caching a top-level fingerprint is desirable until we have per-segment caching. ",
+            "id": "comment-15497304"
+        },
+        {
+            "date": "2016-09-16T20:54:59+0000",
+            "author": "Mike Drob",
+            "content": "Yea, that makes sense. I'm much less worried about correctness and efficiency when we can delegate to the JDK and trust them to do it correctly. ",
+            "id": "comment-15497337"
+        },
+        {
+            "date": "2016-09-16T21:27:23+0000",
+            "author": "David Smiley",
+            "content": "RE computeIfAbsent and IOException:   I recent reviewed some code and gave feedback on an issue pertaining to this (I can't seen to find right it now).  The code on whatever issue it was could have theoretically used computeIfAbsent and would thus have been much nicer were it not for the IOException.  So we couldn't use it; what a pain, sigh....  If we want to use it here too (were it not for IOException) we might want to add a utility to make this easy so that the semantics of what we're doing is clear.  computeIfAbsent is beautiful when you can use it. ",
+            "id": "comment-15497429"
+        },
+        {
+            "date": "2016-09-16T21:47:16+0000",
+            "author": "Pushkar Raste",
+            "content": "The reason I didn't use computeIfAbsent is computing fingerprint could throw an exception. Code to account for exception looks pretty ugly.\n\nIt also seems like some changes to the original patch, I dont remember using ConcurrentHashmap.\n\nI will double check though. ",
+            "id": "comment-15497474"
+        },
+        {
+            "date": "2016-09-16T21:49:58+0000",
+            "author": "Pushkar Raste",
+            "content": "PS : We are planning to cache fingerprint per segment under Solr-9506 ",
+            "id": "comment-15497481"
+        },
+        {
+            "date": "2016-09-16T21:54:27+0000",
+            "author": "Pushkar Raste",
+            "content": "May be we should hold off 6.2.1 release ",
+            "id": "comment-15497495"
+        },
+        {
+            "date": "2016-09-16T22:19:54+0000",
+            "author": "Pushkar Raste",
+            "content": "Nice catch. \n\nMay be we should right a test case, now that twice fingerprint caching got us in trouble. ",
+            "id": "comment-15497566"
+        },
+        {
+            "date": "2016-09-17T07:13:17+0000",
+            "author": "Noble Paul",
+            "content": "fingerprint = maxVersionFingerprintCache.get(maxVersionFingerprintCache);\n\nLOL, nice bug.\n\n\nMay be we should hold off 6.2.1 release\n\nPushkar Raste I don't think it's a big deal. Essentially it's just made caching useless. We didn't have any caching till now. So, it is not going to be any worse than what it used to be  ",
+            "id": "comment-15498410"
+        },
+        {
+            "date": "2016-09-17T14:22:03+0000",
+            "author": "Yonik Seeley",
+            "content": "We didn't have any caching till now. So, it is not going to be any worse than what it used to be\n\nIt was cached before SOLR-9310, so if everyone was in sync (say coming back up from a reboot, or after electing a new leader), it could certainly be more expensive than it was. ",
+            "id": "comment-15499113"
+        },
+        {
+            "date": "2016-09-17T14:28:09+0000",
+            "author": "Mike Drob",
+            "content": "\nRE computeIfAbsent and IOException: I recent reviewed some code and gave feedback on an issue pertaining to this (I can't seen to find right it now). The code on whatever issue it was could have theoretically used computeIfAbsent and would thus have been much nicer were it not for the IOException. So we couldn't use it; what a pain, sigh.... If we want to use it here too (were it not for IOException) we might want to add a utility to make this easy so that the semantics of what we're doing is clear. computeIfAbsent is beautiful when you can use it.\nI've been poking at this, but due to some quirks of java generics, it's harder to put in a generic utility than it would appear at first blush. Going down this route, we may have to limit ourselves strictly to IOException.\n\nI don't think it's a big deal. Essentially it's just made caching useless. We didn't have any caching till now. So, it is not going to be any worse than what it used to be\nIt only made the second check useless. The first check and the put are still correct, so we will still have some amount of caching right now, but multiple threads asking at once could end up all doing the work. ",
+            "id": "comment-15499123"
+        },
+        {
+            "date": "2016-09-17T15:17:13+0000",
+            "author": "Pushkar Raste",
+            "content": "I will look through logs of our collections (fortunately we have plenty of those) and see how expensive is fingerprint computation. There is already a ticket @noble opened for caching fingerprint per segment. I am going to get to it next week. ",
+            "id": "comment-15499190"
+        },
+        {
+            "date": "2016-09-20T19:57:42+0000",
+            "author": "Mike Drob",
+            "content": "I will look through logs of our collections (fortunately we have plenty of those) and see how expensive is fingerprint computation.\nPushkar Raste - did you get a chance to verify this? I tried to check on our systems, but the first few deployments I looked at were all on versions before index fingerprinting. ",
+            "id": "comment-15507625"
+        },
+        {
+            "date": "2016-09-20T21:14:02+0000",
+            "author": "Pushkar Raste",
+            "content": "I checked logs on one of our biggest collection with following stats\nnum docs: 1591412892\nshards: 12 spread across two solr instances (each process hosts 6 shards and each instance runs on separate physical box).\nauto soft commit : 1 secs (not sure this matters as computing fingerprint opens a new NR searcher anyway)\nThere is replication too but I don't think that matters a lot here.\n\nIt is typically taking  ~2 seconds on avg.\n\nThis definitely requires caching. \n\nI am planning to take on SOLR-9506 this week.  ",
+            "id": "comment-15507812"
+        },
+        {
+            "date": "2016-09-20T22:52:27+0000",
+            "author": "Mike Drob",
+            "content": "Thanks for looking. I agree that SOLR-9506 would be a good improvement too.\n\n\nThe reason I didn't use computeIfAbsent is computing fingerprint could throw an exception. Code to account for exception looks pretty ugly.\n\nIt also seems like some changes to the original patch, I dont remember using ConcurrentHashmap.\nThe CHM was added in commit 37ae065 by Noble.\n\nI think that the ugliness of the code around exception handling here is a fine tradeoff for the correctness issue that we've already seen and the performance issue of locking on the whole map. If you have 5 fingerprints to calculate, then the current code will need 10 seconds total since each calculation can only happen serially. Letting computeIfAbsent manage the concurrent access for us seems much much better. ",
+            "id": "comment-15508053"
+        },
+        {
+            "date": "2016-09-21T06:00:26+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit afc57347b47322290d6b0e6c00e4e3413ce2fbf0 in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=afc5734 ]\n\nSOLR-9524: SolrIndexSearcher.getIndexFingerprint uses dubious synchronization ",
+            "id": "comment-15508867"
+        },
+        {
+            "date": "2016-09-21T06:05:29+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7a1e6efa9678f9cdfb3f59f61fba6e60e725f3a7 in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7a1e6ef ]\n\nSOLR-9524: SolrIndexSearcher.getIndexFingerprint uses dubious synchronization ",
+            "id": "comment-15508879"
+        },
+        {
+            "date": "2016-10-05T02:21:20+0000",
+            "author": "Yonik Seeley",
+            "content": "I wonder if we could use the same type of logic for UnInvertedField.getUnInvertedField().... perhaps by adding an additional method to SolrCache that takes a creator? ",
+            "id": "comment-15547393"
+        },
+        {
+            "date": "2016-11-09T08:38:48+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Closing after 6.3.0 release. ",
+            "id": "comment-15650293"
+        }
+    ]
+}

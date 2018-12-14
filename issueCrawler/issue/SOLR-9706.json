@@ -1,0 +1,55 @@
+{
+    "id": "SOLR-9706",
+    "title": "fetchIndex blocks incoming queries when issued on a replica in SolrCloud",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "6.3",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "This is something of an edge case, but it's perfectly possible to issue a fetchIndex command through the core admin API to a replica in SolrCloud. While the fetch is going on, incoming queries are blocked. Then when the fetch completes, all the queued-up queries execute.\n\nIn the normal case, this is probably the proper behavior as a fetchIndex during \"normal\" SolrCloud operation indicates that the replica's index is too far out of date and shouldn't serve queries, this is a special case.\n\nWhy would one want to do this? Well, in extremely high indexing throughput situations, the additional time taken for the leader forwarding the query on to a follower is too high. So there is an indexing cluster and a search cluster and an external process that issues a fetchIndex to each replica in the search cluster periodiclally.\n\nWhat do people think about an \"expert\" option for fetchIndex that would cause a replica to behave like the old master/slave days and continue serving queries while the fetchindex was going on? Or another solution?\n\nFWIW, here's the stack traces where the blocking is going on (6.3 about). This is not hard to reproduce if you introduce an artificial delay in the fetch command then submit a fetchIndex and try to query.\n\nBlocked query thread(s)\nDefaultSolrCoreState.loci(159)\nDefaultSolrCoreState.getIndexWriter (104)\nSolrCore.openNewSearcher(1781)\nSolrCore.getSearcher(1931)\nSolrCore.getSearchers(1677)\nSolrCore.getSearcher(1577)\nSolrQueryRequestBase.getSearcher(115)\nQueryComponent.process(308).\n\nThe stack trace that releases this is\nDefaultSolrCoreState.createMainIndexWriter(240)\nDefaultSolrCoreState.changeWriter(203)\nDefaultSolrCoreState.openIndexWriter(228) // LOCK RELEASED 2 lines later\nIndexFetcher.fetchLatestIndex(493) (approx, I have debugging code in there. It's in the \"finally\" clause anyway.)\nIndexFetcher.fetchLatestIndex(251).",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-11-01T12:41:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Interesting. Does this affect non-cloud master/slave setups as well? ",
+            "id": "comment-15625330"
+        },
+        {
+            "date": "2016-11-01T14:54:43+0000",
+            "author": "Erick Erickson",
+            "content": "M/S replication does not show this behavior. That's why I wondered if it's deliberate or just an accident of coding.\n\nGiven that it only happens in SolrCloud, and the node should be in recovery when the logic for a fetchindex kicks in and thus not receive any queries, if it's accidental then it could easily have been there from day 1. One could even argue that this is correct in the \"normal\" case.\n\nThis scenario is one in which an explicit fetchindex is submitted while the search cluster is actively serving queries, thus something of an edge case.\n\nThe idea of passing a parameter to override this behavior assumes that it's deliberate. If changing the code such that explicit fetchindex commands in cloud mode don't block incoming queries that would be fine too. ",
+            "id": "comment-15625624"
+        },
+        {
+            "date": "2016-11-25T10:22:19+0000",
+            "author": "Jeremy Hoy",
+            "content": "We have a setup that has separate indexing and searching clusters.  We do this using both solr cloud (primarily for searching) and master slave replication.  It's worth noting that we ingest into named shards rather than letting solr cloud deal with sharding.  So this is achieved by using the normal enable.slave and enable.master init arguments, together with solrcloud.\u200bskip.\u200bautorecovery and using the NoOpDistributingUpdateProcessorFactory in the updateRequestProcessorChain in solrconfig.  The problem described here bit us as the searching slaves were usually blocked when partial replication started and would continue to be blocked until the new segments were downloaded; this was made worse for us as we monitor that solr is responding to admin ping requests and restart solr if that fails or times out a number of times in succession, which it was!\n\nThe reason the blocking happens is that in the IndexFetcher.fetchLatestIndex the searcher is closed if we're running solrcloud (which in our scenario we are, kind of!) and the replication is partial.  A new index writer is then created which takes an index writer write lock, which in turn blocks the creation of a newSearcher so any subsequent requests are blocked until the write lock is released when the replication completes.  This behavior was introduced as part of SOLR-6640 .  So the behavior is intentional in the sense the searcher is (must be) closed to prevent uncommited/flushed files resulting in index corruption.\n\nFor our situation then an obvious way to fix this is to check the init args to see if enabled.slave is set and then not close the searcher.  We could do the check using a method in IndexFetcher, setting a private property in the IndexFetcher constructor, or possibly adding a public get method for isSlave in the ReplicationHandler, or something else.  Not sure what the best approach is, but I'm happy to put a patch together, if you have a preference.\n\nIn the more general sense, would I be right in suggesting that in an high indexing scenario, or indeed post some sort of network partition event, that this could pose a real problem in a normal solrcloud setup if the new segment files being downloaded are large and either the network isn't particularly quick or you have a large number of followers in recovery all pulling files from the leader?  I.e there could be a bunch of followers blocked from taking search requests and a leader with a saturation network interface servicing all searches and delivering segment files to followers.  I'm not sure what the right approach to solving this would be.  Would opening a new searcher after the unused files have been cleaned up be a feasible way to at least mitigate the problem?  It's probably worth noting that with the code as it stands, and for our situation at least, it is possible for new searchers to be created during this process (it doesn't always block), depending on the timing of incoming search requests. ",
+            "id": "comment-15695492"
+        },
+        {
+            "date": "2016-11-25T15:08:11+0000",
+            "author": "Erick Erickson",
+            "content": "Jeremy:\n\nI haven't seen this in a straight SolrCloud setup. IIUC in regular cloud mode we wouldn't get to index fetching unless the replica were marked as something other than \"active\", in which case it wouldn't get requests. It's only when using replication outside of the normal SolrCloud usage that you can be in a state where the index is being replicated and the replica receives queries.\n\nThanks for taking the time to update this with your research BTW, that'll help a lot! ",
+            "id": "comment-15696067"
+        },
+        {
+            "date": "2016-12-07T07:21:17+0000",
+            "author": "Mark Miller",
+            "content": "It's really just never been a supported operation for the user. It's really an abuse of the system unless someone thinks out and designs support and tests for this type of thing. ",
+            "id": "comment-15727984"
+        },
+        {
+            "date": "2017-05-26T00:19:57+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Took a look at this in the context of replica types (SOLR-9835 and SOLR-10233). In TLOG and PULL replicas the searcher is not closed and there should be no block. I believe it's fine since, the same as with Master/Slave, there are no commits on those types of replicas, so they should not be flushing any segments. ",
+            "id": "comment-16025590"
+        }
+    ]
+}

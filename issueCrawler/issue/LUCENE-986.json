@@ -1,0 +1,91 @@
+{
+    "id": "LUCENE-986",
+    "title": "Refactor segmentInfos from IndexReader into its subclasses",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "2.3"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "References to segmentInfos in IndexReader cause different kinds of problems\nfor subclasses of IndexReader, like e. g. MultiReader.\n\nOnly subclasses of IndexReader that own the index directory, namely \nSegmentReader and MultiSegmentReader, should have a SegmentInfos object\nand be able to access it.\n\nFurther information:\nhttp://www.gossamer-threads.com/lists/lucene/java-dev/51808\nhttp://www.gossamer-threads.com/lists/lucene/java-user/52460\n\nA part of the refactoring work was already done in LUCENE-781",
+    "attachments": {
+        "lucene-986.patch": "https://issues.apache.org/jira/secure/attachment/12365691/lucene-986.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2007-08-23T04:46:22+0000",
+            "content": "one aspect of this that should be considered: It may not make sense for MultiReader to extend MultiSegmentReader ... as Michael says, only subclasses that own the index directory should have segmentInfos, and a MultiReader (as defined on the trunk now) can never own it's own directory.\n\nI haven't worked through all the implications, but perhaps the most logical refactoring would be...\n\n\n\tIndexReader\n    ...as abstract as possible given that we can't actually make methods abstract\n\tDirectoryIndexReader extends IndexReader\n       ...new class, encapsulated all the segmentInfos and locking logic currently in \n          IndexReader (can definitely be made abstract if helpful)\n\tSegmentReader extends DirectoryIndexReader\n\tMultiSegmentReader extends DirectoryIndexReader\n\tParallelIndexReader extends IndexReader\n\tFilterIndexReader extends IndexReader\n\tMultiReader extends IndexReader\n       ...(side note that i really haven't thought through completley: should \n          MultiReader extend FilterIndexReader?)\n\n\n\nthere would likely be some utlity functionality that could be reused between MultiReader and MultiSegmentReader ... possible as static methods in IndexReader (or a new util class)\n ",
+            "author": "Hoss Man",
+            "id": "comment-12522025"
+        },
+        {
+            "date": "2007-08-23T06:19:01+0000",
+            "content": "This is good stuff, Hoss. I like the DirectoryIndexReader idea.\nSounds like a very clean and logical separation.\n\nI'll work through the code to understand all consequences. ",
+            "author": "Michael Busch",
+            "id": "comment-12522038"
+        },
+        {
+            "date": "2007-08-30T05:35:36+0000",
+            "content": "What do you think about this alternative approach:\n\n\n\tSegmentReader, MultiSegmentReader and MultiReader all extend IndexReader\n\tIndexReader.open() always returns a MultiSegmentReader instance, even\nif the index has only one segment. We can make some optimizations, so that\ne. g. MultiSegmentReader.termDocs() returns a SegmentTermDocs in case \nthere's only one underlying SegmentReader.\n\tAll write lock and transaction logic goes into MultiSegmentReader, as\nit is the only reader that has to obtain a write lock.\n\n\n\nThe advantage here is that only one class (MultiSegmentReader) is\nresponsible for acquiring the write lock. It would also make \nIndexReader.open() simpler,  because it can then return a \nMultiSegmentReader instance in all cases. The logic of opening the \ndifferent segments could move from IndexReader.open() to the constructor\nof MultiSegmentReader. Also LUCENE-743 (IndexReader.reopen()) would\nbecome simpler.\nThe disadvantage of this approach is apparently that always using\na MultiSegmentReader would add some overhead when reading optimized \nindexes, but actually I don't think that this overhead would really be\nsignificant.\n\nIf we go the DirectoryIndexReader way (where SegmentReader and \nMultiSegmentReader both extend DirectoryIndexReader), then we still need\nan ownDirectory variable that tells SegmentReader if it has to acquire a\nwrite lock or not, depending on whether it is a subreader of \nMultiSegmentReader or not. And of course we add another layer to the\nIndexReader hierachy. \n\nSo I'm not sure which approach is the better one. I'm hoping to get some\nopionions here! Hoss? Others? ",
+            "author": "Michael Busch",
+            "id": "comment-12523768"
+        },
+        {
+            "date": "2007-08-30T06:13:39+0000",
+            "content": "i rarely remember a week later what i was thinking when i wrote something, but i suspect that when i suggested the DirectoryIndexReader i was assuming it would have everything directory/lock related thta currently exists in the IndexReader base class (including the directoryOwner boolean) ... in cases where there is a single Segment in a directory, there will be SegmentReader with directoryOwner==true ... in the multi segment cases, the MultiSegmentReader will have directoryOwner==true, and it's sub SegmentReaders will all have directoryOwner==false. ...\n\n...the key point of DirectoryIndexReader being that any subclass can own a directory (and automaticly inherits all the code for dealing with locks properly when it needs/wants to) but doesn't always have to own the directory.  meanwhile MultiReader (and ParallelIndexReader and FilteredIndexReader) make no attempt at owning a directory, and inherit no code for doing so (or for dealing with the locking of such non existent directories)\n\nI don't really know enough about the performance characteristics of SegmentReader vs a MultiSegmentReader of one segment to have a sense of how possible/practical it would be to eliminate the need for SegmentReader and replace it completely with MultiSegmentReader ... \n\none hitch might be that SegmentReader.get is public, and in order to keep supporting it, SegmentReader still needs to have/inherit the same segment info and directory owning/locking code that we want to move out of IndexReader (so just putting it MultiSegmentReader won't fly unless we kill that public method) ",
+            "author": "Hoss Man",
+            "id": "comment-12523774"
+        },
+        {
+            "date": "2007-09-13T06:54:45+0000",
+            "content": "Here is the patch with the DirectoryIndexReader approach.\n\nIt moves SegmentInfos and Directory from IndexReader into\nDirectoryIndexReader, as well as the commit and rollback logic.\n\nMultiSegmentReader and SegmentReader extend DirectoryIndexReader. \nMultiReader extends IndexReader now and uses some methods from \nMultiSegmentReader that I made static.\n\nI added the method acquireWriteLock() to IndexReader that does \nnothing by default. Subclasses must implement it if they require \na write lock (so does DirectoryIndexReader now).\n\nIndexReader is very abstract now and almost all logic moved into\nthe subclasses. The methods isOptimized(), isCurrent(), and \ngetVersion() all throw an UnsupportedOperationException (UOE). I \nfurther deprecated the IndexReader constructor that takes a\nDirectory as argument. As soon as we remove this ctr the method\nIndexReader.getDirectory() should throw an UOE as well. I added\na TODO comment as a reminder.\n\nAll unit tests pass with this patch. ",
+            "author": "Michael Busch",
+            "id": "comment-12526998"
+        },
+        {
+            "date": "2007-09-18T02:23:08+0000",
+            "content": "> one hitch might be that SegmentReader.get is public, and in order to keep \n> supporting it, SegmentReader still needs to have/inherit the same segment info \n> and directory owning/locking code that we want to move out of IndexReader (so \n> just putting it MultiSegmentReader won't fly unless we kill that public method).\n\nOK, I implemented the DirectoryIndexReader approach. Also because I'm not sure \nabout the performance characteristics of a MultiSegmentReader acting as a \nSegmentReader. \n\nI'd like to commit this rather soon. A review of the patch would be highly \nappreciated. ",
+            "author": "Michael Busch",
+            "id": "comment-12528225"
+        },
+        {
+            "date": "2007-09-18T06:20:40+0000",
+            "content": "Michael: I've been meaning to look at this, but haven't had the time ... your recent update has goaded me \n\njust to clarify: the patch you added on September 12th is your latest patch right?  ... it's not clear from you comment on the 17th if you intended to attach an update and something went wrong.\n\nI ask because i'm haivng trouble applying the patch from the 12th ... i must be tired because i can't understand why, it doesn't look like the files have changed since you posted the patch, so i'm not sure what it's complaining about ...  visually everything seems to match up...\n\nhossman@coaster:~/lucene/lucene$ svn update\nAt revision 576718.\nhossman@coaster:~/lucene/lucene$ svn status\n?      lucene-986.patch\nhossman@coaster:~/lucene/lucene$ patch --dry-run -p0 -i lucene-986.patch patching file src/java/org/apache/lucene/index/DirectoryIndexReader.java\npatching file src/java/org/apache/lucene/index/FilterIndexReader.java\npatching file src/java/org/apache/lucene/index/IndexReader.java\npatching file src/java/org/apache/lucene/index/MultiReader.java\nHunk #1 FAILED at 19.\n1 out of 2 hunks FAILED \u2013 saving rejects to file src/java/org/apache/lucene/index/MultiReader.java.rej\npatching file src/java/org/apache/lucene/index/MultiSegmentReader.java\nHunk #1 FAILED at 30.\nHunk #2 FAILED at 39.\nHunk #3 FAILED at 156.\nHunk #4 FAILED at 171.\nHunk #5 FAILED at 256.\nHunk #6 FAILED at 278.\n6 out of 6 hunks FAILED \u2013 saving rejects to file src/java/org/apache/lucene/index/MultiSegmentReader.java.rej\npatching file src/java/org/apache/lucene/index/ParallelReader.java\npatching file src/java/org/apache/lucene/index/SegmentReader.java\nHunk #1 succeeded at 32 with fuzz 2.\npatching file src/test/org/apache/lucene/index/TestMultiReader.java\nhossman@coaster:~/lucene/lucene$  ",
+            "author": "Hoss Man",
+            "id": "comment-12528271"
+        },
+        {
+            "date": "2007-09-18T08:18:46+0000",
+            "content": "I got the patch to apply cleanly (see mailing list for details)  On the whole it looks really good, i'm attaching an updated version with some minor improvements (mainly javadocs), but first a few questions...\n\n\n\tjust to clarify: IndexReader(Directory) is only around for\n  backwards compatibility in subclasses right?  And the only reason\n  for the \"private Directory\" is to keep supporting the directory()\n  method for any subclasses relying on it?\n\n\n\n\n\tIndexReader() says it can be removed once the other constructor is\n  removed ... why? is that just pointing out that we can rely on the\n  default constructor?\n\n\n\n\n\tsince one of the goals is that IndexReaders which don't own their\n  directory shouldn't utilize segmentInfos, would it make sense to\n  eliminate directoryOwner from DirectoryIndexReader and instead test\n  whether (null == segmentInfos) ?\n\n\n\n\n\tthe way TestMultiReader is setup with the \"mode\" is a bit confusing\n  ... perhaps instead we should make a subclass where only openReader\n  is overwritten (it will inherit the individual test methods) ?\n\n\n\n\n\nhere's the list of tweaks I made...\n\n\n\tadded a note in the IndexReader class javadocs about\n  methods that throw UnSupOp but aren't abstract.\n\tadded javadocs to the IndexReader(Directory) constructor based on my\n  understanding\n\tadded back javadocs to IndexReader methods that now throw UnSupOp to\n  make it clear what they do to callers looking at the API, but made\n  it clear tthe default impls throw UnSupOp\n\tmade IndexReader.directory() throw UnSupOp if directory is null,\n  enhanced it's javadocs.\n\t/* NOOP */ in IndexReader.acquireWriteLock so it's clear to code analysis tools that it's not a mistake.\n\tsmall additions to javadocs for DirectoryIndexReader class, but\n  these should probably be elaborated on (depending on what you think\n  of my segmentInfos==null idea above)\n\tmade DirectoryIndexReader(...) call init(...) to eliminate a small\n  about of duplication.\n\n ",
+            "author": "Hoss Man",
+            "id": "comment-12528298"
+        },
+        {
+            "date": "2007-09-18T19:34:39+0000",
+            "content": "> I got the patch to apply cleanly (see mailing list for details) \n\nThanks, Hoss! I'm using TortoiseSVN, I have to check how to set those\ndefault properties for new files correctly.\n\n>    * just to clarify: IndexReader(Directory) is only around for\n>      backwards compatibility in subclasses right? And the only reason\n>      for the \"private Directory\" is to keep supporting the directory()\n>      method for any subclasses relying on it?\n\nYes, correct.\n\n>    * IndexReader() says it can be removed once the other constructor is\n>      removed ... why? is that just pointing out that we can rely on the\n>      default constructor?\n\nYes, just a suggested simplification. Keeping the constructor wouldn't hurt\nthough.\n\n>    * since one of the goals is that IndexReaders which don't own their\n>      directory shouldn't utilize segmentInfos, would it make sense to\n>      eliminate directoryOwner from DirectoryIndexReader and instead test\n>      whether (null == segmentInfos) ?\n\nSounds good, will do...\n\n>    * the way TestMultiReader is setup with the \"mode\" is a bit confusing\n>      ... perhaps instead we should make a subclass where only openReader\n>      is overwritten (it will inherit the individual test methods) ?\n\nYes, that's cleaner, will make that change as well.\n\n> here's the list of tweaks I made...\n\nThe improvements look good to me.\nThanks for the review, Hoss! I'll attach a new patch shortly. ",
+            "author": "Michael Busch",
+            "id": "comment-12528522"
+        },
+        {
+            "date": "2007-09-18T20:24:23+0000",
+            "content": "In addition to Hoss' changes this patch:\n\n\n\tRemoves the boolean directoryOwner variable from DirectoryIndexReader\n     and checks for segmentInfos != null instead. I also added a comment\n     to DirectoryIndexReader about this.\n\n\n\n\n\tTestMultiReader now extends the new unit test TestMultiSegmentReader\n     and overwrites the method openReader().\n\n\n\n\nI'm planning to commit this in a day or so if nobody objects. ",
+            "author": "Michael Busch",
+            "id": "comment-12528547"
+        },
+        {
+            "date": "2007-09-20T07:30:34+0000",
+            "content": "Committed Rev. 577596 ",
+            "author": "Michael Busch",
+            "id": "comment-12529006"
+        }
+    ]
+}

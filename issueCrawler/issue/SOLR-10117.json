@@ -1,0 +1,67 @@
+{
+    "id": "SOLR-10117",
+    "title": "Big docs and the DocumentCache; umbrella issue",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "This is an umbrella issue for improved handling of large documents (large stored fields), generally related to the DocumentCache or SolrIndexSearcher's doc() methods.  Highlighting is affected as it's the primary consumer of this data.  \"Large\" here is multi-megabyte, especially tens even hundreds of megabytes. We'd like to support such users without forcing them to choose between no DocumentCache (bad performance), or having one but hitting OOM due to massive Strings winding up in there.  I've contemplated this for longer than I'd like to admit and it's a complicated issue with difference concerns to balance.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-02-10T06:38:32+0000",
+            "content": "Some ideas I have rejected or have serious doubts with:\n\n\tMake Document implement Accountable then use LRUCache's configurable RAM size.  The problem with this is that lazy field loading and Documents which would basically grow in size after they have already been measured by the cache.  And lazy field loading is important, especially with large documents.\n\tA special VeryLazyField perhaps subclassing LazyDocument.LazyField that always goes to disk instead of keeping a reference.  I started down this approach but stopped because I realized that multi-valued fields would be difficult to handle, likely resulting in terrible performance as each value would need to go to seek/decompress the document on its own.\n\tBlack-list certain fields from being placed onto the Document, thus never making it into the cache.  A highlighter (or anything else) that used the StoredFieldVisitor API would be able to reach it though.  I'm worried that such a feature would have unintended breakage of other things; perhaps atomic updates or who-knows what.\n\n\n\nOne key thing to understand is how LazyDocument works and the semantics of lazy field loading.  Essentially, the moment you refer to any field that wasn't loaded eagerly (loaded expressly the first time), all fields of the document are loaded.  If some fields are big, this is bad.\n\nThe kernel of an idea I feel is most promising is either have lazy field loading be on a configurable set of fields only (others are always eager), or leave lazy field loading as is but have an additional configuration to designate some fields as \"very large\" (potentially so, any way).  In the latter, these fields would be backed by a separate LazyDocument instance and thus their loading would not be triggered by lazy loading of other fields.  In the former case (restrict which fields are lazy), the intention is that if you have very big fields that you'd configure lazy field loading to just them.\n\nWith that kernel of an idea in place, the next piece is revisiting the cache semantics of using the SolrIndexSearcher#doc(docId,StoredFieldVisitor) method which is currently only used by the UnifiedHighlighter, PostingsHighlighter (it's ancestor), and oddly in distributed grouping.  The latter ought to be adjusted to not use it, by the way \u2013 very simple.  This method currently will detect a document cache entry and use it, and will indirectly trigger lazy field loading as a consequence.  But for very big fields, we don't want that to happen.  So perhaps we could change the cache semantics a bit such that if a very large field is requested, it skips the cached doc and goes straight to disk loading the fields that way.\n\nI'm very interested in any feedback on my thoughts on this.  There are some tangential issues as well that could very well be sub-tasks here. ",
+            "author": "David Smiley",
+            "id": "comment-15860833"
+        },
+        {
+            "date": "2017-02-10T06:44:34+0000",
+            "content": "A couple tangential issues worth addressing:\n\n\tQueryComponent.doPreFetch logic should be configurable or perhaps simply never do it and make the highlighting component smart enough to ensure the applicable docs are in the cache with fl + hl.fl + id.\n\tUnifiedSolrHighlighter loads only the IDs in a way that will likely have bad cache performance.\n\tSolrIndexSearcher#doc(docId,StoredFieldVisitor) doesn't populate the DocumentCache; it only reads from it if present.  It's more work but it'd be nice if it populated it as well with not only the \"needsField(field)\" == true results but perhaps also by detecting \"fl\".\n\n ",
+            "author": "David Smiley",
+            "id": "comment-15860835"
+        },
+        {
+            "date": "2017-02-15T00:13:37+0000",
+            "content": "Here's a patch that adds a \"large\" boolean property to schema fields.  Such fields, in conjunction with lazy field loading, will get their own separate lazy document.  This is one piece of a larger puzzle. \n\nIt would be awesome to instead have large-ness detected dynamically without having to declare them as large as I'm doing here but that has some issues.  First if the lazy field loading wanted to know the size then it has to incur the cost of loading it, which defeats the point.  A possible solution I'm in favor of (yet might be controversial?) would be Solr's DocumentBuilder detecting large string values and then if there is one then adding the name to a proposed docValues _largeFields_ field.  Then lazy field loading could examine the values.  An alternative variation on this is to save it as a stored value that comes first in the stored document, since lazy field loading has to go to disk for this any way. I actually like that better than using docValues.  It might even go further and place the largest field value(s) last to benefit from a Lucene level optimization I got in a while back.\n\nNotice this LargeFieldsTest uses some testing techniques I want to popularize and refine.  There are no new schema/solrconfig files despite that this test defines fields, field types, and makes solrconfig changes.  And it doesn't copy configs to do this. ",
+            "author": "David Smiley",
+            "id": "comment-15866979"
+        },
+        {
+            "date": "2017-02-15T07:43:55+0000",
+            "content": "Another idea that I'm starting to like even more I think about it is to put large fields into BinaryDocValues, with compression (either at DocValuesFormat (codec) layer, or at Solr layer).  For very large fields, I think column stored (hence docValues) actually makes more sense than the stored field codec (row stored).  Then at the Solr layer we add docValues support to TextField (as BinaryDocValues), and then also at the Solr layer enable SolrIndexSearcher.doc() to see useDocValuesAsStored fields thus enabling highlighting to see it.  I wish I had thought of this earlier. ",
+            "author": "David Smiley",
+            "id": "comment-15867396"
+        },
+        {
+            "date": "2017-02-21T20:24:20+0000",
+            "content": "Another technique that I think makes a lot of sense is to cap the stored value to a configurable amount \u2013 a cap after which there can be no highlighting of course.  This can be achieved even without an explicit Solr feature with a copyField with maxChars set.  Although it may hinder hl.requireFieldMatch=true if one chooses to go that route. ",
+            "author": "David Smiley",
+            "id": "comment-15876640"
+        },
+        {
+            "date": "2017-03-09T06:04:36+0000",
+            "content": "spinning off SOLR-10255 for BinaryDocValues based approach.  I could have used a JIRA sub-task but I'm not a fan when the issue space is a bit exploratory. ",
+            "author": "David Smiley",
+            "id": "comment-15902542"
+        },
+        {
+            "date": "2017-03-09T15:35:01+0000",
+            "content": "No help with code I am afraid, but a question:\n\nWould this deduplicate large fields replicated in multiple records? We advise people to denormalize records, so if big stored fields were actually stored once (e.g. repeated description pushed into child records), it would probably be a marketing argument, not just a technical one. ",
+            "author": "Alexandre Rafalovitch",
+            "id": "comment-15903226"
+        },
+        {
+            "date": "2017-03-09T16:08:14+0000",
+            "content": "Would this deduplicate large fields replicated in multiple records?\n\nNo.  If I were tasked to do that, I might implement a customized DocValuesFormat that deduplicated per segment (could not dedup at higher tiers) by using the length as a crude hash and then verifying the dedup by re-reading the original.  Query time would be no overhead; it'd simply share the internal offset/length pointer. ",
+            "author": "David Smiley",
+            "id": "comment-15903287"
+        }
+    ]
+}

@@ -1,0 +1,181 @@
+{
+    "id": "SOLR-9142",
+    "title": "JSON Facet, add hash table method for terms",
+    "details": {
+        "components": [
+            "Facet Module"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.3"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "I indexed a dataset of 2M docs\n\ntop_facet_s has a cardinality of 1000 which is the top level facet.\nFor nested facets it has two fields sub_facet_unique_s and sub_facet_unique_td which are string and double and have cardinality 2M\n\n\nThe nested query for the double field returns in the 1s mark always. The nested query for the string field takes roughly 10s to execute.\n\nnested string facet\nq=*:*&rows=0&json.facet=\n\t{\n\t\t\"top_facet_s\": {\n\t\t\t\"type\": \"terms\",\n\t\t\t\"limit\": -1,\n\t\t\t\"field\": \"top_facet_s\",\n\t\t\t\"mincount\": 1,\n\t\t\t\"excludeTags\": \"ANY\",\n\t\t\t\"facet\": {\n\t\t\t\t\"sub_facet_unique_s\": {\n\t\t\t\t\t\"type\": \"terms\",\n\t\t\t\t\t\"limit\": 1,\n\t\t\t\t\t\"field\": \"sub_facet_unique_s\",\n\t\t\t\t\t\"mincount\": 1\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\n\n\nnested double facet\nq=*:*&rows=0&json.facet=\n\t{\n\t\t\"top_facet_s\": {\n\t\t\t\"type\": \"terms\",\n\t\t\t\"limit\": -1,\n\t\t\t\"field\": \"top_facet_s\",\n\t\t\t\"mincount\": 1,\n\t\t\t\"excludeTags\": \"ANY\",\n\t\t\t\"facet\": {\n\t\t\t\t\"sub_facet_unique_s\": {\n\t\t\t\t\t\"type\": \"terms\",\n\t\t\t\t\t\"limit\": 1,\n\t\t\t\t\t\"field\": \"sub_facet_unique_td\",\n\t\t\t\t\t\"mincount\": 1\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\n\n\nI tried to dig deeper to understand why are string nested faceting that slow compared to numeric field\n\nSince the top facet has a cardinality of 1000 we have to calculate sub facets on each of them. Now the key difference was in the implementation of the two .\n\nFor the string field, In FacetField#getFieldCacheCounts we call createCollectAcc with nDocs=0 and numSlots=2M . This then initializes an array of 2M. So we create a 2M array 1000 times for this one query which from what I understand makes this query slow.\n\nFor numeric fields FacetFieldProcessorNumeric#calcFacets uses a CountSlotAcc which doesn't assign a huge array. In this query it calls createCollectAcc with numDocs=2k and numSlots=1024 .\n\nIn string faceting, we create the 2M array because the cardinality is 2M and we use the array position as the ordinal and value as the count. If we could improve on this it would speed things up significantly? For sub-facets we know the maximum cardinality can be at max the top level bucket count.",
+    "attachments": {
+        "SOLR_9412_FacetFieldProcessorByHashDV.patch": "https://issues.apache.org/jira/secure/attachment/12825310/SOLR_9412_FacetFieldProcessorByHashDV.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-05-23T10:21:09+0000",
+            "author": "Varun Thacker",
+            "content": "Attaching the code snippet used to create the data set:\n\nTestJSONFacetAPI.java\nimport org.apache.lucene.util.TestUtil;\nimport org.apache.solr.client.solrj.SolrServerException;\nimport org.apache.solr.client.solrj.impl.HttpSolrClient;\nimport org.apache.solr.common.SolrInputDocument;\n\nimport java.io.IOException;\nimport java.util.ArrayList;\nimport java.util.List;\nimport java.util.Random;\n\npublic class TestJSONFacetAPI {\n\n\n  public static void main(String args[]) throws IOException, SolrServerException {\n    Random r = new Random();\n    HttpSolrClient client = new HttpSolrClient(\"http://localhost:8983/solr\");\n    client.deleteByQuery(\"techproducts\", \"*:*\");\n\n    List<SolrInputDocument> docs = new ArrayList<>(10000);\n\n    for (int i=0; i<2000000; i++) {\n      SolrInputDocument document = new SolrInputDocument();\n\n      document.addField(\"id\", i);\n      document.addField(\"top_facet_s\", i%1000);\n      document.addField(\"sub_facet_unique_s\", TestUtil.randomSimpleString(r, 3, 10) + \" \" + TestUtil.randomSimpleString(r, 3, 10));\n      document.addField(\"sub_facet_unique_td\", i);\n\n      document.addField(\"sub_facet_limited_s\", i%5);\n      document.addField(\"sub_facet_limited_td\", i%5);\n\n      docs.add(document);\n      if (i%10000 ==0) {\n        client.add(\"techproducts\", docs);\n        client.commit(\"techproducts\");\n        docs.clear();\n        System.out.println(i);\n      }\n    }\n    client.add(\"techproducts\", docs);\n    client.commit(\"techproducts\");\n  }\n\n}\n\n ",
+            "id": "comment-15296197"
+        },
+        {
+            "date": "2016-05-23T10:30:41+0000",
+            "author": "Joel Bernstein",
+            "content": "Just curious if you've tried method:stream?\n\nI had some brief conversations with Yonik Seeley about this, and it seems like this would be more efficient for high cardinality faceting. I'm not sure if this is supported in distributed mode, but I was planning to change the FacetStream to use method:stream and then handle the merge within the FacetStream itself.\n\nCurrently the guidance with Streaming Expressions is to use the RollupStream which relies on MapReduce shuffling for high cardinality faceting. But it would be great if we could have performant high cardinality faceting through the JSON facet API. ",
+            "id": "comment-15296206"
+        },
+        {
+            "date": "2016-05-23T10:51:34+0000",
+            "author": "Varun Thacker",
+            "content": "Hi Joel,\n\nI had tried method:uif and method:dv but both had similar performances ( 10s mark ).\n\nI tried with method:stream and got responses in under a second! So it's a great start. Going to check with distributed mode and try out streaming expressions for distributed mode otherwise.\n ",
+            "id": "comment-15296223"
+        },
+        {
+            "date": "2016-05-23T11:40:36+0000",
+            "author": "Varun Thacker",
+            "content": "I tried method:stream by indexing the same data on the gettingstarted example. The results are the same as compared to the non cloud setup.\n\nThe speed gains are lesser though. The query returns in the 3s range. I guess combining the results is adding the overhead.\n\n ",
+            "id": "comment-15296257"
+        },
+        {
+            "date": "2016-05-23T12:08:47+0000",
+            "author": "Joel Bernstein",
+            "content": "I think the issue is that the merge is not optimized for streaming. We can ask Yonik for more details. ",
+            "id": "comment-15296283"
+        },
+        {
+            "date": "2016-05-23T14:38:24+0000",
+            "author": "Yonik Seeley",
+            "content": "Yes, the issue here is faceting on a string field with a high cardinality compared to it's domain is less efficient than it could be.\nFor those cases, the direct map slot == ord is sub optimal and we should go instead with a hash based approach (something like we do with numeric faceting).\nPerhaps creating an accumulator implementation that does the mapping before calling another accumulator.\n\nEven the hashing approach we use with numeric faceting could perhaps be improved on... today we use the slot in the hash table as the slot in the accumulator (think of each accumulator as a bunch of parallel hash tables), but we could alternately hash to a dense table (i.e. the hash would hold the slot number).  This really only applies to accumulators needed in phase 1 (sorting), but could make any that contained a lot of state per slot more efficient. ",
+            "id": "comment-15296448"
+        },
+        {
+            "date": "2016-05-23T14:42:46+0000",
+            "author": "Yonik Seeley",
+            "content": "I think the issue is that the merge is not optimized for streaming. \n\nRight... method:streaming for field faceting pretty much does true streaming at the shard level, but for distributed search the merging is not streamed (it's just the standard merge of collect the top N from each shard).  Right now, that's where streaming expressions comes in since they can do true streaming at the merge level. ",
+            "id": "comment-15296453"
+        },
+        {
+            "date": "2016-05-23T14:46:01+0000",
+            "author": "Joel Bernstein",
+            "content": "Does method:stream take an entirely different approach? For example are hash tables still used in accumulation, or are the facets aggregated in bucket order? ",
+            "id": "comment-15296458"
+        },
+        {
+            "date": "2016-05-23T15:00:27+0000",
+            "author": "Joel Bernstein",
+            "content": "I need to get started on integrating the streaming facets into the FacetStream. There are two big use cases for this sitting out there:\n\n1) SQL aggregations should always be done with streaming facets, rather then switching between facet and map_reduce. map_reduce aggregations should only come into play following a join, never on a single table query.\n\n2) gatherNodes, should use streaming facets to retrieve the edges. This is a big win because edges are currently uniqued at the worker so the network gets flooded with duplicate edges. An example of duplicate edges happens when a from address emails the same to address hundreds of times. Currently the from->to edge get's uniqued at the worker. Pushing the unique operation into the search engine then becomes a form of compression, which is very cool. Also currently gatherNodes is only operating on single valued fields. By traversing the facets we can operate over multi-valued fields. This is also a huge win.  ",
+            "id": "comment-15296476"
+        },
+        {
+            "date": "2016-05-23T15:03:05+0000",
+            "author": "Yonik Seeley",
+            "content": "method:stream today is like facet.method=enum except it currently only supports sort:\"index asc\" since it steps over the terms in the field and then calculates each bucket individually before sending it out.  That's why it's called \"stream\"... we don't keep more than one facet bucket in memory at a time.  Each bucket is generated right before being written to the response output stream.\n\nstream still won't be optimal for high cardinality facets where the input domain is only a few documents since it involves stepping over all of the terms.\nBut we can certainly implement more methods that support streaming (including supporting the full range of sorts that other facet methods do). ",
+            "id": "comment-15296483"
+        },
+        {
+            "date": "2016-08-04T21:40:05+0000",
+            "author": "David Smiley",
+            "content": "Getting back to the issue here, the solution Yonik Seeley recommended in his first comment here is to go with a hash based accumulator instead of an array one.  That makes perfect sense; I agree.\n\nI've been looking very closely at this codebase more, and in a debugger with Varun's sample data & queries to get more familiar with it all.  When I look at FacetFieldProcessorNumeric it seems very close to being suitable to use on String data using the global ordinals as the number it works with.  I've thought of that and the name of this class and the name of it's FacetFieldProcessor compatriots and I think some refactoring is in order.  Here's a glimpse of my thoughts on that:\n\nFacetFieldProcessors refactoring\n\n\ttaste: the fact that some FFP's are declared within FacetField.java and some are top-level is bad IMO; they should all be top-level once any subclasses start becoming so.\n\tFFPFCBase:  This is basically the base class for array based accumulator implementations \u2013 i.e. direct slot/value accumulators.  I suggest rename to FFPArray.  It can handle terms (strings), not numbers directly but those encoded as terms, and multi-valued capable.\n\tFFPDV: Rename to FFPArrayDV: accesses terms from DocValues\n\tFFPUIF: Rename to FFPArrayUIF: accesses terms via UIF, kind of a pseudo-DV\n\tFFPNumeric: Rename to FFPHashDV:  Now currently this thing is expressly for single-valued numeric DocValues... but it could be made generic to handle terms by global ordinal.\n\tFFPStream: Rename to FFPEnumTerms:  This does enumeration (not hash or array accumulation), and it gets data from Terms.  Perhaps Stream could also go in the name but I think Enum is more pertinent.  One day once we have PointValues in Solr, we might add a FFPEnumPoints.  Note that such a thing wouldn't stream, since that API uses a callback API instead of an iterator style.\n\n\n\nMost of that should be another issue, and basically renames/moves.\n\nThe only thing above not a refactoring, where there's some substantial work, is overhauling FFPNumeric to be FFPHashDV supporting numbers & terms.  It's probably multi-valued capable too.  That work could stay here.\n\nThoughts? ",
+            "id": "comment-15408535"
+        },
+        {
+            "date": "2016-08-10T15:03:05+0000",
+            "author": "Yonik Seeley",
+            "content": "Yep, lots of refactorings still make sense (and why at the Java level I've been considering the entire thing experimental).\n\nI've also done refactoring as part of SOLR-7452 , it prob makes sense for me to get those refactorings committed to try and minimize potential collisions.  ",
+            "id": "comment-15415406"
+        },
+        {
+            "date": "2016-08-10T15:14:29+0000",
+            "author": "David Smiley",
+            "content": "I filed SOLR-9404 to do the simple refactorings.  I'll add a modicum of javadocs too.\n\nYonik Seeley I looked at your refactoring in SOLR-7452 and it appears it won't conflict with SOLR-9404 or this as it doesn't touch FacetFieldProcessor \u2013 at least not yet. ",
+            "id": "comment-15415431"
+        },
+        {
+            "date": "2016-08-24T18:31:41+0000",
+            "author": "David Smiley",
+            "content": "Here's a working patch.  The patch will be easier to digest in an IDE.\n\n\tAs expected it's very fast for the use-case prompting this issue.  Given Varun's test program on my laptop, it produced results in ~420ms compared to over 9 seconds for the array approach.\n\tMy testing thus far (which is insufficient, granted) is just to locally modify the facet method picking code to pick this method by default (if it applies), and then run TestJsonFacets.  It helped me find some bugs and known limitations.\n\t\n\t\tnocommit: need to add testing.  I'd like to see a way of testing that varies the method and then tests for equivalent results.  At least, that's how I'd like to approach testing this enhancement versus something explicit.\n\t\n\t\n\tLimitations:\n\t\n\t\tDoesn't support mincount==0. I don't think it makes sense to add that here.\n\t\tDoesn't support prefix.  It could be added.\n\t\tDoesn't support multi-valued.  It could be added.\n\t\n\t\n\tFacetFieldProcessorByHashNumeric still has this name in the patch but should be renamed to FacetFieldProcessorByHashDV. I'd like to see that done in a separate commit to keep the history cleaner.\n\tThere weren't that much changes to this class despite whatever impression one may have from the diff. I added stuff but didn't really change anything that was already there aside from a refacotring-oriented change. The refactoring was mostly to structure the method names/structure of FacetFieldProcessorByArray so that you can read both and find your way around.\n\t\n\t\tfindTopSlots has lots of code and it's so similar in both classes; not good!  I didn't introduce that mess but I'd like to fix it; perhaps in a follow-on commit.\n\t\n\t\n\tI introduced a new subclass of FacetRangeProcessor.Calc that is for ordinals.  Perhaps this is a little hacky... I'm open to suggestions. One possibility is making Calc top-level in this package \u2013 it's not just for ranges.\n\tAcross this facet module I keep seeing the same DocSet & IndexReader collection code, and sometimes with TODOs to refactor.  I took a little stab at a DocSet utility collector and put it in it's own class for the moment.  Only this Hash based class uses it right now.  There are some nocommits to improve it further...\n\t\n\t\tDocSet is not necessarily an ordered set \u2013 so says it's javadocs.  Yet our collecting code assumes it is!  For large ones it is but HashDocSet it won't be.  Maybe JSON Facets module always assume the DocSet has always come from the filter cache and maybe that cache always uses sortable ones?  I think that's a dangerous assumption even if it turns out to be true today.\n\t\tI propose DocSet.collect(IndexReader,Collector) exist... and we could define 2 utility implementations to pick from \u2013 one that's for our sorted DocSets, and another for unsorted that works by iterating segments first and re-scanning for applicable docsets.  The latter might be slow but it'd only be used on small DocSets.\n\t\n\t\n\tFor numeric field faceting, we should more clearly tell the user that we don't really support mincount==0 or prefix so I added checks & exception throwing for that.\n\n\n\nYonik Seeley can you please review this? ",
+            "id": "comment-15435436"
+        },
+        {
+            "date": "2016-08-26T21:33:43+0000",
+            "author": "David Smiley",
+            "content": "Updated patch a little:\n\n\n\tMoved Calc & LongCounts instances to fields and then removed from many methods \u2013 more consistent with FacetFieldProcessorByArray\n\trenamed collectFirstPhase in the first patch to collectValFirstPhase as to not confuse  \"long val\" with \"long slot\" in identical overloaded method signature\n\tMoved the utility DocSet collector in the first patch to DocSetUtil as collectSortedDocSet() and refactored so that it accepts a Lucene Collector.  Removed that it returned 'count'.  Added checks for sorted order so that it throws an exception if it isn't.\n\t\n\t\tNocommit?: Propose a SortedDocSet interface be created.\n\t\n\t\n\n\n\nWant to incorporate some tests next. ",
+            "id": "comment-15439908"
+        },
+        {
+            "date": "2016-08-29T19:10:12+0000",
+            "author": "David Smiley",
+            "content": "Updated Patch:\n\n\tThe default facet method is now held in a package-accessible static field that is toggled by a test.  (similar to existing default hash table size).  I modified TestJsonFacets to use a feature of RandomizedTesting called @ParameterFactory that allows all of them to be tested for the same test class. Admittedly this approach can be a little awkward when reproducing a case (particularly in an IDE).  I tend to go about it by edit the file temporarily to work around that while debugging a test.\n\tCurrently, it has effectively been the case that if you set method=stream, that the sort order is ignored.   I think that's bad; method should be a hint (or at the very least resulting in an error). I changed this so that method=stream only has an effect when sort=index asc (in addition to the existing requirement of having an index). this is a back-compat break for anyone using method=stream who forgot to explicitly set sort=index asc.  Given it's not common to set this and the \u201cexperimental\u201d nature of this module/feature, I think this change is okay to do in a point-release, provided we're explicit in the release notes.\n\tMade method=enum work as an alias to method=stream. Some day we can add support for this distinction \u2014 which is when we can do enum faceting that is not index ascending\n\tSome day this will support SortedSetDocValues so I adjusted TermOrdCalc to not contain SortedDocValues, and instead take a Function that does the ord to BytesRef resolution.  Although annoyingly this is initialized in collectDocs().\n\tI refactored findTopDocs() between the Array & Hash based impls to a common implementation in FacetFieldProcessor.  Java 8 Functional methods proved convenient to make this possible.\n\n\n\nI think this is now committable.  There is one nocommit to remind myself to rename this class after I commit it.  Also, it's tempting to consider breaking up some of the portions of this into discrete commits (or separate issue even, like for method=stream)... but that would be a pain and so if nobody asks me to then I probably won't.\n\nI plan to commit this Wednesday morning. ",
+            "id": "comment-15446775"
+        },
+        {
+            "date": "2016-08-31T17:41:23+0000",
+            "author": "David Smiley",
+            "content": "Updated path to fix a bug:\n\nWhile running tests I noticed an odd failure in TestRandomDVFaceting, which doesn't explicitly use the JSON Facet API, however it does set facet.method=uif and it turns out SimpleFacets.java calls out to JSON Facet API to do it.  Wow; you learn something new every day, as they say.  Of course, setting the method doesn't necessarily mean that UIF will be used, and in the case of a single valued number (score_f field which is a float) \u2013 it certainly won't be \u2013 it uses this hash method.  TestRandomDVFaceting is an awesome test \u2013 very thorough.  And it tickled a bug in my refactoring/consolidation of findTopSlots that occurs when there are more collected values than the top-X you want \u2013 when it's sort by count and falls-back on index order to tie-break equal counts.\n\nSo I fixed it by simplifying the use of the PriorityQueue to simply be a PriorityQueue<Integer> instead of a Slot int wrapper, and thus removed Slot altogether.  The former code was re-using Slots but in order to do that it needed to invoke the ordering predicate with a primitive int.  The refactored version is a bit more generic and it'd be annoying to reuse the same predicate using the old Slot code \u2013 I'd need to add some interface taking the primitive ints.  I'm not sure how much perf benefit there is here; so I'm going with code that's easier to maintain.\n\nI'll commit later today. ",
+            "id": "comment-15452855"
+        },
+        {
+            "date": "2016-08-31T18:12:46+0000",
+            "author": "David Smiley",
+            "content": "Updated patch again... I re-introduced the Slot thing as I found a straight-forward way to keep it by having a new temporary Slot instance used to compare the bottom against.\n\np.s. the patch files are named erroneously: I should have used 9142 ",
+            "id": "comment-15452932"
+        },
+        {
+            "date": "2016-08-31T20:56:43+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7b5df8a10391f5b824e8ea1793917ff60b64b8a8 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7b5df8a ]\n\nSOLR-9142: json.facet: new method=dvhash which works on terms. Also:\n(1) method=stream now requires you set sort=index asc to work\n(2) faceting on numerics with prefix or mincount=0 will give you an error\n(3) refactored similar findTopSlots into one common one in FacetFieldProcessor\n(4) new DocSet.collectSortedDocSet utility ",
+            "id": "comment-15453337"
+        },
+        {
+            "date": "2016-08-31T20:56:44+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6a4184c6742e4ef3764bfc2184015af6b95d31bb in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6a4184c ]\n\nSOLR-9142: rename FFPByHashNumeric to FFPByHashDV as it's not just for numerics anymore ",
+            "id": "comment-15453338"
+        },
+        {
+            "date": "2016-08-31T21:17:40+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 820ba9f868968e1deadbca06168d749dd728a51e in lucene-solr's branch refs/heads/branch_6x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=820ba9f ]\n\nSOLR-9142: json.facet: new method=dvhash which works on terms. Also:\n(1) method=stream now requires you set sort=index asc to work\n(2) faceting on numerics with prefix or mincount=0 will give you an error\n(3) refactored similar findTopSlots into one common one in FacetFieldProcessor\n(4) new DocSet.collectSortedDocSet utility\n(cherry picked from commit 7b5df8a) ",
+            "id": "comment-15453384"
+        },
+        {
+            "date": "2016-08-31T21:17:41+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 4c97712a607a1ee0449b933e1e688b5cfa25f8fc in lucene-solr's branch refs/heads/branch_6x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4c97712 ]\n\nSOLR-9142: rename FFPByHashNumeric to FFPByHashDV as it's not just for numerics anymore\n(cherry picked from commit 6a4184c) ",
+            "id": "comment-15453386"
+        },
+        {
+            "date": "2016-09-01T01:50:09+0000",
+            "author": "Yonik Seeley",
+            "content": "Thanks David, good improvements!\n\nDocSet is not necessarily an ordered set \u2013 so says it's javadocs. Yet our collecting code assumes it is! For large ones it is but HashDocSet it won't be.\nI think HashDocSet (as well as DocList) should be moved out of the DocSet hierarchy.  HashDocSet is currently only used as a utility class internal to certain faceting methods.\nPerhaps we could use the \"Bits\" interface instead when we want/require a fast random access set.\n\nI was surprised this adds a method (dvhash).  Although perhaps convenient for testing things out, it would be tedious in production since the best method will depend on the domain size, which will often not be known ahead of time by the user.  For the normal \"dv\" method, we should definitely make it pick hashing when the domain is much smaller than the number of unique terms in the field.  We already do stuff like this in the DV faceting to pick whether we accumulate global ords, or accumulate local (per-seg) ords first and then do a mapping at the end to global ords. ",
+            "id": "comment-15454007"
+        },
+        {
+            "date": "2016-09-01T03:56:11+0000",
+            "author": "David Smiley",
+            "content": "Perhaps we could use the \"Bits\" interface instead when we want/require a fast random access set.\n\nDo you mean this?: Code that needs a fast set would be changed to work on a Bits interface, and we'd change HashDocSet to be a hypothetical HashBits and implement Bits.  Meanwhile any DocSet that is already fast for random sets could be enhanced to either implement Bits or expose the Bits?   +1 to that.\n\nI was surprised this adds a method (dvhash). \n\nEven if we had a heuristic to auto-pick this, nonetheless sometimes the user knows best.  Ok; I could imagine the herustic number itself might be tunable to get the intended effect.  So if we can add auto-tuning in before v6.3 then we don't need a method=dvhash.\n\nAlthough perhaps convenient for testing things out, it would be tedious in production since the best method will depend on the domain size, which will often not be known ahead of time by the user. For the normal \"dv\" method, we should definitely make it pick hashing when the domain is much smaller than the number of unique terms in the field. We already do stuff like this in the DV faceting to pick whether we accumulate global ords, or accumulate local (per-seg) ords first and then do a mapping at the end to global ords.\n\nCertainly that would be nice... it's a TODO in the method selection code to auto-pick dvhash.  If it was trivial I would have added it... but the method-selection code doesn't conveniently have access to the Terms/DocValues to know the stats, furthermore we might want to try to get stats from Terms and/or DocValues depending on which is available. There are other TODOs as well like supporting multi-valued and prefix.\n ",
+            "id": "comment-15454221"
+        },
+        {
+            "date": "2016-09-01T12:51:30+0000",
+            "author": "Yonik Seeley",
+            "content": "Do you mean this?: Code that needs a fast set would be changed to work on a Bits interface,\n\nYep... there are already too many places in the code that need/assume ordered sets.\nA utility method DocSetUtil.getBits(DocSet set)? could just unwrap BitDocSet if needed since OpenBitSet (err... FixedBitSet these days) implements Bits, or use a hash for SortedIntDocSet.\n\nbut the method-selection code doesn't conveniently have access to the Terms/DocValues to know the stats\n\nYeah... we're going to have to figure out the best way to handle that.\n\nOh, and as far as hashing, it will also make sense when using uif as well... I'll open a separate issue for that. ",
+            "id": "comment-15455287"
+        },
+        {
+            "date": "2016-11-09T08:39:29+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Closing after 6.3.0 release. ",
+            "id": "comment-15650331"
+        }
+    ]
+}

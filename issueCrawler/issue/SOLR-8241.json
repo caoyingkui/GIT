@@ -1,0 +1,246 @@
+{
+    "id": "SOLR-8241",
+    "title": "Evaluate W-TinyLfu cache",
+    "details": {
+        "components": [
+            "search"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "SOLR-2906 introduced an LFU cache and in-progress SOLR-3393 makes it O(1). The discussions seem to indicate that the higher hit rate (vs LRU) is offset by the slower performance of the implementation. An original goal appeared to be to introduce ARC, a patented algorithm that uses ghost entries to retain history information.\n\nMy analysis of Window TinyLfu indicates that it may be a better option. It uses a frequency sketch to compactly estimate an entry's popularity. It uses LRU to capture recency and operate in O(1) time. When using available academic traces the policy provides a near optimal hit rate regardless of the workload.\n\nI'm getting ready to release the policy in Caffeine, which Solr already has a dependency on. But, the code is fairly straightforward and a port into Solr's caches instead is a pragmatic alternative. More interesting is what the impact would be in Solr's workloads and feedback on the policy's design.\n\nhttps://github.com/ben-manes/caffeine/wiki/Efficiency",
+    "attachments": {
+        "SOLR-8241.patch": "https://issues.apache.org/jira/secure/attachment/12786768/SOLR-8241.patch",
+        "proposal.patch": "https://issues.apache.org/jira/secure/attachment/12832307/proposal.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-12-23T06:36:21+0000",
+            "author": "Shawn Heisey",
+            "content": "ARC was a cache type that I had read about when I went looking for something better than LRU.  If I had known the idea was patented, I never would have created an issue for it and would have went straight to LFU.\n\nIf I ever find some time, I will work on SOLR-3393.  I haven't looked at how W-TinyLfu works or whether it would be a good alternative.  I think there are few things to consider:  How the speed compares to the code I cobbled together on SOLR-3393, how difficult it is to incorporate/debug, and whether any significant library dependencies are added.  It looks like you've used the Apache License, so there's no conflicts there. ",
+            "id": "comment-15069229"
+        },
+        {
+            "date": "2015-12-23T07:05:47+0000",
+            "author": "Ben Manes",
+            "content": "Benchmarks of Caffeine shows that the cache is ~33% as fast as an unbounded ConcurrentHashMap. As an earlier version is already a dependency, for a proof-of-concept the easiest would be to use an adapter into a Solr Cache. If the results are attractive, the next decision can be whether to use Caffeine or incorporate its ideas into a Solr cache instead.\n\nLRU and LFU only retain information of the current working set. That turns out to be a limitation and by capturing more history a significantly better prediction (and hit rate) can be achieved. How that history is stored and used is how many newer polices differ (ARC, LIRS, 2Q, etc). Regardless they outperform a LRU / LFU by sometimes very wide margins, which makes choosing one very attractive. In the case of TinyLFU its very easy to adapt onto an existing policy as it works by filtering (admission) rather than organizing the order of exiting (eviction).\n\nThe paper is a bit long, but a good read. The simulation code is very simple, though Caffeine's version isn't due to tackling the concurrency aspect as well. ",
+            "id": "comment-15069335"
+        },
+        {
+            "date": "2016-02-08T08:25:09+0000",
+            "author": "Ben Manes",
+            "content": "Attached a patch that includes a new SolrCache implementation based on Caffeine (version 2.1.0). This was based on the LruCache, trimmed extensively to match the requirements in the SolrCaching wiki page.\n\nThis passes the \"ant precommit\" check, but due to a lack of familiarity with Solr I didn't run the server to test it. Due to the simplicity of the change I think this should be a relatively good prototype to start from. Hopefully there isn't much work required to complete this task and see if the cache is beneficial. Based on my limited understanding of Solr's existing caches, I expect this new one to be both faster and have a higher hit rate.\n\nShawn, can you please take a look? Thanks! ",
+            "id": "comment-15136695"
+        },
+        {
+            "date": "2016-02-08T15:55:30+0000",
+            "author": "Shawn Heisey",
+            "content": "If this proves to be advantageous, it would be my recommendation to replace LFUCache, not add an entirely new implementation.  I would also suggest that we build something into the tests that will help us evaluate the performance of the various cache implementations, to determine if a later step should be to change the example configs to use LFUCache.  In general, I believe LFU to be a more viable eviction method for Solr than LRU, inherently more capable of reaching a higher hit ratio, but we need an efficient implementation.\n\nIt looks like this is a master-only patch.  I can see some code that looks like it's for Java 8 only, both before and after the patch.  I do not understand this part of the patch, because I do not have any idea how to use the new capabilities in Java 8, or what those new capabilities actually do:\n\n\n-    RemovalListener<BlockCacheKey,BlockCacheLocation> listener = \n-        notification -> releaseLocation(notification.getValue());\n+    RemovalListener<BlockCacheKey,BlockCacheLocation> listener =\n+        (key, value, cause) -> releaseLocation(value);\n\n\n\nThe code that is patched above does not exist in branch_5x.  It's not a problem to have a master-only patch, just something notable.\n\nAs for the actual implementation: That is going to take me longer to digest.  My free time is in short supply. ",
+            "id": "comment-15137111"
+        },
+        {
+            "date": "2016-02-08T17:43:59+0000",
+            "author": "Ben Manes",
+            "content": "I only used the LruCache as a template and removed much of it, though looking at LfuCache it might have been easier to work with, since mine was trimmed to look very similar. \n\nLFU is substantially better than LRU for search engine workloads like Solr's. I do not have any Solr specific metrics to offer, but the search engine traces I do have are very promising. LFU is superior to LRU, and TinyLFU is a substantial further improvement. If the impact was not so significant then I would not be advocating this change.\n\nWebSearch1 @ 4M (U. of Mass.)\n\n\tLru: 21.6%\n\tLfu: 27.1%\n\tW-TinyLfu: 41.5%\n\tOptimal: 57.8%\n\n\n\nS3 @ 400K (ARC paper)\n\n\tLru: 12.0%\n\tLfu: 29.4%\n\tW-TinyLfu: 43.0%\n\tOptimal: 60.0%\n\n\n\nYes, this is Java 8 only. The interface of RemovalListener was changed from v1.x to v2.x in order to be friendlier lambda syntax for the builder's type inference.\n\nPlease read this short article which describes the policy and concurrency mechanism. That should provide you enough context to judge this change without taking a deep dive into the library's implementation. The patch to Solr's code is quite small. ",
+            "id": "comment-15137321"
+        },
+        {
+            "date": "2016-02-08T18:48:27+0000",
+            "author": "David Smiley",
+            "content": "+1 Cool work Ben!  I like the relative simplicity and low amount of code for the implementation. ",
+            "id": "comment-15137458"
+        },
+        {
+            "date": "2016-03-03T16:53:25+0000",
+            "author": "Ben Manes",
+            "content": "I see that YCSB includes Solr as a backend. It is a popular benchmark, though is oriented for comparing key-value queries. Still, that might be an easy way to see the performance and cache efficiency impact of this proposal. ",
+            "id": "comment-15178106"
+        },
+        {
+            "date": "2016-03-03T18:45:23+0000",
+            "author": "Shawn Heisey",
+            "content": "I'm pretty sure that no matter what benchmarks we run, your implementation will be MUCH better than my current implementation.  If we put this in, which I am in favor of doing as soon as we can, I believe it should replace LFUCache.\n\nCode simplicity alone probably makes it better than my improved implementation that isn't committed (SOLR-3393).\n\nI wonder if it might be possible for Solr's cache implementations (including this one) to use the codahale metrics library (already in Solr) to record statistics about eviction time.  Evictions are the pain point for a cache implementation, and being able to compare results with different cache implementations would be awesome. ",
+            "id": "comment-15178352"
+        },
+        {
+            "date": "2016-03-03T19:07:53+0000",
+            "author": "Ben Manes",
+            "content": "Using the metrics library should be really easy. There are two simple implementation approaches,\n\n1. Use the same approach as Guava metrics that polls the cache's stats. Caffeine is the next gen, so it has a nearly identical API.\n2. Use a custom StatsCounter and Caffeine.recordStats(statsCounter) that records directly into the metrics. This rejected feature request shows an example of that, though I'd return a disabledStatsCounter() instead of throwing an exception if polled.\n\nThe only annoyance is neither Guava or Caffeine bothered to include a put statistic. That was partially an oversight and partially because we really wanted everyone to load through the cache (put is often an anti-pattern due to races). I forgot to add it in with v2 and due to being an API change semvar would require that it be in v3 or maybe we can use a default method hack for sneaking it into v2. ",
+            "id": "comment-15178389"
+        },
+        {
+            "date": "2016-03-03T22:27:06+0000",
+            "author": "Shawn Heisey",
+            "content": "neither Guava or Caffeine bothered to include a put statistic\n\nFor all the Solr cache implementations currently shipping, the put operation is pretty much identical, so stats are not likely to be very interesting when comparing implementations.  The situation is similar for lookups.  I am not at all worried about seeing time stats on either of those, unless it's easy and really fast to obtain.\n\nI think that hit ratio is the most important statistic for cache performance, and it's already available.  Eviction performance is important, though.  The count of evictions, also present currently, is useful.  The speed of evictions, in conjunction with the count, can help decide whether the cache is too slow.\n\nIf the implementation itself happens to track stats, that's awesome, but I'm after more than a calculation of the average time.  Percentile stats give a clearer picture of what's happening than plain averages.  I'd love to have the same detail on speed data that we got for QTime with SOLR-1972. ",
+            "id": "comment-15178727"
+        },
+        {
+            "date": "2016-03-03T23:50:52+0000",
+            "author": "Ben Manes",
+            "content": "Percentile stats are best obtained by the metrics library. The stats provided by Caffeine are monotonically increasing over the lifetime of the cache. This lets the percentiles over a time window be easily calculated by the metrics reporter.\n\nThe only native time statistic is the load time (cost of computing the entry on a miss) because it adds to the user-facing latency. All cache operations are O(1) and designed for concurrency, so broadly tracking time would be prohibitively expensive given how slow the native time methods are. From benchmarks I think the cache offers enough headroom to not be a bottleneck, so tracking the hit rate and minimizing the miss penalty are probably the more interesting areas to monitor.\n\nI'm not sure what my next steps are to assist here, so let me know if I can be of further help. ",
+            "id": "comment-15178872"
+        },
+        {
+            "date": "2016-04-11T20:35:12+0000",
+            "author": "Jeff Wartes",
+            "content": "Since Solr requires Java 8 as of 6.0, it seems like this patch could be applied pretty easily now? ",
+            "id": "comment-15235935"
+        },
+        {
+            "date": "2016-04-12T18:53:06+0000",
+            "author": "Ben Manes",
+            "content": "There are some other caches that might be worth migrating as well (e.g. LRUQueryCache, LRUHashMap, NameIntCacheLRU). It might be good to follow-up after this patch and see what other caches benefit from being migrated. ",
+            "id": "comment-15237765"
+        },
+        {
+            "date": "2016-04-12T21:17:34+0000",
+            "author": "Shawn Heisey",
+            "content": "Those are Lucene caches.  The first one is in Lucene core.  The other two are in the Lucene facet module \u2013 which is a completely different implementation from Solr's faceting.\n\nRecently I found some instances of entire external source files being copied into the Lucene core module.  When I asked about it, I was told that this is to comply with a strict rule about Lucene core remaining 100 percent dependency-free.  I have not confirmed this rule, but it would not surprise me.\n\nI'm all for replacing LFUCache in Solr with your implementation, and I'm willing to do the work to make it happen.  We have quite a few external dependencies already.\n\nWorking on Lucene will require a separate issue, and even though I have write access to the code, I'm going to leave that to people who really understand Lucene and who've been around the code a lot longer than I have. ",
+            "id": "comment-15237993"
+        },
+        {
+            "date": "2016-04-12T23:01:41+0000",
+            "author": "Ben Manes",
+            "content": "Thanks for the information. I definitely meant that would be a new issue if we were happy with the results here. It makes sense that Lucene wouldn't want dependencies and a different expert would be needed to review. As those are synchronous I can easily port the code over (its the concurrency that's hard). We'll revisit that if we have a positive experience here, as I think this is the more critical cache for Solr.\n\nThanks a lot Shawn for pushing this forward and all your help thus far. ",
+            "id": "comment-15238184"
+        },
+        {
+            "date": "2016-07-17T04:17:16+0000",
+            "author": "Ben Manes",
+            "content": "Can we try to move this forward again? Thanks! ",
+            "id": "comment-15381077"
+        },
+        {
+            "date": "2016-09-23T17:19:33+0000",
+            "author": "Shawn Heisey",
+            "content": "After some experience using Caffeine in my own code, I think it's absolutely something we should have in Solr.  My time is still limited, but I'd like to begin pushing this through as a replacement for the existing LFUCache.\n\nI had a thought.  The decay capability currently present in LFUCache can be replaced by the expiration feature in Caffeine.  I did have some questions about that:\n\nI'm not sure what the default expiration time for cache entries should be, but it should definitely be configurable.  The idea that comes to mind first is 4 hours.\n\nI'm also not sure what time unit to use for expiration.  Milliseconds would probably result in very large numbers.  I can see arguments for seconds, minutes, hours, and for some users, days.  Caffeine supports multiple time units, so the unit could be configurable, which puts millis back on the table.\n\nI don't see support for a feature that I think would be really quite cool:  A \"minimum size\" for the cache, so when the number of entries in the cache drops to that level, entries will no longer be removed because of expiration.  For Solr's purposes, this would mean that if the cache has seen some activity, there will always be something available for autowarming, even if it's been a week since Solr got a query.  Perhaps this could be configured with \"expireAfter\" methods when the cache is constructed? ",
+            "id": "comment-15517021"
+        },
+        {
+            "date": "2016-09-23T17:35:36+0000",
+            "author": "Shawn Heisey",
+            "content": "Decay (as implemented) can't be completely replaced by expiration, unless it's possible to migrate the last access time to the new cache when autowarming.  I haven't delved deeply enough into Caffeine to determine whether that's possible.\n\nI don't recall anything that could be used to directly implement decay as already implemented. ",
+            "id": "comment-15517065"
+        },
+        {
+            "date": "2016-09-23T17:44:42+0000",
+            "author": "Ben Manes",
+            "content": "Expiration is tricky because it means the data is no longer valid to be consumed and should not be consumed. The middle ground here is to refreshAfterWrite, which serves stale entries and tries to asynchronously reload the value. That covers the common case by not penalizing active entries by evicting, while letting inactive ones expire.\n\nThat probably isn't enough and its impossible to cover all use-cases. So instead its more of a data structure to (hopefully) be malleable to have custom workarounds. The CacheWriter can be used to create a victim cache, which a CacheLoader could retrieve from. So you could let expired entries populate the victim and be promoted back into the cache, sometimes within the same atomic operation. Then a rewarming could clear the victim when its done as its contents are unnecessary. So something like this is might be workable. ",
+            "id": "comment-15517090"
+        },
+        {
+            "date": "2016-09-23T19:58:23+0000",
+            "author": "Shawn Heisey",
+            "content": "It's been so long since I wrote LFUCache that I'm having a hard time understanding the code.\n\nI seem to remember that I intended warming to preserve the access counter on each entry when it was added to the new cache ... but I can't seem to find any evidence that I actually implemented this.  I think I might have implemented it in the faster replacement that never got finished.\n\nI can't see a way with Caffeine to preserve the hitcounter and other relevance information when warming a new cache, which I think means that all warmed entries will be as relevant as anything new that ends up in the cache, and will therefore likely be the first to get evicted from a freshly warmed cache that happens to fill up, even if those particular entries were accessed millions of times in previous cache instances.\n\nIf there's a way to do the following we'd be OK: \"copy the top Nth key from the old cache, preserving access info, and then replace the value with XXX\"\n\nEven without this capability, Caffeine would probably be overall more efficient than LRU, assuming that there's a reasonable span of time between commits that open new searchers. ",
+            "id": "comment-15517418"
+        },
+        {
+            "date": "2016-09-23T20:04:52+0000",
+            "author": "Ben Manes",
+            "content": "Can you explain why a new instance is required and the entire cache swapped?\n\nThere is an open issue for supporting bulk refresh, but its been low on my list of priorities. Not sure if that would have worked for this rewarming process. ",
+            "id": "comment-15517433"
+        },
+        {
+            "date": "2016-09-23T20:18:52+0000",
+            "author": "Shawn Heisey",
+            "content": "Each searcher has its own cache instances.  It needs to have access to those, with information relevant to the previous commit point, until the searcher finally gets closed and disappears.  That might happen after the new searcher begins accepting requests and populating its cache, so I think they do need to be separate instances. ",
+            "id": "comment-15517462"
+        },
+        {
+            "date": "2016-09-23T20:43:35+0000",
+            "author": "Ben Manes",
+            "content": "The cache does provide basic snapshot features ordered by the policy (hot/cold, young/old). You might be able to change perspectives by having the old searchers use a snapshot and rewarming the cache instance.\n\nI do think it will be okay to recreate and warm, just not optimal. It looks like in my patch I did try to transfer over the hottest entries, so its probably alright. ",
+            "id": "comment-15517521"
+        },
+        {
+            "date": "2016-09-25T20:33:43+0000",
+            "author": "Ben Manes",
+            "content": "I took look to refresh myself on LFUCache and decay. I don't think there is an issue because TinyLFU has similar logic to age the frequencies asynchronously. It observes a sample of 10 * maximum size and then halves the counters. The difference is the counters are stored in an array, are 4-bit, and represent all items (not just those currently residing in the cache). This extended history and using frequency for admission (rather than eviction) is what allows the policy to have a superior hit rate and be amortized O(1). ",
+            "id": "comment-15521377"
+        },
+        {
+            "date": "2016-10-08T18:32:34+0000",
+            "author": "Shawn Heisey",
+            "content": "Taking a look at this today.\n\nWould you be able to build some tests?  I can copy the existing LFUCache tests and modify them until they pass, but it would be better for somebody who knows how the cache is supposed to work to engineer those tests so they check for what should happen.  Best possible result would be that my assumptions for LFUCache will hold without changes, but that is probably not likely.\n\nNew cache warming loses old frequency information, as I already mentioned earlier.  I suspect that even without this being preserved, we're likely to see a generally higher hitrate than LRU.  I would like to preserve this information if possible, but I don't view it as a blocker. ",
+            "id": "comment-15558485"
+        },
+        {
+            "date": "2016-10-08T18:38:01+0000",
+            "author": "Shawn Heisey",
+            "content": "Updated patch against master.  Changes from the previous version:\n\nNo changes to SolrCache.java \u2013 those were whitespace only.  I've also upgraded to the newest version of Caffeine currently available (2.3.3).  Removed the unused RemovalCause import.  Precommit passes.\n\nAt this time, I am leaving LFUCache alone and keeping the new cache as a class addition.  I will make a decision later about whether to replace LFUCache.\n\nI don't have a CHANGES.txt entry yet.  That will go in last, once we nail down what version gets the change.  I haven't done anything with tests yet. ",
+            "id": "comment-15558495"
+        },
+        {
+            "date": "2016-10-08T18:52:09+0000",
+            "author": "Ben Manes",
+            "content": "I can take a stab at tests, but its unclear what to include other than basic operations. Otherwise I'd defer to the library for deeper testing, e.g. scan resistance and efficiency. In those areas writing tests is for the author to have assurance that the library does what it claims. I'd prefer if someone obtained production traces instead, which I think would show you an interesting hit rate curve for how the policies stack up.\n\nI'm pretty sure the current warming, which populates with the hottest entries first, should be good enough. Since reads dominate writes, the hot entries will quickly have a high frequency by the time an eviction is triggered. We can try to give the first few hot entries a small bump too, by adding a few accesses, to add an extra nudge. ",
+            "id": "comment-15558521"
+        },
+        {
+            "date": "2016-10-08T20:59:19+0000",
+            "author": "Ben Manes",
+            "content": "I think there is a small bug in the \"hottest\" ordering provided by Caffeine, so the warmed-up cache doesn't contain the desired entries. I believe this is a simple mistake of concatenating two lists in the wrong order, so that it chooses a luke-warm entry instead. I'm not sure how to test my changes to verify this with a custom jar in Ivy, though. ",
+            "id": "comment-15558709"
+        },
+        {
+            "date": "2016-10-08T23:48:16+0000",
+            "author": "Ben Manes",
+            "content": "I have some basic tests ported (testSimple, testTimeDecay). The first performs access operations and the second ensures frequency is taken into account. The changes also adds cumulative stats by aggregating during warm() (this was simpler than the init approach since Caffeine's stats object is immutable).\n\nMinor changes are to rename the class to TinyLfuCache to emphasize the policy over the library. That conforms with the HBase and Accumulo integration, and matches the existing naming convention.\n\nThis version of the patch requires changes in Caffeine 2.3.4-SNAPSHOT. I improved the hot iteration order which previously returned in warm, hot, cold order. Given real world cache sizes it might not have made a difference, but was a required improvement for the tests. So I'm adding this version as a proposal and can cut a release when you're ready for integration. ",
+            "id": "comment-15558915"
+        },
+        {
+            "date": "2016-10-31T02:06:56+0000",
+            "author": "Ben Manes",
+            "content": "Rebased and updated to v2.3.4. Any remaining tasks? ",
+            "id": "comment-15620972"
+        },
+        {
+            "date": "2017-01-05T16:28:21+0000",
+            "author": "Timothy M. Rodriguez",
+            "content": "+1 for this issue.  Solr currently uses caffeine-1.0.1 in it's distribution, which can cause conflicts if you create any extensions that intend to use the new library. ",
+            "id": "comment-15801792"
+        },
+        {
+            "date": "2017-01-05T17:47:03+0000",
+            "author": "Shawn Heisey",
+            "content": "This issue was filed by the author of Caffeine (Ben Manes) and does include upgrading the caffeine dependency already present.  I haven't checked yet, but presumably all the Solr tests still pass with the upgrade. ",
+            "id": "comment-15802010"
+        },
+        {
+            "date": "2017-01-05T18:11:49+0000",
+            "author": "Ben Manes",
+            "content": "I think the tests all passed last I checked with this new SolrCache, but I don't think we had made it the default yet so that might be a premature statement. If you want to upgrade only the 1.x usage, that would be a safe change to extract from this patch (a minor API tweak). If anything the later versions also have fewer bugs.\n\nI'd love to see this patch land. ",
+            "id": "comment-15802076"
+        },
+        {
+            "date": "2017-01-26T02:20:51+0000",
+            "author": "Ben Manes",
+            "content": "Shawn Heisey: Solr 6.4.0 was just released. Do you think we can make a commitment to resolve this for 6.5.0? We've iterated on the patch for about a year now. ",
+            "id": "comment-15839058"
+        },
+        {
+            "date": "2017-02-17T18:21:30+0000",
+            "author": "Ben Manes",
+            "content": "Timothy M. Rodriguez, solr master is now on 2.3.5 (to upgrade its usage in the block cache). ",
+            "id": "comment-15872244"
+        },
+        {
+            "date": "2017-12-30T23:36:54+0000",
+            "author": "Ben Manes",
+            "content": "Shawn, is this issue something you'd be interested in finalizing in the new year? If not, what are the next steps to resolve? ",
+            "id": "comment-16307000"
+        },
+        {
+            "date": "2018-12-05T20:47:11+0000",
+            "author": "Ben Manes",
+            "content": "Another year, another ping!\n\nDo you think that you'll have some time over the holidays or in 2019 to revisit this? ",
+            "id": "comment-16710613"
+        }
+    ]
+}

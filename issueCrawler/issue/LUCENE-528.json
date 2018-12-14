@@ -1,0 +1,72 @@
+{
+    "id": "LUCENE-528",
+    "title": "Optimization for IndexWriter.addIndexes()",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "One big performance problem with IndexWriter.addIndexes() is that it has to optimize the index both before and after adding the segments.  When you have a very large index, to which you are adding batches of small updates, these calls to optimize make using addIndexes() impossible.  It makes parallel updates very frustrating.\n\nHere is an optimized function that helps out by calling mergeSegments only on the newly added documents.  It will try to avoid calling mergeSegments until the end, unless you're adding a lot of documents at once.\n\nI also have an extensive unit test that verifies that this function works correctly if people are interested.  I gave it a different name because it has very different performance characteristics which can make querying take longer.",
+    "attachments": {
+        "AddIndexes.patch": "https://issues.apache.org/jira/secure/attachment/12324426/AddIndexes.patch",
+        "AddIndexesNoOptimize.patch": "https://issues.apache.org/jira/secure/attachment/12343586/AddIndexesNoOptimize.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2006-08-16T19:27:23+0000",
+            "content": "In an email thread titled \"LUCENE-528 and 565\", I described a weakness of the proposed solution:\n\n\"I'm totally for a version of addIndexes() where optimize() is not always called. However, with the one proposed in the patch, we could end up with an index where: segment 0 has 1000 docs, 1 has 2000, 2 has 4000, 3 has 8000, etc. while Lucene desires the reverse. Or we could have a sandwich index where: segment 0 has 4000 docs, 1 has 100, 2 has 100, 3 has 4000. While neither of these will occur if you use addIndexesNoOpt() carefully, there should be a more robust merge policy.\"\n\nHere is an alternative solution which merges segements so that the docCount of segment i is at least twice as big as the docCount of segment i+1. If we are willing to make it a bit more complicated, we can take merge factor into consideration.\n\n\n  public synchronized void addIndexesNoOpt(Directory[] dirs) throws IOException {\n    for (int i = 0; i < dirs.length; i++) {\n      SegmentInfos sis = new SegmentInfos(); // read infos from dir\n      sis.read(dirs[i]);\n      for (int j = 0; j < sis.size(); j++) \n{\n        segmentInfos.addElement(sis.info(j)); // add each info\n      }\n    }\n\n    int start = 0;\n    int docCountFromStart = docCount();\n\n    while (start < segmentInfos.size()) {\n      int end;\n      int docCountToMerge = 0;\n\n      if (docCountFromStart <= minMergeDocs) \n{\n        // if the total docCount of the remaining segments\n        // is lte minMergeDocs, merge all of them\n        end = segmentInfos.size() - 1;\n        docCountToMerge = docCountFromStart;\n      }\n      else {\n        // otherwise, merge some segments so that the docCount\n        // of these segments is at least half of the remaining\n        for (end = start; end < segmentInfos.size(); end++) {\n          docCountToMerge += segmentInfos.info(end).docCount;\n          if (docCountToMerge >= docCountFromStart / 2) \n{\n            break;\n          }\n        }\n      }\n\n      mergeSegments(start, end + 1);\n      start++;\n      docCountFromStart -= docCountToMerge;\n    }\n  } ",
+            "author": "Ning Li",
+            "id": "comment-12428478"
+        },
+        {
+            "date": "2006-10-20T07:00:25+0000",
+            "content": "We want a robust algorithm for the version of addIndexes() which\ndoes not call optimize().\n\nThe robustness can be expressed as the two invariants guaranteed\nby the merge policy for adding documents (if mergeFactor M does not\nchange and segment doc count is not reaching maxMergeDocs):\n      B for maxBufferedDocs, f defined as ceil(log_M(ceil(n/B)))\n      1: If i (left*) and i+1 (right*) are two consecutive segments of doc\n          counts x and y, then f >= f.\n      2: The number of committed segments on the same level (f) <= M.\n\nReferences are at http://www.gossamer-threads.com/lists/lucene/java-dev/35147,\nLUCENE-565 and LUCENE-672.\n\nAddIndexes() can be viewed as adding a sequence of segments S to\na sequence of segments T. Segments in T follow the invariants but\nsegments in S may not since they could come from multiple indexes.\nHere is the merge algorithm for addIndexes():\n\n1. Flush ram segments.\n\n2. Consider a combined sequence with segments from T followed\n    by segments from S (same as current addIndexes()).\n\n3. Assume the highest level for segments in S is h. Call maybeMergeSegments(),\n    but instead of starting w/ lowerBound = -1 and upperBound = maxBufferedDocs,\n    start w/ lowerBound = -1 and upperBound = upperBound of level h.\n    After this, the invariants are guaranteed except for the last < M segments\n    whose levels <= h.\n\n4. If the invariants hold for the last < M segments whose levels <= h, done.\n    Otherwise, simply merge those segments. If the merge results in\n    a segment of level <= h, done. Otherwise, it's of level h+1 and call\n    maybeMergeSegments() starting w/ upperBound = upperBound of level h+1.\n\nSuggestions? ",
+            "author": "Ning Li",
+            "id": "comment-12443723"
+        },
+        {
+            "date": "2006-10-20T13:34:05+0000",
+            "content": "I think you need to ensure that no segments from the source index \"S\" remain after the call, right? ",
+            "author": "Yonik Seeley",
+            "id": "comment-12443841"
+        },
+        {
+            "date": "2006-10-20T17:47:09+0000",
+            "content": "> I think you need to ensure that no segments from the source index \"S\" remain after the call, right?\n\nCorrect. And thanks!\n\nSo in step 4, in the case where the invariants hold for the last < M segments whose levels <= h,\nif some of those < M segments are from S (not merged in step 3), properly copy them over.\n\nAlgorithm looks good?\n\nThis makes me notice a bug in current addIndexes(Directory[]). In current addIndexes(Directory[]),\nsegment infos in S are added to T's \"segmentInfos\" upfront. Then segments in S are merged to T\nseveral at a time. Every merge is committed with T's \"segmentInfos\". So if a reader is opened on T\nwhile addIndexes() is going on, it could see an inconsistent index. ",
+            "author": "Ning Li",
+            "id": "comment-12443911"
+        },
+        {
+            "date": "2006-10-20T21:05:59+0000",
+            "content": "> Algorithm looks good? \n\nYep, looks good.\n\nA possible optimization far down the road for segments that need copying could be to \"steal\" the segments if rename/mv is supported (if they are both of the same Directory type, on the same partition for FSDirectories, etc), and if the caller indicated it was OK.  Rather than try to detect when it's safe, there could be an attachSegments(Directory[]) call. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12443940"
+        },
+        {
+            "date": "2006-10-21T00:00:32+0000",
+            "content": "I'll submit a patch next week. ",
+            "author": "Ning Li",
+            "id": "comment-12443978"
+        },
+        {
+            "date": "2006-10-24T22:26:49+0000",
+            "content": "This patch implements addIndexesNoOptimize() following the algorithm described earlier.\n\n\tThe patch is based on the latest version from trunk.\n\tAddIndexesNoOptimize() is implemented. The algorithm description is included as comment and the code is commented.\n\tThe patch includes a test called TestAddIndexesNoOptimize which covers all the code in addIndexesNoOptimize().\n\tmaybeMergeSegments() was conservative and checked for more merges only when \"upperBound * mergeFactor <= maxMergeDocs\". Change it to check for more merges when \"upperBound < maxMergeDocs\".\n\tMinor changes in TestIndexWriterMergePolicy to better verify merge invariants.\n\tThe patch passes all unit tests.\n\n\n\nOne more comment on the implementation:\n\n\tWhen we copy un-merged segments from S in step 4, ideally, we want to simply copy\n    those segments. However, directory does not support copy yet. In addition, source may\n    use compound file or not and target may use compound file or not. So we use\n    mergeSegments() to copy each segment, which may cause doc count to change\n    because deleted docs are garbage collected. That case is handled properly.  \n\n ",
+            "author": "Ning Li",
+            "id": "comment-12444541"
+        },
+        {
+            "date": "2006-10-26T22:56:26+0000",
+            "content": "Thanks Ning, I just committed this.\nWish I had had it some time ago \nhttp://www.mail-archive.com/lucene-user@jakarta.apache.org/msg10758.html ",
+            "author": "Yonik Seeley",
+            "id": "comment-12445041"
+        }
+    ]
+}

@@ -1,0 +1,331 @@
+{
+    "id": "LUCENE-2575",
+    "title": "Concurrent byte and int block implementations",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "6.0"
+        ],
+        "affect_versions": "Realtime Branch",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "The current *BlockPool implementations aren't quite concurrent.\nWe really need something that has a locking flush method, where\nflush is called at the end of adding a document. Once flushed,\nthe newly written data would be available to all other reading\nthreads (ie, postings etc). I'm not sure I understand the slices\nconcept, it seems like it'd be easier to implement a seekable\nrandom access file like API. One'd seek to a given position,\nthen read or write from there. The underlying management of byte\narrays could then be hidden?",
+    "attachments": {
+        "LUCENE-2575.patch": "https://issues.apache.org/jira/secure/attachment/12454388/LUCENE-2575.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-07-29T09:36:44+0000",
+            "content": "Logically, every term has its own open IndexOutput, where it can write any number of bytes.  During indexing, when we hit a given term, we init its IndexOutput (two of of them \u2013 one frq, one prx) and write a few bytes as appropriate.\n\nIt's that abstraction that the interleaved byte slices API provides \u2013 the ability to hold open a great many IndexOutputs.\n\nWe should then be able to init IndexInputs against these slices as well, but they can only sequentially scan.\n\nTo handle skipping, I think we can write to another ByteBlockPool?  That skip data would be similar to the multi-level skip data we now record, except instead of indexing into a single frq or prx file, it indexes into positions in the primary ByteBlockPool.\n\nWhere is there a concurrency problem?  Is it a JMM visibility issue of writes from one thread vs reads, in a shared byte[]? ",
+            "author": "Michael McCandless",
+            "id": "comment-12893564"
+        },
+        {
+            "date": "2010-07-29T13:53:53+0000",
+            "content": "Where is there a concurrency problem? Is it a JMM\nvisibility issue of writes from one thread vs reads, in a shared\nbyte[]?\n\nFor example if the 1st dimension of the byte array increases,\nhow is that made visible while it's also being read? In\naddition, there's the JMM issue of the actual byte[]s that hold\nthe data (ie, if we're writing to a byte[] there's no guarantee\nas to when those bytes will be available to reading threads).\n\nWe're writing segments to the Directory API today, it seems we\nshould be able to also write to a virtual ram filesystem (a\nconcurrent RAMDir?) with some basic block level locking\nsemantics (encapsulated in a flush method). Then we could safely\nand concurrently read from this new RAMDr. Couldn't we also use\nthe RAMDir to interleave IndexOutputs, or provide an abstraction\nthat performs actual the interleaving? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12893615"
+        },
+        {
+            "date": "2010-09-08T03:02:07+0000",
+            "content": "every term has its own open IndexOutput\n\nI'm not seeing IndexOutput in use with the RAM buffer, do you\nmean the the write* (writeVInt, writeBytes, writeByte) methods\nof TermsHashPerField? \n\nIncluded in this patch will need to be a way to concurrently\ngrow other arrays such as ParallelPostingsArray. PPA is used to\nstore pointers to data stored in the block pools. Maybe we need\na class that concurrently manages growing arrays and block\npools. \n\nOr we may need to slightly re-architect how we're storing the\nRAM buffer data so that concurrency can be guaranteed, ie, I\nthink we'll need to write to temporary arrays, which are then\nflushed to primary readable arrays. The flush would occur after\nadding a document, or probably for better efficiency, only when\ngetReader is called. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12907069"
+        },
+        {
+            "date": "2010-09-09T00:18:31+0000",
+            "content": "I'm finally understanding the slice concept, basically we're\nover-allocating space within the ByteBlockPool byte[]s for more\npostings for a particular term, hence the levelSizeArray which\ndetermines the length of each \"slice\" of a byte[] the postings\nwill use. They're probably not always filled in completely?\n\nIt's a bit tricky to follow by reading the code, which makes\nfiguring out how to make the RAM buffer concurrent challenging.\nEspecially in the newSlice method which rewrites the end of the\nlast slice with the forwarding index/address of the next slice.\nIt's very clever however maybe we can encapsulate it better with\nmethods delineating the various operations which right now are\noperations directly on the assortment of arrays. In general we\ncan possibly get away with using copy-on-write to achieve\nperformant single-threaded write and multi-threaded reader\nconcurrency.\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12907493"
+        },
+        {
+            "date": "2010-09-09T10:40:29+0000",
+            "content": "Right, we over-allocate each slice according to the sizes in levelSizeArray.\n\nFor a given \"stream\", all of its slices but the last one will be filled in.  The interleaved slices \"logically\" encode many streams (one per unique term), and all of these streams will have a \"tip\" slice, where any bytes written to that stream will go.\n\nHow to make this properly concurrent is a challenge.  Each reader knows its max docID, so, it can stop reading a given stream when it hits a docID over the max.  But, because the write can go back and overwrite the last 4 bytes of a slice (w/ the address of the next slice), we have to guard for that case (when a reader is trying to read that slice at the same time). ",
+            "author": "Michael McCandless",
+            "id": "comment-12907587"
+        },
+        {
+            "date": "2010-09-09T13:20:24+0000",
+            "content": "I see the stream as an argument to the writeByte method, however I only see 0 or 1 being passed in for freq and prox respectively.  \n\nI'm not sure how we can implement the linked slices concept concurrently without pre-allocating 4 bytes at the end of each slice for the forwarding address.  We would be able to go back to byte[]s that are readonly, copy, rewrite the forwarding address(es), and then synchronously flush the rewritten byte[]s back to the readonly list.  We could have a switch that turns the auto-address writing on or off if a user does not plan on using realtime search. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12907624"
+        },
+        {
+            "date": "2010-09-09T13:54:19+0000",
+            "content": "Actually, have said that, we don't need to pre-allocate the forwarding address because we're copy-on-writing the byte[]s.  So I guess we're good! ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12907628"
+        },
+        {
+            "date": "2010-09-11T22:48:58+0000",
+            "content": "Here's a start at concurrency, the terms dictionary, and\niterating over doc ids. \n\n\n\tIt needs concurrency unit tests\n\n\n\n\n\tAt an as yet undetermined interval, we need to conglomerate\nthe existing terms into a sorted int[] rather than continue to\nuse the ConcurrentSkipListMap, which consumes a far greater\namount of RAM. The tradeoff and reason for using the CSLM is the\nlevel of concurrency gained by using it at the cost of greater\nmemory consumption when compared with the sorted int[] of term\nids.\n\n\n\n\n\tAn int[] based term enum needs to be implemented. In addition,\na multi term enum, maybe there's one we can use, I'm not\nfamiliar enough with the new flex code base.\n\n\n\n\n\tCopy on write is used to obtain a read-only version of the\nByteBlockPool and IntBlockPool. In the case of the byte blocks,\na boolean[] marks which elements need to be copied prior to\nwriting by the DocumentsWriterPerThread on byte slice forwarding\naddress rewrite.\n\n\n\n\n\tA write lock on each DWPT guarantees that as reference copies\nare made, arrays being copied will not be altered in flight.\nThere shouldn't be an issue even though to get a complete\nIndexReader[], we need to wait for each document to finish\nflushing, we're not blocking indexing, only the obtaining of the\nIRs. I can't see this being an issue for most use cases.\n\n\n\n\n\tSimilarly, a reference is copied of the ParallelPostingsArray\n(rather than a full copy) for use by the RAM Buffer based\nIndexReader. It is OK for the PPA to be changed during future doc\nadds, as the only the elements greater than the IRs max term id\nwill be altered, ie, we're not going to run into JMM thread\nissues because the writing and read-only array reference copies\noccur in a reentrant lock.\n\n\n\n\n\tRecycling of byte[]s becomes a bit more complex as RAM IRs will\nlikely hold references to them. When the RAM IR is closed, however,\nthe byte[]s can be recycled. The user could experience unusual\nRAM usage spikes if IRs are not closed properly.\n\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12908380"
+        },
+        {
+            "date": "2010-09-12T03:21:42+0000",
+            "content": "This includes a basic implementation of the sorted term id based\nterm enum. We'll want to over-allocate the sorted term id array\nso that future merges of new term ids will not require\nallocating a new array for growth. I think overall the ram\nbuffer based searching will not require too much more of a RAM\noutlay. The merging of new term ids could occur in a background\nthread if we think it's expensive, however for now we can simply\nmerge them in on demand as new RAM readers are created.\n\nSeek is implemented as a binary search of the sorted term ids.\nIf this is not efficient enough, we can implement a terms index\nala the current system.\n\nFor now the conversion from CSLM to sorted term id array can be\na percentage of the total number of terms, which I'll default to\n10%. We may want to make this a function (eg, percentage) of RAM\nconsumption in the future. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12908409"
+        },
+        {
+            "date": "2010-09-13T16:22:45+0000",
+            "content": "One thing I noticed, correct me if I'm wrong, is the term doc\nfrequency (the one stored per term, ie, TermsEnum.docFreq)\ndoesn't seem to be currently recorded in the ram buffer code\ntree. It will be easy to add, though if we make it accurate per\nRAM index reader then we could be allocating a unique array, the\nlength of the number of terms, per reader. I'll implement it\nthis way to start and we can change it later if necessary.\nActually, to save RAM this could be another use case where a 2\ndimensional copy-on-write array is practical. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12908849"
+        },
+        {
+            "date": "2010-09-14T17:12:03+0000",
+            "content": "Term frequency is recorded and returned.  There are Terms, TermsEnum, DocsEnum implementations.  Needs the term vectors, doc stores exposed via the RAM reader, concurrency unit tests, and a payload unit test.  Still quite rough. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12909338"
+        },
+        {
+            "date": "2010-09-14T22:42:42+0000",
+            "content": "Added a unit test for payloads, term vectors, and doc stores.  The reader flushes term vectors and doc stores on demand, once per reader.  Also, little things are getting cleaned up in the realtime branch. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12909495"
+        },
+        {
+            "date": "2010-09-15T04:05:29+0000",
+            "content": "For the posting skip list we need to implement seek on the\nByteSliceReader. However if we're rewriting a portion of a\nslice, then I guess we could have a problem... Meaning we'd be\nstoring an absolute position in the skip list, and we could go\nto look up the value, however that byte(s) could have been\naltered to not be delta encoded doc ids anymore, but instead\nis/are the forwarding address to the next slice. \n\nDo we need an intelligent mechanism that interacts with the byte\nslice writer to not point at byte array elements (ie the end of\nslices) that could later be converted into forwarding addresses? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12909580"
+        },
+        {
+            "date": "2010-09-15T15:29:06+0000",
+            "content": "Because of the way byte slices work, eg, they need to pre-know\nthe size of the slice before iterating on it, we can't simply\npoint to the middle of a slice and read without probably\niterating over the forwarding address.\n\nIt seems the skip list will need to point to the beginning of a\nslice. This'll make the interval iteration in the RAM buffer\nskip list writer a little more complicated than today in that\nit'll need to store positions that are the start of byte slices.\nIn other words, the intervals will be slightly uneven at times. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12909771"
+        },
+        {
+            "date": "2010-09-15T18:42:39+0000",
+            "content": "Is there a way to know the level of a slice given only the forwarding address/position?  It doesn't look like it.  Hmm... This could mean encoding the level or the size of the slice into the slice, which would elongate slices in general, I suppose though that the level index would only add one byte and that would be okay.  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12909839"
+        },
+        {
+            "date": "2010-09-15T19:21:13+0000",
+            "content": "In the following line of ByteBlockPool.allocSlice we're recording the slice level, however it's at the end of the slice rather than the beginning, which is where we'll need to write the level in order to implement slice seek.  I'm not immediately sure what's reading the level at this end position of the byte[].\n\n\nbuffer[byteUpto-1] = (byte) (16|newLevel);\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12909852"
+        },
+        {
+            "date": "2010-09-16T12:21:23+0000",
+            "content": "I'm not immediately sure what's reading the level at this end position of the byte[].\n\nThis is so that once we exhaust the slice and must allocate the next one we know what size (level + 1, ceiling'd) to make the next slice. ",
+            "author": "Michael McCandless",
+            "id": "comment-12910123"
+        },
+        {
+            "date": "2010-09-16T15:58:42+0000",
+            "content": "we know what size (level + 1, ceiling'd) to make the next slice.\n\nThanks.  In the midst of debugging last night I realized this.  The next question is whether to remove it. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12910201"
+        },
+        {
+            "date": "2010-09-22T04:22:05+0000",
+            "content": "This issue is blocked because the change made to ByteBlockPool to add the level of the slice, to the beginning of the slice, moves all of the positions forward by one.  This has caused TestByteSlices to fail an assertion.  I'm not sure if the test needs to be changed, or there's a bug in the new BBP implementation.  Either way it's a bit of a challenge to debug. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12913383"
+        },
+        {
+            "date": "2010-09-22T05:33:51+0000",
+            "content": "A further question for this issue, in regards to copy-on-write\nof the 1st dimension of the byte[][] array, will we want to keep\na count of references to the byte array, in the case of, lets\nsay multiple readers keeping references to each individual byte\narray (the one with the bytes data). Assuming we will want to\ncontinue to pool the byte[]s, I think we'll need to use\nreference counting, or simply not pool the byte[]s after\nflushing, in order to avoid overwriting of arrays. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12913403"
+        },
+        {
+            "date": "2010-09-22T15:02:18+0000",
+            "content": "The reference counting described above is a common pattern throughout Lucene, one similarly used place is IR reopen and clone. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12913597"
+        },
+        {
+            "date": "2010-09-24T19:28:01+0000",
+            "content": "The current MultiLevelSkipList* system relies on writing out\nfixed length skip list buffers before they are readable. This\nobviously will not work for RT so I'm working on modifying MLSL\ninto new class(es) that writes and reads from the concurrent-ish\nBBP. \n\nIn trunk, each level is a RAMOutputStream, that'll need to\nchange, and each level will likely be a stream keyed into\nthe BBP. A question is whether we will statically assign the\nnumber of levels prior to the creation of the MLSL, or will we\nneed to somehow make the number of levels dynamic, in which case\nusing streams becomes slightly more complicated.\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12914607"
+        },
+        {
+            "date": "2010-09-24T19:57:59+0000",
+            "content": "Maybe we can get an initial version of this working, without the skipping?  Ie skipping is implemented as scanning.\n\nMy guess is for in-RAM postings we don't need as aggressive skipping as we do on-disk, and it's possible single level skipping, with a larger skip interval, is fine for even large RAM buffers. ",
+            "author": "Michael McCandless",
+            "id": "comment-12914624"
+        },
+        {
+            "date": "2010-09-24T20:06:30+0000",
+            "content": "\nI think we'll need to use\nreference counting, or simply not pool the byte[]s after\nflushing, in order to avoid overwriting of arrays.\n\nCan we just have IW allocate a new byte[][] after flush?  So then any open readers can keep using the one they have? ",
+            "author": "Michael McCandless",
+            "id": "comment-12914626"
+        },
+        {
+            "date": "2010-09-24T20:12:15+0000",
+            "content": "This issue is blocked because the change made to ByteBlockPool to add the level of the slice, to the beginning of the slice, moves all of the positions forward by one.\n\nHmm so does this waste that byte?  Ie when the next slice is allocated, today, we overwrite the level byte w/ the 4 bytes forwarding address.  Ie the level byte is only needed when the slice isn't full yet.\n\nBut if you move the level byte to the start, does that mean it's never re-used? ",
+            "author": "Michael McCandless",
+            "id": "comment-12914630"
+        },
+        {
+            "date": "2010-09-24T20:14:18+0000",
+            "content": "Since we now have parallel arrays, we could also store the level byte in a separate parallel array, ie outside of the pool? ",
+            "author": "Michael McCandless",
+            "id": "comment-12914631"
+        },
+        {
+            "date": "2010-09-24T20:23:27+0000",
+            "content": "Maybe we can not skip until we've hit the max slice?  This way skipping would always know it's on the max slice.  This works out to 429 bytes into the stream... likely this is fine. ",
+            "author": "Michael McCandless",
+            "id": "comment-12914634"
+        },
+        {
+            "date": "2010-09-24T22:29:42+0000",
+            "content": "Maybe we can not skip until we've hit the max slice? This\nway skipping would always know it's on the max slice. This works\nout to 429 bytes into the stream... likely this is fine. \n\nMe like-y. I'll implement the skip list to point to the largest\nlevel slices.\n\nCan we just have IW allocate a new byte[][] after flush?\nSo then any open readers can keep using the one they have?\n\nThis means the prior byte[]s will still be recycled after all\nactive previous flush readers are closed? If there are multiple\nreaders from the previous flush, we'd probably still need\nreference counting (ala bitvector and norms)? Unfortunately a\nreference count parallel array will not quite work because we're\ncopy-on-writing the byte[]s, eg, there's nothing consistent for\nthe index numeral to point to. A hash map of byte[]s would\nlikely be too heavyweight? We may need to implement a ByteArray\nobject composed of a byte[] and a refcount. This is somewhat\ncounter to our parallel array memory savings strategy, though it\nis directly analogous to the way norms are implemented in\nSegmentReader.\n\nit's possible single level skipping, with a larger skip\ninterval, is fine for even large RAM buffers.\n\nTrue, I'll implement a default of one level, and a default\nlarge-ish skip interval.\n\nMaybe we can get an initial version of this working,\nwithout the skipping? Ie skipping is implemented as scanning.\n\nHow many scorers, or how often is skipping used? It's mostly for\ndisjunction queries? If we limit the skip level to one, and not\nimplement the BBP level byte at the beginning of the slice, the\nMLSL will be a lot easier (ie faster) to implement and test. \n\nI'd like to see BytesHash get out of THPF (eg, LUCENE-2662), get\ndeletes working in the RT branch, and merge the flush by DWPT to\ntrunk. Concurrently I'll work on the search on the RAM buffer\nwhich is most of the way completed. I'd prefer to test a more\ncomplete version of LUCENE-2312 with skip lists (which can\neasily be turned off), so that when we do take it through the\nlaundromat of testing, we won't need to retrofit anything back\nin, re-test, and possibly re-design. \n\nOn a side note related to testing: One naive way I've tested is\nto do the copy-on-write of the BBP when the segment needs to be\nflushed to disk, and write the segment from the read-only copy\nof the BBP. If the segment is correct, then at least we know the\ncopy worked properly and nothing's missing. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12914684"
+        },
+        {
+            "date": "2010-09-25T10:35:14+0000",
+            "content": "\nCan we just have IW allocate a new byte[][] after flush?  So then any open readers can keep using the one they have?\n\nThis means the prior byte[]s will still be recycled after all\nactive previous flush readers are closed?\n\nProbably we should stop reusing the byte[] with this change?  So when all readers using a given byte[] are finally GCd, is when that byte[] is reclaimed.\n\n\nit's possible single level skipping, with a larger skip interval, is fine for even large RAM buffers.\n\nTrue, I'll implement a default of one level, and a default\nlarge-ish skip interval.\n\nWell, I was thinking only implement the single-level skip case (since it ought to be alot simpler than the MLSLW/R)....\n\n\nHow many scorers, or how often is skipping used? It's mostly for\ndisjunction queries?\n\nActually, conjunction (AND) queries, and also PhraseQuery (which is really an AND query followed by positions checking).  One thing to remember is that skipping is costly (especially, the first time you use it) \u2013 I think we over-use it today, ie, in many cases we should do a spin loop (.next()) instead, if your target \"is not that far away\".  PhraseQuery (the exact case) has a heuristic to do this, but really this ought to be implemented in the codec.\n\nget deletes working in the RT branch,\n\nDo we have a design thought out for this?  The challenge is because every doc state now has its own private docID stream, we need a global sequence ID to track \"when\" a deletion arrived, to know whether or not that deletion applies to each docID, right?  (And, each added doc must also record the sequenceID when it was added). ",
+            "author": "Michael McCandless",
+            "id": "comment-12914802"
+        },
+        {
+            "date": "2010-09-25T10:36:22+0000",
+            "content": "Can you explain what's the \"copy on write ByteBlockPool\"?  Exactly when do we make a copy....? ",
+            "author": "Michael McCandless",
+            "id": "comment-12914803"
+        },
+        {
+            "date": "2010-09-25T17:24:20+0000",
+            "content": "Can you explain what's the \"copy on write ByteBlockPool\"?\nExactly when do we make a copy....? \n\nA copy of the byte[][] refs is made when getReader is called.\nEach DWPT is locked, eg, writes stop, a copy of the byte[][] is\nmade (just the refs) for that reader. I think the issue at the\nmoment is I'm using a boolean[] to signify if a byte[] needs to\nbe copied before being written to. As with BV and norms cloning,\nread-only references are carried forward, which would imply\nmaking copies of the boolean[] as well. In other words, as with\nBV and norms, I think we need ref counts to the individual\nbyte[]s so that read-only references to byte[]s are carried\nforward properly. However this implies creating a BytesRefCount\nobject because a parallel array cannot point back to the same\nunderlying byte[] if the byte[] in the byte[][] can be replaced\nwhen a copy is made. \n\nDo we have a design thought out for this? The challenge\nis because every doc state now has its own private docID\nstream\n\nIt sounded easy when I first heard it, however, I needed to\nwrite it down to fully understand and work through what's going\non. That process is located in LUCENE-2558. \n\nWell, I was thinking only implement the single-level skip\ncase (since it ought to be alot simpler than the\nMLSLW/R)....\n\nI started on this, eg, implementing a single-level skip list\nthat reads and writes from the BBP. It's a good lesson in how to\nuse the BBP.\n\nActually, conjunction (AND) queries, and also\nPhraseQuery\n\nBoth very common types of queries, so we probably need some type\nof skipping, which we will, it'll just be single-level.\n\nProbably we should stop reusing the byte[] with this\nchange? So when all readers using a given byte[] are finally\nGCd, is when that byte[] is reclaimed.\n\nI have a suspicion we'll change our minds about pooling byte[]s.\nWe may end up implementing ref counting anyways (as described\nabove), and the sudden garbage generated could be a massive\nchange for users? Of course ref counting was difficult to\nimplement the first time around in LUCENE-1314, perhaps however\nit'll be easier the 2nd time. \n\nAs a side note, there is still an issue in my mind around the\nterm frequencies parallel array (introduced in these patches),\nin that we'd need to make a copy of it for each reader (because\nif it changes, the scoring model becomes inaccurate?). However,\nwe could in fact use a 2 dimensional PagedBytes (in this case,\nPagesInts) for this purpose. Or is the garbage of an int[] the\nsize of the number of docs OK per reader? There is also the\nlookup cost to consider. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12914838"
+        },
+        {
+            "date": "2010-09-25T18:57:35+0000",
+            "content": "Further thoughts on ref counting the byte[]s.  If we add a BytesRefCount (or some other similarly named class that I want to call BytesRef, though I can't use because that's taken), then I think adding 4 bytes for the int count variable, 8 bytes for the byte[] pointer, is 12 bytes total added to a 32k (ie, 32768 len) byte[] really too much?  I don't think so.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12914860"
+        },
+        {
+            "date": "2010-09-25T19:24:18+0000",
+            "content": "In regards to the performance effects on writes of obtaining the reader from each DWPT, there should not be any, because it is the thread calling getReader that will wait for the lock on the DWPT in between doc adds.  The copy-on-write is it's most primitive form, is a copy of object references, eg, the cost is extremely low.  And so I do not think indexing performance will be affected whatsoever by the copy-on-write approach.  Of course we'll need to benchmark to verify. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12914863"
+        },
+        {
+            "date": "2010-09-26T01:59:50+0000",
+            "content": "The RAM buffer single-level skip list writer probably requires two additional parallel arrays.  One for the beginning address into the skip list BBP.  The second for the address upto, where the last skip list entry that was written left off. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12914902"
+        },
+        {
+            "date": "2010-09-27T05:43:50+0000",
+            "content": "Here are the new parallel arrays.  It seems like something went wrong and there are too many, however I think each is required.\n\n\nfinal int[] skipStarts; // address where the term's skip list starts (for reading)\nfinal int[] skipAddrs; // where writing left off\nfinal int[] sliceAddrs; // the start addr of the last posting slice\nfinal byte[] sliceLevels; // posting slice levels\nfinal int[] skipLastDoc; // last skip doc written\nfinal int[] skipLastAddr; // last skip addr written\n\n\n\nIn regards to writing into the skip list the start address of\nthe first level 9 posting slice: Because we're writing vints\ninto the posting slices, and vints may span more than 1 byte, we\nmay (and this has happened in testing) write a vint that spans\nslices, so if we record the last slice address and read a vint\nfrom that point, we'll get an incorrect vint. If we start 1+\nbytes into a slice, we will not know where the slice ends\n(because we are assuming they're 200 bytes in length). Perhaps\nin the slice address parallel array we can somehow encode the\nfirst slice's length, or add yet another parallel array for the\nlength of the first slice.  Something to think about. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12915130"
+        },
+        {
+            "date": "2010-09-27T06:07:49+0000",
+            "content": "There's a little error in thinking of the last comment.  Also, the best solution is probably to store the length of the posting slice into the skip list byte pool.  This'll mean a slight modification to byte slice reader, however I think it'll work. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12915137"
+        },
+        {
+            "date": "2010-09-28T09:31:07+0000",
+            "content": "A copy of the byte[][] refs is made when getReader is called.\n\nHmm why can't the reader just use the current byte[][]?  The writer only adds in new blocks to this array (doesn't overwrite the already written blocks, until flush)?  (And then allocates a new byte[][] once that array is full).\n\n\nI think the issue at the\nmoment is I'm using a boolean[] to signify if a byte[] needs to\nbe copied before being written to\nHmm so we also copy-on-write a given byte[] block?  Is this because JMM can't make the guarantees we need about other threads reading the bytes written?\n\n\nI have a suspicion we'll change our minds about pooling byte[]s.\nWe may end up implementing ref counting anyways (as described\nabove), and the sudden garbage generated could be a massive\nchange for users?\n\nBut even if we do reuse, we will cause tons of garbage, until the still-open readers are closed?  Ie we cannot re-use the byte[] being \"held open\" by any NRT reader that's still referencing the in-RAM segment after that segment had been flushed to disk.\n\nAlso the garbage shouldn't be that bad since each object is large.  It's not like 3.x's situation with FieldCache or terms dict index, for example....\n\nI would start simple by dropping reuse.  We can then add it back if we see perf issues?\n\n\nBoth very common types of queries, so we probably need some type\nof skipping, which we will, it'll just be single-level.\nI would start simple, here, and make skipping stupid, ie just scan.  You can get everything working, all tests passing, etc., and then adding in skipping is much more isolated change.  You need all the isolation you can get here!  This stuff is hairy.\n\n\nAs a side note, there is still an issue in my mind around the\nterm frequencies parallel array (introduced in these patches),\nin that we'd need to make a copy of it for each reader (because\nif it changes, the scoring model becomes inaccurate?).\n\nHmm your'e right that each reader needs a private copy, to remain truly \"point in time\".  This (4 bytes per unique term X number of readers reading that term) is a non-trivial addition of RAM.\n\nBTW I'm assuming IW will now be modal?  Ie caller must tell IW up front if NRT readers will be used?  Because non-NRT users shouldn't have to pay all this added RAM cost? ",
+            "author": "Michael McCandless",
+            "id": "comment-12915685"
+        },
+        {
+            "date": "2010-09-28T15:55:43+0000",
+            "content": "Hmm so we also copy-on-write a given byte[] block? Is\nthis because JMM can't make the guarantees we need about other\nthreads reading the bytes written?\n\nCorrect. The example of where everything could go wrong is the\nrewriting of a byte slice forwarding address while a reader is\ntraversing the same slice. The forwarding address could be\nhalf-written, and suddenly we're bowling in lane 6 when we\nshould be in lane 9. By making a [read-only] ref copy of the\nbyte[]s we're ensuring that the byte[]s are in a consistent\nstate while being read.\n\nSo I'm using a boolean[] to tell the writer whether it needs to\nmake a copy of the byte[]. The boolean[] also tells the writer\nif it's already made a copy. Whereas in IndexReader.clone we're\nkeeping ref counts of the norms byte[], and decrementing each\ntime we make a copy until finally it's 0, and then we give it to\nthe GC (here we'd do the same or give it back to the allocator). \n\nBut even if we do reuse, we will cause tons of garbage,\nuntil the still-open readers are closed? Ie we cannot re-use the\nbyte[] being \"held open\" by any NRT reader that's still\nreferencing the in-RAM segment after that segment had been\nflushed to disk.\n\nIf we do pool, it won't be very difficult to implement, we have\na single point of check-in/out of the byte[]s in the allocator\nclass.\n\nIn terms of the first implementation, by all means we should\nminimize \"tricky\" areas of the code by not implementing skip\nlists and byte[] pooling.\n\nIt's not like 3.x's situation with FieldCache or terms\ndict index, for example....\n\nWhat's the GC issue with FieldCache and terms dict?\n\nBTW I'm assuming IW will now be modal? Ie caller must\ntell IW up front if NRT readers will be used? Because non-NRT\nusers shouldn't have to pay all this added RAM cost?\n\nAt present it's still all on demand. Skip lists will require\ngoing modal because we need to build those upfront (well we\ncould go back and build them on demand, that'd be fun). There's\nthe term-freq parallel array, however if getReader is never\ncalled, it's a single additional array that's essentially\ninnocuous, if useful.\n\nHmm your'e right that each reader needs a private copy,\nto remain truly \"point in time\". This (4 bytes per unique term X\nnumber of readers reading that term) is a non-trivial addition\nof RAM.\n\nPagedInt time? However even that's not going to help much if in\nbetween getReader calls, 10,000s of terms were seen, we could\nhave updated 1000s of pages. AtomicIntArray does not help\nbecause concurrency isn't the issue, it's point-in-timeness\nthat's required. Still I guess PagedInt won't hurt, and in the\ncase of minimal term freq changes, we'd still be potentially\nsaving RAM. Is there some other data structure we could pull out\nof a hat and use?\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12915797"
+        },
+        {
+            "date": "2010-09-29T02:57:15+0000",
+            "content": "OK, I think there's a solution to copying the actual byte[],\nwe'd need to alter the behavior of BBPs. It would require always\nallocating 3 empty bytes at the end of a slice for the\nforwarding address, rather than what we do today, which is write\nthe postings up to the end of the slice, then when allocating a\nnew slice, copying the last 3 bytes forward to the new slice\nlocation. We would also need to pass a unique parallel posting\nupto array to each reader. This is required so that the reader\nnever ventures beyond the end of a slice, as the slice was\nwritten when the reader was instantiated.\n\nThis would yield significant savings because we would not be\ngenerating garbage from the byte[]s, which are 32 KB each. They\nadd up if the indexing is touching many different byte[]s for\nexample. With this solution, there would essentially not be any\ngarbage generated from incremental indexing, only after a DWPTs\nsegment is flushed (and all readers were also GCed). \n\nThe only downside is we'd be leaving those 3 bytes per term\nunallocated at all times, that's not a very high price. Perhaps\nmore impacting is the posting upto array per reader, which'd be\n4 bytes per term, the same cost as the term freq array. It's a\npick your poison problem. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12916000"
+        },
+        {
+            "date": "2010-09-29T03:18:51+0000",
+            "content": "I guess another possible solution is to do away with interleaved slices altogether and simply allocate byte[]s per term and chain them together.  Then we would not need to worry about concurrency with slicing.  This would certainly make debugging easier however it'd add 8 bytes (for the object pointer) per term, somewhat negating the parallel array cutover.  Perhaps it's just a price we'd want to pay.  That and we'd probably still need a unique posting upto array per reader. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12916001"
+        },
+        {
+            "date": "2010-09-29T03:46:01+0000",
+            "content": "The last comment shows the brain is tired, ie, ignore it because\nthere would be too many pointers for the byte[]s. \n\nThe comment prior however will probably work, and I think\nthere's a solution to excessive posting-upto int[] per reader\ngeneration. If when getReader is called, we copy a writable\nposting-upto array to a single master posting-upto parallel\narray, then we will not need to create a unique int[] per\nreader. The reason this would work is, past readers that are\niterating their term docs concurrently with the change to the\nposting-upto array, will stop at the maxdoc anyways. This'll\nbe fun to implement. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12916005"
+        },
+        {
+            "date": "2010-09-29T09:41:49+0000",
+            "content": "\nCorrect. The example of where everything could go wrong is the\nrewriting of a byte slice forwarding address while a reader is\ntraversing the same slice.\n\nAhh right that's a real issue.\n\n\nIt's not like 3.x's situation with FieldCache or terms dict index, for example....\n\nWhat's the GC issue with FieldCache and terms dict?\n\nIn 3.x, the string index FieldCache and the terms index generate tons\nof garbage, ie allocate zillions of tiny objects.  (This is fixed in\n4.0).\n\nMy only point was that having 32 KB arrays as garbage is much less GC\nload than having the same net KB across zillions of tiny objects...\n\n\nThere's\nthe term-freq parallel array, however if getReader is never\ncalled, it's a single additional array that's essentially\ninnocuous, if useful.\n\nHmm the full copy of the tf parallal array is going to put a highish\ncost on reopen?  So some some of transactional (incremental\ncopy-on-write) data structure is needed (eg PagedInts)...\n\nWe don't store tf now do we?  Adding 4 bytes per unique term isn't\ninnocuous!\n\n\nOK, I think there's a solution to copying the actual byte[],\nwe'd need to alter the behavior of BBPs. It would require always\nallocating 3 empty bytes at the end of a slice for the\nforwarding address,\n\nGood idea \u2013 this'd make the byte[] truly write-once.\n\nThis would really decrease RAM efficiency low-doc-freq (eg 1) terms,\nthough, because today they make use of those 3 bytes.  We'd need to\nincrease the level 0 slice size...\n\n\nThe reason this would work is, past readers that are\niterating their term docs concurrently with the change to the\nposting-upto array, will stop at the maxdoc anyways. This'll\nbe fun to implement.\n\nHmm... but the reader needs to read 'beyond' the end of a given slice,\nstill?  Ie say global maxDoc is 42, and a given posting just read doc\n27 (which in fact is its last doc).  It would then try to read the\nnext doc?\n\nOh, except, the next byte would be a 0 (because we always clear the\nbyte[]), which [I think] is never a valid byte value in the postings\nstream, except as a first byte, which we would not hit here (since we\nknow we always have at least a first byte).  So maybe we can get by\nw/o fully copy of postingUpto? ",
+            "author": "Michael McCandless",
+            "id": "comment-12916086"
+        },
+        {
+            "date": "2010-09-29T16:58:51+0000",
+            "content": "We'd need to increase the level 0 slice size...\n\nYes. \n\nbut the reader needs to read 'beyond' the end of a given\nslice, still? Ie say global maxDoc is 42, and a given posting\njust read doc 27 (which in fact is its last doc). It would then\ntry to read the next doc?\n\nThe posting-upto should stop the reader prior to reaching a byte\nelement whose value is 0, ie, it should never happen.\n\nThe main 'issue', which really isn't one, is that each reader\ncannot maintain a copy of the byte[][] spine as it'll be\ngrowing. New buffers will be added and the master posting-upto\nwill also be changing, therefore allowing 'older' readers to\npossibly continue past their original point-in-time byte[][].\nThis is solved by adding synchronized around the obtainment of\nthe byte[] buffer from the BBP, thereby preventing out of bounds\nexceptions.\n\nWe don't store tf now do we? Adding 4 bytes per unique\nterm isn't innocuous!\n\nWhat I meant is, if we're merely maintaining the term freq array\nduring normal, non-RT indexing, then we're not constantly\ncreating new arrays, we're in innocuous land, though there is no\nuse for the array in this case, eg, it shouldn't be created\nunless RT had been flipped on, modally. \n\nHmm the full copy of the tf parallal array is going to\nput a highish cost on reopen? So some some of transactional\n(incremental copy-on-write) data structure is needed (eg\nPagedInts)...\n\nRight, this to me is the remaining 'problem', or rather\nsomething that needs a reasonable go-ahead solution. For now we\ncan assume PagedInts is the answer.\n\nIn addition, to summarize the skip list. It needs to store the\ndoc, address into the BBP, and the length to the end of the\nslice from the given address. This allows us to point to a\ndocument anywhere in the postings BBP, and still continue with\nslice iteration. In the test code I've written, the slice level\nis stored as well, I'm not sure why/if that's required. I think\nit's a hint to the BBP reader as to the level of the next slice.\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12916199"
+        },
+        {
+            "date": "2010-10-01T10:44:08+0000",
+            "content": "The posting-upto should stop the reader prior to reaching a byte element whose value is 0, ie, it should never happen.\n\nOK but then we are making a full copy of postings upto (int per term) on every reopen?  Or will we try to make this copy-on-write as well?\n\nSo now we need copy-on-write per-term int for tf and for posting upto?  Anything else?\n\nI fear a copy-on-write check per-term is going to be a sizable perf hit. ",
+            "author": "Michael McCandless",
+            "id": "comment-12916853"
+        },
+        {
+            "date": "2010-10-01T15:31:52+0000",
+            "content": "I fear a copy-on-write check per-term is going to be a sizable perf hit.\n\nFor indexing?  The byte[] buffers are also using a page based system.  I think we'll need to measure the performance difference.  We can always shift the cost to getreader by copying from a writable (indexing based) tf array into a per-reader tf of paged-ints.  While this'd be a complete iteration the length of the terms, the CPU cache could make it extremely fast (because each page would be cached, and we'd be iterating sequentially over an array, methinks).\n\nThe other cost is the lookup of the upto when iterating the postings, however that'd be one time per term-docs instantiation, ie, negligible.  \n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12916914"
+        },
+        {
+            "date": "2010-10-11T03:08:41+0000",
+            "content": "As per discussion, this patch removes byte block pool forwarding address rewrites by always allocating 4 bytes at the end of each slice.  newSlice has been replaced with newSliceByLevel because we were always calling this with the first level size.  TestByteSlices passes. \n\nWith this working, we will not need to implement byte block copy-on-write.  Instead, a posting-upto per reader will be used. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12919699"
+        },
+        {
+            "date": "2010-10-17T02:18:54+0000",
+            "content": "The issue with the model given is the posting-upto is handed to\nthe byte slice reader as the end index. However newly written\nbytes may not actually make it to a reader thread as per the\nJMM. A reader thread may reach partially written bytes. There\ndoesn't seem to be a way to tell the reader it's reached the end\nof the written bytes and so we probably need to add 2 paged ints\narrays for freq and prox uptos respectively. This would be\nunfortunate because either the paged ints will need to be\nupdated during the get reader call, or during indexing. Both\ncould be detrimental to performance, though the net is still\nfaster that the current NRT solution. The alternative is to\nsimply copy-on-write the byte blocks, though that'd need to\ninclude the int blocks as well. I think we'd want to update the\npaged ints during indexing, otherwise discount it as a solution\nbecause otherwise it'd require full array iterations in the get\nreader call to compare and update. The advantage of\ncopy-on-write of the blocks is the indexing speed will not be\naffected, nor the read speed, the main potential performance\ndrag could be the garbage generated by the byte and int arrays\nthrown away on reader close. It would depend on how many blocks\nwere updated in between get reader calls. \n\nWe probably need to implement both solutions, try them out and\nmeasure the performance difference. \n\nThere's Michael B.'s multiple slice levels linked together\nby atomic int arrays illustrated here:\nhttp://www.box.net/shared/hivdg1hge9 \n\nAfter reading this, the main idea I think we can use is to\ninstead of using paged ints, simply maintain 2 upto arrays. One\nthat's being written to, and a 2nd that's guaranteed to be in\nsync with the byte blocks. This would save on garbage and\nlookups into paged ints. The cost would is the array copy in the\nget reader lock. Given the array already exists, the copy should\nbe fast?  Perhaps this is the go ahead solution? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12921784"
+        },
+        {
+            "date": "2010-10-18T20:39:50+0000",
+            "content": "The other unique thing implemented in the Twitter search as described by the shared slides, is each posting is a single int.  This makes it fairly simply to detect if a posting has been written because if it hasn't, it'll be 0 or some other pre-init'd value.  However given our postings contain multiple vints, payloads, and we have both freq and prox streams, I don't think we can properly detect while reading if a given posting has in fact been completely written.  We'd maybe need a posting verification check, like writing the posting to a buffer first, then writing the buffer with it's length at the beginning.   That's unnecessarily complex if system array copy is fast enough for copying between a write and read upto array. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12922243"
+        },
+        {
+            "date": "2010-12-19T18:16:23+0000",
+            "content": "The same as the last patch updated to trunk. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973028"
+        },
+        {
+            "date": "2010-12-20T05:20:46+0000",
+            "content": "A few things in BBP needed to be public. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12973094"
+        },
+        {
+            "date": "2011-07-13T22:46:28+0000",
+            "content": "Ok, this guy is updated to trunk again. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-13064924"
+        }
+    ]
+}

@@ -1,0 +1,168 @@
+{
+    "id": "LUCENE-8048",
+    "title": "Filesystems do not guarantee order of directories updates",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [
+            "7.2"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Currently when index is written to disk the following sequence of events is taking place:\n\n\twrite segment file\n\tsync segment file\n\twrite segment file\n\tsync segment file\n...\n\twrite list of segments\n\tsync list of segments\n\trename list of segments\n\tsync index directory\n\n\n\nThis sequence leads to potential window of opportunity for system to crash after 'rename list of segments' but before 'sync index directory' and depending on exact filesystem implementation this may potentially lead to 'list of segments' being visible in directory while some of the segments are not.\n\nSolution to this is to sync index directory after all segments have been written. This commit shows idea implemented. I'm fairly certain that I didn't find all the places this may be potentially happening.",
+    "attachments": {
+        "Screen Shot 2017-11-22 at 12.34.51 PM.png": "https://issues.apache.org/jira/secure/attachment/12898938/Screen%20Shot%202017-11-22%20at%2012.34.51%20PM.png",
+        "LUCENE-8048.patch": "https://issues.apache.org/jira/secure/attachment/12898919/LUCENE-8048.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-11-09T15:53:56+0000",
+            "content": "Not sure how related these two are but they're at least in the same vicinity. ",
+            "author": "Erick Erickson",
+            "id": "comment-16245881"
+        },
+        {
+            "date": "2017-11-10T15:13:25+0000",
+            "content": "Hi Nikolay Martynov, I like the idea of the patch. Actually not much about fsync is guaranteed on any OS, anywhere.So i agree with having an extra dir sync before the rename, just to be safe, although i don't know what filesystems might be affected by this.\n ",
+            "author": "Robert Muir",
+            "id": "comment-16247616"
+        },
+        {
+            "date": "2017-11-10T16:58:54+0000",
+            "content": "The guarantees about fsync are weak anyways (as Robert said), and on top - fsyncing directory metadata is a hack, the Java API does not allow to do it via API, you need a hack with a file handle - but it works in our testing (Michael McCandless had/has a test computer with a remote powerswitch to stress all this for weeks). The directory sync is at least documented in Linux Man Pages, for other UNIX-ial operating systems it not defined (lack of POSIX standard for it).\n\nIn short:\n\n\tOn Linux, the fsync on the directory really works, but we only know about usual file systems (ext4 and xfs I think)\n\tIn addition because the atomic rename use case is very common in Unix world to commit stuff, the kernel already does the right thing. If it sees an atomic rename, it automatically fsyncs directory under certain conditions (read source code). Robert Muir, is this right? - it's long ago when I last looked at that code!\n\tOn MacOSX/Solaris the same applies like for linux, although it does not have the automatism in kernel. And we don't know if fsyncing directory is really done for all file systems. The Man page does not say anything and POSIX does not define it.\n\tOn Windows, the fsync on directory does not work at all (it is a no-op in Lucene -> we have a try-catch around it with an assertion on Windows in the exception block). But Windows file systems guarantee that after the atomic rename the directory is in an consistent state (it's documented). Happens-before also works.\n\n ",
+            "author": "Uwe Schindler",
+            "id": "comment-16247771"
+        },
+        {
+            "date": "2017-11-10T17:58:50+0000",
+            "content": "Just to clarify:\n\n\tOn Linux directory fsync does work, but it doesn't solve the problem currently because this fsync currently happens after segment list has been created. Essentially guarantees about fsync (weak as they are) are in case of failure: before fsync you can see changes in any combination, after fsync you are guaranteed to see exactly what was written.\n\tThis can potentially affect any FS that uses non trivial storage for directories (which is pretty much everything these days). Word on the internet is that btrfs is capable of doing out of order directory writes.\n\t'kernel automatically detects rename pattern' - I think this only works on some FSs (ext4) and only if certain mount options are present (auto_da_alloc). And I think generally this is about syncing file data with directory, not syncing directory as a whole on rename.\n\n ",
+            "author": "Nikolay Martynov",
+            "id": "comment-16247854"
+        },
+        {
+            "date": "2017-11-11T12:23:15+0000",
+            "content": "I think any filesystem that behaves in this way on crash is choosing to corrupt users data by reflecting some later directory entries but not former ones. \n\nBut linux filesystems are straight up buggy as shit around this functionality so it wouldnt surprise me. So like i said, i like the extra sync before rename to try to coerce better behavior on crash during fsync(dir).  ",
+            "author": "Robert Muir",
+            "id": "comment-16248485"
+        },
+        {
+            "date": "2017-11-14T10:30:02+0000",
+            "content": "+1 to fsync directory metadata after writing segments and before writing segments file. ",
+            "author": "Michael McCandless",
+            "id": "comment-16251202"
+        },
+        {
+            "date": "2017-11-22T19:19:48+0000",
+            "content": "So it seems like the consensus is to go ahead and make this change. one-line patch attached, I'll run precommit and test on it but don't expect any issues.\n\nAny objections to checking this in? If not I'll take care of it over the next day or two. ",
+            "author": "Erick Erickson",
+            "id": "comment-16263193"
+        },
+        {
+            "date": "2017-11-22T20:37:57+0000",
+            "content": "This change causes TestIndexWriter.testExceptionsDuringCommit() to fail.\n\nThe first two conditions fail:\n        new FailOnlyInCommit(false, FailOnlyInCommit.PREPARE_STAGE), // fail during global field map is written\n        new FailOnlyInCommit(true, FailOnlyInCommit.PREPARE_STAGE), // fail after global field map is written\n        new FailOnlyInCommit(false, FailOnlyInCommit.FINISH_STAGE)  // fail while running finishCommit    \n\nAre these two conditions something that should fail with this change? I've attached a screen shot of the exception in question. With this change, this exception is not thrown. ",
+            "author": "Erick Erickson",
+            "id": "comment-16263307"
+        },
+        {
+            "date": "2017-11-22T20:42:31+0000",
+            "content": "Erick, can you hold off a bit. I don't think its a good idea to rush in changes to commit over a holiday, these changes really need review. ",
+            "author": "Robert Muir",
+            "id": "comment-16263313"
+        },
+        {
+            "date": "2017-11-22T22:48:06+0000",
+            "content": "But this is when I have spare time ...\n\nPoint taken, it can wait until next week. I'm a bit worried that the test case that now fails indicate something wouldn't be right anyway, it'd be good to give people a chance to look if I can't find anything... ",
+            "author": "Erick Erickson",
+            "id": "comment-16263496"
+        },
+        {
+            "date": "2017-11-29T02:27:32+0000",
+            "content": "OK, now that people have had a chance to catch up after Thanksgiving, any comments? Particularly for two bits:\n\n1> whether the idea of the patch seems OK?\n2> whether the failing tests are now obsolete and should be removed? ",
+            "author": "Erick Erickson",
+            "id": "comment-16269963"
+        },
+        {
+            "date": "2017-12-04T06:45:33+0000",
+            "content": "I couldn't get a repeated test failure in 100 tries, trying,1,000 over the night. If they succeed I'm probably going to check this in tomorrow unless there are objections.\n ",
+            "author": "Erick Erickson",
+            "id": "comment-16276363"
+        },
+        {
+            "date": "2017-12-04T15:20:33+0000",
+            "content": "1,000 runs later, no failures with TestIndexWriter so I'll chalk it up to hallucinations.\n\nRunning precommit and full test suite now, if the pass I'll check this in later today unless there are objections.\n ",
+            "author": "Erick Erickson",
+            "id": "comment-16276931"
+        },
+        {
+            "date": "2017-12-04T20:18:08+0000",
+            "content": "Well, that was short lived optimism. I was running the wrong test. So I'm back to looking at whether these two lines in TestIndexWriteExceptions.testExceptionDuringCommit are a test error or not:\n\n        new FailOnlyInCommit(false, FailOnlyInCommit.PREPARE_STAGE), // fail during global field map is written\n        new FailOnlyInCommit(true, FailOnlyInCommit.PREPARE_STAGE), // fail after global field map is written\n\nAny help appreciated of course. ",
+            "author": "Erick Erickson",
+            "id": "comment-16277423"
+        },
+        {
+            "date": "2017-12-04T21:38:32+0000",
+            "content": "I think you need to modify the test and add this as a valid case, like the patch I attached. ",
+            "author": "Simon Willnauer",
+            "id": "comment-16277560"
+        },
+        {
+            "date": "2017-12-05T00:00:16+0000",
+            "content": "Fella goes out for a run and comes back and some kind person shows him how to solve the problem. Or maybe solves it for me... I'll run it through the rest of its paces, precommit test and the like, as well as, perhaps, finally figure out what that MockDirectoryWrapper is doing.\n\nThanks a bunch Simon! ",
+            "author": "Erick Erickson",
+            "id": "comment-16277784"
+        },
+        {
+            "date": "2017-12-05T17:10:57+0000",
+            "content": "Final patch with CHANGES.txt, Simon's test changes and orlginal. ",
+            "author": "Erick Erickson",
+            "id": "comment-16278873"
+        },
+        {
+            "date": "2017-12-05T17:11:32+0000",
+            "content": "Commit 4a5900728db6a84b4aea42545567a393989f25cf in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4a59007 ]\n\nLUCENE-8048: Filesystems do not guarantee order of directories updates ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16278874"
+        },
+        {
+            "date": "2017-12-05T17:11:34+0000",
+            "content": "Commit 0688be6c667760c1a636d5426ee4355d878a47a7 in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0688be6 ]\n\nLUCENE-8048: Filesystems do not guarantee order of directories updates ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16278875"
+        },
+        {
+            "date": "2017-12-05T17:52:38+0000",
+            "content": "Commit 2bfe7ed0f2f9ddfdd2049c60829869bbd9327d80 in lucene-solr's branch refs/heads/branch_7x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2bfe7ed ]\n\nLUCENE-8048: Filesystems do not guarantee order of directories updates ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16278951"
+        },
+        {
+            "date": "2017-12-05T17:57:59+0000",
+            "content": "Commit eb434dc47ac96e27676006216dd308d8f45beb81 in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=eb434dc ]\n\nLUCENE-8048: correcting misplaced entry in lucene/CHANGES.txt ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16278960"
+        },
+        {
+            "date": "2017-12-05T17:59:23+0000",
+            "content": "Sorry for the noise, apparently I double-commented when I merged my local branch and misplaced the update to lucene/CHANGES.txt... ",
+            "author": "Erick Erickson",
+            "id": "comment-16278962"
+        },
+        {
+            "date": "2017-12-05T22:43:45+0000",
+            "content": "latest patch / commit LGTM sorry for the late response. ",
+            "author": "Simon Willnauer",
+            "id": "comment-16279310"
+        },
+        {
+            "date": "2017-12-06T00:49:13+0000",
+            "content": "Hey, thank you for fixing up the tests for me, it'd have taken me much longer to figure out. And even then I wouldn't have been very confident. ",
+            "author": "Erick Erickson",
+            "id": "comment-16279464"
+        }
+    ]
+}

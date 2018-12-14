@@ -1,0 +1,84 @@
+{
+    "id": "LUCENE-4889",
+    "title": "UnicodeUtil.codePointCount microbenchmarks (wtf)",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.3",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Trivial",
+        "labels": "",
+        "type": "Task",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "This is interesting. I posted a link to a state-machine-based UTF8 parser/recognizer:\nhttp://bjoern.hoehrmann.de/utf-8/decoder/dfa/\n\nI spent some time thinking if the lookup table could be converted into a stateless computational function, which would avoid a table lookup (which in Java will cause an additional bounds check that will be hard to eliminate I think). This didn't turn out to be easy (it boils down to finding a simple function that would map a set of integers to its concrete permutation; a generalization of minimal perfect hashing).\n\nBut out of curiosity I though it'd be fun to compare how Lucene's codepoint counting compares to Java's built-in one (Decoder) and a sequence of if's.\n\nI've put together a Caliper benchmark that processes 50 million unicode codepoints; one only ASCII, one Unicode. The results are interesting. On my win/I7:\n\n\n implementation dataType          ns linear runtime\n         LUCENE  UNICODE 167359502.6 ===============\n         LUCENE    ASCII 334015746.5 ==============================\nNOLOOKUP_SWITCH  UNICODE 154294141.8 =============\nNOLOOKUP_SWITCH    ASCII 119500892.8 ==========\n    NOLOOKUP_IF  UNICODE  90149072.6 ========\n    NOLOOKUP_IF    ASCII  29151411.4 ==\n\n\n\nDisregard the switch lookup \u2013 it's for fun only. But a sequence of if's is significantly faster than the current Lucene's table lookup, especially on ASCII input. And now compare this to Java's built-in decoder...\n\n\n           JAVA  UNICODE   5753930.1 =\n           JAVA    ASCII        23.8 =\n\n\n\nYes, it's the same benchmark. Wtf? I realize buffers are partially native and probably so is utf8 decoder but by so much?! Again, to put it in context:\n\n\n implementation dataType          ns linear runtime\n         LUCENE  UNICODE 167359502.6 ===============\n         LUCENE    ASCII 334015746.5 ==============================\n           JAVA  UNICODE   5753930.1 =\n           JAVA    ASCII        23.8 =\n    NOLOOKUP_IF  UNICODE  90149072.6 ========\n    NOLOOKUP_IF    ASCII  29151411.4 ==\nNOLOOKUP_SWITCH  UNICODE 154294141.8 =============\nNOLOOKUP_SWITCH    ASCII 119500892.8 ==========\n\n\n\nWtf? The code is here if you want to experiment.\nhttps://github.com/dweiss/utf8dfa\n\nI realize the Java version needs to allocate a temporary space buffer but if these numbers hold for different VMs it may actually be worth it...",
+    "attachments": {
+        "LUCENE-4889.patch": "https://issues.apache.org/jira/secure/attachment/12575694/LUCENE-4889.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-03-27T10:35:45+0000",
+            "content": "Just to complete: didn't inspect jit assembly dumps, didn't check for dead code elimination (although I don't think it should happen here because of how Caliper is written). ",
+            "author": "Dawid Weiss",
+            "id": "comment-13615093"
+        },
+        {
+            "date": "2013-03-27T11:00:47+0000",
+            "content": "I think the ASCII-only performance is caused by line 211/212 and 632/633 in http://www.docjar.com/html/api/sun/nio/cs/UTF_8.java.html\nIf your buffer is only ASCII is has a very simple loop that simply copies the bytes. This may explain the speed, together with eliminated bounds checks by hotspot on this simple loop. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13615114"
+        },
+        {
+            "date": "2013-03-27T11:09:15+0000",
+            "content": "But the jdk decoder is buggy. Its easy to make a buggy fast decoder  ",
+            "author": "Robert Muir",
+            "id": "comment-13615120"
+        },
+        {
+            "date": "2013-03-27T11:16:09+0000",
+            "content": "Just pushed a version that doesn't do a table lookup for ASCII.\n\nimplementation dataType          ns linear runtime\n        LUCENE  UNICODE 167374240.6 ===============\n        LUCENE    ASCII 333944799.0 ==============================\n   LUCENE_MOD1  UNICODE 167449028.1 ===============\n   LUCENE_MOD1    ASCII  77172139.4 ======\n          JAVA  UNICODE   5755140.1 =\n          JAVA    ASCII        23.9 =\n   NOLOOKUP_IF  UNICODE  90220440.6 ========\n   NOLOOKUP_IF    ASCII  29145155.3 ==\n\n\n\nCuts the time by 75% but still far above the Java decoder. So it's not a single loop I think, Uwe \n\nAlso: I'm not comparing full decoding, only codepoint counting. I also assumed valid utf8 (since it's what UnicodeUtil does anyway). Finally: I'm not advocating for changing it, I'm just saying it's interesting by how much these timings differ. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13615122"
+        },
+        {
+            "date": "2013-03-27T11:25:21+0000",
+            "content": "I think we should change the counting function... its a little scary in that i think it will loop forever on bad input?\n\nWe could at least fix the table to not use -1 but a large negative value that stands a chance of creating AIOOBE ",
+            "author": "Robert Muir",
+            "id": "comment-13615128"
+        },
+        {
+            "date": "2013-03-27T11:26:34+0000",
+            "content": "I'll actually prepare a patch that replaces the current implementation of UnicodeUtil.codePointCount because it can spin forever on invalid input (yes it does say the behavior is undefined but I think we should just throw an exception on invalid input .\n\nMike can run his magic perf. scripts and we'll see if it breaks anything. I doubt. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13615129"
+        },
+        {
+            "date": "2013-03-27T12:01:50+0000",
+            "content": "I'll actually prepare a patch that replaces the current implementation of UnicodeUtil.codePointCount because it can spin forever on invalid input (yes it does say the behavior is undefined but I think we should just throw an exception on invalid input\n\n+1 ... spinning forever on bad input is not nice! ",
+            "author": "Michael McCandless",
+            "id": "comment-13615148"
+        },
+        {
+            "date": "2013-03-27T12:42:35+0000",
+            "content": "A patch cleaning up codePointCount. The state array is still used in UTF8toUTF32 so I left it in, but replaced -1's with Integer.MIN_VALUE (not that it makes a difference here). ",
+            "author": "Dawid Weiss",
+            "id": "comment-13615178"
+        },
+        {
+            "date": "2013-03-28T08:39:46+0000",
+            "content": "http://i.stack.imgur.com/jiFfM.jpg [Double facepalm]\n\nIt couldn't be right, it was surreal. I checked the code again and indeed, there was a subtle bug in the Java code \u2013 it was looping over the decode loop, all right, but it was never rewiding the input buffer after the first time, damn it. Corrected it shows sensible output:\n\n\nimplementation dataType    ms linear runtime\n[current lucene]\n        LUCENE  UNICODE 167.3 ==========\n        LUCENE    ASCII 333.9 =====================\n[patch]\n   LUCENE_MOD1  UNICODE 103.0 ======\n   LUCENE_MOD1    ASCII  77.2 ====\n[if-based version but without assertions]\n   NOLOOKUP_IF  UNICODE  90.2 =====\n   NOLOOKUP_IF    ASCII  29.1 =\n[java version]\n          JAVA  UNICODE 465.6 ==============================\n          JAVA    ASCII 103.1 ======\n[no branching/counting, just pass over data]\n      NO_COUNT  UNICODE  52.1 ===\n      NO_COUNT    ASCII  26.0 =\n\n\n\nI also did a non-benchmark loop in which everything is just counted 10 times.\n\ntime          codepoints   version data set\n     1.676 <= [ 500000010] UNICODE LUCENE\n     0.905 <= [ 500000010] UNICODE LUCENE_MOD1\n     0.905 <= [ 500000010] UNICODE NOLOOKUP_IF\n     4.686 <= [ 500000010] UNICODE JAVA\n\n     3.339 <= [1000000000] ASCII LUCENE\n     1.028 <= [1000000000] ASCII LUCENE_MOD1\n     1.027 <= [1000000000] ASCII NOLOOKUP_IF\n     1.591 <= [1000000000] ASCII JAVA\n\n\n\nI'll commit the patch since it improves both the speed and the internal validation logic. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13616137"
+        },
+        {
+            "date": "2013-05-10T10:33:40+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13653993"
+        }
+    ]
+}

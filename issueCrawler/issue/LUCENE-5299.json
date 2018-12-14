@@ -1,0 +1,145 @@
+{
+    "id": "LUCENE-5299",
+    "title": "Refactor Collector API for parallelism",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "5.1",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Motivation\n\nWe should be able to scale-up better with Solr/Lucene by utilizing multiple CPU cores, and not have to resort to scaling-out by sharding (with all the associated distributed system pitfalls) when the index size does not warrant it.\n\nPresently, IndexSearcher has an optional constructor arg for an ExecutorService, which gets used for searching in parallel for call paths where one of the TopDocCollector's is created internally. The per-atomic-reader search happens in parallel and then the TopDocs/TopFieldDocs results are merged with locking around the merge bit.\n\nHowever there are some problems with this approach:\n\n\n\tIf arbitary Collector args come into play, we can't parallelize. Note that even if ultimately results are going to a TopDocCollector it may be wrapped inside e.g. a EarlyTerminatingCollector or TimeLimitingCollector or both.\n\tThe special-casing with parallelism baked on top does not scale, there are many Collector's that could potentially lend themselves to parallelism, and special-casing means the parallelization has to be re-implemented if a different permutation of collectors is to be used.\n\n\n\nProposal\n\nA refactoring of collectors that allows for parallelization at the level of the collection protocol. \n\nSome requirements that should guide the implementation:\n\n\n\teasy migration path for collectors that need to remain serial\n\tthe parallelization should be composable (when collectors wrap other collectors)\n\tallow collectors to pick the optimal solution (e.g. there might be memory tradeoffs to be made) by advising the collector about whether a search will be parallelized, so that the serial use-case is not penalized.\n\tencourage use of non-blocking constructs and lock-free parallelism, blocking is not advisable for the hot-spot of a search, besides wasting pooled threads.",
+    "attachments": {
+        "LUCENE-5299.patch": "https://issues.apache.org/jira/secure/attachment/12609450/LUCENE-5299.patch",
+        "benchmarks.txt": "https://issues.apache.org/jira/secure/attachment/12609451/benchmarks.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-10-21T16:28:38+0000",
+            "content": "attaching patch against trunk + benchmarks ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13800775"
+        },
+        {
+            "date": "2013-10-21T17:08:24+0000",
+            "content": "Could you describe a bit about the high level design changes?\n\nIt seems like Collector changed from abstract class to interface, and it now creates a SubCollector per atomic reader?\n\nIn the benchmarks, is \"par vs par\" the before/after test?  Ie baseline = current trunk, passed an ES to IndexSearcher, and then comp = with this patch, also passing ES to IndexSearcher?\n\nIn general, I suspect fine grained parallelism is trickier / most costly then the \"merge in the end\" parallelism we have now.  Typically collection is not a very costly part of the search ... and merging the results in the end should be a minor cost, that shrinks as the index gets larger. ",
+            "author": "Michael McCandless",
+            "id": "comment-13800811"
+        },
+        {
+            "date": "2013-10-21T17:23:18+0000",
+            "content": "What do you have the number of search threads set to in luceneutil?\n\nIf this is too low, maybe its not utilizing all your hardware in the benchmark. (like a web server with a too-small PQ) ",
+            "author": "Robert Muir",
+            "id": "comment-13800835"
+        },
+        {
+            "date": "2013-10-21T17:31:31+0000",
+            "content": "I like the change abstract -> interface! In general, I like the new approach how to manage collection much more than the broken abstract Collector class we currently have. So its more obvious where to do the merging (it should be part of e.g. TopDocCollector). IndexSearcher should not deal with this at all! Users with conventiaonal serial collection can still do this with the abstract base class SerialCollector and don't even need to change their code (exept changing the superclass): This is cool because serial collector implements both interfaces and returns itsself as sub collector!\n\nMy biggest concern is not complexity of API (it is actually simplier and easier to understand!): it is more the fact that parallelism of Lucene Queries is in most cases not the best thing to do (if you have many users). It only makes sense if you have very few queries - which is not where full-text searches are used for. The overhead for merging is higher than what you get, especially when many users hit your search engine in parallel! I generally don't recommend to users to use the parallelization currently available in IndexSearcher. Every user gets one thread and if you have many users buy more processors. With additional parallelism this does not scale if userbase grows. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13800847"
+        },
+        {
+            "date": "2013-10-21T18:46:05+0000",
+            "content": "Could you describe a bit about the high level design changes?\n\nThere is an overview in this email under 'Idea': http://mail-archives.apache.org/mod_mbox/lucene-dev/201310.mbox/%3CCAE_Gd_dt6LY5T9r6ty%2B1j2xEbdr84OCPkU5swsQn10cbDt81Ew%40mail.gmail.com%3E\n\nIn the benchmarks, is \"par vs par\" the before/after test? Ie baseline = current trunk, passed an ES to IndexSearcher, and then comp = with this patch, also passing ES to IndexSearcher?\n\nExactly, sorry that wasn't made clear.\n\nIn general, I suspect fine grained parallelism is trickier / most costly then the \"merge in the end\" parallelism we have now. Typically collection is not a very costly part of the search ... and merging the results in the end should be a minor cost, that shrinks as the index gets larger.\n\n\"Typically collection is not a very costly part of the search\" - I don't know if that's true. Are you referring to just the bits that might happen inside a Collector, or a broader definition of collection as including scoring and potentially some degree of I/O? This change is aiming to parallelize the latter. To do this the Collector API needs refactoring to cleanly separate out the AtomicReader-level state and the composite state, in case they are different.  ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13800947"
+        },
+        {
+            "date": "2013-10-21T18:57:52+0000",
+            "content": "Thanks for your comments Uwe Schindler, I really appreciate the vote of confidence in the API changes \n\nMy biggest concern is not complexity of API (it is actually simplier and easier to understand!): it is more the fact that parallelism of Lucene Queries is in most cases not the best thing to do (if you have many users). It only makes sense if you have very few queries - which is not where full-text searches are used for. The overhead for merging is higher than what you get, especially when many users hit your search engine in parallel! I generally don't recommend to users to use the parallelization currently available in IndexSearcher. Every user gets one thread and if you have many users buy more processors. With additional parallelism this does not scale if userbase grows.\n\nThere is certainly more work to be done overall per search-request for the Collector's where parallelization => merge step(s) [1]. It could mean better latency at the cost of additional hardware to sustain the same level of load. But it's a choice that should be available when developing search applications.\n\n[1] there are trivially parallelizable collectors where the merge step is either really small or non-existent: e.g. TotalHitCountCollector, or even FacetCollector (https://github.com/shikhar/lucene-solr/commit/032683da739bf15c1a8afe9f15cb2586baa0b201?w=1) ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13800954"
+        },
+        {
+            "date": "2013-10-21T20:06:14+0000",
+            "content": "I'm planning to work on parallelizing TopFieldCollector in the same way as for TopScoreDocCollector, so the special-casing from IndexSearcher can be removed and searches are parallelizable even if that collector gets wrapped in something else by Solr. \n\nWe are going to be doing some load-tests and latency measurements on one of our experimental clusters using real traffic logs, and I will report those findings. But first need to do that work on TopFieldCollector as most of our requests have multiple sort fields. ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13801019"
+        },
+        {
+            "date": "2013-10-21T20:16:25+0000",
+            "content": "What do you have the number of search threads set to in luceneutil?\n\nI did not change any of the defaults - what setting is this?\n\nIf this is too low, maybe its not utilizing all your hardware in the benchmark. (like a web server with a too-small PQ)\n\nWhat's a PQ?  ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13801028"
+        },
+        {
+            "date": "2013-10-21T22:14:58+0000",
+            "content": "Attaching patch with the TopFieldCollector changes + removal of bunch of unnecessary code from IndexSearcher\n\nTests pass except for TestExpressionSorts sometimes (see LUCENE-5222), will reopen that and provide fix. ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13801245"
+        },
+        {
+            "date": "2013-10-24T02:46:40+0000",
+            "content": "Attaching latest patch. Broken up into commits at https://github.com/shikhar/lucene-solr/compare/apache:trunk...trunk?w=1. ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13803682"
+        },
+        {
+            "date": "2013-12-13T03:40:28+0000",
+            "content": "What's a PQ? \n\nPriorityQueue\n\nparallelism of Lucene Queries is in most cases not the best thing to do (if you have many users). It only makes sense if you have very few queries\n\nI heard about this patch at tonight's NYC Search meetup talk by your colleague Gregg (http://www.meetup.com/NYC-Search-and-Discovery/events/125548572/ ) and immediately had the same reaction.  This parallelization should not improve query latency at all in deployments with many concurrent queries.  Correct?  Does your benchmark test and show this?\n\nIf this parallelization is optional and those who choose not to use it don't suffer from it, then this may be a good option to have for those with multi-core CPUs with low query concurrency, but if that's not the case.... ",
+            "author": "Otis Gospodnetic",
+            "id": "comment-13847122"
+        },
+        {
+            "date": "2013-12-13T04:21:37+0000",
+            "content": "Thanks for your comments Otis. I have certainly run into the situation of not seeing improvements when there is a higher degree of concurrency of search requests. So I want to try to pin down the associated costs (cost of merge, blocking operations, context switching, number/size of segments, etc.)\n\nI think this could have real-world applicability, but I don't have evidence yet in terms of a high query concurrency benchmark. Let's take as an example a 32-core server that serves 100 QPS at an average latency of 100ms. You'd expect 10 search tasks/threads to be active on average. So in theory you have 22 cores available for helping out with the search.\n\n> If this parallelization is optional and those who choose not to use it don't suffer from it, then this may be a good option to have for those with multi-core CPUs with low query concurrency, but if that's not the case....\n\nIt is optional and it is possible for parallelizable collectors to be written in a way that does not penalize the serial use case. E.g. the modifications to TopScoreDocCollector use a single PriorityQueue in the serial case, and a PriorityQueue for each AtomicReaderContext + 1 for the final merge in case parallelism is used. In the lucene-util benchmarks I ran I did not see a penalty on serial search with the patch. ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-13847146"
+        },
+        {
+            "date": "2013-12-13T04:55:22+0000",
+            "content": "I like the idea here.  Not every app has high QPS requirements, and might never expect to either for that matter.  Not every app is looking to target most of the internet as a potential user.  Sometimes it's everyone in your \"enterprise\" or smaller. ",
+            "author": "David Smiley",
+            "id": "comment-13847165"
+        },
+        {
+            "date": "2013-12-13T15:31:55+0000",
+            "content": "\nI think this could have real-world applicability, but I don't have evidence yet in terms of a high query concurrency benchmark. Let's take as an example a 32-core server that serves 100 QPS at an average latency of 100ms. You'd expect 10 search tasks/threads to be active on average. So in theory you have 22 cores available for helping out with the search.\n\nIn other words somebody bought overly expensive server?  Partial-joking aside, sure, yes, that can happen.  Without looking at the patch, I like the idea - why not if the ability to parallelize improves query latency in such situations, while not negatively impacting those whose CPU cores are already being pushed to the max through query concurrency.\nShowing more numbers will help convince everyone.  ",
+            "author": "Otis Gospodnetic",
+            "id": "comment-13847577"
+        },
+        {
+            "date": "2013-12-14T02:56:21+0000",
+            "content": "That's one phat patch.  Should Fix Version be set to 5.0? ",
+            "author": "Otis Gospodnetic",
+            "id": "comment-13848177"
+        },
+        {
+            "date": "2014-10-27T20:31:37+0000",
+            "content": "Just an update that the code rebased against recent trunk lives at https://github.com/shikhar/lucene-solr/tree/LUCENE-5299. I've made various tweaks, like being able to throttle per-request parallelism in ParallelSearchStrategy.\n\nluceneutil bench numbers when running with ^ & hacked IndexSearcher constructor that uses ParallelSearchStrategy(new ForkJoinPool(128), 8), against trunk, on a 32 core (with HT) Sandy Bridge server, with source wikimedium500k\n\nSEARCH_NUM_THREADS = 16\n\nReport after iter 19:\n                    TaskQPS baseline      StdDev  QPS parcol      StdDev                Pct diff\n                  Fuzzy1       81.91     (43.2%)       52.96     (39.7%)  -35.3% ( -82% -   83%)\n                 LowTerm     2550.11     (11.9%)     1927.28      (5.6%)  -24.4% ( -37% -   -7%)\n                 Respell       43.02     (39.4%)       35.23     (31.5%)  -18.1% ( -63% -   87%)\n                  Fuzzy2       19.32     (25.1%)       16.40     (34.8%)  -15.1% ( -59% -   59%)\n                 MedTerm     1679.37     (12.2%)     1743.27      (8.6%)    3.8% ( -15% -   28%)\n                PKLookup      221.58      (8.3%)      257.36     (13.2%)   16.1% (  -4% -   41%)\n              AndHighLow     1027.99     (11.6%)     1278.39     (15.9%)   24.4% (  -2% -   58%)\n              AndHighMed      741.50     (10.0%)     1198.04     (27.5%)   61.6% (  21% -  110%)\n               MedPhrase      709.04     (11.6%)     1203.02     (24.3%)   69.7% (  30% -  119%)\n             LowSpanNear      601.13     (16.9%)     1127.30     (16.7%)   87.5% (  46% -  145%)\n         LowSloppyPhrase      554.87     (10.8%)     1130.25     (30.5%)  103.7% (  56% -  162%)\n               OrHighMed      408.55     (10.4%)      977.56     (20.1%)  139.3% (  98% -  189%)\n               LowPhrase      364.36     (10.8%)      893.27     (41.0%)  145.2% (  84% -  220%)\n               OrHighLow      355.78     (12.7%)      893.63     (19.6%)  151.2% ( 105% -  210%)\n             AndHighHigh      390.73     (10.3%)     1004.70     (24.3%)  157.1% ( 111% -  213%)\n                HighTerm      399.01     (11.8%)     1067.67     (12.1%)  167.6% ( 128% -  217%)\n                Wildcard      754.76     (11.6%)     2067.96     (28.0%)  174.0% ( 120% -  241%)\n            HighSpanNear      153.57     (14.8%)      463.54     (24.3%)  201.8% ( 141% -  282%)\n              OrHighHigh      212.16     (12.4%)      665.56     (28.2%)  213.7% ( 154% -  290%)\n              HighPhrase      170.49     (13.1%)      547.72     (17.3%)  221.3% ( 168% -  289%)\n        HighSloppyPhrase       66.91     (10.1%)      219.59     (12.0%)  228.2% ( 187% -  278%)\n         MedSloppyPhrase      128.73     (12.5%)      425.67     (20.3%)  230.7% ( 175% -  300%)\n             MedSpanNear      130.31     (10.7%)      436.12     (18.2%)  234.7% ( 185% -  295%)\n                 Prefix3      166.91     (14.9%)      652.64     (26.7%)  291.0% ( 217% -  390%)\n                  IntNRQ      110.73     (15.0%)      467.72     (33.6%)  322.4% ( 238% -  436%)\n\n\n\nSEARCH_NUM_THREADS=32\n\n                    TaskQPS baseline      StdDev  QPS parcol      StdDev                Pct diff\n                 LowTerm     2401.88     (12.7%)     1799.27      (6.3%)  -25.1% ( -39% -   -6%)\n                  Fuzzy2        6.52     (14.4%)        5.74     (24.0%)  -11.9% ( -43% -   30%)\n                 Respell       45.13     (90.2%)       40.94     (83.5%)   -9.3% ( -96% - 1679%)\n                PKLookup      232.02     (12.9%)      228.35     (12.4%)   -1.6% ( -23% -   27%)\n                 MedTerm     1612.01     (14.0%)     1601.71     (10.9%)   -0.6% ( -22% -   28%)\n                  Fuzzy1       14.19     (79.3%)       14.71    (177.6%)    3.7% (-141% - 1258%)\n              AndHighLow     1205.65     (17.5%)     1254.76     (15.9%)    4.1% ( -24% -   45%)\n             MedSpanNear      478.11     (25.4%)      946.72     (34.5%)   98.0% (  30% -  211%)\n               OrHighLow      424.71     (14.5%)      941.39     (31.4%)  121.7% (  66% -  195%)\n             AndHighHigh      377.82     (13.3%)      910.77     (32.2%)  141.1% (  84% -  215%)\n                HighTerm      325.35     (11.3%)      855.63      (8.9%)  163.0% ( 128% -  206%)\n              AndHighMed      346.57     (11.7%)      914.59     (26.4%)  163.9% ( 112% -  228%)\n               MedPhrase      227.47     (13.1%)      621.50     (22.9%)  173.2% ( 121% -  240%)\n         LowSloppyPhrase      265.21     (10.4%)      748.30     (49.2%)  182.2% ( 110% -  269%)\n               OrHighMed      221.49     (12.2%)      632.55     (23.9%)  185.6% ( 133% -  252%)\n               LowPhrase      190.34     (14.9%)      586.71     (22.6%)  208.2% ( 148% -  288%)\n                 Prefix3      305.01     (15.9%)      948.63     (17.0%)  211.0% ( 153% -  289%)\n         MedSloppyPhrase      229.15     (15.0%)      718.29     (41.4%)  213.5% ( 136% -  317%)\n             LowSpanNear      102.98     (14.0%)      323.91     (37.1%)  214.5% ( 143% -  309%)\n                Wildcard      249.66     (13.3%)      787.42     (17.0%)  215.4% ( 163% -  283%)\n              OrHighHigh      124.76     (10.5%)      394.72     (35.0%)  216.4% ( 154% -  292%)\n            HighSpanNear      119.23     (15.5%)      386.33     (57.5%)  224.0% ( 130% -  351%)\n              HighPhrase       86.95     (14.4%)      293.00     (15.5%)  237.0% ( 180% -  311%)\n        HighSloppyPhrase      136.37     (12.9%)      462.38     (21.7%)  239.1% ( 181% -  314%)\n                  IntNRQ      100.48     (14.1%)      391.02     (14.2%)  289.1% ( 228% -  369%)\n\n\n\nSEARCH_NUM_THREADS=64\n\nReport after iter 19:\n                    TaskQPS baseline      StdDev  QPS parcol      StdDev                Pct diff\n                PKLookup      213.67     (23.0%)       11.53      (6.5%)  -94.6% (-100% -  -84%)\n                  Fuzzy1       48.00     (85.5%)       26.33     (74.5%)  -45.2% (-110% -  789%)\n                  Fuzzy2        4.10     (16.8%)        2.92      (9.2%)  -28.8% ( -46% -   -3%)\n                 Respell       15.21    (159.4%)       12.86    (118.6%)  -15.5% (-113% - -441%)\n                 LowTerm     1247.47     (16.6%)     1187.85     (14.8%)   -4.8% ( -31% -   32%)\n                 MedTerm      875.84     (11.7%)     1093.66     (19.5%)   24.9% (  -5% -   63%)\n         LowSloppyPhrase      445.65     (12.3%)      668.59     (58.6%)   50.0% ( -18% -  137%)\n              AndHighLow      429.62     (20.8%)      672.25     (51.2%)   56.5% ( -12% -  162%)\n              AndHighMed      365.37     (18.8%)      609.35     (51.1%)   66.8% (  -2% -  168%)\n               OrHighMed      253.66     (14.4%)      467.54     (68.7%)   84.3% (   1% -  195%)\n               MedPhrase      351.70     (14.3%)      653.30     (31.6%)   85.8% (  34% -  153%)\n               OrHighLow      288.46     (18.2%)      563.37     (36.4%)   95.3% (  34% -  183%)\n               LowPhrase      288.58     (10.5%)      567.36     (35.3%)   96.6% (  45% -  159%)\n             AndHighHigh      245.55     (14.5%)      528.54     (73.8%)  115.2% (  23% -  238%)\n             LowSpanNear      192.64      (7.5%)      440.77     (71.6%)  128.8% (  46% -  224%)\n             MedSpanNear      201.70     (14.4%)      487.17     (62.4%)  141.5% (  56% -  254%)\n                HighTerm      285.68     (10.1%)      716.36     (30.6%)  150.8% ( 100% -  212%)\n              HighPhrase       81.87     (17.0%)      215.48    (136.8%)  163.2% (   7% -  382%)\n        HighSloppyPhrase      111.43     (11.9%)      306.32    (114.9%)  174.9% (  43% -  342%)\n         MedSloppyPhrase       91.36     (15.9%)      257.01    (134.5%)  181.3% (  26% -  394%)\n              OrHighHigh      126.72     (17.9%)      362.42     (40.4%)  186.0% ( 108% -  297%)\n                Wildcard      401.61      (5.8%)     1170.84     (25.2%)  191.5% ( 151% -  236%)\n            HighSpanNear       96.98     (26.3%)      302.07     (77.1%)  211.5% (  85% -  427%)\n                 Prefix3      287.06     (13.3%)      990.66     (43.0%)  245.1% ( 166% -  347%)\n                  IntNRQ      109.19     (13.8%)      429.31     (48.4%)  293.2% ( 203% -  412%)\n\n ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-14185751"
+        },
+        {
+            "date": "2014-11-15T00:17:34+0000",
+            "content": "Slides from my talk at Lucene/Solr Revolution 2014 about this stuff - https://www.dropbox.com/s/h2nqsml0beed0pm/Search-time%20Parallelism.pdf\n\nSome backstory about the recent revival of this issue. The presentation was going to be a failure story since had not seen good performance on our test cluster when I tried it out last year.\n\nHowever after adding that request-level 'parallelism' throttle and possibly eliminating some bugs in cherry-picking onto latest trunk - seen consistently good results. You can see from the replay graphs towards the end p99 dropping by half, a few hundred ms better for p95, and median looks much improved too. CPU usage was more, as expected, but about similar (I think less, but don't have numbers) than the overhead we saw by sharding and running all the shards on localhost. We are still sharded in this manner so as you can see we considered the latency win to be worth it! ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-14213132"
+        },
+        {
+            "date": "2015-02-25T23:10:48+0000",
+            "content": "I think LUCENE-6294 would address the same problem but in a less intrusive way (ie. no new methods on oal.search.Collector)? ",
+            "author": "Adrien Grand",
+            "id": "comment-14337424"
+        },
+        {
+            "date": "2015-02-27T18:34:02+0000",
+            "content": "LUCENE-6294 is definitely a less intrusive approach. I think the tradeoff is that by moving the parallelization into the Collector API itself, we can make it composable and work for any arbitrary permutation of parallelizable collectors. ",
+            "author": "Shikhar Bhushan",
+            "id": "comment-14340521"
+        },
+        {
+            "date": "2015-04-15T00:31:05+0000",
+            "content": "Bulk close after 5.1 release ",
+            "author": "Timothy Potter",
+            "id": "comment-14495428"
+        }
+    ]
+}

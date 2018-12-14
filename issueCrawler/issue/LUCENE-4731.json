@@ -1,0 +1,86 @@
+{
+    "id": "LUCENE-4731",
+    "title": "New ReplicatingDirectory mirrors index files to HDFS",
+    "details": {
+        "components": [
+            "core/store"
+        ],
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "New Feature",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I've been working on a Directory implementation that mirrors the index files to HDFS (or other Hadoop supported FileSystem).\n\nA ReplicatingDirectory delegates all calls to an underlying Directory (supplied in the constructor). The only hooks are the deleteFile and sync calls. We submit deletes and replications to a single scheduler thread to keep things serializer. During a sync call, if \"segments.gen\" is seen in the list of files, we know a commit is finishing. After calling the deletage's sync method, we initialize an asynchronous replication as follows.\n\n\n\tRead segments.gen (before leaving ReplicatingDirectory#sync), save the values for later\n\tGet a list of local files from ReplicatingDirectory#listAll before leaving ReplicatingDirectory#sync\n\tSubmit replication task (DirectoryReplicator) to scheduler thread\n\tCompare local files to remote files, determine which remote files get deleted, and which need to get copied\n\tSubmit a thread to copy each file (one thead per file)\n\tSubmit a thread to delete each file (one thead per file)\n\tSubmit a \"finalizer\" thread. This thread waits on the previous two batches of threads to finish. Once finished, this thread generates a new \"segments.gen\" remotely (using the version and generation number previously read in).\n\n\n\nI have no idea where this would belong in the Lucene project, so i'll just attach the standalone class instead of a patch. It introduces dependencies on Hadoop core (and all the deps that brings with it).",
+    "attachments": {
+        "ReplicatingDirectory.java": "https://issues.apache.org/jira/secure/attachment/12566981/ReplicatingDirectory.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-01-29T14:38:31+0000",
+            "content": "Attaching ReplicatingDirectory.java ",
+            "author": "David Arthur",
+            "id": "comment-13565403"
+        },
+        {
+            "date": "2013-01-29T14:48:08+0000",
+            "content": "Why do you need such a Directory implementation? HDFS already does replication (unless you turn it off), so I wonder what does that replication give you, that HDFS replication doesn't? ",
+            "author": "Shai Erera",
+            "id": "comment-13565414"
+        },
+        {
+            "date": "2013-01-29T14:53:11+0000",
+            "content": "The idea is to have a mirror of your index on a remote HDFS.\n\n ",
+            "author": "David Arthur",
+            "id": "comment-13565418"
+        },
+        {
+            "date": "2013-01-29T15:39:58+0000",
+            "content": "Did you take a look at LUCENE-2632 (TeeDirectory)? I think it's similar to what you need? Perhaps you can compare the two?\n\nHmmm .. but the approach you've taken here is different. While TeeDirectory mimics Unix's \"tee\" and forwards calls to two directories, ReplicationDirectory implements ... replication.\n\nI would not implement replication at the level of Directory, and rely on things like \"when segments.gen is seen we know commit happened\". It sounds too fragile of a protocol to me.\n\nPerhaps instead you can think of a replication module which lets a producer publish IndexCommits whenever it called commit(), and consumers can periodically poll the replicator for updates, giving it their current state. When an update is available, they do the replication? Or something along those lines? IndexCommits are much more \"official\" to rely on, than the fragile algorithm you describe. For example, You can use SnapshotDeletionPolicy to hold onto IndexCommits that are currently being replicated, which will prevent the deletion of their files. Whereas in your algorithm, if two commits are called close to each other, one thread could start a replication action, while the next commit will delete the files in the middle of copy, or just delete some of the files that haven't been copied yet.\n\nI think what we need in Lucene is a Replicator module . ",
+            "author": "Shai Erera",
+            "id": "comment-13565467"
+        },
+        {
+            "date": "2013-01-30T21:19:43+0000",
+            "content": "TeeDirectory was actually the inspiration for this. The primary difference is that I want to asynchronously copy the index files, rather than having two sync underlying Directories. The motivating use case for me is I want to run some Hadoop jobs that make use of my Lucene index, but I don't want to collocate Lucene and Hadoop (sounds like a recipe for bad performance all around). With this async strategy, commits will get to HDFS eventually, and I don't really care how far behind the lag as, so long as I have a readable commit in HDFS.\n\nAlso, regarding push vs pull, I'd rather push from Lucene to avoid having to deal with remote agents pulling.\n\nWhereas in your algorithm, if two commits are called close to each other, one thread could start a replication action, while the next commit will delete the files in the middle of copy, or just delete some of the files that haven't been copied yet.\n\n\"Replication actions\" and \"delete actions\" are serialized by a single thread, so they will not be interleaved. ",
+            "author": "David Arthur",
+            "id": "comment-13566914"
+        },
+        {
+            "date": "2013-01-31T06:16:19+0000",
+            "content": "I see, so you only allow one commit at a time. That's not great either ... e.g. if the replicating thread copies a large index commit (due to merges or something), all other processes are stopped until it finishes. This makes indexing on Hadoop even more horrible (if such thing is possible ).\n\nYou don't have to do pull requests, you can have an agent running on the Hadoop cluster (where MapReduce jobs are run) that will poll the index directory periodically and then push the files to HDFS. The difference is that it will:\n\n\n\tTake a snapshot on the index, so those files that it copies won't get deleted for sure.\n\tIt does not block indexing operations. If it copies a large index commit, and few commits are made in parallel by the indexing process, then when the replication process finishes, it will copy a single index commit with all recent changes. That might even make it more efficient.\n\tYou don't rely on a fragile algorithm, e.g. the detection of segments.gen.\n\n ",
+            "author": "Shai Erera",
+            "id": "comment-13567396"
+        },
+        {
+            "date": "2013-01-31T13:22:09+0000",
+            "content": "all other processes are stopped until it finishes\n\nNot exactly, just no other replication or delete events will happen\n\nTake a snapshot on the index, so those files that it copies won't get deleted for sure.\n\nIs that what the SnapshotDeletionPolicy does? This does sound more robust than watching for segments.gen - where can I see it in use? Is this what Solr uses for replication?\n\nWhat would be a recommended mechanism for receiving \"push requests\" from a remote agent? Does lucene have any kind of RPC server like Thrift built-in (I imagine not). ",
+            "author": "David Arthur",
+            "id": "comment-13567616"
+        },
+        {
+            "date": "2013-01-31T13:30:58+0000",
+            "content": "Not exactly, just no other replication or delete events will happen\n\nWell in that case then you could run into troubles. I.e. imagine two threads, one doing commit() and one doing replication. The commit() thread could be much faster than the replication one. Therefore, it can do commit(#1), replication thread starts to replication that index commit. In the middle, the commit thread does commit(#2), which deletes some files of the previous commit (e.g. due to segment merging), and the replication thread will be left with a corrupt commit ...\n\nIs that what the SnapshotDeletionPolicy does\n\nYes. You can see how it's used in the tests. Also, here's a thread from the user list with an example code: http://markmail.org/message/3novogsi6vcgarur.\n\nI am not sure if Solr uses it, but I think it does. I mean .. it's the \"safe\" way to replicate/backup your index.\n\nLucene doesn't have an RPC server built-in .. I wrote a simple Servlet that responds to some REST API to invoke replication ... ",
+            "author": "Shai Erera",
+            "id": "comment-13567621"
+        },
+        {
+            "date": "2013-07-23T18:44:34+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 ",
+            "author": "Steve Rowe",
+            "id": "comment-13716991"
+        },
+        {
+            "date": "2014-04-16T12:54:40+0000",
+            "content": "Move issue to Lucene 4.9. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13970837"
+        }
+    ]
+}

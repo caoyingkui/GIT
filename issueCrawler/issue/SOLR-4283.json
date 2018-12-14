@@ -1,0 +1,98 @@
+{
+    "id": "SOLR-4283",
+    "title": "Improve URL decoding (followup of SOLR-4265)",
+    "details": {
+        "affect_versions": "4.0",
+        "status": "Closed",
+        "fix_versions": [
+            "4.1",
+            "6.0"
+        ],
+        "components": [],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Followup of SOLR-4265:\nSOLR-4265 has 2 problems:\n\n\tit reads the whole InputStream into a String and this one can be big. This wastes memory, especially when your query string from the POSted form data is near the 2 Megabyte limit. The String is then packed in splitted form into a big Map.\n\tit does not report corrupt UTF-8\n\n\n\nThe attached patch will do 2 things:\n\n\tThe decoding of the POSTed form data is done on the ServletInputStream, directly parsing the bytes (not chars). Key/Value pairs are extracted and %-decoded to byte[] on the fly. URL-parameters from getQueryString() are parsed with the same code using ByteArrayInputStream on the original String, interpreted as UTF-8 (this is a hack, because Servlet API does not give back the original bytes from the HTTP request). To be standards conform, the query String should be interpreted as US-ASCII, but with this approach, not full escaped UTF-8 from the HTTP request survive.\n\tthe byte[] key/value pairs are converted to Strings using CharsetDecoder\n\n\n\nThis will be memory efficient and will report incorrect escaped form data, so people will no longer complain if searches hit no results or similar.",
+    "attachments": {
+        "request.http": "https://issues.apache.org/jira/secure/attachment/12563726/request.http",
+        "SOLR-4283.patch": "https://issues.apache.org/jira/secure/attachment/12563655/SOLR-4283.patch",
+        "index.jsp": "https://issues.apache.org/jira/secure/attachment/12563725/index.jsp"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13546478",
+            "date": "2013-01-08T01:12:56+0000",
+            "content": "More tests, disallow missing key "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-13546689",
+            "date": "2013-01-08T08:05:20+0000",
+            "content": "\n+        final InputStream in = new ByteArrayInputStream(queryString.getBytes(IOUtils.CHARSET_UTF_8));\n\n\n\nI think if you pass raw unescaped UTF-8 in a HTTP message the query String (decoded object) will be actually a sequence of char[] with bytes corresponding to the original bytes in the HTTP header, not properly decoded UTF-8 so you'd be double-decoding UTF-8 here. I assume the container parses uris using byte-identity codepage (US-ASCII). It's probably worth checking with a netcat-prepared HTTP message to see what they actually do.\n\nI think it'd be more sensible to decode char[] into byte[] with masking 0xff (and possibly throw an exception if something is non-zero after ~0xff.\n "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13546691",
+            "date": "2013-01-08T08:19:41+0000",
+            "content": "Dawid: I mentioned that:\n\nTo be standards conform, the query String should be interpreted as US-ASCII, but with this approach, not full escaped UTF-8 from the HTTP request survive.\n\nJetty uses uses UTF-8 to parse HTTP requests. This approach is to make at least some request with unescaped UTF-8 bytes survive. If I mask away the lower bits i just loose information. For the URL-decoding it does not matter, so I leave it there. This was already discussed with Yonik in SOLR-4265.\n\nUwe "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-13546715",
+            "date": "2013-01-08T09:02:26+0000",
+            "content": "Jetty uses uses UTF-8 to parse HTTP requests.\n\nI don't think it should (or does); if it does though, it'd be weird because it should treat HTTP headers with US-ASCII and not interpret anything. \n\nI did the following experiment. I prepared a raw HTTP request with an \"\u0142\" character inside (Unicode U+0141, UTF-8 sequence: C5 82). Then I prepared the following simple JSP (servlet):\n\n<%\n  response.setContentType(\"text/plain; charset=UTF-8\");\n  String qs = request.getQueryString();\n  if (qs == null) qs = \"\";\n  for (char chr : qs.toCharArray()) {\n    out.print(Integer.toHexString(chr));\n    out.print(\" \");\n  }\n  out.println();\n%>\n\n\n\nAs you can see what it does is it hexdumps all the char values from the query string, as provided by the container. It is unfortunate that the container HAS to provide a String here because it needs to do some sort of input bytes->chars conversion. My opinion is that this should be an identity mapping of some sort; copying bytes to chars (with 0xff mask) will give you a rough equivalent of doing new String(inputQueryStringBytes, \"ISO8859-1\"). This string cannot be converted back to bytes with qs.getBytes(\"UTF-8\") because these bytes are no longer the same characters (we don't know what they were, actually). Even if we assume they were proper UTF-8 they will no longer be converted as such. \n\nThis is Tomcat, for example:\n\n$ nc6 localhost 8080 < request.http\nnc6: using stream socket\nHTTP/1.1 200 OK\nServer: Apache-Coyote/1.1\nSet-Cookie: JSESSIONID=EFBEE4830C7B91D979938E82C9CAB6CB; Path=/test/; HttpOnly\nContent-Type: text/plain;charset=UTF-8\nContent-Length: 30\nDate: Tue, 08 Jan 2013 08:35:41 GMT\n\n61 61 c5 82 62 62\n\n\n\nThis follows my expectation of a HTTP server \u2013 it didn't corrupt anything, it didn't interpret anything because it couldn't.\n\nNow jetty9:\n\n$ nc6 localhost 8080 < request.http\nnc6: using stream socket\nHTTP/1.1 200 OK\nDate: Tue, 08 Jan 2013 08:42:49 GMT\nSet-Cookie: JSESSIONID=1d4i8p9coo32y11wo09leai3iw;Path=/\nExpires: Thu, 01 Jan 1970 00:00:00 GMT\nContent-Type: text/plain; charset=UTF-8\nContent-Length: 24\nServer: Jetty(9.0.0.M3)\n\n61 61 3f 62 62\n\n\n\nThis is wrong; 3f stands for '?' so clearly Jetty tries to interpret the input bytes from HTTP somehow and fails on doing so. What it does exactly \u2013 I've no idea, would have to check the code.\n\nWith Jetty8, interestingly:\n\n$ nc6 localhost 8080 < request.http\nnc6: using stream socket\nHTTP/1.1 200 OK\nDate: Tue, 08 Jan 2013 08:57:56 GMT\nSet-Cookie: JSESSIONID=12ivf935hblkk1452cmwpgntt9;Path=/\nExpires: Thu, 01 Jan 1970 00:00:00 GMT\nContent-Type: text/plain;charset=UTF-8\nContent-Length: 26\nServer: Jetty(8.1.8.v20121106)\n\n61 61 142 62 62\naa\u0142bb\n\n\n\nHa! So here's where Yonik claim that Jetty parses these UTF-8 URIs right came from...\n\nI honestly think this is a BUG in Jetty8 though (with a regression to an even worse bug in Jetty9...). So I sustain my claim that the conversion:\n\nqueryString.getBytes(\"UTF-8\")\n\n\nto recover the input byte stream is incorrect. A fix? There doesn't seem to be one that would work for all the containers (for tomcat it'd be going back char-to-byte one by one and then parsing as UTF-8 for example, for Jetty8 it's already in UTF-8, for Jetty9 it's screwed up from the beginning).\n\n "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-13546717",
+            "date": "2013-01-08T09:03:00+0000",
+            "content": "Test files. "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-13546730",
+            "date": "2013-01-08T09:32:04+0000",
+            "content": "https://github.com/eclipse/jetty.project/commit/31def062146702f03da8d6f2e7010b7d4586439b\n\nthis is a fairly recent commit (15 days ago). You can see they're still assuming UTF-8 for URIs. I used jetty9M3 in my tests above, don't know if it works with jetty9M5 (probably, given the above commit). "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13546740",
+            "date": "2013-01-08T09:47:58+0000",
+            "content": "Attached is a patch that fails cleanly on the query string if it contains bytes > 127.\n\nThis is the most portable approach and helps users because it explicitely says: encode your query string "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13546742",
+            "date": "2013-01-08T09:52:22+0000",
+            "content": "Fix test bug found by this! Yipee! "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13546782",
+            "date": "2013-01-08T10:57:24+0000",
+            "content": "More readable and helpful Exception message on BAD_REQUEST HTTP response.\n\nI think it is ready to commit. We should try this out and find out how this affects users with incorrect applications. "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13547032",
+            "date": "2013-01-08T17:24:13+0000",
+            "content": "[trunk commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1430396\n\nSOLR-4283: Improvements for URL-Decoding "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13547037",
+            "date": "2013-01-08T17:30:25+0000",
+            "content": "[branch_4x commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1430397\n\nMerged revision(s) 1430396 from lucene/dev/trunk:\nSOLR-4283: Improvements for URL-Decoding "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13547038",
+            "date": "2013-01-08T17:32:28+0000",
+            "content": "Committed to trunk and 4.x.\n\nA next step would be to make the encoding of the GET-URLs configureable (using the defacto standard \"&ie=charset\" URL parameter, as used by most REST webservices of major search engines). "
+        }
+    ]
+}

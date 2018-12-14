@@ -1,0 +1,155 @@
+{
+    "id": "SOLR-8925",
+    "title": "Add gatherNodes Streaming Expression to support breadth first traversals",
+    "details": {
+        "components": [],
+        "type": "New Feature",
+        "labels": "",
+        "fix_versions": [
+            "6.1"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Implemented",
+        "priority": "Major"
+    },
+    "description": "The gatherNodes Streaming Expression is a flexible general purpose breadth first graph traversal. It uses the same parallel join under the covers as (SOLR-8888) but is much more generalized and can be used for a wide range of use cases.\n\nSample syntax:\n\n\n gatherNodes(friends,\n             gatherNodes(friends,\n                         search(articles, q=\u201cbody:(queryA)\u201d, fl=\u201cauthor\u201d),\n                         walk =\"author->user\u201d,\n                         gather=\"friend\"),\n             walk=\u201cfriend->user\u201d,\n             gather=\"friend\",\n             scatter=\u201cbranches, leaves\u201d)\n\n\n\n\nThe expression above is evaluated as follows:\n\n1) The inner search() expression is evaluated on the articles collection, emitting a Stream of Tuples with the author field populated.\n2) The inner gatherNodes() expression reads the Tuples form the search() stream and traverses to the friends collection by performing a distributed join between articles.author and friends.user field.  It gathers the value from the friend field during the join.\n3) The inner gatherNodes() expression then emits the friend Tuples. By default the gatherNodes function emits only the leaves which in this case are the friend tuples.\n4) The outer gatherNodes() expression reads the friend Tuples and Traverses again in the \"friends\" collection, this time performing the join between friend Tuples  emitted in step 3. This collects the friend of friends.\n5) The outer gatherNodes() expression emits the entire graph that was collected. This is controlled by the \"scatter\" parameter. In the example the root nodes are the authors, the branches are the author's friends and the leaves are the friend of friends.\n\nThis traversal is fully distributed and cross collection.\n\nAggregations are also supported during the traversal. This can be useful for making recommendations based on co-occurance counts: Sample syntax:\n\ntop(\n      gatherNodes(baskets,\n                  search(baskets, q=\u201cprodid:X\u201d, fl=\u201cbasketid\u201d, rows=\u201c500\u201d, sort=\u201crandom_7897987 asc\u201d),\n                  walk =\u201cbasketid->basketid\u201d,\n                  gather=\u201cprodid\u201d,\n                  fl=\u201cprodid, price\u201d,\n                  count(*),\n                  avg(price)),\n      n=4,\n      sort=\u201ccount(*) desc, avg(price) asc\u201d)\n\n\n\nIn the expression above, the inner search() function searches the basket collection for 500 random basketId's that have the prodid X.\n\ngatherNodes then traverses the basket collection and gathers all the prodid's for the selected basketIds.\nIt also aggregates the counts and average price for each productid collected. The count reflects the co-occurance count for each prodid gathered and prodid X. The outer top expression selects the top 4 prodid's emitted from gatherNodes, based the co-occurance count and avg price.\n\nLike all streaming expressions the gatherNodes expression can be combined with other streaming expressions. For example the following expression uses a hashJoin to intersect the network of friends rooted to authors found with different queries:\n\n\nhashInnerJoin(\n                      gatherNodes(friends,\n                                  gatherNodes(friends,\n                                              search(articles, q=\u201cbody:(queryA)\u201d, fl=\u201cauthor\u201d),\n                                              walk =\"author->user\u201d,\n                                              gather=\"friend\"),\n                                  walk=\u201cfriend->user\u201d,\n                                  gather=\"friend\",\n                                  scatter=\u201cbranches, leaves\u201d),\n                       gatherNodes(friends,\n                                  gatherNodes(friends,\n                                              search(articles, q=\u201cbody:(queryB)\u201d, fl=\u201cauthor\u201d),\n                                              walk =\"author->user\u201d,\n                                              gather=\"friend\"),\n                                  walk=\u201cfriend->user\u201d,\n                                  gather=\"friend\",\n                                  scatter=\u201cbranches, leaves\u201d),\n                      on=\u201cfriend\u201d\n         )",
+    "attachments": {
+        "SOLR-8925.patch": "https://issues.apache.org/jira/secure/attachment/12798089/SOLR-8925.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-04-08T19:38:34+0000",
+            "author": "Dennis Gove",
+            "content": "I like this. Just a couple of questions.\n\n1. What does this do with duplicate nodes? ie, overlapping friend networks. Will it prune those out, show the node twice, mark a node has having multiple sources?\n\n2. When using the scatter parameter will the nodes be marked as which group they fall into? What if a node falls into multiple groups (kinda related to #1 above)?\n\n3. Will a node include information about its source, ie - why it's included in a graph?\n\n4. If gatherNodes is doing a 'join' between friends and articles I'd expect the tuple to be a join of the tuple found in articles and the tuple found in friends. But if \"The inner gatherNodes() expression then emits the friend Tuples\" I believe this is more of an intersect. Ie, give me tuples in friends which also appear in articles, using the author->user equalitor. Though I guess it would be returning tuples from both the left and right streams whereas a standard intersect only returns tuples from the left stream. That said, it's not joining those tuples together.\n\n5. What could one do if they wished to build a graph using a subset of data in friends collection? Can they apply a filter on friends as part of the gatherNodes function? Perhaps they could be allowed to add fq filters. ",
+            "id": "comment-15232782"
+        },
+        {
+            "date": "2016-04-08T19:48:01+0000",
+            "author": "Dennis Gove",
+            "content": "The order in the walk parameter might be confusing. \n\nwalk =\"author->user\u201d,\n\n\nIn other expressions where we're checking equality between two streams we use a standard of firstStreamField = secondStreamField. In gatherNodes, the field on the right appears to go with the first stream while the field on the left goes with the second stream. I'm not suggesting I don't like the author->user structure, because I do, but perhaps that the use of collection as the first param might lead to confusion. ",
+            "id": "comment-15232800"
+        },
+        {
+            "date": "2016-04-09T00:39:40+0000",
+            "author": "Joel Bernstein",
+            "content": "What does this do with duplicate nodes? ie, overlapping friend networks. Will it prune those out, show the node twice, mark a node has having multiple sources?\n\nDuplicate nodes are removed by cycle detection. All the ancestors are tracked and are returned with the Tuple in the ancestors field.\n\n\nWhen using the scatter parameter will the nodes be marked as which group they fall into? What if a node falls into multiple groups (kinda related to #1 above)?\n\nnodes will  be marked with the level of the traversal and the collection they came from.\n\n\nIf gatherNodes is doing a 'join' between friends and articles I'd expect the tuple to be a join of the tuple found in articles and the tuple found in friends. But if \"The inner gatherNodes() expression then emits the friend Tuples\" I believe this is more of an intersect. Ie, give me tuples in friends which also appear in articles, using the author->user equalitor. Though I guess it would be returning tuples from both the left and right streams whereas a standard intersect only returns tuples from the left stream. That said, it's not joining those tuples together.\n\nIt's a join but not similar to the other joins expressions which are done with a single search for the left and right streams. This a parallel batched nested loop join. So I'm not sure it expresses quite like the other joins. You can see the implementation in the ShortestPathStream. Looking at the implementation might spark some ideas of how to express it. I'm open to ideas.\n\n\nWhat could one do if they wished to build a graph using a subset of data in friends collection? Can they apply a filter on friends as part of the gatherNodes function? Perhaps they could be allowed to add fq filters.\n\nThe fq,and fl params will be supported. This will support filtering and listing/aggregating edge properties. ",
+            "id": "comment-15233224"
+        },
+        {
+            "date": "2016-04-09T01:01:08+0000",
+            "author": "Joel Bernstein",
+            "content": "I think the direction of the traversal is interesting. The direction of the traversal is to walk or traverse from author to user.\n\nIt might make sense to not think of a traversal as a join, but as it's own operation. ",
+            "id": "comment-15233244"
+        },
+        {
+            "date": "2016-04-11T19:49:07+0000",
+            "author": "Joel Bernstein",
+            "content": "First patch also contains support for aggregations on the nodes during the traversal. Needs test cases. ",
+            "id": "comment-15235830"
+        },
+        {
+            "date": "2016-04-12T19:11:15+0000",
+            "author": "Joel Bernstein",
+            "content": "Patch with first very simple first test case. Shows the basic machinery working. ",
+            "id": "comment-15237793"
+        },
+        {
+            "date": "2016-04-12T20:27:45+0000",
+            "author": "Joel Bernstein",
+            "content": "Patch with count metric working. ",
+            "id": "comment-15237907"
+        },
+        {
+            "date": "2016-04-14T16:01:16+0000",
+            "author": "Joel Bernstein",
+            "content": "New patch with some nice syntax improvements and more tests. ",
+            "id": "comment-15241411"
+        },
+        {
+            "date": "2016-04-14T19:10:37+0000",
+            "author": "Joel Bernstein",
+            "content": "New patch adds more test cases. ",
+            "id": "comment-15241746"
+        },
+        {
+            "date": "2016-04-14T20:25:24+0000",
+            "author": "Joel Bernstein",
+            "content": "More tests and removed debugging ",
+            "id": "comment-15241834"
+        },
+        {
+            "date": "2016-04-14T20:46:41+0000",
+            "author": "Joel Bernstein",
+            "content": "Added a test with cycle detection ",
+            "id": "comment-15241878"
+        },
+        {
+            "date": "2016-04-14T20:50:47+0000",
+            "author": "Joel Bernstein",
+            "content": "Initial unit tests are coming along well. I plan to move on to manual testing with the Enron email dataset and if that looks good I think this is pretty close to being committed to trunk. ",
+            "id": "comment-15241884"
+        },
+        {
+            "date": "2016-04-15T15:39:58+0000",
+            "author": "Joel Bernstein",
+            "content": "New patch with an efficient TaversalIterator implementation. ",
+            "id": "comment-15243121"
+        },
+        {
+            "date": "2016-04-15T15:47:50+0000",
+            "author": "Joel Bernstein",
+            "content": "Manual testing is looking pretty good on the Enron email dataset. Traversals are reasonably fast, for example a friend of friends of friends traversal returning 6500 leaf nodes responds in 270 millisseconds. This not a huge dataset and things will slow down on large highly interconnected graphs, but that's to be expected. Also there are some big performance and scalability improvements that can be made in later releases. But I think this is getting pretty close to committable. ",
+            "id": "comment-15243128"
+        },
+        {
+            "date": "2016-04-18T20:59:33+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 8659ea33d909ca76c793a778c694feea0c74af3b in lucene-solr's branch refs/heads/master from jbernste\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8659ea3 ]\n\nSOLR-8925: Add gatherNodes Streaming Expression to support breadth first traversals ",
+            "id": "comment-15246522"
+        },
+        {
+            "date": "2016-04-19T15:48:13+0000",
+            "author": "Dennis Gove",
+            "content": "Joel Bernstein, do you intend to apply this to branch_6x? I'd like to apply SOLR-9009 but it includes changes in GatherNodesStream.java. I can of course pull my changes to that file out before applying but if you do intend to put this on branch_6x then I'll just wait. ",
+            "id": "comment-15248020"
+        },
+        {
+            "date": "2016-04-19T16:07:31+0000",
+            "author": "Joel Bernstein",
+            "content": "Just replied on the RandomStream ticket, we track the discussion there. ",
+            "id": "comment-15248052"
+        },
+        {
+            "date": "2016-04-26T20:30:35+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 9ce830d8f2a547b763999ea3790bab6a4d8727a3 in lucene-solr's branch refs/heads/master from jbernste\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9ce830d ]\n\nSOLR-8925: Integrate the GraphTermsQuery into the gatherNodes expression ",
+            "id": "comment-15258858"
+        },
+        {
+            "date": "2016-05-02T13:29:34+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d77574abbad62cdf80a8f8978ec439f8a7e6da72 in lucene-solr's branch refs/heads/branch_6x from jbernste\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d77574a ]\n\nSOLR-8925: Add gatherNodes Streaming Expression to support breadth first traversals\n\nConflicts:\n\tsolr/core/src/java/org/apache/solr/handler/StreamHandler.java ",
+            "id": "comment-15266602"
+        },
+        {
+            "date": "2016-05-02T13:29:43+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d1f32c04325f97d7fae287de154e628a81c7c98e in lucene-solr's branch refs/heads/branch_6x from jbernste\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d1f32c0 ]\n\nSOLR-8925: Integrate the GraphTermsQuery into the gatherNodes expression ",
+            "id": "comment-15266609"
+        },
+        {
+            "date": "2016-05-02T15:31:02+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 62a28dd0c7dc8f41e43d5c37e28c968556b8e9d2 in lucene-solr's branch refs/heads/master from jbernste\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=62a28dd ]\n\nSOLR-8986, SOLR-8925, SOLR-9027: Update CHANGES.txt ",
+            "id": "comment-15266797"
+        },
+        {
+            "date": "2016-05-02T16:08:04+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit df72df1c58a5884774d003eec2f71c27a4737896 in lucene-solr's branch refs/heads/branch_6x from jbernste\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=df72df1 ]\n\nSOLR-8986, SOLR-8925, SOLR-9027: Update CHANGES.txt\n\nConflicts:\n\tsolr/CHANGES.txt ",
+            "id": "comment-15266889"
+        }
+    ]
+}

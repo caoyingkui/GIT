@@ -1,0 +1,294 @@
+{
+    "id": "SOLR-8069",
+    "title": "Ensure that only the valid ZooKeeper registered leader can put a replica into Leader Initiated Recovery.",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Critical"
+    },
+    "description": "I've seen this twice now. Need to work on a test.\n\nWhen some issues hit all the replicas at once, you can end up in a situation where the rightful leader was put or put itself into LIR. Even on restart, this rightful leader won't take leadership and you have to manually clear the LIR nodes.\n\nIt seems that if all the replicas participate in election on startup, LIR should just be cleared.",
+    "attachments": {
+        "SOLR-8069.patch": "https://issues.apache.org/jira/secure/attachment/12757136/SOLR-8069.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-09-17T15:28:03+0000",
+            "author": "Mark Miller",
+            "content": "Timothy Potter, any immediate thoughts on this? ",
+            "id": "comment-14803093"
+        },
+        {
+            "date": "2015-09-17T16:28:14+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "We have definitely seen this as well, even after commit for SOLR-7109 added zookeeper multi transaction to ZkController.markShardAsDownIfLeader, which is supposed to predicate setting the LiR node on the setter's still having the same election znode it thinks it has when it's a leader.\n\nHmmm, reading the code now I'm not sure it's doing exactly the right thing since it calls getLeaderSeqPath, which just takes the current ElectionContext from electionContexts, which isn't necessarily the one the node had when it decided to mark someone else down, right? Shalin Shekhar Mangar thoughts? ",
+            "id": "comment-14803172"
+        },
+        {
+            "date": "2015-09-17T17:23:24+0000",
+            "author": "Timothy Potter",
+            "content": "Immediate thought is ugh! I'm surprised to hear this is still happening after 7109. I'd like to dig in a bit more, but agreed on:\n\nIt seems that if all the replicas participate in election on startup, LIR should just be cleared.\n ",
+            "id": "comment-14803264"
+        },
+        {
+            "date": "2015-09-17T19:25:57+0000",
+            "author": "Mark Miller",
+            "content": "Not quite working yet, but what about this approach instead? ",
+            "id": "comment-14804320"
+        },
+        {
+            "date": "2015-09-17T20:10:32+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "I still struggle with the safety of getting the ElectionContext from electionContexts, because what's mapped there could change from under this thread. What about if we write down the election node path (e.g.  238121947050958365-core_node2-n_0000000006) into the leader znode as a leader props, so that whenever we're actually checking that we're the leader, we can get that election node path back and do the zk multi checking for that particular election node path?\n\nUgh, but then I guess lots of places are actually looking at the cluster state's leader instead of the leader node. >_< Why are there separate places for marking the leader? I don't know how to reason with the asynchronous nature of cluster state's update wrt actual leader election... ",
+            "id": "comment-14804407"
+        },
+        {
+            "date": "2015-09-17T20:26:14+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "Actually, thinking about it \u2013 why do we have the leader property in cluster state at all? If it's simply to publish leadership to solrj, it seems that on the server-side we should still use the leader znode as the \"source of truth\" so that we can have guarantees of consistent view along with the zk transactions. If solrj's view falls behind due to the asynchronous nature of having the Overseer update the state, at least on the server side we can check the leader znode.\n\nAny historical reason why leadership information is in two places? ",
+            "id": "comment-14804438"
+        },
+        {
+            "date": "2015-09-17T20:31:31+0000",
+            "author": "Mark Miller",
+            "content": "I still struggle with the safety of getting the ElectionContext from electionContexts, because what's mapped there could change from under this thread. \n\nThat is why I check before and after we get the context that we locally think we are the leader. The idea is, if we locally are connected to zk and think we are leader before and after getting the latest context, we have near real confidence that we are the leader and can do still do as we please.\n\nThere really is nothing tricky about the leader being advertised in clusterstate - it's simply slightly stale state that is updated by Overseer. I don't see how it complicates an approach to this? ",
+            "id": "comment-14804446"
+        },
+        {
+            "date": "2015-09-17T21:27:31+0000",
+            "author": "Mark Miller",
+            "content": "Well here is one approach.\n\nIn either case, I'd like to add the checks against CloudDescriptor#isLeader - this is our most up to date and real time information about whether or not we are connected to zk and think we are the leader - if this is false, we don't want to do anything that a leader should do. If we are going to have best effort checks against zk itself to ensure we are still the leader, this important defensive check should also generally be included.\n\nOtherwise, I think the current code does not really work - it's really easy to  grab the latest context and the latest context should usually look right? This code addresses that rather large hole. I'm open to doing more, but I have not grasped the full implementation of it yet given the state available to the various LIR methods. ",
+            "id": "comment-14804543"
+        },
+        {
+            "date": "2015-09-17T21:56:03+0000",
+            "author": "Timothy Potter",
+            "content": "Quick pass over the patch looks good to me (a few non-related changes in HdfsCollectionsAPIDistributedZkTest.java leaked into this patch). I'm focused on other un-related issue at the moment so will take a closer look in the AM when I'm fresh, but I like the approach. ",
+            "id": "comment-14804599"
+        },
+        {
+            "date": "2015-09-17T23:01:03+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "Yes, I think this is definitely an improvement. I'm just not sure if it gets everything covered. I suppose \"we have near real confidence that we are the leader and can do still do as we please\" is probably good enough \u2013 though I haven't convinced myself yet through playing with complex scenarios of repeated leadership changes \u2013 thus I prefer the simple logic of \"do this action only if our zookeeper session state is exactly what it was when we decided to do it\". Anyhow, this is probably beyond the scope of this JIRA.\n\nBTW, we tend to see this most when a \"bad\" query is issued (e.g. doing non-cursorMark deep paging of page 50,000). Presumably it creates GC on each replica it hits (since the request is retried) and a series of leadership changes happen. Along with complication of GC pauses, the states are quite difficult to reason through.  ",
+            "id": "comment-14804677"
+        },
+        {
+            "date": "2015-09-17T23:08:41+0000",
+            "author": "Mark Miller",
+            "content": "I think the thought game comes down to:\n\nWe check if locally think we are the leader (which requires being connected to zk).\n\nWe get the current leader context.\n\nWe check if locally think we are the leader.\n\nIf all that passes, we assume we have context for when we were the leader. Now publishing only works if that same leader is registered.\n\nSo where are the holes?\n\nThere does not seem to be a lot of room to get the wrong context? In what scenario could we think we are the leader before and after the getContext call and end up with the wrong context?\n\n And if we have the leaders context, the multi update ensures the update only happens if that context is still the leader. ",
+            "id": "comment-14804686"
+        },
+        {
+            "date": "2015-09-18T04:15:22+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "The scenario that I have in mind is if somehow we're switching leadership back and forth due to nodes going into GC after receiving retries of an expensive query, what if a node is a leader at time T1, decided to set another node in LiR but went to GC before it did, so that it lost the leadership. Then, the other node briefly gained leadership at T2 and maybe processed an update or two but then also went to GC and lost its leadership. Then, the first node wakes up from GC and became the leader once more at T3--and then this code execute. My question is if it's absolutely safe for this node to set the other node in LiR simply because it's the leader now, even though when it decided to set the LiR, it was the leader  at T1. ",
+            "id": "comment-14804934"
+        },
+        {
+            "date": "2015-09-18T11:39:56+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Hmmm, reading the code now I'm not sure it's doing exactly the right thing since it calls getLeaderSeqPath, which just takes the current ElectionContext from electionContexts, which isn't necessarily the one the node had when it decided to mark someone else down, right? Shalin Shekhar Mangar thoughts?\n\nRight, we should acquire the leader sequence path at the beginning of the update instead of so late in the game. I believe Mark's patch has the same problem but it is somewhat diluted by checking against CloudDescriptor.isLeader. ",
+            "id": "comment-14847287"
+        },
+        {
+            "date": "2015-09-18T12:41:19+0000",
+            "author": "Mark Miller",
+            "content": "The difference is that this patch ensures we are still the leader when we get the context - rather than blindly getting the current context.\n\nis somewhat diluted \n\nI think it goes from being a large hole still to closed really. Someone might have another idea for an improvement, but I don't see the scenario that really sneaks by this yet.\n\nMy question is if it's absolutely safe for this node to set the other node in LiR simply because it's the leader now,\n\nI think of course it is. It's valid for the leader and only the leader to set anyone as down. ",
+            "id": "comment-14852717"
+        },
+        {
+            "date": "2015-09-18T13:24:47+0000",
+            "author": "Mark Miller",
+            "content": "thus I prefer the simple logic of \"do this action only if our zookeeper session state is exactly what it was when we decided to do it\". Anyhow, this is probably beyond the scope of this JIRA.\n\nI don't see an easy way to do that in this case. Almost all the solutions that fit with the code have the exact same holes / races. I think the local leader check around getting the leader context is the strongest thing I can think of so far other than adding further defensive checks.\n\nI don't know that much more is needed though. If the context returned is from the leader, great, its zkparentversion will will match. If the context is somehow not the right one, it won't match. We get a context and only if it's the context for the leader in ZK do we do anything rather than just if the context has a node in line. I'd say that is a pretty strong improvement.\n\nThis should only work if the node is a valid leader by its local state and by ZooKeeper. ",
+            "id": "comment-14866031"
+        },
+        {
+            "date": "2015-09-18T16:47:13+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "I think of course it is. It's valid for the leader and only the leader to set anyone as down.\n\nIt's definitely only valid for the leader to set anyone down, but it doesn't mean that the leader should set someone down based on old leadership decision. This is the only place I'm unsure about.\n\nI don't see an easy way to do that in this case. Almost all the solutions that fit with the code have the exact same holes / races.\n\nIf we're willing to make more changes, one way I see this work is to write down the election node path as a prop in the leader znode (this is now written via zk transaction from your other commit). Then, have the isLeader logic in DistributedUpdateProcessor be based on reading the leader znode, and at that point record down the election node path as well. Then, when setting LiR, predicate the ZK transaction on the election node path read in the beginning of DistributedUpdateProcessor. ",
+            "id": "comment-14875931"
+        },
+        {
+            "date": "2015-09-18T17:06:25+0000",
+            "author": "Mark Miller",
+            "content": "but it doesn't mean that the leader should set someone down based on old leadership decision.\n\nI think it does. A leader can do this. It doesn't matter if it had a valid reason to do it or not. ",
+            "id": "comment-14875960"
+        },
+        {
+            "date": "2015-09-18T17:36:47+0000",
+            "author": "Mark Miller",
+            "content": "one way I see this \n\nThat really seems the same as just getting the context earlier in the request.\n\nGiven the different ways LIR might be started and used, it really seemed simpler to try and localize the changes rather than tie them more into the request lifecycle. ",
+            "id": "comment-14876022"
+        },
+        {
+            "date": "2015-09-18T17:56:54+0000",
+            "author": "Mark Miller",
+            "content": "predicate the ZK transaction on the election node \n\nAs I think about this, I think I really prefer the approach in the patch - with that, we use ZK to ensure ONLY the leader can put a replica into LIR. It doesn't matter what clumsy things happen elsewhere in the code, with this multi, only one replica in the shard, only the leader as recently properly enforced by ZK will be able to put a replica into LIR. I like that property vs a multi on election nodes.\n ",
+            "id": "comment-14876057"
+        },
+        {
+            "date": "2015-09-18T18:48:43+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Late to the party here.. We experienced the same issue, and Christine Poerschke was trying to create a test case for this. My initial thought was why we even check LIR when we are about to become the leader? Shouldn't the double way sync cover us even if we are behind due to losing documents? ",
+            "id": "comment-14876133"
+        },
+        {
+            "date": "2015-09-18T19:01:31+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "The case we hit was when we cold stopped/started the cloud. This was on 4.10.4, so may not be valid now. Let's say you have R1 and R2.\n\n\n\tR1 is the leader and both R1 and R2 are stopped at the same time.\n\tR2's stops accepting requests but hasn't updated ZK as yet, when R1 sends a update to R2, it fails and puts R2 in LIR.\n\tR2 shuts down first, then R1.\n\tR1 starts up first, finds it should be the leader.\n\tR2 decides it should follow and tries to recover.\n\tR1 decides it can't be leader due to LIR and steps down. But by then R2 is in recovery, doesn't step up, and we have no one stepping forward.\n\n ",
+            "id": "comment-14876156"
+        },
+        {
+            "date": "2015-09-18T19:17:46+0000",
+            "author": "Mark Miller",
+            "content": "initial thought was why we even check LIR when we are about to become the leader?\n\nI think if everyone participates in the election that makes sense. I've started working on that as a separate patch.\n\nI still like the idea of making it so that by zk decree only the current leader can put a replica into LIR as one of two improvements. ",
+            "id": "comment-14876184"
+        },
+        {
+            "date": "2015-09-18T19:27:55+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "That makes sense, but for my understanding, why is it a bad idea even if not everyone is participating? ",
+            "id": "comment-14876205"
+        },
+        {
+            "date": "2015-09-18T19:47:08+0000",
+            "author": "Mark Miller",
+            "content": "I guess I worry about cases where a bad replica was marked as LIR by the leader and the shard goes down. It comes back with two nodes that were LIR but not the good replicas - do we want one of them to become the leader and lose data? We know they are probably not good actual leader candidates and the best way to prevent data loss is manual intervention if possible. ",
+            "id": "comment-14876236"
+        },
+        {
+            "date": "2015-09-18T20:08:53+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Got it. You've to include those in recovery along with the participants since the ones which have gone into recovery are not going to help in anyway (an alternative would be for them to abort recovery and rejoin of no one is around). But in your case, if I understand it right, detecting that there are down replicas (which might come back as good leaders) would certainly be a good idea. ",
+            "id": "comment-14876271"
+        },
+        {
+            "date": "2015-09-18T21:09:07+0000",
+            "author": "Timothy Potter",
+            "content": "Hi Ram,\n\nIn your scenario, why would R1 be in LIR? What put it there? ",
+            "id": "comment-14876419"
+        },
+        {
+            "date": "2015-09-18T23:37:52+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "R1 was not in LIR, but it came up while R2 was still at the lead and decided to recover, before R2 stepped down due to being in LIR. ",
+            "id": "comment-14876697"
+        },
+        {
+            "date": "2015-09-19T05:02:54+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "I think it does. A leader can do this. It doesn't matter if it had a valid reason to do it or not.\nIf you believe that this is true, I do agree that your patch will accomplish the check that at the moment you're setting someone else down, you're the leader. If we're going with this policy though, I think if at this moment it realizes that it's not the leader, it should actually fail the request because it shouldn't accept it on the real leader's behalf. E.g. if it's a node that was a leader but has just been network-partitioned off (but clusterstate change hasn't been made since it's asynchronous) and wasn't able to actually forward the request to the real leader. ",
+            "id": "comment-14876879"
+        },
+        {
+            "date": "2015-09-19T12:28:25+0000",
+            "author": "Mark Miller",
+            "content": "If you believe that this is true, I do agree that your patch will accomplish the check that at the moment you're setting someone else down, you're the leader. \n\nIf the leader cannot set a replica into LIR at any time for any reason, I think we have trouble in general.\n\nI'm not sure I fully follow the rest. I can't wrap my head around LIR causing requests to fail or not...that doesn't make a lot of sense to me. ",
+            "id": "comment-14877082"
+        },
+        {
+            "date": "2015-09-20T15:08:50+0000",
+            "author": "Mark Miller",
+            "content": "I think if everyone participates in the election that makes sense. I've started working on that as a separate patch.\n\nI've spun off this part of the issue to SOLR-8075. ",
+            "id": "comment-14899967"
+        },
+        {
+            "date": "2015-09-21T20:40:33+0000",
+            "author": "Mark Miller",
+            "content": "Having had some time to consider this patch, I think this is the right place to commit for now. I think further improvements should be spun out into other JIRA issues.  ",
+            "id": "comment-14901352"
+        },
+        {
+            "date": "2015-09-21T21:33:01+0000",
+            "author": "Anshum Gupta",
+            "content": "This makes sense and it's also pretty contained. Here are a suggestions:\n\n\n\tThat should be CoreDescriptor in the comment.\nZkController.java\n+                leaderCd); // core node name of current leader\n\n\n\tUnused import MockCoreContainer in HttpPartitionTest\n\tIn ZkController.markShardAsDownIfLeader(), was the move from using getLeaderSeqPath to new org.apache.hadoop.fs.Path(((ShardLeaderElectionContextBase)context).leaderPath).getParent().toString() intentional ?\n\n ",
+            "id": "comment-14901449"
+        },
+        {
+            "date": "2015-09-21T22:50:20+0000",
+            "author": "Mark Miller",
+            "content": "Thanks for taking a look Anshum.\n\nintentional ?\n\nYup, that's really all of the magic. The CloudDescriptor#isLeader stuff is really just a little extra sugar on top. ",
+            "id": "comment-14901572"
+        },
+        {
+            "date": "2015-09-21T23:03:56+0000",
+            "author": "Anshum Gupta",
+            "content": "Just looked at it again, it indeed is .\n\nIn that case let's yank out getLeaderSeqPath. It's not needed elsewhere anyways. ",
+            "id": "comment-14901583"
+        },
+        {
+            "date": "2015-09-22T02:38:51+0000",
+            "author": "Mark Miller",
+            "content": "if it's a node that was a leader but has just been network-partitioned off (but clusterstate change hasn't been made since it's asynchronous) and wasn't able to actually forward the request to the real leader.\n\nI don't think we really protect against such cases where there is only a single leader that can accept an update because all its replicas go bad and then it goes away but the replicas come back. That is what min replication factor on the request is meant to handle. For full data promises, you want to use it - an achieved replication factor of 1 is not going to be fault tolerant. ",
+            "id": "comment-14901817"
+        },
+        {
+            "date": "2015-09-22T06:19:18+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "I don't think we really protect against such cases where there is only a single leader that can accept an update\nThis is not the scenario I'm describing. If you have 3 replicas and one that was the leader gets partitioned off, one of the other 2 will get elected and they can carry on. However, during this transition time, because the cluster state update hasn't been completed or propagated through watches, the old leader can still get trailing updates from the client. In a normal case where the updates are successfully forwarded to all replicas, no one cares. But in this case, the old leader cannot forward the update to others (because it's partitioned off), so it should not reply success to the client because that would be wrong (it is not the leader and it does not have the right to tell the others to recover). ",
+            "id": "comment-14902021"
+        },
+        {
+            "date": "2015-09-22T12:41:38+0000",
+            "author": "Mark Miller",
+            "content": "The old leader has defensive checks that should make that pretty unlikely.\n\nBut yes, it's the same thing. Only one node ack'd your update. We don't protect against that and you have to use min rep factor. ",
+            "id": "comment-14902517"
+        },
+        {
+            "date": "2015-09-22T23:06:00+0000",
+            "author": "Gregory Chanan",
+            "content": "Most of this seems like just adding defensive checks, which seem reasonable.\n\n\nList<Op> ops = new ArrayList<>(2);\n\nnit: this should be 3 in two places.\n\n\n+      ops.add(Op.check(new org.apache.hadoop.fs.Path(((ShardLeaderElectionContextBase)context).leaderPath).getParent().toString(), leaderZkNodeParentVersion));\n       ops.add(Op.setData(znodePath, znodeData, -1));\n\n\nWhat happens if the leaderZkNodeParentVersion doesn't match?  Presumably that's a possibility or else why add the check.  We don't want to loop and see if we get an updated version in electionContexts?  I'm certainly not well versed in this area of the code but checking isLeader seems a little roundabount \u2013 isn't the leaderZkNodeParentVersion what we actually care about?  What happens if we think we are the leader but the version doesn't match?  What does that mean?  Certainly we can optimistically try whatever we pulled out of electionContexts the first time, as you've done here to avoid a zk trip. ",
+            "id": "comment-14903626"
+        },
+        {
+            "date": "2015-09-23T02:05:43+0000",
+            "author": "Mark Miller",
+            "content": "The defensive checks are just sugar like I said. If we are going to check zk if we are still leader it makes sense to check our local reckoning first. \n\nThe meat of the change is the parent version check. If it fails, we don't care. The leader has moved on - we don't care about retries.  ",
+            "id": "comment-14903807"
+        },
+        {
+            "date": "2015-09-23T12:12:43+0000",
+            "author": "Mark Miller",
+            "content": "I was out on the phone last night - a fuller reply:\n\nWhat happens if the leaderZkNodeParentVersion doesn't match? \n\nThe leader cannot update the zk node as we want.\n\nPresumably that's a possibility or else why add the check.\n\nIt's the whole point of the patch?\n\nI'm certainly not well versed in this area of the code but checking isLeader seems a little roundabount\n\nThere is no reason to go to zk if we already know we are not the leader locally - what is roundabout about it?\n\nWhat does that mean?\n\nThat the fix worked??\n\n\n ",
+            "id": "comment-14904408"
+        },
+        {
+            "date": "2015-09-23T12:36:04+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1704836 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1704836 ]\n\nSOLR-8069: Ensure that only the valid ZooKeeper registered leader can put a replica into Leader Initiated Recovery. ",
+            "id": "comment-14904431"
+        },
+        {
+            "date": "2015-09-23T12:42:02+0000",
+            "author": "Mark Miller",
+            "content": "So this adds sensible local isLeader checks where we were already checking ZK, it passes the core descriptor instead of just a name to LIR so it has a lot more context to work with, and it ensures that only the registered ZK leader can put a replica into LIR.\n\nBarring any bugs in the current code, let's open further issues for other changes / improvements. ",
+            "id": "comment-14904435"
+        },
+        {
+            "date": "2015-09-23T12:45:51+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1704837 from Mark Miller in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1704837 ]\n\nSOLR-8069: Ensure that only the valid ZooKeeper registered leader can put a replica into Leader Initiated Recovery. ",
+            "id": "comment-14904442"
+        },
+        {
+            "date": "2015-10-22T07:03:44+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "There's a reproducible failure in the test added by SOLR-8075 caused by assertion error on asserts added in this issue.\n\n\n1 tests failed.\nFAILED:  org.apache.solr.cloud.LeaderInitiatedRecoveryOnShardRestartTest.testRestartWithAllInLIR\n\nError Message:\nCaptured an uncaught exception in thread: Thread[id=43491, name=coreZkRegister-5997-thread-1, state=RUNNABLE, group=TGRP-LeaderInitiatedRecoveryOnShardRestartTest]\n\nStack Trace:\ncom.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=43491, name=coreZkRegister-5997-thread-1, state=RUNNABLE, group=TGRP-LeaderInitiatedRecoveryOnShardRestartTest]\nCaused by: java.lang.AssertionError\n        at __randomizedtesting.SeedInfo.seed([7F78F76DDF75FAD1]:0)\n        at org.apache.solr.cloud.ZkController.updateLeaderInitiatedRecoveryState(ZkController.java:2133)\n        at org.apache.solr.cloud.ShardLeaderElectionContext.runLeaderProcess(ElectionContext.java:434)\n        at org.apache.solr.cloud.LeaderElector.runIamLeaderProcess(LeaderElector.java:197)\n        at org.apache.solr.cloud.LeaderElector.checkIfIamLeader(LeaderElector.java:157)\n        at org.apache.solr.cloud.LeaderElector.joinElection(LeaderElector.java:346)\n        at org.apache.solr.cloud.ZkController.joinElection(ZkController.java:1113)\n        at org.apache.solr.cloud.ZkController.register(ZkController.java:926)\n        at org.apache.solr.cloud.ZkController.register(ZkController.java:881)\n        at org.apache.solr.core.ZkContainer$2.run(ZkContainer.java:183)\n        at org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor$1.run(ExecutorUtil.java:231)\n        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)\n        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)\n        at java.lang.Thread.run(Thread.java:745)\n\n\n\nThe assertion is that leaderCd != null fails because ShardLeaderElectionContext.runLeaderProcess calls ZkController.updateLeaderInitiatedRecoveryState with a null core descriptor  which is by design because if you are marking a replica as 'active' then you don't necessarily need to be a leader. ",
+            "id": "comment-14968664"
+        },
+        {
+            "date": "2015-11-11T14:52:18+0000",
+            "author": "Mark Miller",
+            "content": "The problem is unrelated to this issue. That assert is correct and it's catching a bug with SOLR-8075 or something. It's passing null when it should pass the core descriptor. ",
+            "id": "comment-15000453"
+        }
+    ]
+}

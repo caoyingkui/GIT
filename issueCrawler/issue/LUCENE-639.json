@@ -1,0 +1,139 @@
+{
+    "id": "LUCENE-639",
+    "title": "[PATCH] Slight performance improvement for readVInt() of IndexInput",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "2.0.0",
+        "resolution": "Won't Fix",
+        "status": "Resolved"
+    },
+    "description": "By unrolling the loop in readVInt() I was able to get a slight, about 1.8 %, performance improvement for this method. The test program invoked the method over 17 million times on each run.\n\nI ran the performance tests on:\n\n\tWindows XP Pro SP2\n\tSun JDK 1.5.0_07\n\tYourKit 5.5.4\n\tLucene trunk",
+    "attachments": {
+        "ReadVIntPerformanceMain.java": "https://issues.apache.org/jira/secure/attachment/12337861/ReadVIntPerformanceMain.java",
+        "Lucene2ReadVIntPerformance.patch": "https://issues.apache.org/jira/secure/attachment/12337685/Lucene2ReadVIntPerformance.patch",
+        "readVInt performance results.pdf": "https://issues.apache.org/jira/secure/attachment/12337862/readVInt%20performance%20results.pdf"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2006-07-28T08:31:03+0000",
+            "content": "Loop unrolling in 'readVInt()' of 'IndexInput' for slight performance gain. ",
+            "author": "Johan Stuyts",
+            "id": "comment-12424024"
+        },
+        {
+            "date": "2006-07-28T09:13:27+0000",
+            "content": "The loop you unrolled has no compilation-time known iteration. A VInt is not a limited length type. Your patch only works if you don't use Vint larger than 268,435,456. ",
+            "author": "Nicolas Lalev\u00e9e",
+            "id": "comment-12424038"
+        },
+        {
+            "date": "2006-07-28T09:21:49+0000",
+            "content": "The number of times the loop is executed is indeed not known at compile time. Therefore the loop condition is also replicated multiple times: if (b < 0).\n\nThe comment of 'readVInt()' says that between one and five bytes will be read. The unrolling I did also reads at most five bytes. Five bytes result in 35 bits useful bits for the value, which is more than the number of bits of the return type: int. (The comment also states that negative numbers are not supported, reducing the number of bits of the return type to 31) ",
+            "author": "Johan Stuyts",
+            "id": "comment-12424040"
+        },
+        {
+            "date": "2006-07-28T09:28:05+0000",
+            "content": "oh yeah your right. In fact I was reading the Lucene index format, which don't specify any limit in the integer length.\nEffectively, returning a Java int, it is useless to parse too many bytes ! ",
+            "author": "Nicolas Lalev\u00e9e",
+            "id": "comment-12424043"
+        },
+        {
+            "date": "2006-07-28T14:47:21+0000",
+            "content": "The problem is that one needs to know the distribution of vints for calls to readVInt() in a real Lucene index/application to judge if it's actually faster or not.  I took a shot at a number of versions about 6 months ago:\n\nhttp://www.nabble.com/Lucene-performance-bottlenecks-tf659097.html#a1833842 ",
+            "author": "Yonik Seeley",
+            "id": "comment-12424103"
+        },
+        {
+            "date": "2006-08-01T07:05:38+0000",
+            "content": "Yonik, I think it is possible to make a reasonable assumption about the distribution of the vints. Lucene stores deltas between document IDs instead of document IDs, and I guess (no data available) most frequencies will be below 128.\n\nIn the example given below I take the bit for the frequency that is stored with the document IDs delta into account.\n\nSuppose you have 50 million documents. With a term occurring in 1 in 50 documents 1 million 1-byte vints are needed. With a term occurring 1 in 2000 documents 25.000 2-byte vints are needed. With an occurrence of 1 in 100.000 documents 500 3-byte vints are needed. Together with my guess about the frequencies many more 1-byte and 2-byte vints than 3-byte and longer vints have to be read. So the algorithm for readVInt() should at least perform very good for 1-byte and 2-byte vints.\n\nTo detemine whether or not it is worth improving the algorighm, I wrote an isolated test: no I/O, as little GC as possible, etc. See the attached Java file.\n\nI tested four algorithms:\n\n\tthe current one;\n\tthe unrolled one of this issue;\n\ta new one I came up with that uses exclusive or (see below);\n\tthe one from Yonik.\n\n\n\nThe exclusive or algorithm started with the same assumption as Yonik abou the first byte: you can exit after only a read when no more bytes follow. The I tried to think of a way to reduce the number of bitwise operations. This line of thinking was based on the code of cardinality() of java.util.BitSet, which uses special bit patterns to count the bits in a long as fast as possible. This is the algorithm I ended up with:\n\n    int i = readByte();\n    if (i < 0)\n    {\n      // Second byte present\n      i ^= readByte() << 7;\n      if (i >= 0)\n      {\n        // Third byte present\n        i ^= readByte() << 14;\n        if (i < 0)\n        {\n          // Fourth byte present\n          i ^= readByte() << 21;\n          if (i >= 0)\n          {\n            // Fifth byte present\n            i ^= readByte() << 28;\n            return i ^ 0x0FE03F80;\n          }\n          // No fifth byte\n          return i ^ 0xFFE03F80;\n        }\n        // No fourth byte\n        return i ^ 0x00003F80;\n      }\n      // No third byte\n      return i ^ 0xFFFFFF80;\n    }\n    return i;\n\n\n\nIn the tests all values returned by algorithms are verified to ensure an optimization does not cause invaliid values to be returned.\n\nThe statistics of the test are:\n\n\t6 sets of data with 38,4 million integers per set: random size, 1-byte, 2-byte, 3-byte, 4-byte and 5-byte;\n\t1 warming up and 3 individually measured loops per data set;\n\tper loop each algorithm reads the data set 5 times consecutively.\n\n\n\nIn total each algorithm reads 38,4 million integers * 6 data sets * 4 loops * 5 reads = over 4 billion integers per test run. Over 18 billion integers are read in the total test.\n\nThe tests are run in a single JVM for all algorithms, data sets, loops, etc.\n\nI ran the tests on 7 JVMs. Some JVMs have a client and a server variant, resulting in 12 JVM configurations:\n\n\tBEA JDK 1.4.2 client;\n\tBEA JDK 1.4.2 server;\n\tBEA JDK 1.5.0 client;\n\tBEA JDK 1.5.0 server;\n\tIBM JRE 1.4.2;\n\tIBM JDK 1.5.0;\n\tSun JDK 1.4.2 client;\n\tSun JDK 1.4.2 server;\n\tSun JDK 1.5.0 client;\n\tSun JDK 1.5.0 server;\n\tSun JDK 1.6.0b2 client;\n\tSun JDK 1.6.0b2 server.\n\n\n\nI disconnected all networks on the laptop I ran the tests on. As litle services as possible were running and the firewall was also shutdown. The only applications that were running were Eclipse and the test. The screen saver and energy saving were disabled.\n\nHere is the configuration used to run the tests:\n\n\tIntel Pentium M 1.73 GHz;\n\t1 GB RAM;\n\tWindows XP Pro SP 2;\n\tLucene trunk;\n\tEclipse 3.1.2 Java compiler.\n\n\n\nPlease note that during the running of the tests some disk I/O was observed. Even though I believe that no swapping would be needed, swapping might have occurred.\n\nAfter running all the tests I:\n\n\tremoved the slowest result of each algorithm for each JVM and dataset combination;\n\taveraged the two remaining results;\n\tdivided all results by the time of the current algorithm;\n\tselected the 'best' algorithms for each JVM.\n\n\n\nThe best algorithm is defined as: ((1-byte time - best 1-byte time) + (2-byte time - best 2-byte time)) < 0,02. This means that the total difference between the best 1-byte and 2-byte times cannot be greater than 2 % to be considered the best.\n\nHere are the results, best algorithm first. See the attached PDF for more information:\n\n\texclusive or;\n\tcombine on exit (Yonik's one);\n\tunrolled;\n\tcurrent.\n\n\n\nAcross all JVMs the exclusive or algorithm saves 3,5-4,8 %.\n\nYonik already mentioned this at the URL above, a lot depends on the JVM used to run the tests. You should do tests with the JVM on which you are going to deploy. A colleague of mine also mentioned that the compiler used could influence the results. Unfortunately I do not have the time to test all combinations of compilers and JVMs. ",
+            "author": "Johan Stuyts",
+            "id": "comment-12424769"
+        },
+        {
+            "date": "2006-08-01T07:06:29+0000",
+            "content": "Source for performance test. ",
+            "author": "Johan Stuyts",
+            "id": "comment-12424770"
+        },
+        {
+            "date": "2006-08-01T07:07:45+0000",
+            "content": "Results of running the test. ",
+            "author": "Johan Stuyts",
+            "id": "comment-12424771"
+        },
+        {
+            "date": "2006-08-02T18:37:34+0000",
+            "content": "The XOR algorithm is a clever idea, but based on some quick tests of my own, it seems slower than my \"combine on exit\" for what I would guess would be an important case of a mix of 1 and 2 byte vints.\n\nfor random numbers less than 128, the algorithms tied (not surprising).\nfor random numbers less than 200 (a mix of 1 and 2 byte vints):\n  13% slower on AMD Opteron, Java 1.5.0_07 -server -Xbatch\n  15% slower on P4, Java 6 beta2 -server -Xbatch\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-12425333"
+        },
+        {
+            "date": "2006-08-03T09:04:09+0000",
+            "content": "I don't know what your test method is but a difference of 13-15% is very unlikely. The algorithms are too simple to have such a dramatic effect on performance.\n\nIt is possible that the test that I provided is flawed. Just let me know what should be changed, and I will update it and rerun the tests. ",
+            "author": "Johan Stuyts",
+            "id": "comment-12425473"
+        },
+        {
+            "date": "2006-08-03T14:27:47+0000",
+            "content": "Indeed, I had a bug... I'll do some retesting. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12425529"
+        },
+        {
+            "date": "2006-08-03T14:54:44+0000",
+            "content": "Yonik, please let me know where you think the test that I provided is flawed. Comparing the results from your test to the results from my test is like comparing apples to oranges. So you have to either:\n\n\tprovide arguments why my test is flawed and provide a better test, or\n\trun my tests on your machine(s) and publish those results.\n\n ",
+            "author": "Johan Stuyts",
+            "id": "comment-12425537"
+        },
+        {
+            "date": "2006-08-03T16:40:30+0000",
+            "content": "> Yonik, please let me know where you think the test that I provided is flawed. \n\nTests are always flawed    If our tests don't exactly agree, It doesn't mean one is incorrect.\n I already had a little test framework from before so I used that... it doesn't mean there is anything wrong with your tests, but more validation is better.\n\nIf there is one thing in your tests that I think could perhaps be improved, it's the distribution of VInts.\nTesting 1 byte vints separately from 2 byte vints, etc, will yield different results than testing a realistic mix because of processor branch prediction.\n\nI really want to test with a real Lucene index (I've already started coming up with a simple test).  That will be a better real-world  test IMO, and trump both of our current test frameworks. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12425563"
+        },
+        {
+            "date": "2006-08-03T17:09:52+0000",
+            "content": "OK, I had a bug in Vint2a... correcting it makes it slower than Vint2 on Java6 (at least on a P4).  But VInt2a is still slightly faser on the Opteron w/ Java5.\n\nYou might want to try this version also:\n\nclass VInt2 extends VInt {\n  public int readVInt() throws IOException \n{\n    byte b = readByte();\n    if (b>=0) return b;\n    b &= 0x7f;\n    byte b2 = readByte();\n    if (b2>=0) return (b2<<7) | b;\n    b2 &= 0x7f;\n    byte b3 = readByte();\n    if (b3>=0) return (b3<<14) | (b2<<7) | b;\n    b3 &= 0x7f;\n    byte b4 = readByte();\n    if (b4>=0) return (b4<<21) | (b3<<14) | (b2<<7) | b;\n    b4 &= 0x7f;\n    byte b5 = readByte();\n    return (b5<<28) | (b4<<21) | (b3<<14) | (b2<<7) | b;\n  }\n}\n\n\nFor a random distribution of vints less than 200 only, times in miliseconds:\nP4, Java6 -server -Xbatch: VInt2=15833  VInt2a=17425  XOR=15583  Lucene=16900\nP4, Java5 -server -Xbatch: VInt2=16063 VInt2a=16060  XOR=18097 Lucene=16108\nOpteron, Java5 -server -Xbatch: VInt2=13441 VInt2a=13123  XOR=13110  Lucene=13626\nOpteron, Java5 -server: VInt2=26589 VInt2a=26050 XOR=26484 Lucene=28718  (double the iterations)\n\nIn general, XOR looks good, except for Java5 on P4 for some reason, where it is 12.5% slower.\nBut when -Xbatch isn't used, the results change on the Opteron oddly enough!\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-12425570"
+        },
+        {
+            "date": "2006-08-03T19:09:59+0000",
+            "content": "I tested with a Lucene index (artificially constructed).\nIt contained 10,000 documents with 10% of them containing a term.  I then repeatedly iterated over the docs via a TermDocs instance (I think this is generally the bottleneck - iterating over the docs of common terms).\n\nPreliminary results:\n\nP4: Java6 -server -Xmx128M    Lucene: 19231  VInt2: 19190  XOR: 20374\nP4: Java5 -server -Xmx128M    Lucene: 21957  VInt2: 24141  XOR: 22808\n\nSo with this limited single platform test, the original Lucene version is coming in first on balance! ",
+            "author": "Yonik Seeley",
+            "id": "comment-12425595"
+        },
+        {
+            "date": "2006-08-03T19:35:06+0000",
+            "content": "Here's the simple TermDoc iteration test I used:\nhttp://svn.apache.org/viewvc/lucene/java/trunk/src/test/org/apache/lucene/index/TestTermdocPerf.java\n\nI think our attempts at optimization might be foiled by the larger method size, and the fact that so many vints are going to be a single byte (the term freqs are interleaved with the doc increments).  Hotspot might have an easier time with the small method, and the branch predictor will have fewer branches to track, etc. who knows...\n\nIf anyone else feels like running on a different processor or with different params, please have at it.  For me, the \"more real lucene\" test on the P4 was enough to dissuade me from pursuing this further (yet again). ",
+            "author": "Yonik Seeley",
+            "id": "comment-12425597"
+        },
+        {
+            "date": "2006-08-07T09:38:26+0000",
+            "content": "Yonik, I agree that instead of using artificial data sets instead of real ones might influence the results. Getting my hands on real, large data is going to be difficult.\n\nI also think that you drew your conclusion too fast. You only ran the tests on a few JVMs. As you can see from the test results that I submitted, the differences between JVMs are significant.\n\nThere is no perfect algorithm which runs better on all JVMs, but I think that algorithms that run better on most JVMs exist. ",
+            "author": "Johan Stuyts",
+            "id": "comment-12426181"
+        },
+        {
+            "date": "2006-08-07T14:17:12+0000",
+            "content": "> I also think that you drew your conclusion too fast.\n\nMy conclusion was that I didn't personally have more time to spend on this right now given that initial results with a lucene index were dissapointing on a major platform with the latest JVMs.  If people want to run this test on other platforms, or create even more realistic tests, that's fine with me... I'll still listen in  ",
+            "author": "Yonik Seeley",
+            "id": "comment-12426225"
+        },
+        {
+            "date": "2008-01-13T15:22:40+0000",
+            "content": "The testing and discussion seem inconclusive on this and it hasn't been followed up on in a good amount of time, so I am going to mark it as won't fix. ",
+            "author": "Grant Ingersoll",
+            "id": "comment-12558411"
+        }
+    ]
+}

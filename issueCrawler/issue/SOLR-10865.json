@@ -1,0 +1,65 @@
+{
+    "id": "SOLR-10865",
+    "title": "parameter processor=Template doesn't invoke TemplateUpdateProcessorFactory.",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "update"
+        ],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "7.0",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "Ref docs::\n\n\nThe TemplateUpdateProcessorFactory can be used to add new fields to documents based on a template pattern.\nThis can be used directly in a request without any configuration. To enable this processor, use the parameter processor=Template.\n\nSample curl::\n\n\ncurl -X POST -H 'Content-Type:application/json' 'http://localhost:8983/solr/gettingstarted/update/json/docs?processor=Template&Template.field=fullName_s:AmritSarkar&commit=true' --data-binary '{\"id\": 1,\"title\": \"titleA\"}'\n\n\n\nI am receiving exception::\n\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<response>\n<lst name=\"responseHeader\"><int name=\"status\">400</int><int name=\"QTime\">3</int></lst><lst name=\"error\"><lst name=\"metadata\"><str name=\"error-class\">org.apache.solr.common.SolrException</str><str name=\"root-error-class\">org.apache.solr.common.SolrException</str></lst><str name=\"msg\">No such processor Template</str><int name=\"code\">400</int></lst>\n</response>\n\n\n\nERROR - 2017-06-10 07:39:51.598; [c:gettingstarted s:shard2 r:core_node1 x:gettingstarted_shard2_replica_n1] org.apache.solr.common.SolrException; org.apache.solr.common.SolrException: No such processor Template\n\tat org.apache.solr.update.processor.UpdateRequestProcessorChain.getReqProcessors(UpdateRequestProcessorChain.java:286)\n\tat org.apache.solr.update.processor.UpdateRequestProcessorChain.constructChain(UpdateRequestProcessorChain.java:235)\n\n\n\nI looked into how the testclass has been created::\n\nTemplateUpdateProcessorTest::\n\n  public void testSimple() throws Exception {\n    AddUpdateCommand cmd = new AddUpdateCommand(new LocalSolrQueryRequest(null,\n        new ModifiableSolrParams()\n            .add(\"processor\", \"Template\")\n            .add(\"Template.field\", \"id:${firstName}_${lastName}\")\n            .add(\"Template.field\", \"another:${lastName}_${firstName}\")\n            .add(\"Template.field\", \"missing:${lastName}_${unKnown}\")\n    ));\n    cmd.solrDoc = new SolrInputDocument();\n    cmd.solrDoc.addField(\"firstName\", \"Tom\");\n    cmd.solrDoc.addField(\"lastName\", \"Cruise\");\n\n    new TemplateUpdateProcessorFactory().getInstance(cmd.getReq(), new SolrQueryResponse(), null).processAdd(cmd);\n    assertEquals(\"Tom_Cruise\", cmd.solrDoc.getFieldValue(\"id\"));\n    assertEquals(\"Cruise_Tom\", cmd.solrDoc.getFieldValue(\"another\"));\n    assertEquals(\"Cruise_\", cmd.solrDoc.getFieldValue(\"missing\"));\n  }\n\n\n\nThere is no test to check whether processor=Template works or not, TemplateUpdateProcessorFactory() object is EXPLICITLY created to getInstance and do processing on the updates.",
+    "attachments": {
+        "SOLR-10865.patch": "https://issues.apache.org/jira/secure/attachment/12872689/SOLR-10865.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-06-12T12:36:15+0000",
+            "content": "Figured out what the problem is =>\n\nTo leverage the processor=Template or processor=Atomic or processor = X, where X + \"UpdateRequestProcessor\", must and must have system property -Denable.runtime.lib=true\n\nNow when we start a SolrCloud with default settings, I don't think we have enable.runtime.lib enabled in our configs. And the error we receive at the end of the request is:\n\n2017-06-12 11:05:55.517 WARN  (qtp846947180-13) [c:gettingstarted s:shard1 r:core_node1 x:gettingstarted_shard1_replica_n1] o.a.s.c.PluginBag runtime library loading is not enabled, start Solr with -Denable.runtime.lib=true\norg.apache.solr.common.SolrException; org.apache.solr.common.SolrException: No such processor Template\n\n\nabsolutely misleading. I guess improving the error message will make the user make the necessary changes to make it work. A nested message is better to fix this.\n\nPatch attached with appropriate error or exception, which will help one figure out what to fix, where to fix when we see \"No processor\". ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16046506"
+        },
+        {
+            "date": "2017-06-12T12:48:58+0000",
+            "content": "Also it would be best if we specify this bit of information => \n\nenable enable.runtime.lib while starting up solr nodes to support:\nprocessor=X to invoke XUpdateRequestProcessor.\n\nPatch uploaded with slight adjustments. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16046527"
+        },
+        {
+            "date": "2017-06-12T12:50:02+0000",
+            "content": "Are you saying that the processor=X parameter doesn't work and hasn't worked in any released version unless the user sets -Denable.runtime.lib=true flag?\n\nI think it is a mistake that update processors are being loaded using the runtime lib class loader \u2013 that is only supposed to be used if a plugin has to be loaded from the blob store which is not the case here. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16046529"
+        },
+        {
+            "date": "2017-06-12T14:52:50+0000",
+            "content": "Shalin Shekhar Mangar agreed. This is not working after SOLR-9530 where certain adjustments made in UpdateRequestProcessorChain.java to make sure inform(...) works for AtomicURP (related to LazyPluginHolder in PluginBag.java_). I didn't make the changes myself but I see what are you saying and we may have gone wrong there.\n\npatch snippet from SOLR-9530 =>\n\ndiff --git a/solr/core/src/java/org/apache/solr/update/processor/UpdateRequestProcessorChain.java b/solr/core/src/java/org/apache/solr/update/processor/UpdateRequestProcessorChain.java\nindex 0ed626cb0f..05d1a5ae3f 100644\n--- a/solr/core/src/java/org/apache/solr/update/processor/UpdateRequestProcessorChain.java\n+++ b/solr/core/src/java/org/apache/solr/update/processor/UpdateRequestProcessorChain.java\n@@ -28,6 +28,8 @@ import org.apache.solr.common.params.MapSolrParams;\n import org.apache.solr.common.params.SolrParams;\n import org.apache.solr.common.util.NamedList;\n import org.apache.solr.common.util.StrUtils;\n+import org.apache.solr.common.util.Utils;\n+import org.apache.solr.core.PluginBag;\n import org.apache.solr.core.PluginInfo;\n import org.apache.solr.core.SolrCore;\n import org.apache.solr.request.SolrQueryRequest;\n@@ -271,9 +273,13 @@ public final class UpdateRequestProcessorChain implements PluginInfoInitialized\n       UpdateRequestProcessorFactory p = core.getUpdateProcessors().get(s);\n       if (p == null) {\n         try {\n-          p = core.createInstance(s + \"UpdateProcessorFactory\", UpdateRequestProcessorFactory.class,\n-              \"updateProcessor\", null, core.getMemClassLoader());\n-          core.getUpdateProcessors().put(s, p);\n+          PluginInfo pluginInfo = new PluginInfo(\"updateProcessor\",\n+              Utils.makeMap(\"name\", s,\n+                  \"class\", s + \"UpdateProcessorFactory\",\n+                  \"runtimeLib\", \"true\"));\n+\n+          PluginBag.PluginHolder<UpdateRequestProcessorFactory> pluginHolder = core.getUpdateProcessors().createPlugin(pluginInfo);\n+          core.getUpdateProcessors().put(s, p = pluginHolder.get());\n         } catch (SolrException e) {\n         }\n         if (p == null)\n\n\n\nI don't recall the exact reason behind this, but will surely look into it. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16046648"
+        },
+        {
+            "date": "2017-06-12T18:46:18+0000",
+            "content": "The URPFactories are not allowed to Lazy Initialized and hence inform(Solrcore ...) never gets called for URPs which are not defined in SolrConfig. The one mentioned in config, get through their inform(...) at core creation. \n\nIf we are making URPs free of config, we need to allow processors to be initialized lazy (after core creation) and instead of using flag runtimeLib flag to get LazyPluginHolder, we can pass startup=true, justifiable and neat.\n\nAttached patch for the same. Some minor corrections, blank spaces / lines here and there.  ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16046929"
+        },
+        {
+            "date": "2017-06-13T06:21:26+0000",
+            "content": "even if runtimLib=true and the class is available in the system classpath it should be loaded irrespective of enable.runtime.lib system property ",
+            "author": "Noble Paul",
+            "id": "comment-16047483"
+        },
+        {
+            "date": "2017-06-14T09:07:33+0000",
+            "content": "Resolving this as SOLR-10876 is resolved. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16048896"
+        }
+    ]
+}

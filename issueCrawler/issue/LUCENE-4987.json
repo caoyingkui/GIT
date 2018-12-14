@@ -1,0 +1,96 @@
+{
+    "id": "LUCENE-4987",
+    "title": "Test framework may fail internally under J9 (some serious JVM exclusive-section issue).",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.4",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "This was reported by Shai. The runner failed with an exception:\n\n[junit4:junit4] Caused by: java.util.NoSuchElementException\n[junit4:junit4]         at java.util.ArrayDeque.removeFirst(ArrayDeque.java:289)\n[junit4:junit4]         at java.util.ArrayDeque.pop(ArrayDeque.java:518)\n[junit4:junit4]         at com.carrotsearch.ant.tasks.junit4.JUnit4$1.onSlaveIdle(JUnit4.java:809)\n[junit4:junit4]         ... 17 more\n\n\n\nThe problem is that this is impossible because the code around JUnit4.java:809 looks like this:\n\n\n     final Deque<String> stealingQueue = new ArrayDeque<String>(...);\n     aggregatedBus.register(new Object() {\n        @Subscribe\n        public void onSlaveIdle(SlaveIdle slave) {\n          if (stealingQueue.isEmpty()) {\n            ...\n          } else {\n            String suiteName = stealingQueue.pop();\n            ...\n          }\n        }\n      });\n\n\n\nand the contract on Guava's EventBus states that:\n\n\n * <p>The EventBus guarantees that it will not call a handler method from\n * multiple threads simultaneously, unless the method explicitly allows it by\n * bearing the {@link AllowConcurrentEvents} annotation.  If this annotation is\n * not present, handler methods need not worry about being reentrant, unless\n * also called from outside the EventBus\n\n\n\nI wrote a simple snippet of code that does it in a loop and indeed, two threads can appear in the critical section at once. This is not reproducible on Hotspot and only appears to be the problem on J9/1.7/Windows (J9 1.6 works fine).\n\nI'll provide a workaround in the runner (an explicit monitor seems to be working) but this is some serious J9 issue.",
+    "attachments": {
+        "j9.zip": "https://issues.apache.org/jira/secure/attachment/12582291/j9.zip"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-05-08T13:16:49+0000",
+            "content": "Compile and run under J9 (and hotspot):\n\njavac -cp guava-14.0.1.jar;junit-4.10.jar;randomizedtesting-runner-2.0.9.jar J9SanityCheck.java\njava -cp guava-14.0.1.jar;junit-4.10.jar;randomizedtesting-runner-2.0.9.jar;. J9SanityCheck\n\n ",
+            "author": "Dawid Weiss",
+            "id": "comment-13651872"
+        },
+        {
+            "date": "2013-05-08T13:29:35+0000",
+            "content": "I think I found the reason. J9 seems to be optimizing away the following code:\n\n  @Override public synchronized void handleEvent(Object event)\n      throws InvocationTargetException {\n    super.handleEvent(event);\n  }\n\n\nthis method is removed entirely as the stack trace from the 'wtf' exception shows:\n\njava.lang.reflect.InvocationTargetException\n\tat sun.reflect.GeneratedMethodAccessor3.invoke(Unknown Source)\n\tat sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:55)\n\tat java.lang.reflect.Method.invoke(Method.java:613)\n\tat com.google.common.eventbus.EventHandler.handleEvent(EventHandler.java:74)\n\tat com.google.common.eventbus.EventBus.dispatch(EventBus.java:314)\n\tat com.google.common.eventbus.EventBus.dispatchQueuedEvents(EventBus.java:296)\n\tat com.google.common.eventbus.EventBus.post(EventBus.java:267)\n\tat com.carrotsearch.ant.tasks.junit4.it.TestJ9SanityCheck$2.call(TestJ9SanityCheck.java:75)\n\tat com.carrotsearch.ant.tasks.junit4.it.TestJ9SanityCheck$2.call(TestJ9SanityCheck.java:1)\n\tat java.util.concurrent.FutureTask$Sync.innerRun(FutureTask.java:345)\n\tat java.util.concurrent.FutureTask.run(FutureTask.java:177)\n\tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1121)\n\tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:614)\n\tat java.lang.Thread.run(Thread.java:777)\nCaused by: java.lang.RuntimeException: Wtf? two threads in a handler: Thread[pool-100-thread-1,5,TGRP-TestJ9SanityCheck] and Thread[pool-100-thread-2,5,TGRP-TestJ9SanityCheck]\n\tat com.carrotsearch.ant.tasks.junit4.it.TestJ9SanityCheck$1.onSlaveIdle(TestJ9SanityCheck.java:52)\n\t... 14 more\n\n\n\nThe eventhandler type is definitely SynchronizedEventHandler and on Hotspot you do get a synchronized indirection layer (a call under a synchronized monitor), whereas on J9 this becomes a full race condition.\n ",
+            "author": "Dawid Weiss",
+            "id": "comment-13651882"
+        },
+        {
+            "date": "2013-05-08T13:39:18+0000",
+            "content": "Thanks Dawid. I filed a PMR with the J9 team. Will post back when they respond/resolve the issue. ",
+            "author": "Shai Erera",
+            "id": "comment-13651888"
+        },
+        {
+            "date": "2013-05-08T19:56:15+0000",
+            "content": "Yeah, I'm confident it's this. I've replaced the synchronized method flag with an explicit monitor and it works then.\n\n  @Override public void handleEvent(Object event)\n      throws InvocationTargetException {\n      synchronized (this) {\n          super.handleEvent(event);\n      }\n  }\n\n\nSo it's a JVM issue. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13652268"
+        },
+        {
+            "date": "2013-05-08T20:51:45+0000",
+            "content": "I've released and pushed rr 2.0.10 to maven repositories with a workaround for J9's bug. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13652346"
+        },
+        {
+            "date": "2013-05-09T10:25:57+0000",
+            "content": "I added this bug to the JVM bugs wiki page: http://wiki.apache.org/lucene-java/JavaBugs ",
+            "author": "Uwe Schindler",
+            "id": "comment-13652852"
+        },
+        {
+            "date": "2013-07-01T21:14:31+0000",
+            "content": "The JIT team has confirmed this to be a bug in the JIT generation code \u2013 it apparently wrongly optimized away handleEvent calling super(), neglecting the fact that it is synchronized. They are working on a fix. Once I'll know which J9 version will include it, I'll update the issue.\n\nIn the meanwhile they suggested we try to run with -Xjit:disableNewMethodOverride as a workaround. ",
+            "author": "Shai Erera",
+            "id": "comment-13697184"
+        },
+        {
+            "date": "2013-07-01T21:19:20+0000",
+            "content": "Mhmm... took them a while, don't you think? I mean:\n\nI think I found the reason. J9 seems to be optimizing away the following code: [...]\ntook me an hour or so to pinpoint this, even without access to the JIT's source code  ",
+            "author": "Dawid Weiss",
+            "id": "comment-13697194"
+        },
+        {
+            "date": "2013-07-01T21:19:45+0000",
+            "content": "But thanks for the follow-up anyway, Shai. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13697195"
+        },
+        {
+            "date": "2013-07-01T21:23:06+0000",
+            "content": "Sigh ... what can I say? \n\nI think it took them a while to understand why it's optimizing away. From what I understand, their code failed to check the method flags, in this case 'synchronized' and therefore assumed this is just an empty override. ",
+            "author": "Shai Erera",
+            "id": "comment-13697199"
+        },
+        {
+            "date": "2013-07-23T06:49:10+0000",
+            "content": "Word is that the fix will be included in the next J9 SR. ",
+            "author": "Shai Erera",
+            "id": "comment-13716165"
+        },
+        {
+            "date": "2013-07-23T18:37:06+0000",
+            "content": "Bulk close resolved 4.4 issues ",
+            "author": "Steve Rowe",
+            "id": "comment-13716747"
+        }
+    ]
+}

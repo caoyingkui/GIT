@@ -1,0 +1,103 @@
+{
+    "id": "LUCENE-2130",
+    "title": "Investigate Rewriting Constant Scoring MultiTermQueries per segment",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Duplicate",
+        "status": "Closed"
+    },
+    "description": "This issue is likely not to go anywhere, but I thought we might explore it. The only idea I have come up with is fairly ugly, and unless something better comes up, this is not likely to happen.\n\nBut if we could rewrite constant score multi-term queries per segment, MTQ's with auto (when the heuristic doesnt cut over to constant filter), or constant boolean rewrite could enum terms against a single segment and then apply a boolean query against each segment with just the terms that are known to be in that segment. This also allows you to avoid DirectoryReaders MultiTermEnum and its PQ. (See Roberts comment below).\n\nNo biggie, not likely, but what the heck.\n\nSo the ugly way to do it is to add a property to query's and weights - lateCnstRewrite or something, that defaults to false. MTQ would return true if its in a constant score mode. On the top level rewrite, if this is detected, an empty ConstantScoreQuery is made, and its Weight is turned to lateCnstRewrite and it keeps a ref to the original MTQ query. It also gets its boost set to the MTQ's boost. Then when we are searching per segment, if the Weight is lateCnstRewrite, we grab the orig query and actually do the rewrite against the subreader and grab the actual constantscore weight. It works I think - but its a little ugly.\n\nNot sure its worth the baggage for the win - but perhaps the objective can be met in another way.",
+    "attachments": {
+        "LUCENE-2130.patch": "https://issues.apache.org/jira/secure/attachment/12427273/LUCENE-2130.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-12-08T01:49:06+0000",
+            "content": "Okay - so talking to Robert in chat - the advantage when you are enumerating a lot of terms is that you avoid DirectoryReaders MultiTermEnum and its PQ. ",
+            "author": "Mark Miller",
+            "id": "comment-12787248"
+        },
+        {
+            "date": "2009-12-08T01:54:51+0000",
+            "content": "The ugly patch - (which doesn't yet handle the filter supplied case) ",
+            "author": "Mark Miller",
+            "id": "comment-12787250"
+        },
+        {
+            "date": "2009-12-08T02:57:58+0000",
+            "content": "I like the idea of fixing this problem somehow, here is the background:\n\nI noticed one very bad-performing wildcard query on an index with numbers 0000000-9999999 was the query \"*NNNNNN\" where N's are random numbers.\nthe problem is that the query will enumerate the entire term dict but only return 10 results.\n\nin Constant Auto mode, this means it will use DirectoryReader's MultiTerms, even on an optimized index, with a lot of wasted priority queue usage, etc.\n\nThis is a corner case in my tests, but the reason I think it would be nice to fix is because things like contrib/regex behave in this way maybe more often, they frequently scan the entire term dictionary only to return a few results. ",
+            "author": "Robert Muir",
+            "id": "comment-12787269"
+        },
+        {
+            "date": "2009-12-08T03:42:24+0000",
+            "content": "I've spewed too much confusion in this issue - just going to rewrite the summary. ",
+            "author": "Mark Miller",
+            "id": "comment-12787284"
+        },
+        {
+            "date": "2009-12-08T04:46:52+0000",
+            "content": "updated ",
+            "author": "Mark Miller",
+            "id": "comment-12787312"
+        },
+        {
+            "date": "2010-07-11T20:58:07+0000",
+            "content": "I think this is very important to fix...\n\nWe should somehow make the MultiTermQuery.RewriteMethod handle a per-segment API (ie, add .setNextReader).\n\nI'm running some unrelated perf-tests, and ended up testing the fuzzy query united~0.6 (max edit distance=2), against the same 5M Wikipedia index in optimized and unoptimized (13 segs) form.  The unoptimized index takes ~45 seconds to run, while the same index optimized takes 750 msec (~60X slower)!  For query united~0.7 (max edit distance=1), it's ~4330 msec vs ~114 msec (~38X slower). ",
+            "author": "Michael McCandless",
+            "id": "comment-12887228"
+        },
+        {
+            "date": "2010-07-11T21:05:15+0000",
+            "content": "I think the slowness comes from a particularly bad interaction b/w how FuzzyTermsEnum uses MultiTermsEnum.seek during the rewrite, and MTE's impl of seek.\n\nEG if you seek MTE to term Naa.  Say there are 4 segments, that seek to these terms:  Nab M O P.\n\nIf you next seek to term Nac, then the 3 segments (M O P above) will do tons of work (a full re-seek, ie binary search through the index, re-scan) only to discover they are still at M O P.  There's an O(N^2) factor at play, where N = term index interval, and the constant factor is highish (decoding each term entry on scan).\n\nI think we could conceivably fix MTE to better handle this \"seeking a bit forward at a time\" case, eg by keeping track of last seek term and not touching the M O P segments since we know they'll just seek back to the same point, I suspect if we do so the perf will still be sizably slower than if we can rewrite per-segment. ",
+            "author": "Michael McCandless",
+            "id": "comment-12887230"
+        },
+        {
+            "date": "2010-07-11T21:12:19+0000",
+            "content": "Definitely not setNextReader(), that would be the same broken design as CustomScoreQuery in 2.9.0 . MTQ Rewrite modes are stateless. So the new rewrite modes need to be some factories for instances per query execution that may have state and use setNextReader(). ",
+            "author": "Uwe Schindler",
+            "id": "comment-12887232"
+        },
+        {
+            "date": "2010-07-12T11:01:44+0000",
+            "content": "OK it turns out fixing MultiTermsEnum to optimize for this particular usage (seeking forward a bit at a time) wasn't too bad \u2013 patch attached.\n\nI just track the last seek term, and if a given sub's term is after the new seek term, we can skip seeking it since that'd [very wastefully] just seek back to the term it's already on.\n\nWith this patch, for query united~0.6 (N=2) the multi-segment index takes ~1588 msec vs ~736 msec on the optimized index.  This is still not great (2.2X slower), so we should still pursue per-segment rewrite for fuzzy query, but is much better than 60X slower!  Progress not perfection... ",
+            "author": "Michael McCandless",
+            "id": "comment-12887342"
+        },
+        {
+            "date": "2010-07-12T11:50:56+0000",
+            "content": "Progress not perfection...\n\nnice work! I agree, I think we should commit this patch for now, and fix the n^2 problem in MTE... so slow for seeking like this that its almost buggish ",
+            "author": "Robert Muir",
+            "id": "comment-12887351"
+        },
+        {
+            "date": "2010-07-13T14:58:49+0000",
+            "content": "OK I updated w/ the cool RandomIW, and tests all pass with this patch and random.multiplier=3.  I'll commit shortly! ",
+            "author": "Michael McCandless",
+            "id": "comment-12887787"
+        },
+        {
+            "date": "2010-07-13T15:05:16+0000",
+            "content": "OK I committed the optimization in MTE.\n\nBut I'll leave this open, to pursue rewrite per-segment, so we can try to make up the remaining 2.2X perf loss on a multi-seg index for FuzzyQuery. ",
+            "author": "Michael McCandless",
+            "id": "comment-12887790"
+        },
+        {
+            "date": "2010-10-15T14:41:48+0000",
+            "content": "Fixed per LUCENE-2690. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12921386"
+        }
+    ]
+}

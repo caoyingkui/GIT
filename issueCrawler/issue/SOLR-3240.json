@@ -1,0 +1,116 @@
+{
+    "id": "SOLR-3240",
+    "title": "add spellcheck 'approximate collation count' mode",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.4",
+            "6.0"
+        ],
+        "components": [
+            "spellchecker"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "SpellCheck's Collation in Solr is a way to ensure spellcheck/suggestions\nwill actually net results (taking into account context like filtering).\n\nIn order to do this (from my understanding), it generates candidate queries,\nexecutes them, and saves the total hit count: collation.setHits(hits).\n\nFor a large index it seems this might be doing too much work: in particular\nI'm interested in ensuring this feature can work fast enough/well for autosuggesters.\n\nSo I think we should offer an 'approximate' mode that uses an early-terminating\nCollector, collect()ing only N docs (e.g. n=1), and we approximate this result\ncount based on docid space. \n\nI'm not sure what needs to happen on the solr side (possibly support for custom collectors?),\nbut I think this could help and should possibly be the default.",
+    "attachments": {
+        "SOLR-3240.patch": "https://issues.apache.org/jira/secure/attachment/12531728/SOLR-3240.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "James Dyer",
+            "id": "comment-13228463",
+            "date": "2012-03-13T15:53:07+0000",
+            "content": "Are you saying that if a user only cares that a collation will yield some hits, but doesn't care how many, then we can short-circuit these queries to quit once one document is collected?  (alternatively, quit after n docs are collected is the user doesn't care if it is \"greater than n\" ?) "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13228469",
+            "date": "2012-03-13T15:59:30+0000",
+            "content": "Yes, but I'm saying that we can also still approximate the hit count.\n\nfor example, for n=1, if you have 20,000 docs, and the first docid is '100', we estimate there are 200 matching docs.\nyou can increase n (max # of collected docs), to increase the accuracy at the cost of performance.\ncurrently n=infinity and its always exact \n\nJames can you tell me how collation.hits is used? Does collation use this directly as a heuristic for re-ranking suggestions? \nOr is it only metadata supplied to the user.\n\nThe idea here is that exact numbers are probably not needed for most use cases: they would probably rather have\ninexact hit counts but faster performance. "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13228492",
+            "date": "2012-03-13T16:26:12+0000",
+            "content": "collation.hits is just metadata for the user, so I think what you want to do would be entirely valid.  \n\nThe estimates would only be good if the hits are somewhat evenly distributed across the index, right?  For instance, if you're indexing something by topic and all and then a bunch of new docs get added on the same topic around the same time, you'd get a cluster of hits in one place.  \n\nEven so, like you say, many (most) people would rather improve performance than have an accurate (any) hit count returned.\n\nBeyond this, there are also some dead-simple optimizations we can make by simply removing any sorting & boosting parameters from the query before testing the collation. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13228504",
+            "date": "2012-03-13T16:36:56+0000",
+            "content": "\nBeyond this, there are also some dead-simple optimizations we can make by simply removing any sorting & boosting parameters from the query before testing the collation.\n\nRight, as a custom collector we effectively get this too though, we wouldnt be sorting or scoring anything. "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13293090",
+            "date": "2012-06-11T21:15:02+0000",
+            "content": "Here's a patch for this one.\n\nRobert, is this something like what you had in mind when you opened this issue? "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13293099",
+            "date": "2012-06-11T21:24:20+0000",
+            "content": "I think so! \n\nWe could optimize it further by ensuring that we arent collecting scores or anything (e.g. i think we should be wrapping something like a TotalHitCollector (http://svn.apache.org/viewvc/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/search/TotalHitCountCollector.java?view=markup), or just not wrapping any collector at all?\n\nBut this patch is probably a good improvement for the worst case. "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13294553",
+            "date": "2012-06-13T16:39:09+0000",
+            "content": "Ok.  I think I have a version here that will never compute scores, without having to write a lot of special code for it.\n\nBest I can tell, when \"collateMaxCollectDocs\" is 0 or not specified, it will use the first inner-class Collector in SolrIndexSearcher#getDocListNC (this one is almost identical to TotalHitCountCollector).  Otherwise, it will use OneComparatorNonScoringCollector with the sort being on \"<id>\".  These queries will also make use of the Solr filter cache & query result cache when they can, etc.\n\nThe one thing is that the unit tests make it easy to determine if it is giving the estimate you'd expect, etc.  What I can't so easily test is if I turn off hit reporting entirely (collateExtendedResults=false), is it still picking a non-scoring collector.  I would like to add a test that does this but not so sure what the least-invasive approach would be.\n\nI'm also thinking I can safely get rid of the \"forceInorderCollection\" flag because requesting docs sorted by doc-id would enforce the same thing, right? "
+        },
+        {
+            "author": "Nalini Kartha",
+            "id": "comment-13562352",
+            "date": "2013-01-25T04:07:06+0000",
+            "content": "Any timeline on when this would go in? It'd be useful for an extra option we're trying to add to the DirectSpellChecker - we want to issue queries for each suggestion to check that they would return some hits taking into account the fq params of the main query. Since we only care about the suggestion returning at least 1 hit, looks like this Collector would improve performance a lot. "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13646704",
+            "date": "2013-05-01T16:46:46+0000",
+            "content": "Here is an updated patch for Trunk which I plan to commit soon.  \n\nNote that this patch's EarlyTerminatingCollector is similar to the recently-added (LUCENE-4858) EarlyTerminatingSortingCollector.  However, there seems to be enough differences that I did not attempt to combine the two.  I have E.T.C. in a \".solr\" package, but possibly this showuld be on a \".lucene\" package instead?\n\nAny review or comments are appreciated. "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13649856",
+            "date": "2013-05-06T16:49:48+0000",
+            "content": "[trunk commit] jdyer\nhttp://svn.apache.org/viewvc?view=revision&revision=1479638\n\nSOLR-3240: add \"spellcheck.collateMaxCollectDocs\" for estimating collation hit-counts. "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13649873",
+            "date": "2013-05-06T17:06:11+0000",
+            "content": "[branch_4x commit] jdyer\nhttp://svn.apache.org/viewvc?view=revision&revision=1479644\n\nSOLR-3240: add \"spellcheck.collateMaxCollectDocs\" for estimating collation hit-counts. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13649874",
+            "date": "2013-05-06T17:06:26+0000",
+            "content": "Thanks for taking care James: nice work "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13649882",
+            "date": "2013-05-06T17:18:00+0000",
+            "content": "[trunk commit] jdyer\nhttp://svn.apache.org/viewvc?view=revision&revision=1479645\n\nSOLR-3240: add \"spellcheck.collateMaxCollectDocs\" (removing dead code). "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13649884",
+            "date": "2013-05-06T17:19:42+0000",
+            "content": "[branch_4x commit] jdyer\nhttp://svn.apache.org/viewvc?view=revision&revision=1479647\n\nSOLR-3240: add \"spellcheck.collateMaxCollectDocs\" (removing dead code). "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13716876",
+            "date": "2013-07-23T18:38:50+0000",
+            "content": "Bulk close resolved 4.4 issues "
+        }
+    ]
+}

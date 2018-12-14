@@ -1,0 +1,171 @@
+{
+    "id": "SOLR-8922",
+    "title": "DocSetCollector can allocate massive garbage on large indexes",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "After reaching a point of diminishing returns tuning the GC collector, I decided to take a look at where the garbage was coming from. To my surprise, it turned out that for my index and query set, almost 60% of the garbage was coming from this single line:\n\nhttps://github.com/apache/lucene-solr/blob/94c04237cce44cac1e40e1b8b6ee6a6addc001a5/solr/core/src/java/org/apache/solr/search/DocSetCollector.java#L49\n\nThis is due to the simple fact that I have 86M documents in my shards. Allocating a scratch array big enough to track a result set 1/64th of my index (1.3M) is also almost certainly excessive, considering my 99.9th percentile hit count is less than 56k.",
+    "attachments": {
+        "SOLR-8922.patch": "https://issues.apache.org/jira/secure/attachment/12796177/SOLR-8922.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-03-30T21:36:55+0000",
+            "author": "Jeff Wartes",
+            "content": "SOLR-5444 had a patch to help with this, (SOLR-5444_ExpandingIntArray_DocSetCollector_4_4_0.patch) but it was mixed in with some other things, and didn't get picked up with the other parts of the issue. ",
+            "id": "comment-15218910"
+        },
+        {
+            "date": "2016-03-30T22:19:10+0000",
+            "author": "Jeff Wartes",
+            "content": "This is essentially the same patch as in SOLR-5444, but applies cleanly against (at least) 5.4 where I did some GC testing, and master. ",
+            "id": "comment-15218972"
+        },
+        {
+            "date": "2016-03-30T22:22:32+0000",
+            "author": "Jeff Wartes",
+            "content": "For my index, (86M-doc shards and a per-shard 99.9th percentile query hit count of 56k) this reduced total garbage generation by 33%, which naturally also brought significant improvements in gc pause and frequency. ",
+            "id": "comment-15218974"
+        },
+        {
+            "date": "2016-03-30T22:45:04+0000",
+            "author": "Erick Erickson",
+            "content": "Jeff: \n\nThanks for pointing that out, we need to keep from generating garbage whenever possible. \n\nOne question I have is whether you've got any good stats on how performant this is?\n ",
+            "id": "comment-15219003"
+        },
+        {
+            "date": "2016-03-30T23:35:31+0000",
+            "author": "Jeff Wartes",
+            "content": "Not yet. The major risk area would be the new ExpandingIntArray class, but it looked reasonable. It expands along powers of two, and although the add() and copyTo() calls are certainly more work than simple array assignment/retrieval, it still all looks like pretty simple stuff. A few ArrayList calls and some simple numeric comparisons mostly. \nI'm more worried about bugs in there than performance, I don't know how well Per Steffensen tested this, although I got the impression he was using it in production at the time.\n\nThere may be better approaches, but this one was handy and I'm excited enough that I'm going to be doing a production test. I'll have more info in a day or two.\n\nAs a side note, I got a similar garbage-related improvement on an earlier test by simply hard-coding the smallSetSize to 100000 - the expanding arrays approach only bought me another 3%. But of course, that 100000 is very index and query set dependant, so I didn't want to offer it as a general case. ",
+            "id": "comment-15219066"
+        },
+        {
+            "date": "2016-03-31T02:42:27+0000",
+            "author": "Erick Erickson",
+            "content": "I'm also wondering if there are some tricks where we could re-use memory rather than allocate new all the time. I guess the reason I'm obsessing about this is that anything that accounts for this much of the garbage collected seems like it's worth the effort. This certainly seems like one of those odd places where efficiency might trump simplicity..\n\nI wonder if there's something we could do that would allocate some kind of reusable pool. I'm thinking of something stupid-simple that we could use for benchmarking (not for commit or production) to get a handle on the dimension of the problem and how broadly it would apply...\n\nAfter all, GC is one of the things we spend a lot of time on when supporting Solr..... ",
+            "id": "comment-15219235"
+        },
+        {
+            "date": "2016-03-31T15:35:00+0000",
+            "author": "Jeff Wartes",
+            "content": "Absolutely. Memory pools were my first thought, between when I saw that 60% and when I looked at my hit rates and realized the allocation size was could just be changed. I had started poking around the internet for terms like \"slab allocators\" and \"direct byte buffers\", but even an on-heap persistent pool sounded good to me. Or, if you had persistent tracking of hit rates for the optimization, perhaps the size of the scratch array could optimize itself over time. All of that would be more complicated, of course.\n\nI did look one other place worth mentioning though. In Heliosearch the way the DocSetCollector handles the \"scratch\" array isn't any different, but it's interesting because it added a lifecycle with a close() method to the class, to support the native bitset implementation. Knowing that it's possible to impose a lifecycle on the class, checking things out and back into a persistent memory pool should be easy. ",
+            "id": "comment-15220045"
+        },
+        {
+            "date": "2016-03-31T15:38:30+0000",
+            "author": "Jeff Wartes",
+            "content": "Incidentally, I had one or two other findings from my garbage analysis. Solutions are less obvious there though, and probably involve some conversation. Is Jira the right place for that, or is there another medium more appropriate? ",
+            "id": "comment-15220052"
+        },
+        {
+            "date": "2016-03-31T16:26:48+0000",
+            "author": "Jeff Wartes",
+            "content": "Ok, so after a little more than 12 hours on one of my production nodes, there was no noticeable change in CPU usage. \nRunning before/after GC logs through GCViewer, it's a little hard to compare rate, since the logs were for different intervals and the \"after\" log included startup. That said, \"Freed mem/minute\" was down by 44%, and \"Throughput\" went from 87% to 93%. I also see noticeably reduced average pause time, and increased average pause interval. All positive signs. \n\nThe only irritation I'm finding here is that it looks like the CMS collector is running more often. I expect that's simply because I changed the footing of a fairly tuned set of GC parameters though.\n ",
+            "id": "comment-15220136"
+        },
+        {
+            "date": "2016-03-31T17:18:13+0000",
+            "author": "Keith Laban",
+            "content": "Just out of curiosity, have you run tests with G1? Was there a performance difference? ",
+            "id": "comment-15220252"
+        },
+        {
+            "date": "2016-03-31T17:21:19+0000",
+            "author": "David Smiley",
+            "content": "Solr uses HPPC for it's native collections.  Just use IntArrayList instead of writing your own. ",
+            "id": "comment-15220259"
+        },
+        {
+            "date": "2016-03-31T17:28:47+0000",
+            "author": "Joel Bernstein",
+            "content": "Also check out ArrayUtil in Lucene ",
+            "id": "comment-15220270"
+        },
+        {
+            "date": "2016-03-31T17:43:01+0000",
+            "author": "Jeff Wartes",
+            "content": "With some tweaking, I was able to get G1 pause to about the same ballpark as I get with ParNew/CMS. But without a compelling difference, the Lucene recommendation against G1 keep me away.\n\nThis issue is more about garbage generation though. Less garbage should be a benefit regardless of the collector you choose. ",
+            "id": "comment-15220299"
+        },
+        {
+            "date": "2016-03-31T18:02:18+0000",
+            "author": "Jeff Wartes",
+            "content": "Both of those appear to add capacity by declaring a new array and doing a System.arraycopy.\nWouldn't that just result in more space allocated and then thrown away? ",
+            "id": "comment-15220342"
+        },
+        {
+            "date": "2016-03-31T20:39:41+0000",
+            "author": "David Smiley",
+            "content": "I spoke too soon; I like your utility  ",
+            "id": "comment-15220633"
+        },
+        {
+            "date": "2016-03-31T21:17:56+0000",
+            "author": "Joel Bernstein",
+            "content": "Yep, that is cool! ",
+            "id": "comment-15220687"
+        },
+        {
+            "date": "2016-04-06T22:33:15+0000",
+            "author": "Jeff Wartes",
+            "content": "I stumbled onto SJK recently, which provides me a more lightweight way to measure allocation rate on my production nodes, and also eliminate startup noise from the measurement. \nAccording to this tool, the node with this patch is allocating heap space at roughly 60% of the rate that the others are.\nThat's reasonably consistent with my other measurements, and a pretty big improvement.\n\nIf anyone decides to pull this in, I'd appreciate it getting applied to the 5.5 branch as well, in case there's a 5.5.1 release. ",
+            "id": "comment-15229260"
+        },
+        {
+            "date": "2016-04-06T22:50:30+0000",
+            "author": "Yonik Seeley",
+            "content": "I quickly tried some patches in the past that resulted in a performance decreases, so I never got around to committing something.\nI'll try to take a look at the patch here soon. ",
+            "id": "comment-15229286"
+        },
+        {
+            "date": "2016-04-09T18:59:05+0000",
+            "author": "Yonik Seeley",
+            "content": "OK, it took me much longer to do the benchmarks than planned.  It was sometimes difficult to get stable numbers (mostly due to variations in how hotspot can optimize/deoptimize things I imagine).\n\nI took the first patch here and further optimized it, getting rid of some of the branches in the inner loop.  This new patch also keeps track of the smallSetSize to avoid over-allocating space that won't be used.  On the best runs, this did not seem to make too much of a difference, but it became apparent that slower runs were much more frequent before this optimization (the average seemed to be about 15% better).\n\nBenchmark of new patch vs trunk:\n10M doc index, 20% chance of a document missing the value for a field.\nQueries consisted of many filters (using the filter() support in the query syntax)... 50 per request, with a filterCache size of 1 to generally avoid cache hits.  The large number of filters per request is to just try and make docset generation the bottleneck.\n\nSingle-threaded performance: (nterms is the number of unique terms in the field across the entire index)\n\n\n\n nterms \n perf improvement \n\n\n10\n1.88%\n\n\n100\n-1.05%\n\n\n1000\n38.25%\n\n\n10000\n75.10%\n\n\n100000\n88.86%\n\n\n1000000\n94.49%\n\n\n\n\n\nSingle-threaded analysis: one could expect single threaded performance of the patch to be slower... if we promote to a bit set, we will have allocated more memory and done more work.  Also, with a single thread doing requests, other CPU cores are free to concurrently perform GC.  The fact that the patch was faster for the field with 10 unique terms is most likely measurement inaccuracies.  nterms=10 had the most instability across runs, while nterms=100 had the next most instability.  Standard deviation of performance results dropped with increasing nterms values.\n\nMulti-threaded performance (8 threads on a 4 core CPU):\n\n\n\n nterms \n perf improvement \n\n\n100\n14.49%\n\n\n1000\n93.36%\n\n\n10000\n179.07%\n\n\n100000\n216.65%\n\n\n1000000\n148.45%\n\n\n\n ",
+            "id": "comment-15233682"
+        },
+        {
+            "date": "2016-04-09T23:10:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit cfba58f0d0adecab495c8ea073f38b0e53f5481f in lucene-solr's branch refs/heads/master from Yonik Seeley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cfba58f ]\n\nSOLR-8922: optimize DocSetCollector to produce less garbage ",
+            "id": "comment-15233768"
+        },
+        {
+            "date": "2016-04-09T23:11:13+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 301e178681d72a142dac4bc44416b93f42f33c01 in lucene-solr's branch refs/heads/branch_6x from Yonik Seeley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=301e178 ]\n\nSOLR-8922: optimize DocSetCollector to produce less garbage ",
+            "id": "comment-15233771"
+        },
+        {
+            "date": "2016-04-09T23:11:58+0000",
+            "author": "Yonik Seeley",
+            "content": "Committed.  Thanks Jeff! ",
+            "id": "comment-15233773"
+        },
+        {
+            "date": "2016-04-10T04:26:10+0000",
+            "author": "David Smiley",
+            "content": "Wow; I'm (pleasantly) surprised to see such a general performance increase; I thought this was just about saving memory.  Why is it faster?  Less GC time?\n\nI'm confused by the benchmark and/or I don't understand the setup.  \n\n20% chance of a document missing the value for a field.\n\nPut another way, do you mean any given term has an 80% chance of being in the doc?\n\nI'm confused why the number of terms that are in the field has anything to do with the performance of this patch.  Perhaps what you've done in your benchmark is have the fields with the larger number of terms result in any given term matching fewer documents?  I think it would be far clearer to report the performance increase over varying number of docs that were counted in the doc set.  However many terms were in the field doesn't really matter in and of itself (I think).  Couldn't you have done all this in one field and just chosen your 50 term queries based on those terms that have the same(ish) document frequency.  It might be as a percentage of the total docs (thus making the numbers more generally interpretable). ",
+            "id": "comment-15233876"
+        },
+        {
+            "date": "2016-04-10T12:40:47+0000",
+            "author": "Yonik Seeley",
+            "content": "I thought this was just about saving memory. Why is it faster? Less GC time?\n\nThe fact that any difference can be seen at all is that I made docset generation a bottleneck in the test.  So the benchmark itself is certainly not typical, even if it is real. And yes, I expect that it's all due to GC... but it's hard to prove.\n\n> 20% chance of a document missing the value for a field.\nbc. Put another way, do you mean any given term has an 80% chance of being in the doc?\n\nNo, an 80% chance having a value for the field.  The chance for having \"any given term\" would be 80%/nterms.\n\nI'm confused why the number of terms that are in the field has anything to do with the performance of this patch.\n\nI'm leveraging pre-existing indexes and tools to test this.  Using the different fields with different doc freqs for the terms was an easy way to vary the number of docs collected.  100 unique values in the field means a single matching term query on that field will match 10M docs * .80 / 100, or 80K docs. ",
+            "id": "comment-15234092"
+        },
+        {
+            "date": "2016-04-20T12:40:36+0000",
+            "author": "Per Steffensen",
+            "content": "I don't know how well Per Steffensen tested this, although I got the impression he was using it in production at the time\n\nWell, I know I am late, but just for the record. It was tested thoroughly and the gain was significant. It has been running in several production-systems since forever. ",
+            "id": "comment-15249790"
+        }
+    ]
+}

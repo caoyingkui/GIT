@@ -1,0 +1,77 @@
+{
+    "id": "SOLR-1951",
+    "title": "extractingUpdateHandler doesn't close socket handles promptly, and indexing load tests eventually run out of resources",
+    "details": {
+        "affect_versions": "1.4.1,                                            1.5",
+        "status": "Resolved",
+        "fix_versions": [],
+        "components": [
+            "update"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Invalid"
+    },
+    "description": "When multiple threads pound on extractingUpdateRequestHandler using multipart form posting over an extended period of time, I'm seeing a huge number of sockets piling up in the following state:\n\ntcp6       0      0 127.0.0.1:8983          127.0.0.1:44058         TIME_WAIT\n\nDespite the fact that the client can only have 10 sockets open at a time, huge numbers of sockets accumulate that are in this state:\n\nroot@duck6:~# netstat -an | fgrep :8983 | wc\n  28223  169338 2257840\nroot@duck6:~#\n\nThe sheer number of sockets lying around seems to eventually cause commons-fileupload to fail (silently - another bug) in creating a temporary file to contain the content data.  This causes Solr to erroneously return a 400 code with \"missing_content_data\" or some such to the indexing poster.",
+    "attachments": {
+        "solr-1951.zip": "https://issues.apache.org/jira/secure/attachment/12447020/solr-1951.zip"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878576",
+            "date": "2010-06-14T13:34:33+0000",
+            "content": "This is the test code I'm using. "
+        },
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878602",
+            "date": "2010-06-14T14:54:29+0000",
+            "content": "A site I found talks about this problem and potential solutions:\n\n>>>>>>\nFirst of all, are the TIME_WAITs client-side or server-side? If server-side, then you\nneed to redesign your protocol so that your clients initiate the active close of the\nconnection, whenever possible... (Except for the server occassionally booting\nidle/hostile clients, etc...) Generally, a server will be handling clients from many\ndifferent machines, so it's far better to spread out the TIME_WAIT load among the\nmany clients, than it is to make the server bear the full load of them all...\n\nIf they're client side, it sounds like you just have a single client, then? And, it's making\na whole bunch of repeated one-shot connections to the server(s)? If so, then you\nneed to redesign your protocol to add a persistent mode of some kind, so your client\ncan just reuse a single connection to the server for handling multiple requests, without\nneeding to open a whole new connection for each one... You'll find your performance\nwill improve greatly as well, since the set-up/tear-down overhead for TCP is now\nadding up to a great deal of your processing, in your current scheme...\n\nHowever, if you persist in truly wanting to get around TIME_WAIT (and, I think it's a\nhorribly BAD idea to try to do so, and don't recommend ever doing it), then what you\nwant is to set \"l_linger\" to 0... That will force a RST of the TCP connection, thereby\nbypassing the normal shutdown procedure, and never entering TIME_WAIT... But,\nhonestly, DON'T DO THIS! Even if you THINK you know WTF you're doing! It's\njust not a good idea, ever... You risk data loss (because your close() of the socket\nwill now just throw away outstanding data, instead of making sure it's sent), you risk\ncorruption of future connections (due to reuse of ephemeral ports that would otherwise\nbe held in TIME_WAIT, if a wandering dup packet happens to show up, or something),\nand you break a fundamental feature of TCP that's put there for a very good reason...\nAll to work around a poorly designed app-level protocol... But, anyway, with that\nsaid, here's the FAQ page on SO_LINGER... \n<<<<<<\n\nSo, if this can be taken at face value, it would seem to argue that the massive numbers of TIME_WAITs are the result of every document post opening and closing the socket connection to the server, and that the best solution is to keep the socket connection alive for multiple requests. Under http, and jetty, it's not clear yet whether it's possible to achieve that goal.  But a little research should help.\n\nIf that doesn't work out, the SO_LINGER = 0 may well do the trick, but I think that might require a change to jetty. "
+        },
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878613",
+            "date": "2010-06-14T15:17:58+0000",
+            "content": "So, the proper solution appears to be to use http keep-alive.  Jetty apparently supports the Http 1.0 specification for this, which means that you can get Jetty to not close the socket if you simply include the header:\n\nConnection: Keep-Alive\n\n... in each request, and never close the socket but instead reuse it for request after request.\n\nBut, unfortunately, keep-alive doesn't seem to work with jetty/Solr.  Only the first request posted (per connection) seems to be recognized.  Subsequent requests are silently eaten.  Either that, or I'm doing something fundamentally wrong.\n "
+        },
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878625",
+            "date": "2010-06-14T16:10:59+0000",
+            "content": "When I turn on http 1.1 with Jetty, I get the following in the response header:\n\nResponse header: Connection: close\n\n... which indicates that jetty wants the connection closed.  So, unless there's a config parameter I've missed, that's the end of the story: jetty doesn't handle keep-alive, and therefore jetty will always have this TIME_WAIT problem.\n\nI guess the next thing to try is Tomcat... "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12878628",
+            "date": "2010-06-14T16:17:36+0000",
+            "content": "From what I've always seen, both jetty and tomcat handle persistent connections just fine.  Problems with this are often in the clients.  Although I've done almost zero testing with multi-part upload in the past, so separating the two issues for testing would probably be best. "
+        },
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878641",
+            "date": "2010-06-14T17:16:37+0000",
+            "content": "Well, it's hard to get past the consistent \"Connection: close\" header back from Jetty.  That tells me that it will not allow a connection to survive a request.\n\nI know from previous experience that Tomcat's keep-alive implementation is sound, so that will effectively separate the multipart handling in Jetty from the issue of keep-alive.  Stay tuned. "
+        },
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878680",
+            "date": "2010-06-14T18:26:00+0000",
+            "content": "Ok, so the scoop is the following.  Both jetty and tomcat DO work \"fine\" - for some definition of fine.  Problem was that jetty responds with an HTTP/1.1 chunked response to an HTTP/1.0 keep-alive request, which certainly was unexpected .  But coding to allow for that made it possible to run properly with keep-alive.  And when I do:\n\nroot@duck6:~# netstat -an | fgrep :8983 | wc\n     21     126    1680\nroot@duck6:~#\n\n... which is a much more reasonable number.\n\nSo, if this code does not run out of resources mid-run, we may have gotten past the immediate TIME_WAIT problem.  There's still potentially the temp file leak issue, but that will be addressed in a separate ticket, if it turns out to be a problem.\n\n "
+        },
+        {
+            "author": "Karl Wright",
+            "id": "comment-12878926",
+            "date": "2010-06-15T10:44:17+0000",
+            "content": "The overnight indexing run did not die due to resource starvation, so it appears that using keep-alive solves this problem, and no fix in Solr is required. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-12879590",
+            "date": "2010-06-17T00:02:32+0000",
+            "content": "fixing status so it's clear no changes were made "
+        }
+    ]
+}

@@ -1,0 +1,374 @@
+{
+    "id": "SOLR-8744",
+    "title": "Overseer operations need more fine grained mutual exclusion",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.1"
+        ],
+        "affect_versions": "5.4.1",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Blocker"
+    },
+    "description": "SplitShard creates a mutex over the whole collection, but, in practice, this is a big scaling problem.  Multiple split shard operations could happen at the time time, as long as different shards are being split.  In practice, those shards often reside on different machines, so there's no I/O bottleneck in those cases, just the mutex in Overseer forcing the operations to be done serially.\n\nGiven that a single split can take many minutes on a large collection, this is a bottleneck at scale.\n\nHere is the proposed new design\n\nThere are various Collection operations performed at Overseer. They may need exclusive access at various levels. Each operation must define the Access level at which the access is required. Access level is an enum. \n\nCLUSTER(0)\nCOLLECTION(1)\nSHARD(2)\nREPLICA(3)\n\nThe Overseer node maintains a tree of these locks. The lock tree would look as follows. The tree can be created lazily as and when tasks come up.\n\nLegend: \nC1, C2 -> Collections\nS1, S2 -> Shards \nR1,R2,R3,R4 -> Replicas\n\n\n                 Cluster\n                /       \\\n               /         \\         \n              C1          C2\n             / \\         /   \\     \n            /   \\       /     \\      \n           S1   S2      S1     S2\n        R1, R2  R3.R4  R1,R2   R3,R4\n\n\n\nWhen the overseer receives a message, it tries to acquire the appropriate lock from the tree. For example, if an operation needs a lock at a Collection level and it needs to operate on Collection C1, the node C1 and all child nodes of C1 must be free. \n\nLock acquiring logic\n\nEach operation would start from the root of the tree (Level 0 -> Cluster) and start moving down depending upon the operation. After it reaches the right node, it checks if all the children are free from a lock.  If it fails to acquire a lock, it remains in the work queue. A scheduler thread waits for notification from the current set of tasks . Every task would do a notify() on the monitor of  the scheduler thread. The thread would start from the head of the queue and check all tasks to see if that task is able to acquire the right lock. If yes, it is executed, if not, the task is left in the work queue.  \nWhen a new task arrives in the work queue, the schedulerthread wakes and just try to schedule that task.",
+    "attachments": {
+        "SmileyLockTree.java": "https://issues.apache.org/jira/secure/attachment/12805817/SmileyLockTree.java",
+        "SOLR-8744.patch": "https://issues.apache.org/jira/secure/attachment/12805564/SOLR-8744.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-05-11T18:09:45+0000",
+            "author": "Scott Blum",
+            "content": "Design looks good to me.\n\nOne think to talk through, this may not be a problem per se, but I could imagine starvation becoming an issue.  If a task is trying to lock the cluster it may never get to run if smaller tasks keep acquiring pieces of the lock tree.  This may not be an issue in practice. ",
+            "id": "comment-15280534"
+        },
+        {
+            "date": "2016-05-12T03:58:51+0000",
+            "author": "Noble Paul",
+            "content": "good question. Starvation is indeed a problem and we must make the best effort to run tasks on a first come first served basis\n\nWe can address it by making the scheduling itself smarter as follows:\n\nAs the scheduler thread starts with trying to acquire a lock, it could build a tree of its own with  nodes marked 'busy' in a local tree for previously unassignable tasks. The local tree would look as follows.\n\nIf the Task T1 needs a lock on Collection C1 and it is unable to acquire a lock, The local tree would look as follows\n\nCluster\n  /\n /\nC1\n\n\nWhen task T2 is taken up, which requires a lock on Cluster -> C1 -> S1 , It would not try to acquire a lock from lock tree because the path Cluster ->C1 is already is marked as 'busy' in the local tree.  So T2 would remain in the work queue till T1 is completed. ",
+            "id": "comment-15281175"
+        },
+        {
+            "date": "2016-05-12T04:16:46+0000",
+            "author": "Scott Blum",
+            "content": "Good plan! ",
+            "id": "comment-15281187"
+        },
+        {
+            "date": "2016-05-22T17:35:10+0000",
+            "author": "Noble Paul",
+            "content": "Patch with tests .\u00a0More testing required. But please review the class LockTree to see the logic implemented ",
+            "id": "comment-15295648"
+        },
+        {
+            "date": "2016-05-23T14:28:18+0000",
+            "author": "David Smiley",
+            "content": "I looked over the patch just a little bit but the suggestion I'm about to give is mostly based on the issue description & comments.  This is an interesting/fun programming problem.  The main thing I don't like about the current design (and this is not a blocker, I'm not vetoing) is that we obtain locks recursively on down to every object of lower depths (ultimately to replicas).  Instead, I propose we consider an alternative design (to follow) in which we only obtain a fixed small number of locks, which is for each parent.  This lowers the number of locks, and also allows the actual lock nodes to be much more dynamic, being GC'ed when the locks aren't in use.\nProposal:\n\n\tLockTree maintains a cache/map of string keys to weakly reference-able LockNode.  That's right; they'll get GC'ed when not in use.  The root node will be strongly referenced apart from the map so it's always there.  It's just a string key, with expectation we'll use some separator to denote hierarchy.  When looking up a lock, we simply synchronize as obtaining locks will be infrequent.  When looking up a Lock, it will recursively look up a parent, creating it first if not there.  Getting the key is a simple matter of stringKey.substring(0, stringKey.lastIndexOf('/')) and assuming all keys start with a leading \"/\" (thus the root key is the empty string).\n\tLockNode implements the JDK Lock interface, but only implementing lock() and unlock().  This makes the API easy for consumers \u2013 it's a known abstraction for code using this utility.\n\tLockNode's fields consist of a parent LockNode and a JDK ReentrantReadWriteLock.  The ReentrantReadWriteLock is instantiated with fairness=true.\n\tLockNode.lock: call parent.readLock() (see below) then call readWriteLock.writeLock().lock().\n\tLockNode.unlock: call readWriteLock.writeLock.unlock(); then parent.readUnlock(); (see below)\n\tLockNode.readLock (private method): call readLock on parent first (this is recursive), and then after that call readWriteLock.readLock().lock().  Thus we lock from top-down (from root down) in effect.\n\tLockNode.readUnlock (private method): call readWriteLock.readLock() then recursively call parent.readUnlock().\n\n\n\nWhat do you think? ",
+            "id": "comment-15296426"
+        },
+        {
+            "date": "2016-05-23T16:08:49+0000",
+            "author": "Noble Paul",
+            "content": "Thanks David Smiley for your comments\n\nwhich we only obtain a fixed small number of locks, which is for each parent.\n\nI miss that . Only one operation should be able to lock at a level.\n\nlockTree maintains a cache/map of string keys to weakly reference-able LockNode. \n\nIt's an optimisation that could be done.  Here we are just talking about a few hundred (may be  afew thousand? ) extremely lightweight objects\n\nGetting the key is a simple matter of stringKey.substring(0, stringKey.lastIndexOf('/')) \n\nI didn't get that one\n\nLockNode implements the JDK Lock interface\n\nJava Lock interface makes me implement too many things. In this, we don't even expose the lock() method. The semantics are much different here. implementing/using java Lock interface sets a wrong set of expectations. \n\n\nLockTree is not a general purpose utility. I wrote it as an independent class because it is a complex enough functionality which should be tested independently.  ",
+            "id": "comment-15296569"
+        },
+        {
+            "date": "2016-05-23T21:08:19+0000",
+            "author": "David Smiley",
+            "content": "The main purpose of my suggestion is simplicity:  LockTree (public) and internally LockTree.Node (private) \u2013 that's it; no new abstractions, and it'd have very little code.  Node would keep track of it's parent only, not children.  No Session or LockObject.  Returning a JDK Lock helps in that regard (it is an existing abstraction and if we wanted to it'd be easy to support all its methods) but it's not critical \u2013 my suggested LockTree.Node could be public and we don't implement Lock if you feel that's better.  I disagree with you on the semantics being different vs the same but whatever. It just so happens that my suggestion might yield something general purpose but that's not my objective, it's simplicity.  Locking on fewer objects is nice too, but perhaps it won't become a real issue with your proposal.  Perhaps I'm not fully appreciating the task at hand \u2013 I admit I glossed over the starvation issue and the code here concerned with marking busy/not.  I hoped the \"fairness\" boolean configuration to JDK's ReentrantReadWriteLock would address that but maybe not?\n\n(me) Getting the key is a simple matter of stringKey.substring(0, stringKey.lastIndexOf('/'))\n\nJust a minor implementation detail to get a parent key instead of working with a List<String> \u2013 nevermind. ",
+            "id": "comment-15297086"
+        },
+        {
+            "date": "2016-05-23T21:18:45+0000",
+            "author": "Scott Blum",
+            "content": "Digging into the LockTree now to understand it better.  Some preliminary notes:\n\n\n\tIn OverseerTaskProcessor, handing off the lock object (up to and including the tpe.execute call) should probably move inside the try block; on successfully executing the task, null out the lock local, and then put an \"if lock != null unlock\" into a finally block.\n\n\n\n\n\tDo we need some kind of complete reset in the event stuff really blows up?  Should there be a session-level clear that just unlocks everything?\n\n\n\n\n\tI think MigrateStateFormat could be collection level rather than cluster level?\n\n ",
+            "id": "comment-15297100"
+        },
+        {
+            "date": "2016-05-24T05:28:04+0000",
+            "author": "Noble Paul",
+            "content": "In OverseerTaskProcessor, handing off the lock object (up to and including the tpe.execute call) should probably move inside the try block; on successfully executing the task, null out the lock local, and then put an \"if lock != null unlock\" into a finally block.\n\nThe runner is always executed in a different thread. So the finally block will always evaluate lock != null to true. Actually, only in case of an exception, OverseerTaskProcessor should unlock it\n\nDo we need some kind of complete reset in the event stuff really blows up? Should there be a session-level clear that just unlocks everything?\n\nYes, we need it, but not at the session level. If I clear up everything for each session, it defeats the purpose. The session is valid for only one batch. The locks should survive for multiple batches.\n\nA better solution is to periodically check if the running tasks are empty and if yes, just create a new LockTree. I was planning t do it anyway\n\nI think MigrateStateFormat could be collection level rather than cluster level?\n\nI have set the lock levels more pessimistically. We should re-evaluate them ",
+            "id": "comment-15297710"
+        },
+        {
+            "date": "2016-05-24T05:32:14+0000",
+            "author": "Noble Paul",
+            "content": "Node would keep track of its parent only, not children.\n\nI do not know how to traverse down a tree without keeping track of the children. \n\nNo Session or LockObject.\n\nThe session is created for a purpose.  It is to abstract out the starvation logic.\n\nI'm not sure I understand your design. Maybe an alternate patch with an implementation of LockTree would help ",
+            "id": "comment-15297713"
+        },
+        {
+            "date": "2016-05-24T05:48:04+0000",
+            "author": "David Smiley",
+            "content": "Here's SmileyLockTree.java (name is obviously just to not confuse it with your LockTree).  I ditched the weak values idea as I had doubts on the added complexity.  I changed the impl a bit from what I had said to make it feel more elegant to me, and I implemented most of JDK Lock for fun.  After a short discussion with Scott Blum on IRC on the context of this task, I believe there's no issue of starvation (for SmileyLockTree specifically any way) since the Overseer runs sequentially so I didn't add the fairness=true option. ",
+            "id": "comment-15297728"
+        },
+        {
+            "date": "2016-05-24T06:45:16+0000",
+            "author": "Noble Paul",
+            "content": "Thanks David Smiley\n\nThe implementation is wrong\n\nIt's not enough to ensure that your parent is not locked. It is also required that none of your children are locked too. For example, C1 cannot be locked if C1/S1/R1 or C1/S2/R1 is locked\n\nThe flat map and substring based approach is expensive in terms of resources. Every substring() call creates a new String. It does not have to be that expensive when you can achieve the same with a map lookup. It may look simple, but I would say it's inefficient and lazy. \n\nUsing the java Lock is contrived because we don't need any of that functionality. We just need a mark() unmark() functionality. There are no real locks required here.  ",
+            "id": "comment-15297771"
+        },
+        {
+            "date": "2016-05-24T13:20:07+0000",
+            "author": "Noble Paul",
+            "content": "The locktree is reset every time the runningTasks is empty. So there is no chance of a blow up.  ",
+            "id": "comment-15298155"
+        },
+        {
+            "date": "2016-05-24T14:05:21+0000",
+            "author": "David Smiley",
+            "content": "Thanks for the review Noble Paul.  I attached a new version that uses List<String> instead of '/' separated strings.  It's even fewer lines of code \n\nIt's not enough to ensure that your parent is not locked. It is also required that none of your children are locked too. For example, C1 cannot be locked if C1/S1/R1 or C1/S2/R1 is locked\n\nDid you see the javadocs?  I could have added more, and I added a little more.  Or maybe you are unfamiliar with how ReentrantReadWriteLock works?  See, there are two locks at each node in the tree \u2013 a read lock and a write lock, courtesy of ReentrantReadWriteLock which does most of the work here.  Multiple read locks can be open for a ReentrantReadWriteLock but the write lock is mutually exclusive to them all.  The Lock that SmileyLockTree returns at a given \"node\" will first obtain a read lock at all ancestors (top down) and then obtain a write lock on the node for itself.  If a Lock for C1/S1/R1 is obtained, it will be a LayeredLock with \"thisLock\" being the write lock for itself (R1) and the \"parentLock\" is a chain of LeveledLock of read locks to its ancestors.  The origin of the chain (i.e. if you keep following LevelledLock parentLock instances) is the read lock on the root, which is a direct instance of ReentrantReadWriteLock.readLock whereas all the rest are the anonymous inner class ReadWriteLock that returns a LayeredLock for it's read & write sides.  So when the caller calls lock(), the first concrete Lock impl to be locked with be the read Lock on root (empty string), then the read lock on C1 then the read lock on C1/S1 then the write lock on C1/S1/R1.  For the duration of time this is locked, any siblings of R1 or R1's ancestors may be locked, or they could have been locked before.  What would block would be a an ancestor \u2013 C1 in your example would block because the write lock blocks for read locks, and the read block is locked by not only C1/S1/R1 but also C1/S2/R1 in your example.\n\nIt's a little functional which maybe you aren't used to, and it leverages useful abstractions and implementations from the JDK that maybe you are unfamiliar with, so perhaps that's why it's not clear how this works.  Do you grok this Scott Blum? ",
+            "id": "comment-15298216"
+        },
+        {
+            "date": "2016-05-24T16:47:00+0000",
+            "author": "Scott Blum",
+            "content": "Have you run your impl against the test Noble Paul wrote?  Curious if it passes.\n\nI think I grok it, but I found a few problems on inspection:\n\n\n\tLayeredLock.tryLock() doesn't really implement markBusy() because it doesn't retain readLocks on the parent chain if you fail to lock the child.  To implement markBusy you'd need to leave them locked (and have a way to later completely reset all the read locks).\n\n\n\n\n\tI still think implementing the j.u.c.L interface is silly here, tryLock() is the only operation that makes sense in context.\n\n\n\n\n\tYou can move the synchronized(locks) from the private recursive method into the public one and acquire it once.\n\tYou can move the ArrayList copy from the private recursive method into the public one and only make a single copy that you later take sublists of.\n\n\n\n\n\tJust as a note: you'd need to occasionally throw away the entire tree as it only grows and never shrinks.\n\n\n ",
+            "id": "comment-15298482"
+        },
+        {
+            "date": "2016-05-24T16:49:14+0000",
+            "author": "Noble Paul",
+            "content": "David , It works.  But it is not yet complete. But, I miss the point. What are we trying to solve?  Is the current implementation buggy? We just need one correct implementation. I have no reason to reimplement everything unless there is something wrong with the current implementation. I'm mostly done with the current patch and I plan to commit this as soon as I clean up the cruft.  ",
+            "id": "comment-15298486"
+        },
+        {
+            "date": "2016-05-24T19:26:27+0000",
+            "author": "David Smiley",
+            "content": "(Noble) David , It works. But it is not yet complete. But, I miss the point. What are we trying to solve? Is the current implementation buggy? We just need one correct implementation.\n\nI am merely offering an alternative implementation to part of the task that I feel is more simple / elegant (as I stated).  In part I'm doing this because it's fun/interesting   Other than complexity of it and related code already in OverseerTaskProcessor, I'm not sure what bugs may or may not be in your patch or the existing code.\n\n(Scott) Have you run your impl against the test Noble Paul wrote? Curious if it passes.\n\nNo; I'd like to do that.  I suggest Noble Paul commit to a branch, push, and I commit on top (assuming tests pass).  Of course it will be reverted if you all don't like it.\n\n(Scott) LayeredLock.tryLock() doesn't really implement markBusy() because it doesn't retain readLocks on the parent chain if you fail to lock the child. To implement markBusy you'd need to leave them locked (and have a way to later completely reset all the read locks).\n\nThanks for clarifying on IRC why the Overseer would want to use tryLock() instead of lock() \u2013 something that confused me from your question/statement.  I had thought OverseerTaskProcessor was going to spawn off a task/thread (more likely Executor impl) that would simply call lock() in its own thread and it may wait as long as needed to acquire the lock and to do its task.  I am quite ready to admit I don't know what's actually going on here ;-P  which is apparently the case.  Let me ask you this then... why doesn't it work in this manner?  It sounds simple enough.  I do see an executor (tpe field), but there's so much surrounding code that it is confusing my ability to grok it and thus why tryLock vs lock might be wanted.  In such a design (in my simple conceptual model), fairness=true should be on the ReentrantReadWriteLocks in SmileyLockTree to prevent starvation to get FIFO behavior on the write lock.  If it's too complicated to explain, maybe let me have at it on a branch.  And again, I may very well not appreciate (yet) why OverseerTaskProcessor with it's proposed LockTree needs to be so complicated.  So please don't take any of my questions or suggestions as a slight. ",
+            "id": "comment-15298756"
+        },
+        {
+            "date": "2016-05-24T19:47:22+0000",
+            "author": "David Smiley",
+            "content": "Maybe my ideas to simplify should really be its own issue because there's apparently more to it than the locking \u2013 it's interrelated with  OverseerTaskProcessor itself.  I think the SmileyLockTree.java could be part of a solution (assuming I'm not missing requirements overall by the OTP) but by itself with OTP's present design, it is perhaps not enough / not right. ",
+            "id": "comment-15298781"
+        },
+        {
+            "date": "2016-05-24T20:22:23+0000",
+            "author": "Scott Blum",
+            "content": "Noble Paul One more comment, instead of making LockTree.LockObject public, I think you could just have LockObject implement the Lock interface and return the interface.  Then you don't have to do the \"return lock == null ? null : lock::unlock\" weirdness, and the FREELOCK sentinel can be a dummy interface impl instead of a concrete object. ",
+            "id": "comment-15298821"
+        },
+        {
+            "date": "2016-05-24T20:23:23+0000",
+            "author": "Scott Blum",
+            "content": "Or make \"OverseerLock\" a top-level interface type in the package. ",
+            "id": "comment-15298822"
+        },
+        {
+            "date": "2016-05-24T20:32:46+0000",
+            "author": "Scott Blum",
+            "content": "Noble Paul One more big question for me: why does the LockTree need a clusterStateProvider?  I don't follow the need to call findChildren in order to prepopulate locks at a given level.  In many cases, you might need to lock something that doesn't really even exist.  For example, create collection or create shard or create replica should acquire the lock for the thing they are about to try to create, even if the thing doesn't exist yet.  This code:\n\n\n        if (child == null) {\n          LOG.info(\"locktree_Unable to get path for \" + currentAction + \" path \" + path);\n          return FREELOCK;//no such entity . So no need to lock\n        }\n\n\n\nIt seems to me that this basically isn't true.  I don't think the LockTree needs knowledge of the actual elements in the real cluster state tree?  I'm also not sure the Level actually matters beyond OCMH.lockTask, where we really just need to translate the lock level into the right-length path.  Does that make any sense? ",
+            "id": "comment-15298839"
+        },
+        {
+            "date": "2016-05-24T20:34:19+0000",
+            "author": "Scott Blum",
+            "content": "Relatedly, lockTask should probably ensure that the appropriate number of path elements are non-nil for the given lock level.  E.g. a shard lock level should ensure that message.getStr(ZkStateReader.SHARD_ID_PROP) is non-null. ",
+            "id": "comment-15298841"
+        },
+        {
+            "date": "2016-05-25T05:25:26+0000",
+            "author": "Noble Paul",
+            "content": "One more big question for me: why does the LockTree need a clusterStateProvider?\n\nExactly. I could create a lock blindly and don't bother whether that entity actually exists. \n\nOne more comment, instead of making LockTree.LockObject public\n\nTrue ",
+            "id": "comment-15299479"
+        },
+        {
+            "date": "2016-05-25T05:38:14+0000",
+            "author": "Noble Paul",
+            "content": "Implements your suggestions Scott Blum ",
+            "id": "comment-15299493"
+        },
+        {
+            "date": "2016-05-25T16:58:04+0000",
+            "author": "Scott Blum",
+            "content": "Good stuff, new LockTree looking good.\n\nWhen does TaskBatch.batchId get assigned?  It looks like it's always 0 right now. ",
+            "id": "comment-15300417"
+        },
+        {
+            "date": "2016-05-25T17:45:52+0000",
+            "author": "Noble Paul",
+            "content": "I missed those changes while merging between branches. Added back in this patch. I'll do another review to see what else is lost ",
+            "id": "comment-15300503"
+        },
+        {
+            "date": "2016-06-01T20:24:15+0000",
+            "author": "Scott Blum",
+            "content": "Hi, any update on this!  Seemed like it was really close. ",
+            "id": "comment-15311044"
+        },
+        {
+            "date": "2016-06-02T02:00:16+0000",
+            "author": "Noble Paul",
+            "content": "I'm planning to commit this soon ",
+            "id": "comment-15311583"
+        },
+        {
+            "date": "2016-06-02T09:18:21+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 459a9c77a6a9b807deb98c58225d4d0ec1f75bac in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=459a9c7 ]\n\nSOLR-8744: Overseer operations performed with fine grained mutual exclusion ",
+            "id": "comment-15312007"
+        },
+        {
+            "date": "2016-06-02T09:25:21+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 734dcb99fcdd557ef046166193ae804824023db3 in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=734dcb9 ]\n\nSOLR-8744: Overseer operations performed with fine grained mutual exclusion ",
+            "id": "comment-15312017"
+        },
+        {
+            "date": "2016-06-07T06:46:50+0000",
+            "author": "Noble Paul",
+            "content": "We have another problem because of tasks which cannot be run because they can't acquire a lock.\n\nimagine we have around 100 items (this is the current limit) in the work-queue. New tasks are  added to the work queue. The call to peekTopN() would return only the same set of 100 items. Newly added items do not get fetched. This leads to 2 problems\n\n\n\tNew tasks which could be processed, do not get a chance\n\tZK is unnecessarily hammered with requests to fetches the same set of items again and again.\n\n\n ",
+            "id": "comment-15317982"
+        },
+        {
+            "date": "2016-06-07T11:23:11+0000",
+            "author": "Noble Paul",
+            "content": "This keeps a local copy of clocked tasks and uses that in the excluded tasks check ",
+            "id": "comment-15318312"
+        },
+        {
+            "date": "2016-06-07T16:32:07+0000",
+            "author": "Scott Blum",
+            "content": "Some quick feedback:\n\n\n\tI think we need a cap on the total size of blockedTasks; otherwise in the face of a cluster level task, you'll read everything in ZK into memory continually and grow blockedTasks without bound.\n\n\n\n1) \"while (runningTasks.size() > MAX_PARALLEL_TASKS) \n{ ...wait... }\n\" should account for blockedTasks.size() as well, or else maybe there should be a separate sleep check on blockedTasks being too full\n\n2) \"workQueue.peekTopN(MAX_PARALLEL_TASKS\" could also peek for a smaller number of tasks when blockedTasks() is almost full.  Something like:\n\nworkQueue.peekTopN(Math.min(MAX_PARALLEL_TASKS - runningTasks.size(), MAX_BLOCKED_TASKS - blockedTasks.size(), ...\n\n\n\texcludedTasks could be a Sets.union() of the other two if you want to automatically retain things like toString() and size() instead of a Function\n\n\n ",
+            "id": "comment-15318816"
+        },
+        {
+            "date": "2016-06-07T17:37:17+0000",
+            "author": "Noble Paul",
+            "content": "think we need a cap on the total size of blockedTasks; otherwise in the face of a cluster level task, you'll read everything in ZK into memory continually and grow blockedTasks without bound.\n\nIt's a tricky situation. It is very cheap to hold a few 1000 tasks in memory (or even 10000s) . While we have limited no:of threads to process. It still makes sense to read newer tasks hoping that they will be able to process without getting blocked. I shall address these issues (as much as possible) and post a fresh patch. ",
+            "id": "comment-15318967"
+        },
+        {
+            "date": "2016-06-07T18:01:54+0000",
+            "author": "Scott Blum",
+            "content": "Yeah 1000 seems totally reasonable.  Beyond that, it seems kind of pointless; if you have 1000 tasks blocked, chances are that subsequent tasks aren't going to be able to run either. ",
+            "id": "comment-15319026"
+        },
+        {
+            "date": "2016-06-07T20:18:59+0000",
+            "author": "Scott Blum",
+            "content": "btw: mind if I land SOLR-9191 first?  I will potentially need to backport that change to a bunch of branches which don't have the LockTree stuff, so it'll be a little cleaner port if I land first. ",
+            "id": "comment-15319289"
+        },
+        {
+            "date": "2016-06-08T01:51:23+0000",
+            "author": "Noble Paul",
+            "content": "Sure Scott. Let's commit that first. Let's make these two a blocker for 6.1.0 release. ",
+            "id": "comment-15319849"
+        },
+        {
+            "date": "2016-06-09T17:50:14+0000",
+            "author": "Noble Paul",
+            "content": "Scott Blum This takes care of your concerns ",
+            "id": "comment-15322973"
+        },
+        {
+            "date": "2016-06-09T19:53:23+0000",
+            "author": "Scott Blum",
+            "content": "Mostly LG.  One completely minor comment:\n\n\n+              if (blockedTasks.size() < MAX_BLOCKED_TASKS) {\n+                blockedTasks.put(head.getId(), head);\n+              }\n\n\n\nMaybe unnecessary?  It doesn't actually matter if blockedTasks.size() gets to 1100 items, the check at the top of the loop will keep it from growing endlessly.  If you drop these tasks on the floor, you'll just end up re-fetching the bytes from ZK later. ",
+            "id": "comment-15323205"
+        },
+        {
+            "date": "2016-06-09T19:54:11+0000",
+            "author": "Scott Blum",
+            "content": "BTW, I landed SOLR-9191 in master and 6x, so you should be good to go on that front. ",
+            "id": "comment-15323207"
+        },
+        {
+            "date": "2016-06-09T21:26:16+0000",
+            "author": "Scott Blum",
+            "content": "I got one test failure patching this into master:\n\nMultiThreadedOCPTest fails reliably:\n\njava.lang.AssertionError\n\tat __randomizedtesting.SeedInfo.seed([7F3C69CF3DAFFDD5:F76856159353902D]:0)\n\tat org.junit.Assert.fail(Assert.java:92)\n\tat org.junit.Assert.assertTrue(Assert.java:43)\n\tat org.junit.Assert.assertTrue(Assert.java:54)\n\tat org.apache.solr.cloud.MultiThreadedOCPTest.testFillWorkQueue(MultiThreadedOCPTest.java:106) ",
+            "id": "comment-15323393"
+        },
+        {
+            "date": "2016-06-09T21:48:29+0000",
+            "author": "Scott Blum",
+            "content": "Actually, I may have a fix.  You need a Thread.sleep() in the final loop or you can burn through 500 iterations on a fast machine.  Here's a patch. ",
+            "id": "comment-15323436"
+        },
+        {
+            "date": "2016-06-09T21:55:56+0000",
+            "author": "Scott Blum",
+            "content": "One other comment:\n\n\n            // We are breaking out if we already have reached the no:of parallel tasks running\n            // By doing so we may end up discarding the old list of blocked tasks . But we have\n            // no means to know if they would still be blocked after some of the items ahead\n            // were cleared.\n            if (runningTasks.size() >= MAX_PARALLEL_TASKS) break;\n\n\n\nIn this case, can't we just shove all the remaining tasks into blockedTasks?  It's a slight redefinition to mean either \"tasks that are blocked because of locks\" or \"tasks blocked because too many are running\". ",
+            "id": "comment-15323447"
+        },
+        {
+            "date": "2016-06-09T22:13:14+0000",
+            "author": "ASF GitHub Bot",
+            "content": "GitHub user dragonsinth opened a pull request:\n\n    https://github.com/apache/lucene-solr/pull/42\n\n    SOLR-8744 blockedTasks\n\n    @noblepaul \n\nYou can merge this pull request into a Git repository by running:\n\n    $ git pull https://github.com/fullstorydev/lucene-solr SOLR-8744\n\nAlternatively you can review and apply these changes as the patch at:\n\n    https://github.com/apache/lucene-solr/pull/42.patch\n\nTo close this pull request, make a commit to your master/trunk branch\nwith (at least) the following in the commit message:\n\n    This closes #42\n\n\ncommit 668d426633fe5551b24ab38036e14c15e7ed4cdf\nAuthor: Scott Blum <dragonsinth@apache.org>\nDate:   2016-06-09T21:28:07Z\n\n    WIP: SOLR-8744 blockedTasks\n\ncommit 4b2512abcc5e55c653c923eba9762988cf1faae8\nAuthor: Scott Blum <dragonsinth@apache.org>\nDate:   2016-06-09T22:11:26Z\n\n    Simplifications\n\n ",
+            "id": "comment-15323476"
+        },
+        {
+            "date": "2016-06-09T22:13:25+0000",
+            "author": "Scott Blum",
+            "content": "See second commit in https://github.com/apache/lucene-solr/pull/42 ",
+            "id": "comment-15323478"
+        },
+        {
+            "date": "2016-06-09T23:23:29+0000",
+            "author": "ASF GitHub Bot",
+            "content": "Github user dragonsinth commented on the issue:\n\n    https://github.com/apache/lucene-solr/pull/42\n\n    FYI: both of these SHAs passed the test suite ",
+            "id": "comment-15323589"
+        },
+        {
+            "date": "2016-06-10T07:17:53+0000",
+            "author": "Noble Paul",
+            "content": "Yes, but I'm not sure if it's worth that optimization ",
+            "id": "comment-15324022"
+        },
+        {
+            "date": "2016-06-10T07:19:24+0000",
+            "author": "Noble Paul",
+            "content": "I will have to beast this test and see if I can reproduce this ",
+            "id": "comment-15324024"
+        },
+        {
+            "date": "2016-06-10T07:21:25+0000",
+            "author": "Noble Paul",
+            "content": "That is true, they may not be necessarily blocked, They are essentially items read from work queue which we don't want to refetch ",
+            "id": "comment-15324026"
+        },
+        {
+            "date": "2016-06-10T09:07:21+0000",
+            "author": "Noble Paul",
+            "content": "incorporated the changes. Beasted the test and no failures ",
+            "id": "comment-15324108"
+        },
+        {
+            "date": "2016-06-10T17:30:20+0000",
+            "author": "Scott Blum",
+            "content": "LG.  I only have one suggestion left, to formulate the \"fetch\" section like this:\n\n\n          ArrayList<QueueEvent> heads = new ArrayList<>(blockedTasks.size() + MAX_PARALLEL_TASKS);\n          heads.addAll(blockedTasks.values());\n\n          // If we have enough items in the blocked tasks already, it makes\n          // no sense to read more items from the work queue. it makes sense\n          // to clear out at least a few items in the queue before we read more items\n          if (heads.size() < MAX_BLOCKED_TASKS) {\n            //instead of reading MAX_PARALLEL_TASKS items always, we should only fetch as much as we can execute\n            int toFetch = Math.min(MAX_BLOCKED_TASKS - heads.size(), MAX_PARALLEL_TASKS - runningTasks.size());\n            List<QueueEvent> newTasks = workQueue.peekTopN(toFetch, excludedTasks, 2000L);\n            log.debug(\"Got {} tasks from work-queue : [{}]\", newTasks.size(), newTasks.toString());\n            heads.addAll(newTasks);\n          } else {\n            Thread.sleep(1000);\n          }\n\n          if (isClosed) break;\n\n          if (heads.isEmpty()) {\n            continue;\n          }\n\n          blockedTasks.clear(); // clear it now; may get refilled below.\n\n\n\nThis prevents two problems:\n\n1) The log.debug message \"Got {} tasks from work-queue\" won't keep reporting blockedTasks as if they were freshly fetched.\n2) When the blockedTask map gets completely full, the Thread.sleep() will prevent a free-spin (the only other real pause in the loop is peekTopN) ",
+            "id": "comment-15324891"
+        },
+        {
+            "date": "2016-06-10T17:30:51+0000",
+            "author": "Scott Blum",
+            "content": "Also, add blockedTasks to printTrackingMaps()? ",
+            "id": "comment-15324896"
+        },
+        {
+            "date": "2016-06-10T17:41:02+0000",
+            "author": "Scott Blum",
+            "content": "Attached a slightly modified patchfile with the changes I suggested.\nOtherwise LGTM ",
+            "id": "comment-15324928"
+        },
+        {
+            "date": "2016-06-10T19:18:05+0000",
+            "author": "Scott Blum",
+            "content": "That said, if you'd feel more comfortable committing your patch as-is, I can toss my tweaks down after. ",
+            "id": "comment-15325119"
+        },
+        {
+            "date": "2016-06-12T07:41:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 232b44e283dfd01f9ec01b4e68b09b3755a1b17a in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=232b44e ]\n\nSOLR-8744:\u00a0Minimize the impact on ZK when there are a lot of blocked tasks ",
+            "id": "comment-15326246"
+        },
+        {
+            "date": "2016-06-12T07:44:08+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ff6475c3a7229a27f7e97057fbbfadd2600032dd in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ff6475c ]\n\nSOLR-8744:\u00a0Minimize the impact on ZK when there are a lot of blocked tasks ",
+            "id": "comment-15326247"
+        },
+        {
+            "date": "2016-06-12T07:45:19+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 4726c5b2d2efa9ba160b608d46a977d0a6b83f94 in lucene-solr's branch refs/heads/branch_6_1 from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4726c5b ]\n\nSOLR-8744:\u00a0Minimize the impact on ZK when there are a lot of blocked tasks ",
+            "id": "comment-15326290"
+        },
+        {
+            "date": "2016-06-13T19:36:44+0000",
+            "author": "ASF GitHub Bot",
+            "content": "Github user dragonsinth closed the pull request at:\n\n    https://github.com/apache/lucene-solr/pull/42 ",
+            "id": "comment-15328028"
+        }
+    ]
+}

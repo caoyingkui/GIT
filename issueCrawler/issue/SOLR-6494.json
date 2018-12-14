@@ -1,0 +1,85 @@
+{
+    "id": "SOLR-6494",
+    "title": "Query filters applied in a wrong order",
+    "details": {
+        "affect_versions": "4.8.1",
+        "status": "Resolved",
+        "fix_versions": [],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Invalid"
+    },
+    "description": "This query:\n\n{\n  fq: [\"type:Award::Nomination\"],\n  sort: \"score desc\",\n  start: 0,\n  rows: 20,\n  q: \"*:*\"\n}\n\n\ntakes just a few milliseconds, but this one:\n\n{\n  fq: [\n    \"type:Award::Nomination\",\n    \"created_at_d:[* TO 2014-09-08T23:59:59Z]\"\n  ],\n  sort: \"score desc\",\n  start: 0,\n  rows: 20,\n  q: \"*:*\"\n}\n\n\ntakes almost 15 seconds.\n\nI have just \u224812k of documents with type \"Award::Nomination\", but around half a billion with created_at_d field set. And it seems Solr applies the created_at_d filter first going through all documents where this field is set, which is not very smart.\n\nI think if it can't do anything better than applying filters in the alphabet order it should apply them in the order they were received.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Erick Erickson",
+            "id": "comment-14127278",
+            "date": "2014-09-09T17:37:35+0000",
+            "content": "First, please raise issues like this on the user's list first to insure that it's really a bug before raising JIRAs.\n\nSecond, I don't think you understand how filter queries work. By design, fq clauses like this are calculated for the entire document set and the results cached, there is no \"ordering\" for that part. Otherwise, how could they be re-used for a different query?\n\nYou can get around this by specifying \"non-cached\" filters, or just pay the price the first time and be able to re-use the cache later, perhaps with warming queries creating the filter (assuming it's a common one) to hide the pain of first-time use.\n\nSee: http://searchhub.org/2012/02/10/advanced-filter-caching-in-solr/ "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14127304",
+            "date": "2014-09-09T18:03:19+0000",
+            "content": "Hi, thank you for the explanation, but I think sometimes (like in this case) it would be much more efficient to run filters one by one. It seems that the cost parameter should do what I need, e.g.:\n\n{!cost=1}type:\"Award::Nomination\"\n{!cost=10}created_at_d:[* TO 2014-09-08T23:59:59Z]\n\n "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14128322",
+            "date": "2014-09-10T10:37:23+0000",
+            "content": "Unfortunately that doesn't solve the problem completely, these queries take \u22487 seconds instead of 15:\n\n{!cache=false}type:\"Award::Nomination\"\n{!cache=false cost=10}created_at_d:[* TO 2014-09-08T23:59:59Z]\n\n\nWhich is still not good since I have only 11 974 docs with type:\"Award::Nomination\" and 139 716 883 with created_at_d:[* TO 2014-09-08T23:59:59Z]. if the cost parameter tells Solr to apply cheapest filters first why the query still takes so long? It seems even though it doesn't run them in parallel filters still don't know of each other and go through all docs. My point is that it would be much faster if it could run filters one by one and if each next filter would work not with the entire data set but with results returned from the previous filter.\n\nAlso tried cost >= 100 to apply a filter as a post filter, but nothing changes, same 7 seconds. Filter cache doesn't help here.\n\nSo this:\n>> By design, fq clauses like this are calculated for the entire document set and the results cached, there is no \"ordering\" for that part.\ndoesn't sound right to me. Sometimes we don't need to reuse filters (and sometimes even can't, e.g. the cost option requires cache=false).\n\nIn the provided use case the way Solr applies filters is more harmful than useful. I'd even say more than 600 times harmful. The query that wouldn't take more than a second in MySQL takes 15 seconds in a search engine that uses rapid SSD RAID 10, has a few shards and replicas, uses more that 160G of memory in total and has \u224840 CPU cores.\n\nThus this sounds like a feature leak (at least). Please share your thoughts on this. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-14129109",
+            "date": "2014-09-10T21:12:34+0000",
+            "content": "Please note the most important part of Erick's comment...\n\nFirst, please raise issues like this on the user's list...\n\nThe user list is the appropriate place to ask questions about how to use features, and about performance issues you might be seeing.  The entire solr user community can help you, instead of the much smaller subset of people who track Jira bug reports. \n\nPlease also note the following useful tips for asking for help...\nhttps://wiki.apache.org/solr/UsingMailingLists\n\nSince you haven't provided any details about your schema, fields, fieldtypes, or even a full example of what your query looks like (beyond just the fq params) it's pretty much impossible to guess why your queries might be slow.\n\n\n\nTo re-iterate: ask questions on the user mailing list, not in the bug tracker. "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14129956",
+            "date": "2014-09-11T12:32:20+0000",
+            "content": "Added the schema and debug output here: http://lucene.472066.n3.nabble.com/Help-with-a-slow-filter-query-td4158159.html "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14131495",
+            "date": "2014-09-12T13:02:23+0000",
+            "content": "So I've added a new field nominated_at_d to all docs with type \"Award::Nomination\". Now this query:\n\n{\n  fq: [\n    \"type:Award::Nomination\",\n    \"nominated_at_d:[* TO 2014-09-08T23:59:59Z]\"\n  ],\n  sort: \"score desc\",\n  start: 0,\n  rows: 20,\n  q: \"*:*\"\n}\n\n\ndoesn't take longer than a few milliseconds.\n\nThe new nominated_at_d is the same field as created_at_d, the only difference is that there are only \u2248 12k of documents with nominated_at_d field and \u2248 100m with created_at_d.\n\nSo again, I am saying that current way Solr applies filters is not optimal, sometimes we need to skip cache and apply filters incrementally. So each filter doesn't have to go through entire collection, so we can filter this way:\n\n200m docs \u2192 filter (type:Award::Nomination) \u2192 12k docs \u2192 filter (created_at_d:[* TO 2014-09-08T23:59:59Z]) \u2192 500 docs\n\n\n\nI don't think the entire solr user community can do anything with this, but a few solr developers could. Do I have to be an solr expert to report bugs/feature leaks? "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14259150",
+            "date": "2014-12-26T17:19:42+0000",
+            "content": "Just an idea, but what if Solr detecting that the filter does use date rages like [* TO 2014-09-08T23:59:59Z] (or probably any ranges where cache is not very efficient), and if there are other simpler filters in the query, will apply such range filters at last? And probably to already fetched results as a post filter? And probably avoid caching for this filter? That sounds like a good optimization to me. This will avoid losing of more useful filters from the cache, increase warming speed and which is the most important \u2014 increase the search speed.\n\nLike in the case above, if you have 200m of docs, but only 12k with type:AwardNomination, and query has 2 filters where one with a date range. Solr definitely can detect this and do the right thing instead of simply looping through all 200m documents with this cache-inefficient filter. Could this be at least considered as a wish and reopened?\n\nErick Erickson Hoss Man\n\nBest,\nAlex "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-14259222",
+            "date": "2014-12-26T21:30:57+0000",
+            "content": "I'd heed Erick and Hoss and bring this up on the user list in the form of \"how can I speed up my particular request?\"\nIf you want to understand more of the internals yourself, and why some of your previous attempts haven't worked, I'd recommend starting with the ConstantScoreQuery class. "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14259627",
+            "date": "2014-12-28T12:48:10+0000",
+            "content": "As I was told already, Solr does not apply filters incrementally, instead each filter runs through the entire data set, then Solr caches the results. In the case with filters that contain ranges cache is not effective, especially when we need NRT search and commits being triggered multiple times per minute. Then big caches make no sense and big autowarming numbers causing Solr to fail. My point is that cache is not always efficient and for such cases Solr need to use another strategy and apply filters incrementally (read as post filters).\n\nSo this:\n\nBy design, fq clauses like this are calculated for the entire document set and the results cached, there is no \"ordering\" for that part. Otherwise, how could they be re-used for a different query?\ndoes not work in all cases.\n\nSomething like this:\n\n# cost > 100 to run as a post filter, but something like post=true would be better I think\nfq={!cache=false cost=101}field:value\n\n\nwould definitely solve the problem, but this is not supported.\n\nThe frange parser has support for this, but it is not always suitable and fails with different errors, like \"can not use FieldCache on multivalued field: type\", etc.\n\nDoes that look like a missing feature? I mean for me it definitely does, but could this be considered as a wish and implemented some day? How can Solr community help with missing features? "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-14262963",
+            "date": "2015-01-02T15:48:21+0000",
+            "content": "what if Solr detecting that the filter does use date rages like [* TO 2014-09-08T23:59:59Z] (or probably any ranges where cache is not very efficient)\n\nI don't understand why a date range would not be very efficient on the cache.  If the values in the range are static, it is just like any other filter query.\n\nThe only time a date range affects cache usage is if that date range uses an unaltered \"NOW\" keyword.  NOW changes with every millisecond that passes, so multiple queries using that keyword will be different, which makes the cache useless.  If NOW is rounded (NOW/HOUR, NOW/DAY, etc), then the value will not change from query to query, and the cache will be useful.\n\nThere is a capability called postfilter, which lets you declare a filter's cost as high enough that it will be executed AFTER everything else, but I don't think the standard query parser supports that functionality.  I would love to be proven wrong about that assumption.\n\nhttp://heliosearch.org/advanced-filter-caching-in-solr/ "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14262969",
+            "date": "2015-01-02T16:02:35+0000",
+            "content": "Correct, and that's exactly my case, because the time is entered by users and differ between queries. I'd love to have something like this working with the standard query parser:\n\nfq={!cache=false cost=101}field:value\n\n\nIt seems that `cache=false` does actually work, but `cost` doesn't (some parsers, like the frange one, do threat and apply all queries with the `cost` higher than 100 as post filters). "
+        }
+    ]
+}

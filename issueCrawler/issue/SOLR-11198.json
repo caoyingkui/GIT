@@ -1,0 +1,127 @@
+{
+    "id": "SOLR-11198",
+    "title": "downconfig downloads empty file as folder",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [
+            "6.7",
+            "7.1",
+            "master (8.0)"
+        ],
+        "affect_versions": "6.6",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "With Solr 6.6.0, when downloading a config from Zookeeper (3.4.10), if a file is empty, it is downloaded as a folder (on Windows, at least).\n\nA Zookeeper browser (Eclipse: Zookeeper Explorer) shows the file as a file, however, in ZK.\n\nNoticed because we keep an empty synonyms.txt file in the Solr config provided with our product, in case a client would want to use it.\n\nThe workaround is simple, since the file allows comments: just add a comment, so it is not empty.",
+    "attachments": {
+        "SOLR-11198.patch": "https://issues.apache.org/jira/secure/attachment/12880549/SOLR-11198.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-08-04T20:58:32+0000",
+            "content": "We need a bit more info on how you are downloading the config - the command you are using - to be sure there isn't an error somewhere in there. I tried it on my machine (Mac), and it worked fine, so we want to be clear how you are using it so we can reproduce.\n\nHere's the command I used: ./bin/solr zk cp zk:/configs/gettingstarted/stopwords.txt file:/Desktop -z localhost:9983 (When I did this, I modified the default stopwords.txt so it is empty). ",
+            "author": "Cassandra Targett",
+            "id": "comment-16114961"
+        },
+        {
+            "date": "2017-08-04T22:06:01+0000",
+            "content": "My command (on Windows)\n\n> java -cp \"C:\\Path\\to\\lib*\" org.apache.solr.cloud.ZkCLI -cmd downconfig -zkhost localhost:2181/ot/solr -confname otif_en -confdir \"C:\\Path\\to\\output\\otif_en\"\n\nNote that I cannot reproduce the issue using Zookeeper 3.4.6 and Solr 5.4.1, with exactly the same command.\nWe just upgraded to Zookeeper 3.4.10 and Solr 6.6.0\n\nI'll try  Zookeeper 3.4.6 with Solr 6.6.0, and Zookeeper 3.4.10 with Solr 5.4.1, if it can help narrow things down.\n\n****\nUpdate : \nNo matter what version of Zookeeper, -cmd downconfig :\n\n\tSolr 6.6.0 outputs the empty synonyms.txt file as a folder.\n\tSolr 5.4.1 outputs the empty synonyms.txt file as a file.\n\n ",
+            "author": "Isabelle Giguere",
+            "id": "comment-16115023"
+        },
+        {
+            "date": "2017-08-05T17:39:30+0000",
+            "content": "WHOA! I got all confused between Isabelle's original comment and Cassandra's, Isabelle uses ZkCLI and Cassandra uses bin/solr.\n\nI think the problem may be common to both, but my comments below are about the bin/solr version.\n\nI think I see the problem and that this particular issue should be fixed, i.e. empty znodes with no children should be files locally rather than directories.\n\nI don't think I want to try anything fancier. If a user copies down from ZK and the ZK state changes (i.e. a node with data gets children etc.) then erroring out and recommending that they use a clean local directory seems reasonable.\n\nThe rest of this is details you can read through if you want to or wonder what the heck the second point means.\n\nI think the problem is in ZkMaintenanceUtils.downloadFromZk. This code\n\n   if (children.size() == 0) {\n        // If we didn't copy data down, then we also didn't create the file. But we still need a marker on the local\n        // disk so create a dir.\n        if (copyDataDown(zkClient, zkPath, file.toFile()) == 0) {\n          Files.createDirectories(file);\n        }\n\n\n\ncopyDataDown returns, well, zero if there's no data in the znode. I changed this code a while back because recursive copy wasn't working correctly (SOLR-10108) and I suspect it was introduced then. And it went in Solr 6.6 so it fits Isabelle's testing, including the bit about putting a comment in the stopwords.txt makes it a file rather than a directory..\n\nzNodes can have both data and children. The logic says, in effect, \"if the znode has no data and no children it'll be mapped into an empty directory\". There's logic in there that if a znode has both data and children, it's made into a directory with a special file containing its data (zknode.data).\n\nThe simple fix would be just to decide the other way, i.e. a znode with no data and no children would become an empty file locally rather than a directory. That actually seems OK since I don't think ZK cares. \n\nThe more I think about this the more I think the correct behavior is the easy fix above. ZK doesn't care; a znode can have data added and children added at will so if we make the local node an empty text file it'd be copied back up as a znode just like any other, albeit one without data or children, but that's OK as far as ZK is concerned. That doesn't preclude someone adding children to the ZK node after pushing it back up via another mechanism.\n\nThere'll still be an edge case where \n\n\tsomeone copies an empty znode from ZK and it becomes a file\n\tthe ZK node gets children\n\tthe person tries the copy again from ZK to local\n\n\n\nSince the copy down now already has a text file for that znode and then tries to make a directory there it'll probably error out. At least it better. I think we can live with that, it would be a good thing to add a test though.\n\nI'm torn about whether to try to \"do the right thing\" in the case above. First, it appears to much of an edge case. One could write something like:\nif (the local file is zero length) {\n  remove the file\n  create a directory in it's place\n}\n\nWhich seems relatively safe. Except.... that doesn't handle the case where \n\n\ta znode exists with data\n\tdownconfig copies it locally as a text file\n\tthe znode gets children through some other mechanism\n\tdownconfig is run again\n\n\n\nIn that case \"the right thing\" would be to move the data to the zknode.data and make the local node into a directory and continue. Probably could do this \"en passant\" by just deleting the text file and continuing, the directory would be add it in its place and children would be added. Deleting data on the local disk makes me nervous though.\n\nI'll assign it to myself, if anyone else wants to take it feel free. ",
+            "author": "Erick Erickson",
+            "id": "comment-16115470"
+        },
+        {
+            "date": "2017-08-06T05:51:08+0000",
+            "content": "OK, false alarm. bin/solr, zkcli and ZkCLI all look like they go through ZkMaintenanceUtils so the same fix should work for them all.\n\nThe fix isn't even a one-liner in ZkMaintnanceUtils, there was a lot more work in the tests. Not unusual.\n\nAnyway, I tested with bin/solr, zkcli.sh and ZkCLI (mac) but I can't test it on Windows. Isabelle, if you're feeling brave could you download the patch, compile and give it a whirl and let me know?\n\nBTW, the start scripts may be easier to use, try \"bin/solr.cmd zk -help\". The upconfig/downconfig are modeled closely on the ZkCLI, but don't require all the classpath etc. \n\nI have yet to precommit and run all the tests, but certainly all the tests in SolrCLIZkUtilsTest run successfully. ",
+            "author": "Erick Erickson",
+            "id": "comment-16115653"
+        },
+        {
+            "date": "2017-08-06T16:48:45+0000",
+            "content": "Commit 522367cc4db3b23ddd728b407f2d10326bb9c858 in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=522367c ]\n\nSOLR-11198: downconfig downloads empty file as folder ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16115850"
+        },
+        {
+            "date": "2017-08-06T16:59:49+0000",
+            "content": "Commit 002b008c83f79e01ddd22d53f99c33976f966366 in lucene-solr's branch refs/heads/branch_7x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=002b008 ]\n\nSOLR-11198: downconfig downloads empty file as folder\n\n(cherry picked from commit 522367c) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16115852"
+        },
+        {
+            "date": "2017-08-06T17:52:01+0000",
+            "content": "Commit c0ee11f0a90b60a0db82132fa9c495a859438386 in lucene-solr's branch refs/heads/branch_6x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c0ee11f ]\n\nSOLR-11198: downconfig downloads empty file as folder ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16115875"
+        },
+        {
+            "date": "2017-08-06T17:53:32+0000",
+            "content": "Final patch with CHANGES.txt ",
+            "author": "Erick Erickson",
+            "id": "comment-16115877"
+        },
+        {
+            "date": "2017-08-07T01:13:51+0000",
+            "content": "Tests failing on Jenkins etc. Preliminarily it looks like a capitalization issue. ",
+            "author": "Erick Erickson",
+            "id": "comment-16115989"
+        },
+        {
+            "date": "2017-08-07T01:22:00+0000",
+            "content": "Commit e053e2298fb2a6c67e3ccc244413b98648c249cb in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e053e22 ]\n\nSOLR-11198: downconfig downloads empty file as folder, test failures possible fix and logging ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16115992"
+        },
+        {
+            "date": "2017-08-07T01:28:15+0000",
+            "content": "Commit a3c360eddfee65d9eae70106ac941bcf6b946852 in lucene-solr's branch refs/heads/branch_7x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a3c360e ]\n\nSOLR-11198: downconfig downloads empty file as folder, test failures possible fix and logging\n\n(cherry picked from commit e053e22) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16115994"
+        },
+        {
+            "date": "2017-08-07T16:57:48+0000",
+            "content": "Commit 53db72c5985fd6d0027b6888683973ae764c2f85 in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=53db72c ]\n\nSOLR-11198: fix test failures ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16116856"
+        },
+        {
+            "date": "2017-08-07T17:18:54+0000",
+            "content": "Commit 20a963cd7185d22a13a3801b8c06a9498cf39b1c in lucene-solr's branch refs/heads/branch_7x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=20a963c ]\n\nSOLR-11198: fix test failures\n\n(cherry picked from commit 53db72c) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16116888"
+        },
+        {
+            "date": "2017-08-07T18:30:33+0000",
+            "content": "Commit 2c281457dce8b4a09f5b3c101c92b03d28e3d994 in lucene-solr's branch refs/heads/branch_6x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2c28145 ]\n\nSOLR-11198: downconfig downloads empty file as folder, test failures possible fix and logging\n\n(cherry picked from commit e053e22)\n\n(cherry picked from commit a3c360e) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16116999"
+        },
+        {
+            "date": "2017-08-07T18:30:35+0000",
+            "content": "Commit 83e3276225691c2c710e5fc89df1a1605a2b4112 in lucene-solr's branch refs/heads/branch_6x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=83e3276 ]\n\nSOLR-11198: fix test failures\n\n(cherry picked from commit 53db72c) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16117000"
+        },
+        {
+            "date": "2017-08-18T20:52:05+0000",
+            "content": "Compiled and tested on Windows to confirm the patch works (obviously, if you look at it  ) ",
+            "author": "Isabelle Giguere",
+            "id": "comment-16133608"
+        },
+        {
+            "date": "2017-10-17T11:03:37+0000",
+            "content": "Bulk close after 7.1.0 release ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16207340"
+        }
+    ]
+}

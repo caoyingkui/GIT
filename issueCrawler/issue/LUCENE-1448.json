@@ -1,0 +1,206 @@
+{
+    "id": "LUCENE-1448",
+    "title": "add getFinalOffset() to TokenStream",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "modules/analysis"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "2.9"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "If you add multiple Fieldable instances for the same field name to a document, and you then index those fields with TermVectors storing offsets, it's very likely the offsets for all but the first field instance will be wrong.\n\nThis is because IndexWriter under the hood adds a cumulative base to the offsets of each field instance, where that base is 1 + the endOffset of the last token it saw when analyzing that field.\n\nBut this logic is overly simplistic.  For example, if the WhitespaceAnalyzer is being used, and the text being analyzed ended in 3 whitespace characters, then that information is lost and then next field's offsets are then all 3 too small.  Similarly, if a StopFilter appears in the chain, and the last N tokens were stop words, then the base will be 1 + the endOffset of the last non-stopword token.\n\nTo fix this, I'd like to add a new getFinalOffset() to TokenStream.  I'm thinking by default it returns -1, which means \"I don't know so you figure it out\", meaning we fallback to the faulty logic we have today.\n\nThis has come up several times on the user's list.",
+    "attachments": {
+        "LUCENE-1448.patch": "https://issues.apache.org/jira/secure/attachment/12393694/LUCENE-1448.patch",
+        "lucene-1448.patch": "https://issues.apache.org/jira/secure/attachment/12414484/lucene-1448.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2008-11-11T09:52:17+0000",
+            "content": "First cut patch.  It's not ready, though.\n\nFirst: this patch only addresses the final offset, but shouldn't we also address the final position?  Eg if StopFilter removes the last few tokens, shouldn't we make it possible to report those skipped positonIncrements?  Note that Analyzer does provide a getPositionIncrementGap(String fieldName), which could be used as a workaround if we don't do this.  This does seem less important so I'd be OK with doing nothing about positions for now, but I'd like to hear other's takes.\n\nSecond: I can't figure out how to ask StandardTokenizerImpl for the number of chars it pulled from the Reader.  Can someone (who understands JFlex well) help out here?\n\nThird: I haven't done all Tokenizers; eg, SinkTokenizer will need a new ctor so that it's told the final offset.  And I'd like to fix all contrib tokenizers too.\n\nFourth: I'm nervous about an off-by-one error here.  Here's the diff for DocInverterPerField:\n\n\n@@ -161,7 +161,13 @@\n                 break;\n               }\n             }\n-            fieldState.offset = offsetEnd+1;\n+\n+            final int finalOffset = stream.getFinalOffset();\n+            if (finalOffset == -1)\n+              fieldState.offset = offsetEnd+1;\n+            else\n+              fieldState.offset += finalOffset;\n+\n           } finally {\n             stream.close();\n           }\n\n\n\nWhat makes me nervous is: our current logic is to set the base for future instances of the same field to the last endOffset, plus 1.  Why do we have that plus 1?  Logically, I think it should be as if you had simply concatenated the strings together, which would not add an extra +1?  So, I'm not adding +1 in the getFinalOffset()'s that I've added, but I'm hoping someone can explain why we are adding +1 currently.\n\nNote that endOffset is normally \"exclusive\" while startOffset is \"inclusive\".  Ie if a String starts with \"abcd \" then WhitespaceTokenizer would report a startOffset of 0 and endOffset of 4 for that first token. ",
+            "author": "Michael McCandless",
+            "id": "comment-12646515"
+        },
+        {
+            "date": "2008-11-11T14:14:17+0000",
+            "content": "You need that +1 or you will have the subsequent token starting on the tail of the 'stopword'.\n\nWhat I can't figure it out is how exactly these offsets are supposed to match up...abcd has offsets of s:0 e:4, which seems to imply it thinks abcd is 5 chars or the end is one greater than the end index (like with spans). In either case, it seems even if you put back the +1, the endoffsets are off somehow, because some will have an end of +1 the end index, while secondary multi-fields will have an end equal to the end index.\n\nWould be cool to have fixed as this also stymies highlighting with multi-fields.\n\nedit\n\nI see. You need that +1 you took out and you need fields after the first to have +1 more for an end offset. Looks they are supposed to be end index +1.\n\nedit2\n\nNm  I am a bad counter. I think you only need the +1 back. ",
+            "author": "Mark Miller",
+            "id": "comment-12646549"
+        },
+        {
+            "date": "2008-11-11T14:55:20+0000",
+            "content": "Second: I can't figure out how to ask StandardTokenizerImpl for the number of chars it pulled from the Reader. Can someone (who understands JFlex well) help out here?\n\nWhats wrong with?\n\n<code>\n\n  public int getFinalOffset() \n{\n    return scanner.yychar() + scanner.yylength();\n  }\n\n</code> ",
+            "author": "Mark Miller",
+            "id": "comment-12646563"
+        },
+        {
+            "date": "2008-11-11T15:45:45+0000",
+            "content": "Your tests had an off by error.\n\nI corrected them and added the standardanalyzer piece so that both tests pass. (i didnt correctly put the SA piece in the jflex file) ",
+            "author": "Mark Miller",
+            "id": "comment-12646574"
+        },
+        {
+            "date": "2008-11-11T19:43:39+0000",
+            "content": "Attached new patch (changes described below):\n\nYou need that +1 or you will have the subsequent token starting on the tail of the 'stopword'. \n\nSo logically it's like we silently & forcefully insert a space between\nthe Fieldable instances?\n\nMaybe we should add Analyzer.getOffsetGap(String fieldName), which by\ndefault would return 1, and we then add that into the offset for\nsubsequent field instances?\n\nBut then here's another challenge: for NOT_ANALYZED fields we don't\nadd this extra +1.  We just add the string length.  Hmm.\n\nOK I added Analyzer.getOffsetGap(Fieldable), and defaulted it to\nreturn 1 for analyzed fields and 0 for unanalyzed fields.\n\nWhat's wrong with public int getFinalOffset() { return scanner.yychar() + scanner.yylength(); }\n\nDoes that handle spaces at the end of the text?  (Oh it seems like it\ndoes...I added a test case...hmm).\n\ni didnt correctly put the SA piece in the jflex file\n\nI think this change (adding getFinalOffset to StandardTokenizer)\ndoesn't need a change to jflex?  (It's only if you edit\nStandardTokenizerImpl.java).\n\nHmm another complexity is handling a field instance that produced no\ntokens.  Currently, we do not increment the cumulative offset by +1 in\nsuch cases.  But, for position increment gap we always add this gap in\nbetween fields if any field from the past have produced a token.  I\nadded a couple test cases for this.\n\nAlso, I fixed a bug in how CharTokenizer was computing its final\noffset.\n\nStill todo:\n\n\tadd test cases to cover NOT_ANALYZED fields\n\tfix contrib tokenizers to implement getFinalOffset\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12646646"
+        },
+        {
+            "date": "2008-11-14T11:36:42+0000",
+            "content": "OK I added test coverage for NOT_ANAlYZED fields, and fixed contrib TokenStreams to implement getFinalOffset.\n\nAll tests, and back-compat tests, pass.\n\nI think it's ready to commit... I'll wait a day or two.\n\n(Michael: sorry, I think this will cause some conflicts with the new TokenStream API changes...). ",
+            "author": "Michael McCandless",
+            "id": "comment-12647590"
+        },
+        {
+            "date": "2008-11-17T04:43:47+0000",
+            "content": "\nFirst: this patch only addresses the final offset, but shouldn't we also address the final position? Eg if StopFilter removes the last few tokens, shouldn't we make it possible to report those skipped positonIncrements?\n\nHmm now that we have getPositionIncrementGap() and getOffsetGap(), I think it would make sense to also add getFinalPositionIncrement()?\n\n\nTo fix this, I'd like to add a new getFinalOffset() to TokenStream.\n\nCould we add this as Attributes using the new API? FinalOffsetAttribute and FinalPositionIncrementAttribute? ",
+            "author": "Michael Busch",
+            "id": "comment-12648080"
+        },
+        {
+            "date": "2008-11-17T10:20:29+0000",
+            "content": "Hmm now that we have getPositionIncrementGap() and getOffsetGap(), I think it would make sense to also add getFinalPositionIncrement()?\n\nWe could do that.  But how would you implement it?  EG StopFilter skips tokens, and (if enabled) already tracks the skippedPositions, so it could return that PLUS whatever its input reports as its getFinalPositionIncrement, I guess?\n\nCould we add this as Attributes using the new API? FinalOffsetAttribute and FinalPositionIncrementAttribute?\n\nHmm we could do that... but it seems awkward to add new attributes that apply only to ending state of the tokenizer.\n\nI wonder if instead, w/ the new API, we could simply allow querying of certain attributes (offset, posincr) after incrementToken returns \"false\"?\n\nWhy don't you commit the new TokenStream API first, and we can iterate on this issue & commit 2nd? ",
+            "author": "Michael McCandless",
+            "id": "comment-12648122"
+        },
+        {
+            "date": "2008-11-17T19:53:59+0000",
+            "content": "\nHmm we could do that... but it seems awkward to add new attributes that apply only to ending state of the tokenizer.\n\nYeah. Also you wouldn't want to pay overhead in TokenFilters that can buffer tokens to serialize or clone those attributes for every token.\n\n\nI wonder if instead, w/ the new API, we could simply allow querying of certain attributes (offset, posincr) after incrementToken returns \"false\"?\n\nYeah, maybe we can make the AttributeSource more sophisticated, so that it can distinguish between per-field (instance) and per-token attributes. But as a separate patch, not as part of LUCENE-1422.\n\n\nWhy don't you commit the new TokenStream API first, and we can iterate on this issue & commit 2nd?\n\nOK, will do. I think 1422 is ready now. ",
+            "author": "Michael Busch",
+            "id": "comment-12648290"
+        },
+        {
+            "date": "2008-12-01T13:41:17+0000",
+            "content": "I'm torn on how to add getFinalOffset()/getFinalPositionIncrement().\n\nOne option is to add a set/getFinalOffset to OffsetAttribute.  The\ndownside here is it's another int added to that class, that gets\ncopied for caching streams yet is only used at the very end.\n\nAnother option is to \"define\" the API such that when incrementToken()\nreturns false, then it has actually advanced to an \"end-of-stream\ntoken\".  OffsetAttribute.getEndOffset() should return the final\noffset.  Since we have not released the new API, we could simply make\nthis change (and fix all instances in the core/contrib that use the\nnew API accordingly).  I think I like this option best.\n\nYet another option is to open up \"per stream\" attrs rather than \"per\ntoken attrs\".  This seems like alot of added complexity.  Are there\nother things, besides these two, that would be an example of a \"per\nstream\" attr? ",
+            "author": "Michael McCandless",
+            "id": "comment-12651999"
+        },
+        {
+            "date": "2008-12-03T23:54:53+0000",
+            "content": "Another option is to \"define\" the API such that when incrementToken()\nreturns false, then it has actually advanced to an \"end-of-stream\ntoken\". OffsetAttribute.getEndOffset() should return the final\noffset. Since we have not released the new API, we could simply make\nthis change (and fix all instances in the core/contrib that use the\nnew API accordingly). I think I like this option best.\n\n+1. I like this. ",
+            "author": "Mark Miller",
+            "id": "comment-12653065"
+        },
+        {
+            "date": "2008-12-04T00:15:54+0000",
+            "content": "OK, me too.  I'll move forward with that approach. ",
+            "author": "Michael McCandless",
+            "id": "comment-12653079"
+        },
+        {
+            "date": "2008-12-04T22:12:37+0000",
+            "content": "\nAnother option is to \"define\" the API such that when incrementToken()\nreturns false, then it has actually advanced to an \"end-of-stream\ntoken\". OffsetAttribute.getEndOffset() should return the final\noffset. Since we have not released the new API, we could simply make\nthis change (and fix all instances in the core/contrib that use the\nnew API accordingly). I think I like this option best.\n\nThis adds some \"cleaning up\" responsibilities to all existing\nTokenFilters out there. So far it is very straightforward to change an\nexisting TokenFilter to use the new API. You simply have to:\n\n\tadd  attributes the filter needs in its constructor\n\tchange next() to incrementToken() and change return calls that\nreturn null to false, others to true (or what input returns)\n\tdon't access a token but the appropriate attributes to set the data\n\n\n\nBut maybe there's a custom filter in the end of the chain that returns\nmore tokens even after its input returned the last one. For example a\nSynonymExpansionFilter might return a synonym for the last word it\nreceived from its input before it returns false. In this case it might\noverwrite endOffset that another filter/stream already set to the\nfinal endOffset. It needs to cache that value and set it when it\nreturns false.\n\nALso all filters that currently use an offset need to know now to\nclean up before returning false.\n\nI'm not saying this is necessarily bad. I also find this approach\ntempting, because it's simple. But it might be a common pitfall for\nbugs?\n\nWhat I'd like to work on soon is an efficient way to buffer attributes\n(maybe add methods to attribute that write into a bytebuffer). Then\nattributes can implement what variables need to be serialized and\nwhich ones don't. In that case we could add a finalOffset to\nOffsetAttribute that does not get serialiezd/deserialized.\n\nAnd possibly it might be worthwhile to have explicit states defined in\na TokenStream that we can enforce with three methods: start(),\nincrement(), end(). Then people would now if they have to do something\nat the end of a stream they have to do it in end(). ",
+            "author": "Michael Busch",
+            "id": "comment-12653513"
+        },
+        {
+            "date": "2008-12-05T19:03:01+0000",
+            "content": "\nWhat I'd like to work on soon is an efficient way to buffer attributes\n(maybe add methods to attribute that write into a bytebuffer). Then\nattributes can implement what variables need to be serialized and\nwhich ones don't. In that case we could add a finalOffset to\nOffsetAttribute that does not get serialiezd/deserialized.\n\nI like that (it'd make streams like CachingTokenFilter much more\nefficient).  It'd also presumably lead to more efficiently serialized\ntoken streams.\n\nBut: you'd still need a way in this model to serialize finalOffset, once,\nat the end?\n\n\nAnd possibly it might be worthwhile to have explicit states defined in\na TokenStream that we can enforce with three methods: start(),\nincrement(), end(). Then people would now if they have to do something\nat the end of a stream they have to do it in end().\n\nThis also seems good.  So end() would be the obvious place to set\nthe OffsetAttribute.finalOffset, PositionIncrementAttribute.positionIncrementGap, etc.\n\nOK I'm gonna assign this one to you, Michael  ",
+            "author": "Michael McCandless",
+            "id": "comment-12653893"
+        },
+        {
+            "date": "2008-12-06T09:51:15+0000",
+            "content": "\nBut: you'd still need a way in this model to serialize finalOffset, once,\nat the end?\n\nMaybe we can introduce an abstract EndOfStreamAttribute and \nFinalOffsetAttribute and FinalPosIncrAttribute that extend EOSA.\n\nThen in a stream like CachingTokenFilter a AttributeAcceptor can\nbe used that doesn't accept attributes of type EOSA in increment().\n\nIn end() it would use an AttributeAcceptor that accepts EOSA atts\nand cache those.\n\n\nOK I'm gonna assign this one to you, Michael \n\nBummer! Why did I say anything?  j/k ",
+            "author": "Michael Busch",
+            "id": "comment-12654044"
+        },
+        {
+            "date": "2008-12-31T12:17:28+0000",
+            "content": "See also LUCENE-579 which looks like a dup of this one.\n\nMichael what's the game plan on this issue?  I think your EOSA approach makes sense... ",
+            "author": "Michael McCandless",
+            "id": "comment-12660074"
+        },
+        {
+            "date": "2008-12-31T19:11:35+0000",
+            "content": "I'm currently on vacation visiting my family in Germany till the 11th. I'm planning to work on this as soon as I'm back to get all the TokenStream changes (also LUCENE-1460) ready before 2.9. ",
+            "author": "Michael Busch",
+            "id": "comment-12660128"
+        },
+        {
+            "date": "2009-06-10T20:09:40+0000",
+            "content": "Michael are you going to get to this soonish?  Else let's push until after 3.0? ",
+            "author": "Michael McCandless",
+            "id": "comment-12718176"
+        },
+        {
+            "date": "2009-06-24T14:59:02+0000",
+            "content": "Will you have time for this Michael?\n\nIt would be great to have this bug fixed for 2.9, but if we have to push to 3.0 its not the end of the word. Wasnt it done till that darn new Token API came along?  ",
+            "author": "Mark Miller",
+            "id": "comment-12723591"
+        },
+        {
+            "date": "2009-06-24T21:58:05+0000",
+            "content": "Oh man, what did I do suggesting you as the RM?Unable to render embedded object: File (? Now there's another guy chasing me) not found. \n\nCurrently I have to sacrifice some of my already very limited sleep for everything I do on Lucene. After next week I'll have more time. When everything else for 2.9 is done, then I don't think this should block it. Otherwise, I'll try to do it for 2.9. ",
+            "author": "Michael Busch",
+            "id": "comment-12723764"
+        },
+        {
+            "date": "2009-07-22T07:17:49+0000",
+            "content": "OK I think I have this basically working with old and new API (including 1693 changes).\n\nThe approach I took is fairly simple, it doesn't require adding a new Attribute. I added the following method to TokenSteam:\n\n\n  /**\n   * This method is called by the consumer after the last token has been consumed, \n   * i.e. after {@link #incrementToken()} returned <code>false</code> (using the new TokenStream API)\n   * or after {@link #next(Token)} or {@link #next()} returned <code>null</code> (old TokenStream API).\n   * <p/>\n   * This method can be used to perform any end-of-stream operations, such as setting the final\n   * offset of a stream. The final offset of a stream might differ from the offset of the last token\n   * e.g. in case one or more whitespaces followed after the last token, but a {@link WhitespaceTokenizer}\n   * was used.\n   * <p/>\n   * \n   * @throws IOException\n   */\n  public void end() throws IOException {\n    // do nothing by default\n  }\n\n\n\nThen I took Mike's patch and implemented end() in all classes where his patch added getFinalOffset(). \nE.g. in CharTokenizer the implementations looks like this:\n\n\n  public void end() {\n    // set final offset\n    int finalOffset = input.correctOffset(offset);\n    offsetAtt.setOffset(finalOffset, finalOffset);\n  }\n\n\n\nI changed DocInverterPerField to call end() after the stream is fully consumed and use what \noffsetAttribute.endOffset() returns as final offset.\n\nI also added all new tests from Mike's latest patch. \nAll unit tests, including the new ones, pass. Also test-tag.\n\nI'm not posting a patch yet, because this depends on 1693.\n\nMike, Uwe, others: could you please review if this approach makes sense? ",
+            "author": "Michael Busch",
+            "id": "comment-12734022"
+        },
+        {
+            "date": "2009-07-22T07:21:57+0000",
+            "content": "Hmm one thing I haven't done yet is changing Tee/Sink and CachingTokenFilter.\n\nBut it should be simple: CachingTokenFilter.end() should call input.end() when \nit is called for the first time and store the captured state locally as finalState. \nThen whenever CachingTokenFilter.end() is called again, it just restores the\nfinalState.\n\nFor Tee/Sink it should work similarly: The tee just puts a finalState into the\nsink(s) the first time end() is called. And when end() of a sink is called it \nrestores the finalState.\n\nThis should work? ",
+            "author": "Michael Busch",
+            "id": "comment-12734023"
+        },
+        {
+            "date": "2009-07-22T07:31:06+0000",
+            "content": "Hmm another reason why I don't like two Tees feeding one Sink:\n\nWhat is the finalOffset and finalState then? ",
+            "author": "Michael Busch",
+            "id": "comment-12734025"
+        },
+        {
+            "date": "2009-07-22T10:23:14+0000",
+            "content": "This is not the only problem with multiple Tees: The offsets are also completely mixed together, especially if the two tees feed into the sink at the same time (not after each other). In my opinion, the last call to end should be cached by the sink as end state (so if two tees add a end state to the sink, the second one overwrites the first one). ",
+            "author": "Uwe Schindler",
+            "id": "comment-12734063"
+        },
+        {
+            "date": "2009-07-22T19:51:28+0000",
+            "content": "This approach (adding end()) sounds good! ",
+            "author": "Michael McCandless",
+            "id": "comment-12734280"
+        },
+        {
+            "date": "2009-07-22T20:17:44+0000",
+            "content": "Cool, I will take this approach and submit a patch as soon as LUCENE-1693 is committed. ",
+            "author": "Michael Busch",
+            "id": "comment-12734292"
+        },
+        {
+            "date": "2009-07-25T00:06:18+0000",
+            "content": "I changed Mike's last patch so that it uses the new end() approach that I explained above.\n\nIt also applies cleanly on current trunk (now that LUCENE-1693 is committed).\n\nI also made the changes to CachingTokenFilter and TeeSinkTokenFilter that I mentioned above and added two more testcases to TestIndexWriter.\n\nAll tests pass. ",
+            "author": "Michael Busch",
+            "id": "comment-12735212"
+        },
+        {
+            "date": "2009-07-25T00:07:15+0000",
+            "content": "Note that my latest patch only contains fixes for the core TokenStreams.\n\nI'll open a separate issue to implement end() for the contrib TokenStreams, which we can commit after LUCENE-1460 is resolved. ",
+            "author": "Michael Busch",
+            "id": "comment-12735213"
+        },
+        {
+            "date": "2009-07-25T03:50:18+0000",
+            "content": "\n\tupdated to trunk\n\tmade end() final in all implementing TokenStreams\n\n\n\nI'm planning to commit this soon. ",
+            "author": "Michael Busch",
+            "id": "comment-12735240"
+        },
+        {
+            "date": "2009-07-25T04:13:06+0000",
+            "content": "Committed revision 797715.\n\nThanks Mike & Mark for the original patch! ",
+            "author": "Michael Busch",
+            "id": "comment-12735241"
+        }
+    ]
+}

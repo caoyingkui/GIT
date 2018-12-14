@@ -1,0 +1,213 @@
+{
+    "id": "SOLR-6235",
+    "title": "SyncSliceTest fails on jenkins with no live servers available error",
+    "details": {
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.10",
+            "6.0"
+        ],
+        "components": [
+            "SolrCloud",
+            "Tests"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "1 tests failed.\nFAILED:  org.apache.solr.cloud.SyncSliceTest.testDistribSearch\n\nError Message:\nNo live SolrServers available to handle this request\n\nStack Trace:\norg.apache.solr.client.solrj.SolrServerException: No live SolrServers available to handle this request\n        at __randomizedtesting.SeedInfo.seed([685C57B3F25C854B:E9BAD9AB8503E577]:0)\n        at org.apache.solr.client.solrj.impl.LBHttpSolrServer.request(LBHttpSolrServer.java:317)\n        at org.apache.solr.client.solrj.impl.CloudSolrServer.request(CloudSolrServer.java:659)\n        at org.apache.solr.client.solrj.request.QueryRequest.process(QueryRequest.java:91)\n        at org.apache.solr.client.solrj.SolrServer.query(SolrServer.java:301)\n        at org.apache.solr.cloud.AbstractFullDistribZkTestBase.checkShardConsistency(AbstractFullDistribZkTestBase.java:1149)\n        at org.apache.solr.cloud.AbstractFullDistribZkTestBase.checkShardConsistency(AbstractFullDistribZkTestBase.java:1118)\n        at org.apache.solr.cloud.SyncSliceTest.doTest(SyncSliceTest.java:236)\n        at org.apache.solr.BaseDistributedSearchTestCase.testDistribSearch(BaseDistributedSearchTestCase.java:865)",
+    "attachments": {
+        "SOLR-6235.patch": "https://issues.apache.org/jira/secure/attachment/12655408/SOLR-6235.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14057467",
+            "date": "2014-07-10T13:41:48+0000",
+            "content": "Wow, crazy crazy bug! I finally found the root cause.\n\nThe problem is with the leader initiated replica code which uses core name to set/get status. This works fine as long as the core names for all nodes are different but if they all happened to be \"collection1\" then we have this problem  \n\nIn this particular failure that I investigated:\nhttp://jenkins.thetaphi.de/job/Lucene-Solr-4.x-MacOSX/1667/consoleText\n\nHere's the sequence of events:\n\n\tport:51916 - core_node1 was initially the leader, docs were indexed and then it was killed\n\tport:51919 - core_node2 became the leader, peer sync happened, shards were checked for consistency\n\tport:51916 - core_node1 was brought back online, it recovered from the leader, consistency check passed\n\tport:51923 core_node3 and port:51932 core_node4 were added to the skipped servers\n\t300 docs were indexed (to go beyond the peer sync limit)\n\tport:51919 - core_node2 (the leader was killed)\n\n\n\nHere is where things get interesting:\n\n\tport:51923 core_node3 tries to become the leader and initiates sync with other replicas\n\tIn the meanwhile, a commit request from checkShardConsistency makes its way to port:51923 core_node3 (even though it's not clear whether it has indeed become the leader)\n\tport:51923 core_node3 calls commit on all shards including port:51919 core_node2 which should've been down but perhaps the local state at 51923 is not updated yet?\n\tport:51923 core_node3 puts replica collection1 on 127.0.0.1:51919_ into leader-initiated recovery\n\tport:51923 - core_node3 fails to peersync (because number of changes were too large) and rejoins election\n\tAfter this point each shard that tries to become the leader fails because it thinks that it has been put under leader initiated recovery and goes into actual \"recovery\"\n\tOf course, since there is no leader, recovery cannot happen and each shard eventually goes to \"recovery_failed\" state\n\tEventually the test gives up and throws an error saying that there are no live server available to handle the request.\n\n "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14057469",
+            "date": "2014-07-10T13:43:54+0000",
+            "content": "We should use coreNode instead of core names for setting leader initiated recovery. I'll put up a patch. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14057546",
+            "date": "2014-07-10T15:00:07+0000",
+            "content": "Hi Shalin,\n\nGreat find! Using coreNode is a good idea, but why would all the cores have the name \"collection1\"? Is that valid or an indication of a problem upstream from this code?\n\nAlso, you raise a good point about all replicas thinking they are in leader-initiated recovery (LIR). In ElectionContext, when running shouldIBeLeader, the node will choose to not be the leader if it is in LIR. However, this could lead to no leader. My thinking there is the state is bad enough that we would need manual intervention to clear one of the LIR znodes to allow a replica to get past this point. But maybe we can do better here? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057566",
+            "date": "2014-07-10T15:16:48+0000",
+            "content": "but why would all the cores have the name \"collection1\"?\n\nIt's probably historical. When we first where trying to make it easier to use SolrCloud and no Collections API existed, you could start up cores and have them be part of the same collection by giving them the same core name. This helped in trying to make a demo startup that required minimal extra work. So, most of the original tests probably just followed suit.\n\nAs we get rid of predefined cores in SolrCloud and move to the collections API, that stuff will go away. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14057613",
+            "date": "2014-07-10T15:56:16+0000",
+            "content": "but why would all the cores have the name \"collection1\"? Is that valid or an indication of a problem upstream from this code?\n\nThe reasons are what Mark said but it is a supported use-case and pretty common. Imagine stock solr running on 4 nodes - each node would have the same collection1 core name.\n\nAlso, you raise a good point about all replicas thinking they are in leader-initiated recovery (LIR). In ElectionContext, when running shouldIBeLeader, the node will choose to not be the leader if it is in LIR. However, this could lead to no leader. My thinking there is the state is bad enough that we would need manual intervention to clear one of the LIR znodes to allow a replica to get past this point. But maybe we can do better here?\n\nGood question. With careful use of minRf, the user can retry operations and maintain consistency even if we arbitrarily elect a leader in this case. But most people won't use minRf and don't care about consistency as much as availability. For them there should be a way to get out of this mess easily. We can have a collection property (boolean + timeout value) to force elect a leader even if all shards were in LIR. What do you think? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057620",
+            "date": "2014-07-10T16:04:21+0000",
+            "content": "you could start up cores and have them be part of the same collection by giving them the same core name.\n\nIf you don't specify a collection name, it also defaults to the core name - hence collection1 for the core name. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14057622",
+            "date": "2014-07-10T16:07:55+0000",
+            "content": "We can have a collection property (boolean + timeout value) to force elect a leader even if all shards were in LIR\n\nIn case it wasn't clear, I think it should be true by default. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057631",
+            "date": "2014-07-10T16:20:48+0000",
+            "content": "Great work tracking this down!\n\nIndeed, it's a current limitation that you can have all nodes in a shard thinking they cannot be leader, even when all of them are available. This is not required by the distributed model we have at all, it's just a consequence of being over restrictive on the initial implementation - if all known replicas are participating, you should be able to get a leader. So I'm not sure if this case should be optional. But iff not all known replicas are participating and you still want to force a leader, that should be optional - I think it should default to false though. I think the system should default to reasonable data safety in these cases.\n\nHow best to solve this, I'm not quite sure, but happy to look at a patch. How do you plan on monitoring and taking action? Via the Overseer? It seems tricky to do it from the replicas. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057637",
+            "date": "2014-07-10T16:22:20+0000",
+            "content": "On another note, it almost seems we can do better than ask for a recovery on a failed commit. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14057639",
+            "date": "2014-07-10T16:23:01+0000",
+            "content": "We have a similar issue where a replica attempting to be the leader needs to wait a while to see other replicas before declaring itself the leader, see ElectionContext around line 200:\n\n    int leaderVoteWait = cc.getZkController().getLeaderVoteWait();\n    if (!weAreReplacement) \n{\n      waitForReplicasToComeUp(weAreReplacement, leaderVoteWait);\n    }\n\nSo one quick idea might be to have the code that checks if it's in LIR see if all replicas are in LIR and if so, wait out the leaderVoteWait period and check again. If all are still in LIR, then move on with becoming the leader (in the spirit of availability). "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14057652",
+            "date": "2014-07-10T16:45:43+0000",
+            "content": "But iff not all known replicas are participating and you still want to force a leader, that should be optional - I think it should default to false though. I think the system should default to reasonable data safety in these cases.\n\nThat's the same case as the leaderVoteWait situation and we do go ahead after that amount of time even if all replicas aren't participating. Therefore, I think that we should handle it the same way. But to help people who care about consistency over availability, there should be a configurable property which bans this auto-promotion completely.\n\nIn any case, we should switch to coreNodeName instead of coreName and open an issue to improve the leader election part. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057682",
+            "date": "2014-07-10T17:10:29+0000",
+            "content": "That's the same case as the leaderVoteWait situation and we do go ahead after that amount of time even if all replicas aren't participating. \n\nNo, we don't - only if a new leader is elected does he try and do the wait. There are situations where that doesn't happen. This is like the issue where the leader loses the connection to zk after sending docs to replicas and then they fail and the leader asks them to recover and then you have no leader for the shard. We did a kind of workaround for that specific issue, but I've seen it happen with other errors as well. You can certainly lose a whole shard when everyone is participating in the election - no one thinks they can be the leader because they all published recovery last.\n\nThere are lots and lots of improvements to be made to recovery still - it's a baby. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057686",
+            "date": "2014-07-10T17:12:48+0000",
+            "content": "only if a new leader is elected does he try and do the wait.\n\nSorry - that line is confusing - the issue is that waiting for everyone doesn't matter. They might all be participating anyway, the wait is irrelevant. The issue comes after that code, when no one will become the leader. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14057691",
+            "date": "2014-07-10T17:15:40+0000",
+            "content": "I opened this ticket SOLR-6236 for the leader election issue we're discussing, but the title might not be quite accurate  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14057705",
+            "date": "2014-07-10T17:25:45+0000",
+            "content": "there should be a configurable property which bans this auto-promotion completely.\n\nThat's why I'm drawing the distinction between everyone participating and not everyone participating.\n\nSometimes you can lose a shard and it's because the leader->zk connection blinks. In this case, if you have all the replicas in a shard, it's safe to force an election anyway.\n\nSometimes you lose a shard and you don't have all the replicas - in that case, it should be optional to force an election and default to false. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-14057964",
+            "date": "2014-07-10T21:11:55+0000",
+            "content": "Why is core_node3 able to put core_node2 (the old leader) into LIR when core_node3 has not been elected a leader yet? (Actually, why is core_node3 processing any \"update\" at all when it's not a leader?)\n\nThat's really more of a problem than the fact that the one LIR core_node3 wrote to \"collection1\" set everyone else in LIR, because what if really only core_node2 is up-to-date and it just went through a blip and came back--in this case the only right choice for leader is core_node2. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-14057969",
+            "date": "2014-07-10T21:13:02+0000",
+            "content": "Obviously, this is not to say that \"the one LIR core_node3 wrote to 'collection1' set everyone else in LIR\" is not a problem. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14058001",
+            "date": "2014-07-10T21:42:11+0000",
+            "content": "Why is core_node3 able to put core_node2 (the old leader) into LIR when core_node3 has not been elected a leader yet? (Actually, why is core_node3 processing any \"update\" at all when it's not a leader?)\n\nYeah, the discussion went in another direction but this is something I found odd and I'm gonna find out why that happened. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14058089",
+            "date": "2014-07-10T23:04:02+0000",
+            "content": "Why is core_node3 able to put core_node2 (the old leader) into LIR when core_node3 has not been elected a leader yet? (Actually, why is core_node3 processing any \"update\" at all when it's not a leader?)\n\nI have not followed the sequences that closely, but I would guess that it's because of how we implemented distrib commit. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14058094",
+            "date": "2014-07-10T23:07:12+0000",
+            "content": "That is part of my motivation for saying:\n\nOn another note, it almost seems we can do better than ask for a recovery on a failed commit.\n\nThe current method was kind of just a least effort impl, so there might be some other things we can do as well. If I remember right, whoever gets the commit just broadcasts it out to everyone over http, including itself. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-14058096",
+            "date": "2014-07-10T23:08:01+0000",
+            "content": "I would guess that it's because of how we implemented distrib commit.\n\nAs in, anyone (non-leader) can distribute commits to everyone else? Is that why you commented earlier:\n\nOn another note, it almost seems we can do better than ask for a recovery on a failed commit.\n\nIf so, that totally makes sense. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14059139",
+            "date": "2014-07-11T18:24:48+0000",
+            "content": "Right. I think a minimum, doing nothing is probably preferable in most cases. Perhaps a retry or two?\n\nOr perhaps we should look at sending to leaders to originate. We would still want to commit everywhere in parallel though, and I'm not sure we can do anything that is that much better.\n\nThe current situation doesn't seem good though. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14059844",
+            "date": "2014-07-12T16:43:42+0000",
+            "content": "Patch which uses coreNodeName instead of coreName for leader initiated recoveries. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14059845",
+            "date": "2014-07-12T16:48:01+0000",
+            "content": "I fixed another mistake that I found while fixing this problem. The call to ensureReplicaInLeaderInitiatedRecovery in ElectionContext.startLeaderInitiatedRecoveryOnReplicas had core name instead of replicaUrl. In a related note, the HttpPartitionTest can be improved to not rely on Thread.sleep so much \u2013 I'll open a separate issue on that. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14059883",
+            "date": "2014-07-12T19:03:10+0000",
+            "content": "I improved logging by adding coreName as well as coreNodeName everywhere in LIR code. This is ready. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14059892",
+            "date": "2014-07-12T19:34:40+0000",
+            "content": "Commit 1610028 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1610028 ]\n\nSOLR-6235: Leader initiated recovery should use coreNodeName instead of coreName to avoid marking all replicas having common core name as down "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14059894",
+            "date": "2014-07-12T19:37:43+0000",
+            "content": "Commit 1610029 from shalin@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1610029 ]\n\nSOLR-6235: Leader initiated recovery should use coreNodeName instead of coreName to avoid marking all replicas having common core name as down "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14060407",
+            "date": "2014-07-14T07:47:00+0000",
+            "content": "Commit 1610351 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1610351 ]\n\nSOLR-6235: Improved logging in RecoveryStrategy and fixed a mistake in ElectionContext logging that I had made earlier. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14060408",
+            "date": "2014-07-14T07:47:24+0000",
+            "content": "Commit 1610352 from shalin@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1610352 ]\n\nSOLR-6235: Improved logging in RecoveryStrategy and fixed a mistake in ElectionContext logging that I had made earlier. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14060449",
+            "date": "2014-07-14T08:53:32+0000",
+            "content": "Commit 1610361 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1610361 ]\n\nSOLR-6235: Fix comparison to use coreNodeName on both sides in ElectionContext.startLeaderInitiatedRecoveryOnReplicas "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14060453",
+            "date": "2014-07-14T08:54:24+0000",
+            "content": "Commit 1610362 from shalin@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1610362 ]\n\nSOLR-6235: Fix comparison to use coreNodeName on both sides in ElectionContext.startLeaderInitiatedRecoveryOnReplicas "
+        }
+    ]
+}

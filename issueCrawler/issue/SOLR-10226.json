@@ -1,0 +1,80 @@
+{
+    "id": "SOLR-10226",
+    "title": "JMX metric avgTimePerRequest broken",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "metrics"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ],
+        "affect_versions": "6.4.1",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "JMX Metric avgTimePerRequest (of org.apache.solr.handler.component.SearchHandler) doesn't appear to behave correctly anymore. It was a cumulative value in pre-6.4 versions. Since totalTime metric was removed (which was a base for monitoring calculations), avgTimePerRequest seems like possible alternative to calculate \"time spent in requests since last measurement\", but it behaves strangely after 6.4.\n\nI did a simple test on gettingstarted collection (just unpacked the Solr 6.4.1 version and started it with \"bin/solr start -e cloud -noprompt\"). The query I used was:\nhttp://localhost:8983/solr/gettingstarted/select?indent=on&q=*:*&wt=json\nI run it 30 times in a row (with approx 1 sec between executions).\n\nAt the same time I was looking (with jconsole) at bean solr/gettingstarted_shard2_replica2:type=/select,id=org.apache.solr.handler.component.SearchHandler\n\nHere is how metric was changing over time (first number is \"requests\" metric, second number is \"avgTimePerRequest\"):\n10   6.6033\n12   5.9557\n13   0.9015    ---> 13th req would need negative duration if this was cumulative\n15   6.7315\n16   7.4873\n17   0.8458    ---> same case with 17th request\n23   6.1076\n\nAt the same time bean solr/gettingstarted_shard1_replica2:type=/select,id=org.apache.solr.handler.component.SearchHandler  also showed strange values:\n6    5.13482\n8    10.5694\n9    0.504\n10  0.344\n12  8.8121\n18  3.3531\n\nCC Andrzej Bialecki",
+    "attachments": {
+        "SOLR-10226.patch": "https://issues.apache.org/jira/secure/attachment/12856312/SOLR-10226.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-03-03T20:30:34+0000",
+            "content": "At what intervals did you check these numbers? Previous versions of Solr used a very old version of the code, which supposedly used a similar exponentially decaying sampling (with a strong bias towards the most recent 5 min window). The new code uses an exponentially decaying reservoir sampling with the same bias so theoretically results should be the same...\n\nSo, both in the new and in the old code these values would be exponentially decaying over time, so if you don't make any requests for a while the rates will fall down.\n\nIf you could please capture the timestamps at which you made the requests and observations it would be very helpful - thank you! ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-15894980"
+        },
+        {
+            "date": "2017-03-04T07:53:15+0000",
+            "content": "I think avgTimePerRequest in previous versions didn't have decay/sampling applied on it. I am looking at one Solr 6.3 node which was up for the past 2 months (I checked few other setups, different Solr version, but saw the same behavior). Here are the stats from its standard handler:\nrequests:1791464\ntotalTime:564718.746333\navgTimePerRequest:0.3152275157820643\n\nBoth requests and totalTime metrics are cumulative and avgTimePerRequest shows exactly value totalTime/requests, therefore there was no decay/sampling applied in calculation of avgTime before 6.4.\n\n\nWhen it comes to previously posted sample, there was something like 30-60 sec or so between the requests (the time I needed to write down the numbers). I just did another test, fresh values (this time just 3-5 sec between the requests):\n1  85.3\n2  41.2\n3  26.1\n4 17.0\n6 11.08\n7 7.43\n8 4.98\n9 3.62\n11 3.28\n(few min pause)\n13 8.12\n14 3.33\n(few min pause)\n15 9.69\n16 4.09\n\nDoes decay/sampling explain the behavior even with these short periods between the requests (ranging from few sec to few min)? ",
+            "author": "Bojan Smid",
+            "id": "comment-15895573"
+        },
+        {
+            "date": "2017-03-06T17:01:24+0000",
+            "content": "You're right - the Timer implementation that was used in Solr 6.3 and earlier internally used Histogram, which did not apply decaying to the total accumulated value. When we upgraded this class to a newer version from Codahale Metrics the underlying new implementation of Histogram does apply decaying to this value...\n\nAnyway, we have to add back a simple counter to track the total value as \"totalTime\", which somehow disappeared for no good reason. From that you will be able again to calculate the non-decaying average time.\n\nThe question is what to do with avgTimePerRequest. In my opinion, moving forward we should keep the decaying avgTimePerRequest because it more correctly represents the recent state of the system as opposed to the cumulative non-decayed value, which doesn't really reflect anything in particular (there could have been extended periods of idle time followed by recent high activity, and the value would be still low even though the recent load was high).\n\nCC Otis Gospodnetic. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-15897649"
+        },
+        {
+            "date": "2017-03-06T17:14:06+0000",
+            "content": "Patch adding back non-decayed \"totalTime\". ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-15897664"
+        },
+        {
+            "date": "2017-03-06T17:35:39+0000",
+            "content": "Thanks for looking into this and patching it so quickly .\n\nFrom what I see, \"totalTime\" was removed in SOLR-8785. Having it back solves my problem (actually, any monitoring solution would need such cumulative total time). Re avgTimePerRequest - I agree with what you suggest, decayed value makes much more sense (non-decayed would only be useful as a hack to get to totalTime).\n ",
+            "author": "Bojan Smid",
+            "id": "comment-15897711"
+        },
+        {
+            "date": "2017-03-06T18:48:54+0000",
+            "content": "I tested the patch quickly, metric totalTime is now there, but there is one small problem - it is expressed in ns. To be backward compatible it should be in ms. ",
+            "author": "Bojan Smid",
+            "id": "comment-15897818"
+        },
+        {
+            "date": "2017-03-07T13:27:55+0000",
+            "content": "Fixed totalTime conversion so that it's expressed in ms. If there are no objections I'll commit this shortly. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-15899432"
+        },
+        {
+            "date": "2017-03-07T17:10:05+0000",
+            "content": "Commit 2d51a42d3cae3eddc89f407cd3611fa2cd5d55d0 in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2d51a42 ]\n\nSOLR-10226 JMX metric avgTimePerRequest broken. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15899783"
+        },
+        {
+            "date": "2017-03-07T17:10:35+0000",
+            "content": "Commit 242ddfb148eda45347ff34d2b16958a835c340a5 in lucene-solr's branch refs/heads/branch_6x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=242ddfb ]\n\nSOLR-10226 JMX metric avgTimePerRequest broken. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15899784"
+        }
+    ]
+}

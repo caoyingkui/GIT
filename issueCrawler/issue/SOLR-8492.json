@@ -1,0 +1,256 @@
+{
+    "id": "SOLR-8492",
+    "title": "Add LogisticRegressionQuery and LogitStream",
+    "details": {
+        "components": [
+            "streaming expressions"
+        ],
+        "type": "New Feature",
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "This ticket is to add a new query called a LogisticRegressionQuery (LRQ).\n\nThe LRQ extends AnalyticsQuery (http://joelsolr.blogspot.com/2015/12/understanding-solrs-analyticsquery.html) and returns a DelegatingCollector that implements a Stochastic Gradient Descent (SGD) optimizer for Logistic Regression.\n\nThis ticket also adds the LogitStream which leverages Streaming Expressions to provide iteration over the shards. Each call to LogitStream.read() calls down to the shards and executes the LogisticRegressionQuery. The model data is collected from the shards and the weights are averaged and sent back to the shards with the next iteration. Each call to read() returns a Tuple with the averaged weights and error from the shards. With this approach the LogitStream streams the changing model back to the client after each iteration.\n\nThe LogitStream will return the EOF Tuple when it reaches the defined maxIterations. When sent as a Streaming Expression to the Stream handler this provides parallel iterative behavior. This same approach can be used to implement other parallel iterative algorithms.\n\nThe initial patch has  a test which simply tests the mechanics of the iteration. More work will need to be done to ensure the SGD is properly implemented. The distributed approach of the SGD will also need to be reviewed.  \n\nThis implementation is designed for use cases with a small number of features because each feature is it's own discreet field.\n\nAn implementation which supports a higher number of features would be possible by packing features into a byte array and storing as binary DocValues.\n\nThis implementation is designed to support a large sample set. With a large number of shards, a sample set into the billions may be possible.\n\nsample Streaming Expression Syntax:\n\n\nlogit(collection1, features=\"a,b,c,d,e,f\" outcome=\"x\" maxIterations=\"80\")",
+    "attachments": {
+        "logit.csv": "https://issues.apache.org/jira/secure/attachment/12787817/logit.csv",
+        "SOLR-8492.patch": "https://issues.apache.org/jira/secure/attachment/12780624/SOLR-8492.patch",
+        "SOLR-8492.diff": "https://issues.apache.org/jira/secure/attachment/12788458/SOLR-8492.diff"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-01-06T07:41:01+0000",
+            "author": "Cao Manh Dat",
+            "content": "What a wonderful patch. I'm very excited on implementing ml algorithms by using streaming.\n\nA couple of comments for this patch:\n\n//wi = alpha(outcome - sigmoid)*wi + xi\ndouble sig = sigmoid(sum(multiply(vals, weights)));\nerror = outcome - sig;\n\nworkingWeights = sum(vals, multiply(error * alpha, weights));\n\nfor(int i=0; i<workingWeights.length; i++) {\n  weights[i] = workingWeights[i];\n}\n\n\nI dont think this formula is correct. Should it be\n\n// wi = wi - alpha*(sigmoid-outcome) * xi\ndouble sig = sigmoid(sum(multiply(vals, weights)));\nerror = sig - outcome;\n\nworkingWeights = multiply(error * alpha, vals);\n\nfor(int i=0; i<workingWeights.length; i++) {\n  weights[i] -= workingWeights[i];\n}\n\n\n\nThis is the implementation of stochastic gradient descent (which update weight by single example). Should we just move the update part to collect(int doc)?\n\npublic void collect(int doc) {\n  // do the update here\n}\n\n ",
+            "id": "comment-15085146"
+        },
+        {
+            "date": "2016-01-06T09:02:42+0000",
+            "author": "Cao Manh Dat",
+            "content": "Update patch for this issue.\nCurrently, we just handle int field. I'm going to fix this problem. ",
+            "id": "comment-15085247"
+        },
+        {
+            "date": "2016-01-06T11:08:02+0000",
+            "author": "Cao Manh Dat",
+            "content": "This patch :\n\n\tsupport float/double field as features.\n\tsome error handling\n\n\n\nJoel Bernstein I think the computation model are quite ok now. Because when we want to preprocess data or do the computation in workers, we can use updatestream. ",
+            "id": "comment-15085411"
+        },
+        {
+            "date": "2016-01-06T13:31:15+0000",
+            "author": "Joel Bernstein",
+            "content": "Cao Manh Dat, thanks for the comments!\n\nI'll review the formula again and compare to your patch. I'm not a ML expert so guidance in this area is very useful.\n\n\nI moved the implementation to the finish() method to implement the randomization. My understanding is that the randomization is key to algorithm. ",
+            "id": "comment-15085527"
+        },
+        {
+            "date": "2016-01-06T13:32:14+0000",
+            "author": "Joel Bernstein",
+            "content": "Yes this is a problem I noticed after I put the patch up.  ",
+            "id": "comment-15085528"
+        },
+        {
+            "date": "2016-01-06T13:32:33+0000",
+            "author": "Joel Bernstein",
+            "content": "Great, I'll take a look. ",
+            "id": "comment-15085529"
+        },
+        {
+            "date": "2016-01-06T14:33:04+0000",
+            "author": "Cao Manh Dat",
+            "content": "As pointed out in this paper : http://research.microsoft.com/pubs/192769/tricks-2012.pdf\n\nAlthough the theory calls for picking examples randomly, it is usually faster to\nzip sequentially through the training set. But this does not work if the examples\nare grouped by class or come in a particular order. Randomly shuffling the\nexamples eliminates this source of problems\nIn practically, I rarely find data source come in a particular order. Beside, I think moved the implementation to the finish() method is quite costly if we have hundred thousands of training examples. If we wanna make sure the training examples is randomly, we can just sort the stream by any feature. ",
+            "id": "comment-15085585"
+        },
+        {
+            "date": "2016-01-06T15:25:57+0000",
+            "author": "Joel Bernstein",
+            "content": "It is indeed very costly to add the randomization. Perhaps we can have two different collector implementations, one that randomizes and one that does not, and add a parameter for this. ",
+            "id": "comment-15085671"
+        },
+        {
+            "date": "2016-01-06T23:04:30+0000",
+            "author": "Joel Bernstein",
+            "content": "I think the difference might be I actually used a Gradient Ascent algorithm. I did not describe this correctly in the description.  ",
+            "id": "comment-15086453"
+        },
+        {
+            "date": "2016-01-06T23:34:52+0000",
+            "author": "Cao Manh Dat",
+            "content": "Gradient Ascent find maximum for a function. Beside, the gradient ascent formula is kinda like this \n\nwi = wi + alpha*(sigmoid-outcome) * xi\n\n\n\nIn this case, we wanna find minimum for the error function. So gradient descent is correct? I also check the output in test case\n\nDouble[] testRecord = {0.0, 0.0, 0.0, 1.0, 1.0, 1.0};\nDouble[] testWeights = bestWeights.toArray(new Double[bestWeights.size()]);\n\ndouble d = sum(multiply(testRecord, testWeights));\ndouble prob = sigmoid(d); // *prob = 0.999 which is correct (outcome = 1)*\n\nDouble[] testRecord2 = {1.0, 1.0, 1.0, 0.0, 0.0, 0.0};\n\nd = sum(multiply(testRecord2, testWeights));\nprob = sigmoid(d); // *prob = 0.5 which is not correct (outcome = 0)*\n\n ",
+            "id": "comment-15086500"
+        },
+        {
+            "date": "2016-01-07T02:33:35+0000",
+            "author": "Joel Bernstein",
+            "content": "Ok, it sounds like I just had the wrong formula. I'll test out your latest patch as soon as I get a chance. Thanks! ",
+            "id": "comment-15086693"
+        },
+        {
+            "date": "2016-01-08T12:35:15+0000",
+            "author": "Joel Bernstein",
+            "content": "I should have a chance to review the latest patch on this ticket over the next couple days. ",
+            "id": "comment-15089149"
+        },
+        {
+            "date": "2016-01-09T17:47:00+0000",
+            "author": "Joel Bernstein",
+            "content": "Cao Manh Dat, I pulled down your latest patch, read through it and ran the test case. It looks really good. Also the fact that the model is predicting probabilities correctly certainly is a good sign.\n\nThere are a few small things that I need to do to prepare this to be committed, but I'm planning on leaving your code basically as it is.\n\nI'm sure there will be plenty of feedback on this as more people review the code and join the conversation. We can always adjust things based on this feedback.\n\nWe can also always have different implementations for if consensus is not reached on one single algorithm. But I think this is a great way to kick off the wider discussion.\n\nThanks for your help with this! ",
+            "id": "comment-15090713"
+        },
+        {
+            "date": "2016-01-10T19:12:58+0000",
+            "author": "Joel Bernstein",
+            "content": "New patch which moves the test for LogitStream from StreamingTest to StreamExpressionTest to test the Streaming expression. Patch also adds a test to QueryEqualityTest for the LogisticRegressionQuery. ",
+            "id": "comment-15091167"
+        },
+        {
+            "date": "2016-01-10T20:57:01+0000",
+            "author": "Joel Bernstein",
+            "content": "Cao Manh Dat, I was comparing the algorithm in the patch you provided to what's being done in this implementation: https://github.com/tpeng/logistic-regression/blob/master/src/Logistic.java\n\nAre the differences in the implementations because our implementation is using Gradient Descent while the other is using Gradient Ascent? ",
+            "id": "comment-15091233"
+        },
+        {
+            "date": "2016-01-10T23:39:46+0000",
+            "author": "Cao Manh Dat",
+            "content": "He still use Gradient Descent\n\nGradient[i] = alpha*(sigmoid-outcome) * xi\n\n\nWe take steps by moving proportional to the negative of the gradient. Which mean\n\nW[i] = W[i] - Gradient[i]\n\n\nIn the link you provided he simply use (same as above formula)\n\n-Gradient[i] = alpha*(outcome-sigmoid) * xi\nSo W[i] = W[i] - Gradient[i] = W[i] + alpha * (outcome - sigmoid) * xi\n\n ",
+            "id": "comment-15091290"
+        },
+        {
+            "date": "2016-01-12T02:22:08+0000",
+            "author": "Cao Manh Dat",
+            "content": "Beautiful patch!  ",
+            "id": "comment-15093168"
+        },
+        {
+            "date": "2016-01-12T02:46:38+0000",
+            "author": "Cao Manh Dat",
+            "content": "I suggest a minor change for the last patch. This patch support a new parameter called \"positiveLabel\" (default value is 1). This parameter allow user to choose positive label value. For example:\n\nGive documents which outcome can be : 0,1,2,3,4.\nThe logistic regression model for positiveLabel = 1 predict the probability a given doc have outcome = 1\n\nSo we can use this parameter to train a classification model for multi-class (not just binary class).  ",
+            "id": "comment-15093186"
+        },
+        {
+            "date": "2016-01-12T04:13:36+0000",
+            "author": "Cao Manh Dat",
+            "content": "Add positiveLabel to LogitStream (forget to do that in previous patch). \nJoel Bernstein I'm thinking about MultiLogitStream, which each worker train a positiveLabel. For example\n\nAssume that we have 5 label : 0,1,2,3,4.\nWorker 1 will train a model for label 0\nWorker 2 will train a model for label 1\n..... \n\nI think we cant use ParallelStream here because ParallelStream merge stream from workers to a long stream.\n\ntuple11 - tuple12 \\\ntuple21 - tuple22 | -----> tuple11 - tuple21 - tuple31 - tuple12 - ... - EOF\ntuple31 - tuple32 /\n\nBut MultiLogitStream merge tuples from all worker's stream to a single tuple\n\nt11 - t12 \\\nt21 - t22 | -----> merge(t11,t21,t31) - merge(t12,t22,t32) - EOF\nt31 - t32 /\n\nShould we call it \n\n ParallelReducerStream \n ",
+            "id": "comment-15093260"
+        },
+        {
+            "date": "2016-01-12T14:11:05+0000",
+            "author": "Joel Bernstein",
+            "content": "Ok, I think I see how the positive label is being used. So if we have 0,1,2,3,4... possible outcomes we can predict the probability of any of those outcomes. This makes sense. Might be good to adjust the test for this as well. ",
+            "id": "comment-15093927"
+        },
+        {
+            "date": "2016-01-12T14:24:03+0000",
+            "author": "Joel Bernstein",
+            "content": "I think this is an good idea when working with a cluster with lot's of replicas. You could have the whole cluster working at once to train models for the different labels.\n\nLet's do this in another ticket though because I think we're moving into a different set of functionality, which is wrappers around the LogitStream. \n\nThe other thing to consider is a wrapper stream that selects the optimized model based on some criteria and ends the iterations. This wrapper could only return a single Tuple, which contains the best weights. \n ",
+            "id": "comment-15093943"
+        },
+        {
+            "date": "2016-02-13T17:22:08+0000",
+            "author": "Joel Bernstein",
+            "content": "Cao Manh Dat, I've been testing out the algorithm by comparing it to R. I've attached the data set I'm using to the ticket (logit.csv). I'm attempting make sense of the results but they don't seem to match up.\n\nI ran the following LogitStream call with all data in 1 shard:\n\nlogit(collection3, q=\"*:*\", features=\"married_i\", outcome=\"buy_i\", maxIterations=100)\n\n\nAnd got this for the final weights:\n\n{\"features\":[\"married_i\"],\"weights\":[-0.5048080969966502],\"error\":0.3808560947044004}\n\n\n\nIn R, here is the output for the same data set. Note that Is.Married is the same field as married_i in Solr and same for Buy and buy_i\n\n\nCall:\nglm(formula = Buy ~ Is.Married, family = \"binomial\", data = mydata)\n\nDeviance Residuals: \n    Min       1Q   Median       3Q      Max  \n-0.9687  -0.4201  -0.4201  -0.4201   2.2232  \n\nCoefficients:\n            Estimate Std. Error z value Pr(>|z|)    \n(Intercept)  -2.3830     0.1718 -13.870   <2e-16 ***\nIs.Married    1.8699     0.2184   8.563   <2e-16 ***\n---\nSignif. codes:  0 \u2018***\u2019 0.001 \u2018**\u2019 0.01 \u2018*\u2019 0.05 \u2018.\u2019 0.1 \u2018 \u2019 1\n\n(Dispersion parameter for binomial family taken to be 1)\n\n    Null deviance: 646.05  on 672  degrees of freedom\nResidual deviance: 564.47  on 671  degrees of freedom\nAIC: 568.47\n\nNumber of Fisher Scoring iterations: 5\n\n\n\n\nIt appears that they are giving different results. Am I performing the test correctly?\n\n ",
+            "id": "comment-15146074"
+        },
+        {
+            "date": "2016-02-13T17:23:37+0000",
+            "author": "Joel Bernstein",
+            "content": "Attached the test data for comparison to R ",
+            "id": "comment-15146075"
+        },
+        {
+            "date": "2016-02-18T09:41:31+0000",
+            "author": "Cao Manh Dat",
+            "content": "Right, It seem that we missing the bias coefficients. I will fix the patch and rerun training on the dataset. ",
+            "id": "comment-15152021"
+        },
+        {
+            "date": "2016-02-18T11:17:12+0000",
+            "author": "Cao Manh Dat",
+            "content": "File patch is generated by git diff. \n\nJoel Bernstein\nThe result so far.\n\n{\"features\":[\"married_i\"],\"weights\":[1.8802425576618012,-2.395517594531137]\n\n\n\nNotice that \n1.8802425576618012 is coefficient of married_i\n2.395517594531137 is bias coefficient\n\nThe true formula of prediction must be\n\nsigmoid(sum(multiply(vals, weights))+weights[weights.length-1])\n\n ",
+            "id": "comment-15152166"
+        },
+        {
+            "date": "2016-02-18T14:44:16+0000",
+            "author": "Cao Manh Dat",
+            "content": "Reupload patch file because of some mistakes. ",
+            "id": "comment-15152397"
+        },
+        {
+            "date": "2016-02-19T10:29:11+0000",
+            "author": "Cao Manh Dat",
+            "content": "Hi, Joel Bernstein\n\nHere are the lastest patch. I added couple of things in this patch\n\n\tAdd an unit test based on your data set\n\tRearrange the weights order. Because normally the bias coefficient is in first place.\n\n{\"features\":[\"married_i\"],\"weights\":[-2.395517594531137,1.8802425576618012]\n\n\n\tFix error value computation (in the previous patches, LogisticRegressionCollector only return error of last instance). It will be total error now.\n\tAdd ClassificationEvaluation class. It count number of times we rightly predicted or falsely predicted an instance.\n\tAdd threshold parameter. So if sig >= threshold we will predict the label of instance is positive label and negative label if vice versa. Threshold = 0.5 in default.\n\n ",
+            "id": "comment-15154054"
+        },
+        {
+            "date": "2016-02-19T18:41:13+0000",
+            "author": "Joel Bernstein",
+            "content": "Cao Manh Dat, this sounds like a great patch. Having tests with a sample data set will provide the confidence needed to commit the ticket. I'll review and make sure I understand all the changes. Thanks for your work on this. ",
+            "id": "comment-15154628"
+        },
+        {
+            "date": "2016-04-05T10:19:25+0000",
+            "author": "Alessandro Benedetti",
+            "content": "Guys, \ngreat work !\nI have been following the discussion and it is very interesting.\nCan you give an estimation of the maturity of this patch ?\nI didn't have the chance to take a look to the code yet, but it seems it is almost mature to be contributed !\nAm i right ?\nThis would open nice scenarios for classification(as Joel previously pointed out in a separate issue), a score predictor and possibly re-ranking  in Solr ( as we are de facto allowing to build a model that would be able to assign the score for the document) .\n\nIt comes naturally to me to think to add support for categorical features ( as I think at the moment only ordinal features are supported (double/integer)).\nWould say using one-hot encoding or other approaches for feature-decomposition !\nWell done again !\nAs soon as I have some time I will take a look to the code !\nCheers ",
+            "id": "comment-15226032"
+        },
+        {
+            "date": "2016-04-05T13:58:54+0000",
+            "author": "Joel Bernstein",
+            "content": "I haven't yet had a chance to review Cao Manh Dat's last patch, but it sounds like it is indeed very close. I was planning on trying to get this in for 6.1.\n\nI believe the last patch has a test case which is giving comparable results to the output from R. This should give us a reasonable confidence to commit. Committing will also make it easier for the wider community to provide feedback on the implementation. It also provides a basic structure for doing parallel iterative algorithms that the community can use to add more machine learning algorithms.\n\nAlessandro Benedetti any input you have on the ticket would be much appreciated. ",
+            "id": "comment-15226295"
+        },
+        {
+            "date": "2016-04-05T14:04:13+0000",
+            "author": "Alessandro Benedetti",
+            "content": "Will try to take a look this week and give a feedback, but I agree that committing will make much easier to collect feedback from Machine Learning enthusiast / experts / users.\n\nkeep you updated! ",
+            "id": "comment-15226306"
+        },
+        {
+            "date": "2016-04-28T10:43:17+0000",
+            "author": "Cao Manh Dat",
+            "content": "Patch for lastest code in trunk. Detect some memleak problem, trying to fix tonight! ",
+            "id": "comment-15261942"
+        },
+        {
+            "date": "2016-04-29T07:55:13+0000",
+            "author": "Cao Manh Dat",
+            "content": "\n\tUpdate patch for lastest code in trunk.\n\tFix mem leak problem\n\tAdd StreamExpression to Expresstion test.\n\n ",
+            "id": "comment-15263710"
+        },
+        {
+            "date": "2016-04-29T12:01:40+0000",
+            "author": "Joel Bernstein",
+            "content": "Where was the memory leak? ",
+            "id": "comment-15263956"
+        },
+        {
+            "date": "2016-04-29T23:05:29+0000",
+            "author": "Cao Manh Dat",
+            "content": " Joel Bernstein the mem leak appear in LogitCall class, whe create solrclient and never close it. ",
+            "id": "comment-15264923"
+        },
+        {
+            "date": "2016-04-29T23:59:17+0000",
+            "author": "Joel Bernstein",
+            "content": "Yep, I see it. If the client  cache wasn't set it was creating a client and not closing it. Looks like you changed it to always use the cache. Looks good! ",
+            "id": "comment-15264975"
+        },
+        {
+            "date": "2016-05-13T14:56:22+0000",
+            "author": "Joel Bernstein",
+            "content": "Tommaso Teofili, I'd like to get another set of eyes on this. I've been looking at this for a while but I'm still not comfortable enough with the math to commit. If you're comfortable reviewing the math, I can work on reworking tests for the new SolrCloud testing framework. ",
+            "id": "comment-15282757"
+        },
+        {
+            "date": "2017-07-27T08:21:50+0000",
+            "author": "Tommaso Teofili",
+            "content": "sure Joel, I'll have a look and let you know. ",
+            "id": "comment-16102919"
+        }
+    ]
+}

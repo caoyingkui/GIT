@@ -1,0 +1,207 @@
+{
+    "id": "SOLR-5354",
+    "title": "Distributed sort is broken with CUSTOM FieldType",
+    "details": {
+        "affect_versions": "4.4,                                            4.5,                                            4.6,                                            6.0",
+        "status": "Closed",
+        "fix_versions": [
+            "4.7",
+            "6.0"
+        ],
+        "components": [
+            "SearchComponents - other"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "We added a custom field type to allow an indexed binary field type that supports search (exact match), prefix search, and sort as unsigned bytes lexicographical compare. For sort, BytesRef's UTF8SortedAsUnicodeComparator accomplishes what we want, and even though the name of the comparator mentions UTF8, it doesn't actually assume so and just does byte-level operation, so it's good. However, when we do this across different nodes, we run into an issue where in QueryComponent.doFieldSortValues:\n\n          // Must do the same conversion when sorting by a\n          // String field in Lucene, which returns the terms\n          // data as BytesRef:\n          if (val instanceof BytesRef) \n{\n            UnicodeUtil.UTF8toUTF16((BytesRef)val, spare);\n            field.setStringValue(spare.toString());\n            val = ft.toObject(field);\n          }\n\nUnicodeUtil.UTF8toUTF16 is called on our byte array,which isn't actually UTF8. I did a hack where I specified our own field comparator to be ByteBuffer based to get around that instanceof check, but then the field value gets transformed into BYTEARR in JavaBinCodec, and when it's unmarshalled, it gets turned into byte[]. Then, in QueryComponent.mergeIds, a ShardFieldSortedHitQueue is constructed with ShardDoc.getCachedComparator, which decides to give me comparatorNatural in the else of the TODO for CUSTOM, which barfs because byte[] are not Comparable...\n\nFrom Chris Hostetter:\n\nI'm not very familiar with the distributed sorting code, but based on your\ncomments, and a quick skim of the functions you pointed to, it definitely\nseems like there are two problems here for people trying to implement\ncustom sorting in custom FieldTypes...\n\n1) QueryComponent.doFieldSortValues - this definitely seems like it should\nbe based on the FieldType, not an \"instanceof BytesRef\" check (oddly: the\ncomment event suggestsion that it should be using the FieldType's\nindexedToReadable() method \u2013 but it doesn't do that.  If it did, then\nthis part of hte logic should work for you as long as your custom\nFieldType implemented indexedToReadable in a sane way.\n\n2) QueryComponent.mergeIds - that TODO definitely looks like a gap that\nneeds filled.  I'm guessing the sanest thing to do in the CUSTOM case\nwould be to ask the FieldComparatorSource (which should be coming from the\nSortField that the custom FieldType produced) to create a FieldComparator\n(via newComparator - the numHits & sortPos could be anything) and then\nwrap that up in a Comparator facade that delegates to\nFieldComparator.compareValues\n\nThat way a custom FieldType could be in complete control of the sort\ncomparisons (even when merging ids).\n\n...But as i said: i may be missing something, i'm not super familia with\nthat code.  Please try it out and let us know if thta works \u2013 either way\nplease open a Jira pointing out the problems trying to implement\ndistributed sorting in a custom FieldType.",
+    "attachments": {
+        "SOLR-5354__fix_function_edge_case.patch": "https://issues.apache.org/jira/secure/attachment/12616448/SOLR-5354__fix_function_edge_case.patch",
+        "SOLR-5354.patch": "https://issues.apache.org/jira/secure/attachment/12610716/SOLR-5354.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13796289",
+            "date": "2013-10-16T01:15:19+0000",
+            "content": "I think calling indexedToReadable() in QueryComponent.doFieldSortValues won't actually help here because it's trying to get the actual Object of the fields, not the readable String representation. If we do go with sending \"sort_values\" as readable strings, on the other side when QueryComponent.mergeIds is called, it'll need to take care of translating all readable strings to the actual Objects, which I'm not sure if there's an easy way to do.\n\nThe safest thing/ least change is probably to check the sort field type instead of using instanceof in QueryComponent.doFieldSortValues. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13807457",
+            "date": "2013-10-28T23:14:14+0000",
+            "content": "Patch fixing the problem.\n\nQueryComponent.doFieldSortValues() delegates to new method SortField.toExternal(), which serializes according to the sort field type, in the CUSTOM case via new method FieldComparatorSource.toExternal().\n\nShardFieldSortedHitQueue uses ShardComparator.sortVal(), which uses new method SortField.toInternal() to convert the external value to the appropriate object, in the CUSTOM case via new method FieldComparatorSource.toInternal(). "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13808131",
+            "date": "2013-10-29T16:12:49+0000",
+            "content": "If there are no objections I'll commit this tomorrow. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13808147",
+            "date": "2013-10-29T16:23:16+0000",
+            "content": "I think there are a couple issues to address first at least in the lucene part.\n\nCan we please not have the Object/Object stuff in FieldComparatorSource? This is wrong: FieldComparator already has a generic type so I don't understand the need to discard type safety.\n\nThe unicode conversion for String/String_VAL is incorrect and should not exist: despite the name, these types can be any bytes. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13808160",
+            "date": "2013-10-29T16:31:54+0000",
+            "content": "As a concrete example the CollationField and ICUCollationField sort with String/String_VAL comparators but contain non-unicode bytes.\n\nThese currently do not work distributed today either (which I would love to see fixed on this issue). "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13811422",
+            "date": "2013-11-01T16:39:12+0000",
+            "content": "Thanks for the review Robert.\n\nCan we please not have the Object/Object stuff in FieldComparatorSource? This is wrong: FieldComparator already has a generic type so I don't understand the need to discard type safety.\n\nI'm not sure what you have in mind - do you think FieldComparatorSource should be generified? In this case I think each extending class will need to provide an implementation for these methods, since there isn't a sensible way to provide a default implementation of conversion to/from the generic type.\n\nThe unicode conversion for String/String_VAL is incorrect and should not exist: despite the name, these types can be any bytes\n\nThis is the status quo right now - the patch just keeps that in place.  But I agree.  I think the issue is non-binary (XML) serialization, for which UTF-8 is safe, but arbitrary binary is not.  Serializing all STRING/STRING_VAL as Base64 seems wasteful in the general case.\n\nRelatedly, looks like there's an orphaned SortField.Type.BYTES (orphaned in that it's not handled in lots of places) - I guess this should go away?\n\n\nAs a concrete example the CollationField and ICUCollationField sort with String/String_VAL comparators but contain non-unicode bytes.\n\nThese currently do not work distributed today either (which I would love to see fixed on this issue).\n\nI'm working on a distributed version of the Solr (icu) collation tests.  Once I get that failing, I'll be able to test potential solutions. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13811432",
+            "date": "2013-11-01T16:48:31+0000",
+            "content": "\nThis is the status quo right now - the patch just keeps that in place. \n\nNo its not: its a bug in solr. This patch moves that bug into Lucene. \n\nLucene's APIs here work correctly on any bytes today. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13811433",
+            "date": "2013-11-01T16:50:41+0000",
+            "content": "\nI think the issue is non-binary (XML) serialization, for which UTF-8 is safe, but arbitrary binary is not. Serializing all STRING/STRING_VAL as Base64 seems wasteful in the general case.\n\nThis is all solr stuff. I don't think it makes sense to move that logic into lucene, let the user deal with this. They might not be using XML at all: maybe thrift or avro or something else.\n\nWhy not just add serialize/deserialize methods to solr's FieldType.java? It seems like the obvious place.  "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13811450",
+            "date": "2013-11-01T17:03:03+0000",
+            "content": "\nWhy not just add serialize/deserialize methods to solr's FieldType.java? It seems like the obvious place.\n\nWhen SortField's are deserialized on the receiving end, it's no longer clear which FieldType the field came from. If the deserialization method depends on FieldType, the node responsible for the merge must also have the schema loaded, which might not be the case in SolrCloud. Maybe solr needs its own SortField too then? "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13811461",
+            "date": "2013-11-01T17:10:09+0000",
+            "content": "\nWhen SortField's are deserialized on the receiving end, it's no longer clear which FieldType the field came from. If the deserialization method depends on FieldType, the node responsible for the merge must also have the schema loaded, which might not be the case in SolrCloud.\n\nThen where is it getting a comparator from? I don't understand how changing a lucene API solves this problem. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13811463",
+            "date": "2013-11-01T17:12:50+0000",
+            "content": "\nMaybe solr needs its own SortField too then?\n\nOK I see it, I think solr should fix its own apis here? It could add FieldType[] to SortSpec or something like that. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13830238",
+            "date": "2013-11-22T19:07:49+0000",
+            "content": "I've been looking into Solr's distributed sorting code more and more as part of my investigating into SOLR-5463 and i spoke breifly with sarowe off line about the overlap.\n\nI think the problems with CUSTOM distributed sorting is really just a subset of the larger weirdness with the assumptions Solr makes in general about how it can do distributed sorting and how it can de/serialize the sort values when merging hte results from the multiple shards.\n\nI think my earlier suggestion (in email that jessica quoted in the issue summary) about using methods on the FieldType (like indexedToReadable and toObject) to ensure we safely de/serialize the sort values are still the right way to go \u2013 we have to ensure that no matter what strange object an arbitrary objects are used by a FieldComparator, we can safely serialize it.   But i'm not longer convinced re-using those existing methods makes sense \u2013 because the sort values used by a FieldType's FieldComparator may not map directly to the \"end user\" representation of the value (ie: TriedDateField sorts as \"long\", but toObject returns \"Date\"; String fields sort on BytesRefs; Custom classes sort on who-knows-what, etc...)\n\nI think the best solution would be something like:\n\n\n\n\tmove the toExternal/toInternal concept in the existing patch out of FieldComparatorSource and into Solr's FieldType as methods clearly ment to be very speciic to sorting (ie: \"marshalSortValue\" and \"unmarshalSortValue\")>\n\tchange the fsv=true logic on shards to use marshalSortValue for any SortField that is on a field (if it's score or a function it will be a sinple numeric and already safe to serialize over the wire)\n\tchange the mergeIds logic on the coordinator node to explicitly use unmarshalSortValue and then use the actual FieldComparator associated with each SortField instead of the hooky assumptions currently being made in ShardFieldSortedHitQueue.getCachedComparator about using things like \"comparatorNatural\"\n\n\n\n\n\nOther misc comments...\n\n\nIf the deserialization method depends on FieldType, the node responsible for the merge must also have the schema loaded, which might not be the case in SolrCloud.\n\nThat's already a requirement in SolrCloud - the coordnator node merging results and writing them back to the client already has to have the same schema.  (If it didn't a custom FieldType with a custom FieldComparator could never work, because there would be now way at all to know what order things should go in)\n\nI think solr should fix its own apis here? It could add FieldType[] to SortSpec or something like that.\n\nI'm not sure why that would help?  We can already ask each SortField for it's getField() and then look that up in the Schema.  The crux of the problem really seems to be: naive assumptions in the distributed sorting code about how to safely send sort values over the wire; and what comparator to use when sorting those values. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13830727",
+            "date": "2013-11-23T18:08:20+0000",
+            "content": "\nI'm not sure why that would help? We can already ask each SortField for it's getField() and then look that up in the Schema. The crux of the problem really seems to be: naive assumptions in the distributed sorting code about how to safely send sort values over the wire; and what comparator to use when sorting those values.\n\nMy point is that the serialization/deserialization doesn't really belong in the lucene comparator API, thats all. I agree with your proposed solution... "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13832097",
+            "date": "2013-11-26T00:05:51+0000",
+            "content": "Patch moving de/serialization to Solr's FieldType according to Hoss's outline - no Lucene classes are modified in this version.\n\nAll Solr tests pass.\n\nI think this should also fix distributed (ICU)CollationField - I'm working on a test. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13832268",
+            "date": "2013-11-26T03:24:20+0000",
+            "content": "This looks great Steve, thanks. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13833312",
+            "date": "2013-11-27T01:26:49+0000",
+            "content": "Steve: looks great for the most part.\n\na few comments / questions...\n\n\n\tcall me paranoid, but i really dislike distrib tests that only use the query() method to ensure that the distrib response is the same as the control response \u2013 could we please add some assertions that use queryServer() to prove the docs are coming back in the right order in the distrib test?\n\tthe test should really sanity check that multi-level sorts (eg: \"payload asc, id desc\") are working properly\n\twe should be really clear & careful in the javadocs for FieldType.marshalSortValue and FieldType.unmarshalSortValue \u2013 in your patch they refer to \"a value of this FieldType\" but that's not actually what they operate on.  They operate on the values used by the FieldComparator returned by the SortField for this FieldType (ie: SortableDoubleField's toObject returns a Double, but the marshal method operates on ByteRef)\n\tI'm confused why we still need comparatorNatural() and it's use for REWRITEABLE.  Why not actually rewrite() the SortField using the local IndexSearcher and then wrap the rewritten SortField's FieldComparator using comparatorFieldComparator() just like any other SortField? Since we're only ever going to compare the raw values on the coordinator it shouldn't matter if we rewrite in terms of the local IndexSearcher - it's the best we can do, and that seems safer then assuming REWRITABLE == function and trusting comparatorNatural.  (ie: consider someone who writes a custom FieldType that uses REWRITABLE)\n\tdon't the marshal methods in StrField, TextField, and CollationField need null checks (for the possibilities of docs w/o a value in the sort field?)\n\tdo we even have any existing tests of distributed sorting on strings & numerics using sortMisstingLast / sortMissingFirst to be sure we don't break that?\n\n "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13834407",
+            "date": "2013-11-28T00:41:38+0000",
+            "content": "Thanks Robert and Hoss for the reviews.\n\nNew patch incorporating Hoss's suggestions, details below:\n\ncall me paranoid, but i really dislike distrib tests that only use the query() method to ensure that the distrib response is the same as the control response \u2013 could we please add some assertions that use queryServer() to prove the docs are coming back in the right order in the distrib test?\n\nAs Hoss suggested on #solr IRC, I changed BasicDistributedSearchTestCase#query() to return the QueryResponse (instead of void), so that queryServer() doesn't have to be called separately from the random server vs. control check that query() performs.\n\nI then added a new method to SolrTestCaseJ4: assertFieldValues(doclist,fieldName,values), and now check that id field values are in the expected order using this new method.\n\nthe test should really sanity check that multi-level sorts (eg: \"payload asc, id desc\") are working properly\n\nAdded.\n\nwe should be really clear & careful in the javadocs for FieldType.marshalSortValue and FieldType.unmarshalSortValue \u2013 in your patch they refer to \"a value of this FieldType\" but that's not actually what they operate on. They operate on the values used by the FieldComparator returned by the SortField for this FieldType (ie: SortableDoubleField's toObject returns a Double, but the marshal method operates on ByteRef)\n\nReworded.\n\nI'm confused why we still need comparatorNatural() and it's use for REWRITEABLE. Why not actually rewrite() the SortField using the local IndexSearcher and then wrap the rewritten SortField's FieldComparator using comparatorFieldComparator() just like any other SortField? Since we're only ever going to compare the raw values on the coordinator it shouldn't matter if we rewrite in terms of the local IndexSearcher - it's the best we can do, and that seems safer then assuming REWRITABLE == function and trusting comparatorNatural. (ie: consider someone who writes a custom FieldType that uses REWRITABLE)\n\nFixed - comparatorNatural() is gone.\n\ndon't the marshal methods in StrField, TextField, and CollationField need null checks (for the possibilities of docs w/o a value in the sort field?)\n\nYes, they do, ICUCollatonField too - added.\n\ndo we even have any existing tests of distributed sorting on strings & numerics using sortMisstingLast / sortMissingFirst to be sure we don't break that?\n\nNo, I couldn't find any, so I added tests for sortMissingFirst and sortMissingLast on both SortableIntField and StringField on the existing TestDistributedSearch class.  I'll add testing for a Trie field too before I commit, not in the patch yet. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13835075",
+            "date": "2013-11-28T21:00:03+0000",
+            "content": "I added a Trie long field to the sort missing first/last tests, and moved them from the existing TestDistributedSearch class to a new class TestDistributedMissingSort with its own dedicated minimal schema file.\n\nAll solr tests pass, and ant precommit passes.\n\nCommitting shortly.\n\nI'll make a separate issue for testing distributed collation. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13835077",
+            "date": "2013-11-28T21:00:30+0000",
+            "content": "Commit 1546457 from Steve Rowe in branch 'dev/trunk'\n[ https://svn.apache.org/r1546457 ]\n\nSOLR-5354: Distributed sort is broken with CUSTOM FieldType "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13835081",
+            "date": "2013-11-28T21:29:11+0000",
+            "content": "Commit 1546461 from Steve Rowe in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1546461 ]\n\nSOLR-5354: Distributed sort is broken with CUSTOM FieldType (merged trunk r1546457) "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13835082",
+            "date": "2013-11-28T21:29:22+0000",
+            "content": "Committed to trunk and branch_4x. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13835397",
+            "date": "2013-11-29T14:37:02+0000",
+            "content": "Commit 1546571 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1546571 ]\n\nSOLR-5354: don't try to write docvalues with 3.x codec in these tests "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13835434",
+            "date": "2013-11-29T16:03:22+0000",
+            "content": "Commit 1546589 from Steve Rowe in branch 'dev/trunk'\n[ https://svn.apache.org/r1546589 ]\n\nSOLR-5354: fix attribution "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13835435",
+            "date": "2013-11-29T16:04:49+0000",
+            "content": "Commit 1546591 from Steve Rowe in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1546591 ]\n\nSOLR-5354: fix attribution (merged trunk r1546589) "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13835891",
+            "date": "2013-11-30T23:05:15+0000",
+            "content": "Looking further at this as part of SOLR-5463 I realized that this change introduces a new bug in some edge cases of sorting on functions.  The easiest way to reproduce this is to add a catchall dynamic field to the example schema.xml...\n\n<dynamicField name=\"*\" type=\"ignored\" multiValued=\"true\" />\n\n..and then attempt a distributed sort on a function...\n\nhttp://localhost:8983/solr/select?q=*:*&sort=sum%28popularity,price%29+desc&shards=localhost:8983/solr\n\n(But the problem can be reproduced in more sublte ways \u2013 notably any prefix based dynamicField that is also a prefix of a function \u2013 for example \"s*\" or {{\"currency*\"} as dynamicFields)\n\nThe problem comes about because of a mistaken impression I had when i made this comment above...\n\n\nI think solr should fix its own apis here? It could add FieldType[] to SortSpec or something like that.\n\nI'm not sure why that would help? We can already ask each SortField for it's getField() and then look that up in the Schema.\n\nMy mistake was in thinking that SortField.getField() would always be null unless the Sort was on a \"real\" field \u2013 but SortField's built arround functions have a getField method that returns a string representation of the function.  (This is behavior is currently required for the distributed sorting code when serializing/deserializing the list of sort values from each shard in order to know which values belong to which SortField).\n\nIn the past, using SortField.getField() to ask IndexSchema for a FieldType was a rare occurance driven by the runtime type of the value found \u2013 the FieldType found was never used unless the runtime sort value was a String, so it was never a problem if a dynamicField pattern matched a sort function string since they never returned Strings.  But now wit hthis new code, where we use the FieldType's marshalling methods for any valid field, it can cause problems.\n\nI think rmuir's suggestion is spot on: When parsing the SortSpec we need to keep track of the FieldType at a minimum \u2013 but it's just as easy to keep track of the SchemaField itself.\n\nI've got a patch where I tweaked sarowe's new test to demonstrate the bug and then fix it by having SortSpec keep track of a List<SchemaField> that corrisponds one-to-one with the SortFields.  It's a bit hairy, but it works. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13835893",
+            "date": "2013-11-30T23:05:44+0000",
+            "content": "\nSteve: could you take a look at this patch and let me know what you think?  \n\nFeel free to go ahead and commit if you think this looks ok, but if you have concerns and think we should go a different direction for the fix you certainly won't hurt my feelings. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13837786",
+            "date": "2013-12-03T15:23:01+0000",
+            "content": "Commit 1547430 from Steve Rowe in branch 'dev/trunk'\n[ https://svn.apache.org/r1547430 ]\n\nSOLR-5354: applying hoss's patch to fix function edge case in distributed sort "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13837888",
+            "date": "2013-12-03T16:46:36+0000",
+            "content": "Commit 1547473 from Steve Rowe in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1547473 ]\n\nSOLR-5354: applying hoss's patch to fix function edge case in distributed sort (merged trunk r1547430) "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13837900",
+            "date": "2013-12-03T16:57:40+0000",
+            "content": "committed Hoss's patch to trunk and branch_4x "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13872841",
+            "date": "2014-01-15T23:58:52+0000",
+            "content": "Commit 1558618 from Robert Muir in branch 'dev/branches/lucene539399'\n[ https://svn.apache.org/r1558618 ]\n\nLUCENE-5399, SOLR-5354: fix distributed grouping to marshal/unmarshal sort values properly "
+        }
+    ]
+}

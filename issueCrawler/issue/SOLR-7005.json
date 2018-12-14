@@ -1,0 +1,141 @@
+{
+    "id": "SOLR-7005",
+    "title": "facet.heatmap for spatial heatmap faceting on RPT",
+    "details": {
+        "components": [
+            "spatial"
+        ],
+        "type": "New Feature",
+        "labels": "",
+        "fix_versions": [
+            "5.1"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "This is a new feature that uses the new spatial Heatmap / 2D PrefixTree cell counter in Lucene spatial LUCENE-6191.  This is a form of faceting, and as-such I think it should live in the \"facet\" parameter namespace.  Here's what the parameters are:\n\n\tfacet=true\n\tfacet.heatmap=fieldname\n\tfacet.heatmap.geom=[\"-180 -90\" TO \"180 90\"]\n\tfacet.heatmap.gridLevel=6\n\tfacet.heatmap.distErrPct=0.15\n\tfacet.heatmap.format=ints2D | png\n(Officially see FacetParams where options are documented)\n\n\n\nLike other faceting features, the fieldName can have local-params to exclude filter queries or specify an output key.  This could be quite useful in doing difference faceting on the same spatial data to identify relative change against a baseline.\n\nThe geom is optional; you get the whole world or you can specify a box or WKT.\n\nUltimately, this feature needs to know the grid level, which together with the input shape will yield a certain number of cells.  You can specify gridLevel exactly, or don't and instead provide distErrPct which is computed like it is for the RPT field type as seen in the schema.  0.10 yielded ~4k cells but it'll vary.  There's also a facet.heatmap.maxCells safety net defaulting to 100k.  Exceed this and you get an error.\n\nThe output is (JSON):\n\n{gridLevel=6,columns=64,rows=64,minX=-180.0,maxX=180.0,minY=-90.0,maxY=90.0,counts_ints2D=[[0, 0, 2, 1, ....],[1, 1, 3, 2, ...],...]}\n\n\ncounts_ints2D is null if all would be 0.  individual row arrays should likewise be null... I welcome feedback.\n\nIf you set the output to 'png' then you get a 4-byte per pixel/cell PNG, or null if all counts are 0.  The high byte (alpha channel) is inverted so that counts need to exceed 2^24 before the image will start to fade out if you try and view it.\n\nThis supports sharded / distributed queries.",
+    "attachments": {
+        "heatmap_512x256.png": "https://issues.apache.org/jira/secure/attachment/12693632/heatmap_512x256.png",
+        "heatmap_64x32.png": "https://issues.apache.org/jira/secure/attachment/12693633/heatmap_64x32.png",
+        "SOLR-7005_heatmap.patch": "https://issues.apache.org/jira/secure/attachment/12693698/SOLR-7005_heatmap.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-01-20T15:55:21+0000",
+            "author": "David Smiley",
+            "content": "I really don't wan't to weigh down SimpleFacets any more than it is... so I will go the route that interval faceting did and put the code in a separate class and only put a modicum of hooks into FacetComponent and SimpleFacets.  As I write this, my working code in-progress is actually a separate SearchComponent that follows FacetComponent; it extends SimpleFacets to use some of its capability.  But it seems that if I'm going to use the facet namespace, I ought to hook in directly to FacetComponent; plus users need not register a separate component.  As always, I welcome input from other devs.\n\np.s. preliminary perf #'s are super promising.  Real numbers will be forthcoming later.  I envision real-time time-series heatmap movies being generated and displayed in the browser with thousands of cells of resolution per-frame.   ",
+            "id": "comment-14283948"
+        },
+        {
+            "date": "2015-01-20T15:59:35+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I envision real-time time-series heatmap movies being generated and displayed in the browser with thousands of cells of resolution per-frame\n\nThat's super cool! ",
+            "id": "comment-14283953"
+        },
+        {
+            "date": "2015-01-21T17:16:53+0000",
+            "author": "David Smiley",
+            "content": "There are some performance #'s on LUCENE-6191.\n\nI experimented with generating a PNG to carry the data in a compressed manner, since this data can get large.  I'm abusing the image to carry the same detail in the counts, and that means 4 bytes per pixel.  Counts > 16M touch the high byte of a 4-byte int, which is where the alpha channel is, which will progressively lighten the image.  The image is not at all optimized for human viewing that is pleasant on the eyes, except for the bit flip of the high (alpha channel) byte; otherwise you would see nothing until the counts exceed this figure.  That said, it's crude and you can get a sense of it.  If people have input on how to cheaply and easily tweak the value to look nicer, I'm interested.  Since a client app may consume this PNG if it wants this compressed format and render it the way it wants to, there should be a straight-forward algorithm to derive the count from the ARGB (alpha, red, green, blue) int.\n\nThe attached PNG is 512x256 (131,072 cells mind you!) of the 8.5M geonames data set.  On a 16 segment index with no search filters, it took 882ms to compute the underlying heatmap, and 218ms to build the PNG and write it to disk.  The write-to-disk hack is temporary to easily view the image by opening it from the file system.  You can expect there will be more time in consuming this image from Solr's javabin/XML/JSON + base64 wrapper (whatever you choose).\n\nNow a 512x256 image is so detailed that it arguably isn't a heatmap but another way to go about rendering individual points.  A more course, say, 64x32 image would be more true to the heatmap label, and obviously much faster to generate \u2013 like 100ms + only ~2ms to generate the PNG. ",
+            "id": "comment-14285909"
+        },
+        {
+            "date": "2015-01-21T20:32:14+0000",
+            "author": "David Smiley",
+            "content": "Thanks for the encouragement Shalin, and Erik on #lucene-dev, and others via email who have gotten wind of this.\n\nHere's the first-draft patch.  It is still based on being its own SearchComponent, and it doesn't yet support distributed-search \u2013 those issues should be addressed next.\n\nI added support for the \"distErr\" parameter to facilitate computing the grid level in the same fashion as used by Lucene spatial to ultimately derive a grid level for a given shape (a rect/box in this case).  In fact it re-uses utility methods in Lucene spatial to compute the grid level given the world boundary, distErr (if provided) and distErrPct (if provided).  The units of distErr is the same as distanceUnits attribute on the field type (a new Solr 5 thing).  So if units is a kilometer and distErr is 100 then the grid cells returns are at least as precise as 100 kilometers (which BTW is a little less than a spherical degree for Earth, which is 111.2km).  The 512x256 heatmap I uploaded was generated by specifying distErr=111.2.  A client could compute a distErr if they instead know how many minimum cells they want in the heatmap.  I may bake that formula in and provide a minCells param.\n\nFor distributed-search, I'm thinking the internal shard requests will use PNG since it's compressed, and then the user can get whatever format they asked for.  I only want to write the aggregation logic once, not per-format \n\nAs a part of this work I found it useful to add SpatialUtils.parseRectangle which parses the [lowerLeftPoint TO upperRightPoint] format.  In another issue I want to re-use this to provide a more Solr-friendly way of indexing a rectangle (for e.g. BBoxField or RPT) or for specifying worldBounds on the field type.\n\nEven though I don't have distributed-search implemented yet, the test extends BaseDistributedSearchTestCase any way.  I dislike the idea of writing two tests that test the same thing (one distributed, one not) when the infrastructure should make it indifferent since it's transparent to input & output I'm testing.  Unfortunately, assertQ & friends are hard-coded to use TestHarness which is in turn hard-coded to use an embedded Solr instance.  And unfortunately, BaseDistributedSearchTestCase doesn't let me test 0 shards (hey, I haven't implemented that feature yet!).  The patch tweaks BaseDistributedSearchTestCase slightly to let me do this.  ",
+            "id": "comment-14286210"
+        },
+        {
+            "date": "2015-01-21T20:47:12+0000",
+            "author": "David Smiley",
+            "content": "Oh, facet.heatmap.format=png (or \"ints\", ints being the default) ",
+            "id": "comment-14286232"
+        },
+        {
+            "date": "2015-01-22T05:28:09+0000",
+            "author": "David Smiley",
+            "content": "The perf tests on the Lucene issue were of the whole world.  For fun I went to a small part of the globe, NYC region, and generated a heatmap PNG, 9.5m per pixel (cell) of 467x467 cells on this 16-segment (unoptimized) index and it only took 44ms (to include returning the base64'ed PNG to the client).  For more fun I upped the size to be a huge 2096x2096 (4.4M pixels aka cells, bigger than most people's screens) and it took 521ms.  It's sparse though; PNG encoding consumed 90% of the time since it was so large; normally it's a few percent.  A spatial filter of the same region shows 1298 docs, so yes its sparse relative to the heatmap/image as a whole.  This shows this technique can be used for point-plotting purposes when you might want to plot all the points in a search region without them necessarily being in your top-X search list.  That use-case, (high-rez but sparse) suggests a different response format than a grid of ints, such as simply listing point coordinates with counts.  Doing that is for another time though. ",
+            "id": "comment-14286979"
+        },
+        {
+            "date": "2015-01-25T03:27:20+0000",
+            "author": "David Smiley",
+            "content": "This latest patch integrates with the FacetComponent to become a new type of faceting; it's no longer a separate SearchComponent. And this implements distributed/sharding support.  The params were added to FacetParams.\n\nLike interval faceting, the code is kept out of FacetComponent & SimpleFacets but even more so (even the distributed logic), with only one-liner hooks where needed, and only a touch more than that in SimpleFacets.  The whole situation could be a lot more elegant with a major refactor of how the faceting code overall is organized, but I have no time these days.\n\nThere are some nocommits:\n\n\tI need to randomized-test round-trip the PNG encoding.\n\tthe ints format is particularly easy to consume and even eye-ball it to get a sense of the data.  As-such I want to orient the numbers to go right-to-left then top-down.  And maybe rename to \"ints2d\".  But it isn't particularly compact/efficient, and I already know I want a separate format I'm tentatively calling \"skipList\" that would list the counts with negative numbers signifying how many zeroes to insert; and then you have to know the column/row order to read it, which would of course be documented.  This format would be compact and great for sparse data or small heatmaps.  But then would we really need \"ints2d\"?\n\tI'm confused about FacetComponent.distributedProcess() line ~215 (removal of faceting types when distribFieldFacetRefinements != null).  Chris Hostetter (Unused) Which faceting types should be removed here; why is it just facet.field and facet.query; maybe the others should too?\n\tthe facet.heatmap.bbox param actually supports not just the rect-query syntax but WKT as well; which can be convenient but I expect to be atypical. Should 'wkt' be a separate mutually exclusive param?  Ugh; param fatigue.  Or could it be renamed to 'region' or 'shape' or 'geom'?  This reminds me; it could be useful for the underlying Lucene heatmap facet counter to not insist on a rectangular region; why not specify any poly and get counts just for those grid squares.  That would make 'bbox' even less appropriate.\n\n ",
+            "id": "comment-14290969"
+        },
+        {
+            "date": "2015-02-03T17:38:36+0000",
+            "author": "Hoss Man",
+            "content": "I'm confused about FacetComponent.distributedProcess() line ~215 (removal of faceting types when distribFieldFacetRefinements != null). Chris Hostetter Which faceting types should be removed here; why is it just facet.field and facet.query; maybe the others should too?\n\nI'm confused to. (admitedly i haven't looked at it very hard today)\n\nI suspect this code is just really old, from the back when only facet.field & facet.query existed.  I suspect that at that point in time, the idea was:\n\n1) remove every the facet.field params, because we're about loop over the ones we know still need refinment and add them\n2) remove any facet.query, because they never need refined\n\nYou'll note that a few lines down ~233 there is a similar block of code relating to facet.pivot & facet.pivot.mincount \u2013 aparently for the same reasons as #1 above.\n\n...Which faceting types should be removed here; why is it just facet.field and facet.query; maybe the others should too?\n\ni suspect it's safe/efficient to remove all the facet params up front, and let the various types of faceting re-add the params they need if/when they need refined? ... but i'm not certain about that.\n\nthe thing to do is setup a simple cluster where the field terms are vastly diff between two shards (to force refinement) and then look at what distributed refinement requests are sent to each shard when combining multiple types of faceting \u2013 make sure that a facet.field + facet.range + facet.query + facet.pivot + facet.heatmap that requires refinement on the facet.field doesn't unneccessarily re-request the same facet.range + facet.query + facet.pivot + facet.heatmap if they don't also need refinement. ",
+            "id": "comment-14303651"
+        },
+        {
+            "date": "2015-02-04T19:19:28+0000",
+            "author": "Ryan McKinley",
+            "content": "the facet.heatmap.bbox param actually supports not just the rect-query syntax but WKT as well; which can be convenient but I expect to be atypical. Should 'wkt' be a separate mutually exclusive param? Ugh; param fatigue. Or could it be renamed to 'region' or 'shape' or 'geom'? This reminds me; it could be useful for the underlying Lucene heatmap facet counter to not insist on a rectangular region; why not specify any poly and get counts just for those grid squares. That would make 'bbox' even less appropriate.\n\nWhat about `facet.heatmap.bounds` the term does not imply the shape (and one would not be surprised if it converts WKT to a rectangle or uses the original shape as a later improvement) ",
+            "id": "comment-14305777"
+        },
+        {
+            "date": "2015-02-04T20:35:04+0000",
+            "author": "David Smiley",
+            "content": "I like facet.heatmap.bounds a lot.  I like facet.heatmap.geom too for it's consistency \u2013 planned consistency any way with SOLR-4242 in which I suggested the new param should be 'geom' instead of 'wkt'.  I suggested this in the Review Board system but I'll add that to the issue now, where it should be. ",
+            "id": "comment-14305897"
+        },
+        {
+            "date": "2015-02-05T17:12:13+0000",
+            "author": "David Smiley",
+            "content": "i suspect it's safe/efficient to remove all the facet params up front, and let the various types of faceting re-add the params they need if/when they need refined? ... but i'm not certain about that.\n\nI suspect that as well.  I'll look into finding an existing test that exercises distributed refinement, and then I'll see what happens when I throw in extra types of faceting. I don't want to commit that to whatever test that is but I'll use it as a tool to observe.  If we're right, then I'll file an issue as an optimization w/ fix; though arguably it could be considered a performance bug. ",
+            "id": "comment-14307571"
+        },
+        {
+            "date": "2015-02-07T06:05:34+0000",
+            "author": "David Smiley",
+            "content": "Updated patch:\n\n\tformat \"ints\" renamed to \"ints2D\"\n\tints2D is now by-row, top-down making it more easily interpretable by user/developers \u2013 like me when I inspect test output \n\tfacet.heatmap.geom param rename\n\tgeom can be any WKT and it filters the underlying data as well.\n\t\n\t\trefactored this parsing out to a method in SpatialUtils for wider use\n\t\ttested input circle \u2013 0's at the corners\n\t\n\t\n\ttested PNG round-trip (randomized)\n\n\n\nOnly thing left is to figure out what parameters FacetComponent should be setting during refinement so that heatmaps (and interval facets) aren't needlessly computed.\n\nNevertheless I'm inclined to commit this Monday and incrementally address optimizing the refinement request. ",
+            "id": "comment-14310572"
+        },
+        {
+            "date": "2015-02-10T02:31:03+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1658614 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1658614 ]\n\nSOLR-7005: New facet.heatmap on spatial RPT fields ",
+            "id": "comment-14313399"
+        },
+        {
+            "date": "2015-02-10T03:23:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1658617 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1658617 ]\n\nSOLR-7005: New facet.heatmap on spatial RPT fields ",
+            "id": "comment-14313468"
+        },
+        {
+            "date": "2015-02-15T02:18:14+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1659872 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1659872 ]\n\nSOLR-7005: don't add facet.heatmap.format=png to shard requests unless heatmaps are in use\nNot a bug; just a small cleanup. ",
+            "id": "comment-14321784"
+        },
+        {
+            "date": "2015-02-15T02:19:51+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1659873 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1659873 ]\n\nSOLR-7005: don't add facet.heatmap.format=png to shard requests unless heatmaps are in use\nNot a bug; just a small cleanup. ",
+            "id": "comment-14321785"
+        },
+        {
+            "date": "2015-02-15T02:21:41+0000",
+            "author": "David Smiley",
+            "content": "Closing.  The optimization concerning distributed facet.field & facet.pivot refinement requests is now tracked as SOLR-7116. ",
+            "id": "comment-14321786"
+        },
+        {
+            "date": "2015-04-15T00:30:30+0000",
+            "author": "Timothy Potter",
+            "content": "Bulk close after 5.1 release ",
+            "id": "comment-14495304"
+        },
+        {
+            "date": "2016-01-28T04:22:45+0000",
+            "author": "David Smiley",
+            "content": "Note: this code was donated to the Apache Software Foundation by the Harvard Center for Geographic Analysis as part of the Harvard Hypermap (HHypermap) and WorldMap projects. ",
+            "id": "comment-15120728"
+        }
+    ]
+}

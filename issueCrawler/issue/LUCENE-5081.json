@@ -1,0 +1,144 @@
+{
+    "id": "LUCENE-5081",
+    "title": "WAH8DocIdSet",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Our filters use bit sets a lot to store document IDs. However, it is likely that most of them are sparse hence easily compressible. Having efficient compressed sets would allow for caching more data.",
+    "attachments": {
+        "LUCENE-5081.patch": "https://issues.apache.org/jira/secure/attachment/12590055/LUCENE-5081.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-06-28T16:58:06+0000",
+            "content": "Here is an implementation of a compressed doc ID set. Although it is immutable, only supports sequential access and requires doc IDs to be provided in order at building time, it supports fast iteration (nextDoc), skipping (advance), union and intersection. The detailed format is a bit complex (see javadocs), but the rough idea is to store large sequences of null bytes as a VInt and sequences of non-null bytes as-is. This implementation can compress data as soon as it can find more than 2 consecutive null bytes. Moreover, even incompressible sets only require a few bytes more than FixedBitSet.\n\nI ran a quick benchmark to measure the size (as reported by RamUsageEstimator) depending on the percentage of bits set on a bit set containing 2<sup>23</sup> elements (FixedBitSet requires 1MB) as well as the time required to iterate over all document IDs compared to FixedBitSet:\n\n\n\nPercentage of bits set\nSize\nIteration time/FixedBitSet iteration time\n\n\n0.001%\n360 bytes\n0.01\n\n\n0.01%\n2.8KB\n0.10\n\n\n0.1%\n23.8 KB\n0.38\n\n\n1%\n187.7 KB\n0.80\n\n\n10%\n864 KB\n1.3\n\n\n50%\n1 MB\n2.5\n\n\n90%\n1 MB\n2.3\n\n\n100%\n1 MB\n1.7\n\n\n\n\n\nEven in the worst case, memory usage exceeds the memory usage of FixedBitSet by a few bytes, and iteration is 2.5 times slower.\n\nThe patch includes the set implementation but it is not used anywhere yet. I was thinking about using it automatically instead of FixedBitSet in CachingWrapperFilter but it looks like ToParentBlockJoinQuery expects to get a FixedBitSet from the cache. ",
+            "author": "Adrien Grand",
+            "id": "comment-13695564"
+        },
+        {
+            "date": "2013-06-29T11:33:56+0000",
+            "content": "Thanks for opening this Adrien!\n\n\nThe patch includes the set implementation but it is not used anywhere yet. I was thinking about using it automatically instead of FixedBitSet in CachingWrapperFilter but it looks like ToParentBlockJoinQuery expects to get a FixedBitSet from the cache.\n\nMaybe we should anticipate more implementations in the future? I know there are a lot of algorithms and \"Compressed\" is pretty general.\n\nAs far as ToParentBlockJoinQuery, i dont think it should make these assumptions... that seems wrong for it to do that. ",
+            "author": "Robert Muir",
+            "id": "comment-13696099"
+        },
+        {
+            "date": "2013-06-29T11:54:01+0000",
+            "content": "I dont think it should use CachingWrapperFilter as a \"workaround\" and assuming its a FixedBitSet.\n\nIf it needs a FixedBitSet, it can use the filter, get its DocIdSetIterator and pass it to FixedBitSet to create a copy. The use case in BlockJoinQuery has nothing to do with filters, it needs a special implementation to seek backwards through the result set. So it has to clone the bitset by itsself by explicitely creating a FixedBitSet internally (if it detects that the DocIdSet returned by the filter is not a FixedBitSet). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13696103"
+        },
+        {
+            "date": "2013-06-29T11:56:52+0000",
+            "content": "Unfortunately ToParentBlockJoinQuery uses .nextSetBit and .prevSetBit from FixedBitSet, which is why it currently requires a FixedBitSet.\n\nI guess we could relax it and just have it do the obvious dumb and slow approach when the incoming bitset isn't a FixedBitSet?\n\nLUCENE-1969 is another effort to add compressed bit sets to Lucene ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13696104"
+        },
+        {
+            "date": "2013-06-29T11:57:47+0000",
+            "content": "yeah couldnt it use instanceof+fall back? how much slower is the obvious dumb and slow approach? ",
+            "author": "Robert Muir",
+            "id": "comment-13696105"
+        },
+        {
+            "date": "2013-06-29T12:02:31+0000",
+            "content": "Let's open a separate issue for how to fix BJQ; it shouldn't hold up this issue.  EG for BJQ's tests, can't they override CWF.docIdSetToCache to return a FixedBitSet?  Then we can decouple the two issues? ",
+            "author": "Michael McCandless",
+            "id": "comment-13696107"
+        },
+        {
+            "date": "2013-06-29T12:46:10+0000",
+            "content": "EG for BJQ's tests, can't they override CWF.docIdSetToCache to return a FixedBitSet? Then we can decouple the two issues?\n\nGood idea, this patch should just fix the test for now.\n\nOne thing: The Bitset does not implement public Bits bits() so it's not random access. This means that a cached CompressedDocIdSet cannot be applied down-low. Is it possible to make it random access at all? The default method returned by the superclass DocIdSet returns null, so FilteredQuery would fall back to the iterator. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13696116"
+        },
+        {
+            "date": "2013-06-30T11:02:06+0000",
+            "content": "I'm (slowly) working on an implemention of Elias Fano compression, basically as described in in sections 3 and 4 of this article:\n\nSebastiano Vigna, \"Quasi Succinct Indices\", June 19, 2012, http://arxiv.org/pdf/1206.4300\nThe article is quite interesting, not in the least because it compares MG4J directly to Lucene 3.6.\n\nThe implementation I am working on also does backward iteration, but it has no index yet, so it is still somewhat slow for advance()'ing to distant targets. Since there is interest in compression, I'll open an issue for this soon.\n\nFor backward iteration I think it would be good to extend DocIdSetIterator with backwards iterating method(s), possibly in a subclass, and use an implementation of that in the block joins.\n ",
+            "author": "Paul Elschot",
+            "id": "comment-13696317"
+        },
+        {
+            "date": "2013-06-30T14:15:23+0000",
+            "content": "Maybe we should anticipate more implementations in the future?\n\nGood point. I'll rename to WAH8DocIdSet (word-aligned hybrid compression on words of 8 bits).\n\nLUCENE-1969 is another effort to add compressed bit sets to Lucene ...\n\nThanks for the pointer, I'll look into it.\n\nIs it possible to make it random access at all?\n\nUnfortunately it is not possible. Although it is easy to save space when having to either support random access or iterate in order, requiring both makes compression much harder especially if the bit set is not very sparse.\n\nI'm (slowly) working on an implemention of Elias Fano compression, basically as described in in sections 3 and 4 of this article. [...] I'll open an issue for this soon.\n\nThis looks very interesting! I'm looking forward to seeing how this DocIdSet would behave!\n ",
+            "author": "Adrien Grand",
+            "id": "comment-13696339"
+        },
+        {
+            "date": "2013-06-30T15:40:14+0000",
+            "content": "The issue for EliasFanoDocIdSet is LUCENE-5084 ",
+            "author": "Paul Elschot",
+            "id": "comment-13696357"
+        },
+        {
+            "date": "2013-07-04T14:54:20+0000",
+            "content": "The use case in BlockJoinQuery has nothing to do with filters, it needs a special implementation to seek backwards\nFor backward iteration I think it would be good to extend DocIdSetIterator with backwards iterating method(s), possibly in a subclass, and use an implementation of that in the block joins.\n\nI opened LUCENE-5092. ",
+            "author": "Adrien Grand",
+            "id": "comment-13700111"
+        },
+        {
+            "date": "2013-07-10T17:37:34+0000",
+            "content": "New patch:\n\n\trenamed implementation to WAH8DocIdSet\n\tadded an index in order to be able to advance() in logarithmic time, this works pretty much like the old terms index impl by storing the position and doc ID encoded at every n-th sequence and then using binary search to find somewhere before the target and close to it,\n\teven with the index, WAH8DocIdSet is never larger than FixedBitSet by more than 2% (even when the index interval is 8, which is the lowest accepted value in the current impl),\n\tfactored some code out of BitVector and OpenBitSetIterator into BitUtil.\n\n\n\nI haven't wired this set implementation anywhere yet but I think always being less than 2% smaller than FixedBitSet and being able to advance in logarithmic time are nice properties so I'm pretty sure some people will be interested in using it for their caches. I'm waiting for the other implementations to get in/improve (eg. when EliasFanoDocIdSet will have an index) to write more detailed benchmarks to compare speed and memory efficiency of the impls we have for our caches (Elias-Fano, WAH8, FixedBitSet so far, maybe something based on PFOR-delta soon too).\n\nPlease let me know if you would like to review this patch. Otherwise I will commit it soon. ",
+            "author": "Adrien Grand",
+            "id": "comment-13704798"
+        },
+        {
+            "date": "2013-07-10T18:37:56+0000",
+            "content": "I looked thru it: thanks Adrien! +1\n\nPerhaps it would be good to add a few extreme tests (like all bits empty/all set).\nShould we implement hashcode/equals? The other impls (fixed/open/etc) have this.\nIn general we should maybe open a followup issue to give these docidset classes a base test superclass test.\nTestOpenBitset and TestFixedBitset are almost complete duplicates of each other for example. Any stuff that\ncan test via docidset/iterator apis should probably do so, and other impl stuff like intersect() can stay\nin each test (thats fine, at least we improve things). ",
+            "author": "Robert Muir",
+            "id": "comment-13704893"
+        },
+        {
+            "date": "2013-07-10T19:00:44+0000",
+            "content": "Should we implement hashcode/equals? The other impls (fixed/open/etc) have this.\n\nIf we do this, I think the contract for equals and hashCode should be the same as java.util.List, ie. two DocIdSet are equal if their content is the same (no matter what the implementation is).\n\n\nIn general we should maybe open a followup issue to give these docidset classes a base test superclass test.\nTestOpenBitset and TestFixedBitset are almost complete duplicates of each other for example. Any stuff that\ncan test via docidset/iterator apis should probably do so, and other impl stuff like intersect() can stay\nin each test (thats fine, at least we improve things).\n\nGood point, I will do that. ",
+            "author": "Adrien Grand",
+            "id": "comment-13704921"
+        },
+        {
+            "date": "2013-07-10T19:04:08+0000",
+            "content": "\nIf we do this, I think the contract for equals and hashCode should be the same as java.util.List, ie. two DocIdSet are equal if their content is the same (no matter what the implementation is).\n\nI am not sure how these are used today. I was just asking in case there is something relying upon this. If they are just added as a \"bonus\" and not really needed by our codebase, then I am not sure we should worry... but its up to you. ",
+            "author": "Robert Muir",
+            "id": "comment-13704928"
+        },
+        {
+            "date": "2013-07-10T19:24:26+0000",
+            "content": "Commit 1501925 from Adrien Grand\n[ https://svn.apache.org/r1501925 ]\n\nLUCENE-5081: WAH8DocIdSet. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13704946"
+        },
+        {
+            "date": "2013-07-10T19:29:18+0000",
+            "content": "Commit 1501928 from Adrien Grand\n[ https://svn.apache.org/r1501928 ]\n\nLUCENE-5081: WAH8DocIdSet (merged from r1501925). ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13704952"
+        },
+        {
+            "date": "2013-07-10T21:04:57+0000",
+            "content": "In general we should maybe open a followup issue to give these docidset classes a base test superclass test.\n\nLUCENE-5100 ",
+            "author": "Adrien Grand",
+            "id": "comment-13705065"
+        },
+        {
+            "date": "2013-07-10T21:41:07+0000",
+            "content": "I am not sure how these are used today. I was just asking in case there is something relying upon this. If they are just added as a \"bonus\" and not really needed by our codebase, then I am not sure we should worry... but its up to you.\n\n+1, I have no use case at the moment to compare DocIdSets. Especially not cross-implementation. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13705114"
+        },
+        {
+            "date": "2013-10-05T10:18:59+0000",
+            "content": "4.5 release -> bulk close ",
+            "author": "Adrien Grand",
+            "id": "comment-13787057"
+        }
+    ]
+}

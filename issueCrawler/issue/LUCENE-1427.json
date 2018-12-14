@@ -1,0 +1,77 @@
+{
+    "id": "LUCENE-1427",
+    "title": "QueryWrapperFilter should not do scoring",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "2.9"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "The purpose of QueryWrapperFilter is to simply filter to include the docIDs that match the query.\n\nIts implementation is wasteful now because it computes scores for those matching docs even though the score is unused.  We could fix this by getting a Scorer and iterating through the docs without asking for the score:\n\n\nIndex: src/java/org/apache/lucene/search/QueryWrapperFilter.java\n===================================================================\n--- src/java/org/apache/lucene/search/QueryWrapperFilter.java\t(revision 707060)\n+++ src/java/org/apache/lucene/search/QueryWrapperFilter.java\t(working copy)\n@@ -62,11 +62,9 @@\n   public DocIdSet getDocIdSet(IndexReader reader) throws IOException {\n     final OpenBitSet bits = new OpenBitSet(reader.maxDoc());\n \n-    new IndexSearcher(reader).search(query, new HitCollector() {\n-      public final void collect(int doc, float score) {\n-        bits.set(doc);  // set bit for hit\n-      }\n-    });\n+    final Scorer scorer = query.weight(new IndexSearcher(reader)).scorer(reader);\n+    while(scorer.next())\n+      bits.set(scorer.doc());\n     return bits;\n   }\n\n\n\nMaybe I'm missing something, but this seams like a simple win?",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2008-10-22T18:32:59+0000",
+            "content": "Indeed a simple win, but it can be even simpler (untested):\n\n  return new DocIdSet() {\n    public DocIdSetIterator iterator() {\n      return scorer;\n    }\n  };\n\n\nThis DocIdSetIterator should be used only once, so it's best to cache it in a CachingWrapperFilter, and the javadocs could indicate that.\n\nSee also LUCENE-1296, which allows the choice of a supporting data structure other than OpenBitSet. ",
+            "author": "Paul Elschot",
+            "id": "comment-12641930"
+        },
+        {
+            "date": "2008-10-22T20:44:43+0000",
+            "content": "Excellent!  That's about as simple as it can get \n\nBut, I don't really like forcefully wrapping CachingWrapperFilter inside \u2013 that should be up to the caller to decide? ",
+            "author": "Michael McCandless",
+            "id": "comment-12641963"
+        },
+        {
+            "date": "2008-10-26T22:50:46+0000",
+            "content": "But, I don't really like forcefully wrapping CachingWrapperFilter inside - that should be up to the caller to decide?\n\nAgree. Perhaps we should have a OneTimeDocIdSet for cases like this one, and leave the possibility to repeatedly generate a DocIdSetIterator to caching filters. Just thinking out loud.\n\nA OneTimeDocIdSet would throw an for example an IllegalStateException when its iterator() method is called more than once. ",
+            "author": "Paul Elschot",
+            "id": "comment-12642827"
+        },
+        {
+            "date": "2008-10-28T14:22:47+0000",
+            "content": "Perhaps we should have a OneTimeDocIdSet for cases like this one, and leave the possibility to repeatedly generate a DocIdSetIterator to caching filters\n\nI'm torn on this. It's nice in that it'd \"forcefully\" remind you that if you are re-using a filter you really should cache it.  But, then, there are legitimate cases where you don't want to cache it (eg you know you will use it rarely, it's fast enough, and you don't want to spend the RAM).\n\nAlso, for this instance it'd be a break in back compatibility since you can currently re-use a QueryWrapperFilter instance.\n\nSo I guess I'm leaning back towards my original patch, which still allows re-use, but does not waste CPU computing scores which are just discarded. ",
+            "author": "Michael McCandless",
+            "id": "comment-12643221"
+        },
+        {
+            "date": "2008-10-28T16:41:32+0000",
+            "content": "The new Filter api allows to split the concerns of which data structure to use for collecting the  docs in the DocIdSet and the cached data structure used to iterate over this set, and this is what shows up here.\n\nFor backward compatibility QueryWrapperFilter could use an OpenBitSet that is good for collecting the docids, but the new Filter api leaves it not really necessary to use a data structure at all (see my initial suggestion).\n\nSo the question is how we want to deal with the split between initial collecting and later repeated iterations. OpenBitSet is certainly good for collecting, so a good and backward compatible way would be to document the use of OpenBitSet in the javadocs of QueryWrapperFilter, and let CachingWrapperFilter decide later which data structure to cache.\nThe alternative would be to let CachingWrapperFilter always do the initial collecting , but that would not be backward compatible.\n\ninstanceof could be used to decide at CachingWrapperFilter to do this initial collecting when it's not sure that the given data structure allows repeated iteration, but it may be better to add a boolean method to DocIdSet that indicates whether the iterator can be used more than once or not. However, that is better left to LUCENE-1296 .\n\nIn short, I'd like to have a javadoc remark added to the original patch on the use of OpenBitSet, and leave the rest to LUCENE-1296 . ",
+            "author": "Paul Elschot",
+            "id": "comment-12643252"
+        },
+        {
+            "date": "2008-10-28T19:12:03+0000",
+            "content": "Actually, can't we simply instantiate a new scorer each time iterator() is called?  Then we don't need an intermediate OpenBitSet and we can simply return the scorer (your original suggestion).\n\nThe only problem is... we then need to add \"throws IOException\" to DocIdSet.iterator().  While that is technically a non-back-compatible change (places that call DocIdSet.iterator() may suddenly have to add \"throws IOException\" to their method signatures, up the chain), I think it's likely very rare in practice that a code change would be needed, since the next() method of the iterator throws IOException and presumably almost all code that gets an iterator then next()'s through it.  There were no changes in Lucene's core or contrib sources necessary on adding this.  I think it's an acceptable change.\n\nThen the patch looks like this:\n\nIndex: src/java/org/apache/lucene/search/DocIdSet.java\n===================================================================\n--- src/java/org/apache/lucene/search/DocIdSet.java\t(revision 708628)\n+++ src/java/org/apache/lucene/search/DocIdSet.java\t(working copy)\n@@ -17,11 +17,12 @@\n  * limitations under the License.\n  */\n \n+import java.io.IOException;\n \n /**\n  * A DocIdSet contains a set of doc ids. Implementing classes must provide\n  * a {@link DocIdSetIterator} to access the set. \n  */\n public abstract class DocIdSet {\n-\tpublic abstract DocIdSetIterator iterator();\n+\tpublic abstract DocIdSetIterator iterator() throws IOException;\n }\nIndex: src/java/org/apache/lucene/search/QueryWrapperFilter.java\n===================================================================\n--- src/java/org/apache/lucene/search/QueryWrapperFilter.java\t(revision 708628)\n+++ src/java/org/apache/lucene/search/QueryWrapperFilter.java\t(working copy)\n@@ -59,15 +59,13 @@\n     return bits;\n   }\n   \n-  public DocIdSet getDocIdSet(IndexReader reader) throws IOException {\n-    final OpenBitSet bits = new OpenBitSet(reader.maxDoc());\n-\n-    new IndexSearcher(reader).search(query, new HitCollector() {\n-      public final void collect(int doc, float score) {\n-        bits.set(doc);  // set bit for hit\n+  public DocIdSet getDocIdSet(final IndexReader reader) throws IOException {\n+    final Weight weight = query.weight(new IndexSearcher(reader));\n+    return new DocIdSet() {\n+      public DocIdSetIterator iterator() throws IOException {\n+        return weight.scorer(reader);\n       }\n-    });\n-    return bits;\n+    };\n   }\n \n   public String toString() {\n\n\n\nI do agree, longer term, that clarifying the semantics to allow some DocIDSets that do not allow more than one call to iterator(), and then requiring something like CachingWrapperFilter to \"translate\" between different DocIdSets (compact or not, re-iterable, etc) is worth thinking about.  Though, besides this case, which seems easy to fix by just getting another scorer in iterator(), are there other places where not having to provide a repeatable iterator buys us some compelling freedom? ",
+            "author": "Michael McCandless",
+            "id": "comment-12643310"
+        },
+        {
+            "date": "2008-10-28T21:00:00+0000",
+            "content": "... are there other places where not having to provide a repeatable iterator buys us some compelling freedom?\n\nOne might want to cache the Filter based on the version (last mod time) of the index, and not based on the actual index reader. In that case the original reader could not be available when the Filter is used.\n\nI don't know whether that is compelling given the current cost of (re)opening an index. ",
+            "author": "Paul Elschot",
+            "id": "comment-12643337"
+        },
+        {
+            "date": "2008-10-29T18:37:13+0000",
+            "content": "OK I plan to commit the above patch in a day or two. ",
+            "author": "Michael McCandless",
+            "id": "comment-12643590"
+        },
+        {
+            "date": "2008-10-31T16:18:33+0000",
+            "content": "Committed revision 709459.\n\nThanks Paul! ",
+            "author": "Michael McCandless",
+            "id": "comment-12644329"
+        }
+    ]
+}

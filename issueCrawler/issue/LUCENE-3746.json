@@ -1,0 +1,74 @@
+{
+    "id": "LUCENE-3746",
+    "title": "suggest.fst.Sort.BufferSize should not automatically fail just because of freeMemory()",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "modules/spellchecker"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "3.6",
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Follow up op dev thread: FSTCompletionTest failure \"At least 0.5MB RAM buffer is needed\"",
+    "attachments": {
+        "LUCENE-3746.patch": "https://issues.apache.org/jira/secure/attachment/12513002/LUCENE-3746.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-02-02T17:12:39+0000",
+            "content": "Simple fix: consult also with maxMemory if freeMemory not suffice. ",
+            "author": "Doron Cohen",
+            "id": "comment-13198979"
+        },
+        {
+            "date": "2012-02-02T18:06:09+0000",
+            "content": "\nDawid: (maxMemory - totalMemory) because that's how much the heap can\ngrow? The problem is none of this is atomic, so the result can\nunpredictable. There are other methods in management interface that\npermit a somewhat more detailed checks.  Don't know if they guarantee\natomicity of the returned snapshot, but I doubt it.\n\n\tMemoryMXBean.getHeapMemoryUsage()\n\tMemoryPoolMXBean.getPeakUsage()\n\n\n\nCurrent patch not (yet) handling the atomicity issue Dawid described.  ",
+            "author": "Doron Cohen",
+            "id": "comment-13199038"
+        },
+        {
+            "date": "2012-02-05T16:39:10+0000",
+            "content": "Updated patch using ManagementFactory.getMemoryMXBean().getHeapMemoryUsage(). \n\nJavadocs are not explicit about this call being atomic, but from the wording it seems almost certain to conclude that each call returns a new Usage instance. In this patch this is (Java) asserted and the assert passes (-ea) in two different JVMs - IBM and Oracle - so this might be correct. I searched some more explicit info on this with no success. \n\nAnnoyingly though, in IBM JDK, running the tests like this produces the nice warning:\n\n\nWARNING: test class left thread running: Thread[MemoryPoolMXBean notification dispatcher,6,main]\nRESOURCE LEAK: test class left 1 thread(s) running\n\n\n\nThis makes me reluctant to use the memory bean - I did not find a way to prevent that thread leak.\n\nSo perhaps a better approach would be to be conservative about the sequence of calls when using Runtime? something like this:\n\n\nlong free = rt.freeMemory();\nif (free is sufficient)\n  return decideBy(free);\nlong max = rt.maxMemory();\nlong total = rt.totalMemory();\nreturn decideBy(max - total)\n\n\n\nThis is conservative in that 'total' is computed last, and in that total-free is not added to the computed available bytes.\n\nIn both approaches, even if atomicity is guaranteed, it is possible that more heap is allocated in another thread between the time that the size is computed, to the time that the bytes are actually allocated, so not sure how safe this check can be made. ",
+            "author": "Doron Cohen",
+            "id": "comment-13200802"
+        },
+        {
+            "date": "2012-02-05T17:00:13+0000",
+            "content": "Updated patch - without MemoryMXBean - computing 'max, total, free' (in that order) and deciding by 'free' or falling to 'max-free'. This is more conservative, than MemoryMxBean but since the latter is not full proof either, I prefer the simpler approach.  ",
+            "author": "Doron Cohen",
+            "id": "comment-13200806"
+        },
+        {
+            "date": "2012-02-05T19:53:02+0000",
+            "content": "As for spawning MemoryPoolMXBean \u2013 I wouldn't be worried about it, it's probably a system daemon thread for sending memory threshold notifications  (didn't check though). I will peek at openjdk sources and see how the mx is implemented to verify if it's atomic or not (not a guarantee, just curiosity). ",
+            "author": "Dawid Weiss",
+            "id": "comment-13200834"
+        },
+        {
+            "date": "2012-02-05T20:05:55+0000",
+            "content": "Just checked and it seems to be that within a single memory pool the results will be atomic. Unfortunately that call aggregates all memory pools and (depending on the GC used) this may result in inconsistencies if the calculation happens to be interwoven with garbage collector activity. As stated in the sources of G1, for example:\n\n\n// 4) Now, there is a very subtle issue with all the above. The\n// framework will call get_memory_usage() on the three pools\n// asynchronously. As a result, each call might get a different value\n// for, say, survivor_num which will yield inconsistent values for\n// eden_used, survivor_used, and old_gen_used (as survivor_num is used\n// in the calculation of all three). This would normally be\n// ok. However, it's possible that this might cause the sum of\n// eden_used, survivor_used, and old_gen_used to go over the max heap\n// size and this seems to sometimes cause JConsole (and maybe other\n// clients) to get confused. There's not a really an easy / clean\n// solution to this problem, due to the asynchrounous nature of the\n// framework. \n\n\n\nMakes sense to me. I wouldn't bother with management interface then and just use the Runtime.* heuristic you proposed. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13200843"
+        },
+        {
+            "date": "2012-02-06T06:33:17+0000",
+            "content": "Thanks Dawid! \n\n\nit's probably a system daemon thread for sending memory threshold notifications\n\nYes this makes sense. \nStill the difference between the two JDKs felt bothering.\nSome more digging, and now I think it is clear. \n\nHere are the stack traces reported (at the end of the test) with Oracle:\n\n1.  Thread[ReaderThread,5,main]\n2.  Thread[main,5,main]\n3.  Thread[Reference Handler,10,system]\n4.  Thread[Signal Dispatcher,9,system]\n5.  Thread[Finalizer,8,system]\n6.  Thread[Attach Listener,5,system]\n\n\n\nAnd with IBM JDK:\n\n1.  Thread[Attach API wait loop,10,main]\n2.  Thread[Finalizer thread,5,system]\n3.  Thread[JIT Compilation Thread,10,system]\n4.  Thread[main,5,main]\n5.  Thread[Gc Slave Thread,5,system]\n6.  Thread[ReaderThread,5,main]\n7.  Thread[Signal Dispatcher,5,main]\n8.  Thread[MemoryPoolMXBean notification dispatcher,6,main]\n\n\n\nThe 8th thread is the one that started only after accessing the memory management layer. The thing is, that in the IBM JDK that thread is created in the ThreadGroup \"main\", while in the Oracle JDK it is created under \"system\". To me the latter makes more sense. \n\nTo be more sure I added a fake memory notification listener and check the thread in which notification happens: \n\nMemoryMXBean mmxb = ManagementFactory.getMemoryMXBean();\nNotificationListener listener = new NotificationListener() {\n  @Override\n  public void handleNotification(Notification notification, Object handback) {\n    System.out.println(Thread.currentThread());\n  }\n};\n((NotificationEmitter) mmxb).addNotificationListener(listener, null, null);\n\n\n\nEvidently in IBM JDK the notification is in \"main\" group thread (also in line with the thread-group in the original warning message which triggered this threads discussion):\n\nThread[MemoryPoolMXBean notification dispatcher,6,main]\n\n\n\nWhile in Oracle JDK notification is in \"system\" group thread:\n\nThread[Low Memory Detector,9,system]\n\n\n\nThis also explains why the warning is reported only for IBM JDK: because the threads check in LTC only account for the threads in the same thread-group as the one running the specific test case. So when dispatching happens in a \"system\" group thread it is not sensed by that check at all.\n\nOk now with mystery solved I can commit the simpler code... ",
+            "author": "Doron Cohen",
+            "id": "comment-13201073"
+        },
+        {
+            "date": "2012-02-07T07:05:13+0000",
+            "content": "Committed:\n\n\tr1241355 - trunk\n\tr1241363 - 3x\n\n ",
+            "author": "Doron Cohen",
+            "id": "comment-13202121"
+        }
+    ]
+}

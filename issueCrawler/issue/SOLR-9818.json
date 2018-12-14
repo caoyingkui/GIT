@@ -1,0 +1,63 @@
+{
+    "id": "SOLR-9818",
+    "title": "Solr admin UI rapidly retries any request(s) if it loses connection with the server",
+    "details": {
+        "components": [
+            "Admin UI"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "6.3",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "It seems that whenever the Solr admin UI loses connection with the server, be the reason that the server is too slow to answer or that it's gone away completely, it starts hammering the server with the previous request until it gets a success response, it seems. That can be especially bad if the last attempted action was something like collection reload with a SolrCloud instance. The admin UI will quickly add hundreds of reload commands to overseer/collection-queue-work, which may essentially cause the replicas to get overloaded when they're trying to handle all the reload commands.\n\nI believe the UI should never retry the previous command blindly when the connection is lost, but instead just ping the server until it responds again.\n\nSteps to reproduce:\n1.) Fire up Solr\n2.) Open the admin UI in browser\n3.) Open a web console in the browser to see the requests it sends\n4.) Stop solr\n5.) Try an action in the admin UI\n6.) Observe the web console in browser quickly fill up with repeats of the originally attempted request",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-12-02T10:17:29+0000",
+            "author": "Yago Riveiro",
+            "content": "This problem is critical when we use the UI to create replicas, last time I did the operation and the cluster was busy, the result was 23 new replicas for my shard ... ",
+            "id": "comment-15714706"
+        },
+        {
+            "date": "2016-12-07T07:02:18+0000",
+            "author": "Mark Miller",
+            "content": "+1, not great behavior. A lot of these commands are not idempotent and the browser doesn't know what happened depending on the fail.  ",
+            "id": "comment-15727942"
+        },
+        {
+            "date": "2017-02-26T14:31:31+0000",
+            "author": "Amrit Sarkar",
+            "content": "The easiest way to solve this problem is to convert the sync ADDREPLICA call to async and use REQUESTSTATUS to get the status.\n\nIn fact, we can convert all the http requests (POST/PUT) we are making using Collections API asynchronous and ask for the status and if it fails or server is down; don't retry and the request cycle is ended. As Ere suggested, we can keep requesting the status until the machine gets up, but I am inclined towards fail request and user retry the action.\n\nSee discussion on SOLR-10201, I already cooked up a patch for async CREATE collections api.\n\nLet me know your thoughts, I am sure this will be helpful particularly for this issue/bug. ",
+            "id": "comment-15884767"
+        },
+        {
+            "date": "2017-02-26T16:18:27+0000",
+            "author": "Erick Erickson",
+            "content": "Amrit:\n\nSeems like a good approach. Some questions/comments.\n\nThe admin UI still will have some sort of indication that the operation is ongoing until the status is reported as completed, correct?\n\nWhat happens if the response from Solr for the initial async request fails? The scenario I want to avoid is\n\n> The async request is made and is received by Solr but for some mysterious reason the initial call reports a failure. At this point the request is being processed even though the initial call \"failed\".\n\n> The admin UI issues another async request for the same action.\n\nThat's really the scenario now, just making things async won't change that if we retry an initial \"failed\" request that actually was received by Solr.\n\nWe could do something like\n> make the async call.\n> check the status whether the initial call succeeds or not\n> If status found, spin until it completes. else ??? \n\nThe else ??? case is where the gremlins are. Would it be safe to re-submit the call if no status was found? Or just bail and report an error and suggest the user examine their setup and \"do the right thing\"?\n\nOne thing I'm not very clear on is how long the status for an async call stays around. Given that there's a DELETESTATUS API call, I'd guess forever. If that's the case, perhaps it would be safe to re-submit the async call only if the state was \"notfound\". We'd be assuming in that case that the initial call was never received or acted upon.\n\nThat said, though, I think the straw-man behavior I'd propose for discussion is:\n> submit the async request\nif (the initial call failed or there was no status to be found) {\n      report an error and suggest the user look check their \n      system before resubmitting the request. Bail out in this case, \n      no retries, no attempt to drive on.\n} else {\n       put up a progress indicator while periodically \n       checking the status, Continue spinning until we can report \n       the final status.\n}\n\n\nFWIW,\nErick\n ",
+            "id": "comment-15884798"
+        },
+        {
+            "date": "2017-02-26T18:01:18+0000",
+            "author": "Amrit Sarkar",
+            "content": "Erick,\n\nSpot on!\n\n1. Yes, we will introduce an progress bar, or any other suitable icon/gif which will display request-id and its current status.\n\n2. \n\nif (the initial call failed or there was no status to be found)\n{ report an error and suggest the user look check their system before resubmitting the request. Bail out in this case, no retries, no attempt to drive on. }\n\nPositively, if it fails, we will receive an error report which can be displayed on progress bar or red colored box we have right now. For not-found, it was simply never registered, never received by ZK and we can get out. Though we need to decide how much to wait until we receive a status; patch uploaded on SOLR-10201, I set the timer to 15 sec, should be lower I guess.\n\nelse\n{ put up a progress indicator while periodically checking the status, Continue spinning until we can report the final status. }\n\nWe have to decide an upper limit for the request processing time before we tell the user, the request is taking long time to process, go check your logs.\n\n3. Yes, the request status stays around forever and X number of entries are allowed in zookeeper. We can have a range for generated ids something like 0-9999 etc for it; don't want to burden zk with extra memory. There is a chance for collision, especially when more than one user are using these APIs, but what are the odds there? Also we really want to re-submit any calls when the status is not good news (running/completed)? I am inclined towards reporting to user if there is a hint of bad news, let him/her decide what to do next. ",
+            "id": "comment-15884841"
+        },
+        {
+            "date": "2017-02-27T07:23:03+0000",
+            "author": "Ere Maijala",
+            "content": "I initially encountered this issue when trying to reload a collection, so fixing ADDREPLICA of course only fixes one instance where this might happen.\n\nIn my case I would have been happy with an error message that says that the connection timed out and that there's no guarantee that the request was processed or whether it's still being processed. It would be ok to poll the server automatically to see if it's available again, but only like at max once a second or so and with a safe request. ",
+            "id": "comment-15885278"
+        },
+        {
+            "date": "2017-02-27T16:56:53+0000",
+            "author": "Amrit Sarkar",
+            "content": "Created new jira: SOLR-10209 to track the developments, suggestions and feedbacks. Thank you. ",
+            "id": "comment-15886113"
+        }
+    ]
+}

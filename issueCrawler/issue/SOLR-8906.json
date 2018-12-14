@@ -1,0 +1,102 @@
+{
+    "id": "SOLR-8906",
+    "title": "Make transient core cache pluggable.",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.6",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The current Lazy Core stuff is pretty deeply intertwined in CoreContainer. Adding and removing active cores is based on a simple LRU mechanism, but keeping the right cores in the right internal structures involves a lot of attention to locking various objects to update internal structures. This makes it difficult/dangerous to use any other caching algorithms.\n\nAny single age-out algorithm will have non-optimal access patterns, so making this pluggable would allow better algorithms to be substituted in those cases.\n\nIf we ever extend transient cores to SolrCloud, we need to have load/unload decisions that are cloud-aware rather then entirely local so in that sense this is would lay some groundwork if we ever want to go there.\n\nSo I'm going to try to hack together a PoC. Any ideas on the most sensible pattern for this gratefully received.",
+    "attachments": {
+        "SOLR-8906.patch": "https://issues.apache.org/jira/secure/attachment/12858796/SOLR-8906.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-04-02T01:52:12+0000",
+            "author": "Ben Manes",
+            "content": "Not sure if it helps, but there's discussion of using TinyLFU instead of LRU / LFU for the SolrCache (SOLR-8241). That library could be used instead of LRU here too to evict based on recency and frequency. From my reading of transientCores that appears to be a simple migration.  ",
+            "id": "comment-15222638"
+        },
+        {
+            "date": "2016-04-02T02:31:53+0000",
+            "author": "Erick Erickson",
+            "content": "Thanks, I'll take a look. So far I've hacked an \"interface\" that is just a subset of LinkedHashMap to see if it could be made pluggable. Creating an abstraction that's more generalized is high on the priority list, and working with better cache implementations may make sense.\n\nThe biggest gain would be from not unloading caches that were likely to be used again. The simple LRU implementation suffers from implementation patterns that periodically access each entry exactly once (say for health check or some such). Having the frequency of access incorporated into the  eviction policy would be A Good Thing.\n\nThat said, I haven't looked at all at the implementation of TinyLFU, and probably won't get to it for a week or two so don't think I'm totally dropping the ball in the meanwhile. Thanks for bringing it to my attention! ",
+            "id": "comment-15222661"
+        },
+        {
+            "date": "2016-04-02T02:36:19+0000",
+            "author": "Ben Manes",
+            "content": "TinyLFU is scan resistant (see Glimpse trace). For implementation details a nice overview is provided in the HighScalability article. ",
+            "id": "comment-15222663"
+        },
+        {
+            "date": "2016-04-05T21:12:26+0000",
+            "author": "Erick Erickson",
+            "content": "So I did hack together a PoC and it doesn't disrupt CoreContainer too much. I'm not really ready to put it up since it's too crude. The \"interface\" is just selected interfaces from LinkedHashMap for instance, but it works enough to decouple internal locking of objects in CoreContainer from the plugin code which was my first concern.\n\nThinking about this some more, I started asking myself why should only transient cores be manipulated by the plugin? CoreContainer shouldn't really need to care whether the core is transient or not for its purposes. Gotta think about that some more. Once the state of the core is removed from being so intertwined with CoreContainer, it seems like it would be adaptable to  using ZK as \"the one source of truth\" pretty easily... ",
+            "id": "comment-15227136"
+        },
+        {
+            "date": "2017-03-07T00:51:42+0000",
+            "author": "Noble Paul",
+            "content": "lazy cores itself is a vestige a of the old master-slave model where cores were not expected to be up. \n\nSo, this is an X-Y problem. Let's ask the question , why do we want to unload a core?\n\nWe just need to ensure that the resources held by a core is kept minimal. The expensive resources are file handles & caches.(there could be others and we can ignore them for a while). So, if we manage to free up these resources for the unused core we can pretty much achieve our objective.  ",
+            "id": "comment-15898488"
+        },
+        {
+            "date": "2017-03-07T17:32:04+0000",
+            "author": "Erick Erickson",
+            "content": "bq:  why do we want to unload a core?\n\nWell, I know of at least one situation where people have implemented auto-scaling that can do things like:\n> split an index in the background. More generally maintain indexes of size no larger than X. Then move one or more of the splits \"someplace else\".\n> move a core's index to SSD while it's hot.\n> re-partition user's data based on some heuristics without downtime.\n> any situation where a core is manipulated outside Solr and still needs to service requests in the mean time.\n\nSo I do wonder if we can stand the question on its head. Rather than think of it as the transient cores being an afterthought, what if we move all core management to a plugin? NOTE: this is really fuzzy ATM, just askin'.\n\nThen we wouldn't have the distinction in solr of \"transient\", \"lazy loading\", \"regular\" deeply embedded in the CoreContainer & etc. code. Even in the case where we open/close the heavyweight objects rather than load/unload cores, we still have to maintain lists of what cores have searchers already open and the like, similar to what happens in transient cores. Does it make any sense to think of moving all core management to a (suitably modified) transient core plugin? Then the default implementation we provide would just manage the heavyweight objects rather than load/unload cores and others could do as they wished.\n\nGoing forward, when everything is SolrCloud, there would be a degenerate case of leader-only collections that could essentially be treated as we do the current standalone code I'd guess.\n\nbq: lazy cores itself is a vestige a of the old master-slave model\n\nNot at all sure I agree. Even when SolrCloud rules the world, there'll always be edge cases where some organization pushes the limit. I don't want to keep Solr from evolving just to accommodate these edge cases, but I also don't want to prematurely decide for them that \"we can do it better\". 'cause we can't in situation N+1.\n\nOh, and let's keep a distinction between \"lazy\" and \"transient\" cores. \"lazy\" just means it isn't loaded until it's called for, it can be permanent after that. \"transient\" is the whole cache-and-load/unload-when-needed bit. Don't quite know how those will reconcile going forward, but the idea of opening/closing heavyweight objects is still \"lazy\" cores in some sense.\n ",
+            "id": "comment-15899812"
+        },
+        {
+            "date": "2017-03-14T23:56:48+0000",
+            "author": "Erick Erickson",
+            "content": "Here's a patch that moves all the transient core processing to a plugin. If nothing else, changing the code to this model will move us toward a place where we can isolate the core handling to a plugin...\n\nI won't commit this for a while, certainly not until after 6.5 is cut. Between now and then we can debate. ",
+            "id": "comment-15925286"
+        },
+        {
+            "date": "2017-03-15T19:23:51+0000",
+            "author": "Erick Erickson",
+            "content": "Oops, this one has the newly-added files. ",
+            "id": "comment-15926801"
+        },
+        {
+            "date": "2017-03-27T19:44:07+0000",
+            "author": "Erick Erickson",
+            "content": "I think this is close to ready, I'll probably commit it this week sometime. ",
+            "id": "comment-15943924"
+        },
+        {
+            "date": "2017-03-28T03:54:07+0000",
+            "author": "Erick Erickson",
+            "content": "As he slowly learns how to use git to create a proper patch that incorporates more than one local commit.... ",
+            "id": "comment-15944485"
+        },
+        {
+            "date": "2017-04-03T20:29:20+0000",
+            "author": "Erick Erickson",
+            "content": "Final patch with CHANGES.txt. ",
+            "id": "comment-15954119"
+        },
+        {
+            "date": "2017-04-03T20:29:41+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 52632cfc0c0c945cff2e769e6c2dc4dc9a5da400 in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=52632cf ]\n\nSOLR-8906: Make transient core cache pluggable ",
+            "id": "comment-15954120"
+        },
+        {
+            "date": "2017-04-03T20:36:32+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2ca7e7ec490d4c891b27d61cbf8696d4c4dc6953 in lucene-solr's branch refs/heads/branch_6x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2ca7e7e ]\n\nSOLR-8906: Make transient core cache pluggable\n\n(cherry picked from commit 52632cf) ",
+            "id": "comment-15954130"
+        }
+    ]
+}

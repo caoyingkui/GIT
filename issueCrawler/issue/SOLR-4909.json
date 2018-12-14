@@ -1,0 +1,230 @@
+{
+    "id": "SOLR-4909",
+    "title": "Solr and IndexReader Re-opening on Replication Slave",
+    "details": {
+        "affect_versions": "4.3",
+        "status": "Closed",
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "components": [
+            "replication (java)",
+            "search"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "I've been experimenting with caching filter data per segment in Solr using a CachingWrapperFilter & FilteredQuery within a custom query parser (as suggested by Yonik Seeley in SOLR-3763) and encountered situations where the value of getCoreCacheKey() on the AtomicReader for each segment can change for a given segment on disk when the searcher is reopened. As CachingWrapperFilter uses the value of the segment's getCoreCacheKey() as the key in the cache, there are situations where the data cached on that segment is not reused when the segment on disk is still part of the index. This affects the Lucene field cache and field value caches as well as they are cached per segment.\n\nWhen Solr first starts it opens the searcher's underlying DirectoryReader in StandardIndexReaderFactory.newReader by calling DirectoryReader.open(indexDir, termInfosIndexDivisor), and the reader is subsequently reopened in SolrCore.openNewSearcher by calling DirectoryReader.openIfChanged(currentReader, writer.get(), true). The act of reopening the reader with the writer when it was first opened without a writer results in the value of getCoreCacheKey() changing on each of the segments even though some of the segments have not changed. Depending on the role of the Solr server, this has different effects:\n\n\n\tOn a SolrCloud node or free-standing index and search server the segment cache is invalidated during the first DirectoryReader reopen - subsequent reopens use the same IndexWriter instance and as such the value of getCoreCacheKey() on each segment does not change so the cache is retained.\n\n\n\n\n\tFor a master-slave replication set up the segment cache invalidation occurs on the slave during every replication as the index is reopened using a new IndexWriter instance which results in the value of getCoreCacheKey() changing on each segment when the DirectoryReader is reopened using a different IndexWriter instance.\n\n\n\nI can think of a few approaches to alter the re-opening behavior to allow reuse of segment level caches in both cases, and I'd like to get some input on other ideas before digging in:\n\n\n\tTo change the cloud node/standalone first commit issue it might be possible to create the UpdateHandler and IndexWriter before the DirectoryReader, and use the writer to open the reader. There is a comment in the SolrCore constructor by Yonik Seeley that the searcher should be opened before the update handler so that may not be an acceptable approach.\n\n\n\n\n\tTo change the behavior of a slave in a replication set up, one solution would be to not open a writer from the SnapPuller when the new index is retrieved if the core is enabled as a slave only. The writer is needed on a server configured as a master & slave that is functioning as a replication repeater so downstream slaves can see the changes in the index and retrieve them.\n\n\n\nI'll attach a unit test that demonstrates the behavior of reopening the DirectoryReader and it's effects on the value of getCoreCacheKey. My assumption is that the behavior of Lucene during the various reader reopen operations is correct and that the changes are necessary on the Solr side of things.",
+    "attachments": {
+        "SOLR-4909.patch": "https://issues.apache.org/jira/secure/attachment/12600877/SOLR-4909.patch",
+        "SOLR-4909-demo.patch": "https://issues.apache.org/jira/secure/attachment/12586814/SOLR-4909-demo.patch",
+        "SOLR-4909_fix.patch": "https://issues.apache.org/jira/secure/attachment/12587346/SOLR-4909_fix.patch",
+        "SOLR-4909_v3.patch": "https://issues.apache.org/jira/secure/attachment/12600843/SOLR-4909_v3.patch",
+        "SOLR-4909_confirm_keys.patch": "https://issues.apache.org/jira/secure/attachment/12601258/SOLR-4909_confirm_keys.patch",
+        "SOLR-4909_v2.patch": "https://issues.apache.org/jira/secure/attachment/12598561/SOLR-4909_v2.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Michael Garski",
+            "id": "comment-13678499",
+            "date": "2013-06-07T22:08:04+0000",
+            "content": "Attaching unit test that demonstrates the effects on getCoreCacheKey() when the reader is opened in different ways. There are no asserts, just printlns on the segments of the reader. It is not meant to be merged into the code base, only to demonstrate. The patch was created on the lucene_solr_4_3 branch, revision 1490006 "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13678903",
+            "date": "2013-06-09T01:37:31+0000",
+            "content": "this analysis is correct: its the same basic issue as SOLR-4764 "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13679244",
+            "date": "2013-06-10T00:38:11+0000",
+            "content": "Thanks Robert - I'll update the name of this issue to address the replication slave case as SOLR-4764 addresses the NRT case. I should have a patch for that in the next day or two. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13679280",
+            "date": "2013-06-10T03:35:53+0000",
+            "content": "The likely fix for SOLR-4764 is to just open the IW right away - I imagine that will solve this case as well. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13679678",
+            "date": "2013-06-10T17:50:10+0000",
+            "content": "Opening the writer during core initialization and using that to open the reader will not solve the replication case. Currently after the index changes are retrieved the writer is closed and reopened in SnapPuller.openNewWriterAndSearcher to be aware of the changes just pulled in from the master. When a reader is re-opened with a different writer the value of getCoreCacheKey changes for each segment resulting in a loss of any per-segment caches.\n\nAn instance configured only as a replication slave is essentially read-only... should it even have a writer instance?  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13679694",
+            "date": "2013-06-10T17:58:16+0000",
+            "content": "should it even have a writer instance?\n\nDoesn't really matter - the advantagous certainly outweigh any cost.\n\nCurrently after the index changes are retrieved the writer is closed and reopened in SnapPuller.openNewWriterAndSearcher to be aware of the changes just pulled in from the master. \n\nThis depends - it doesn't reopen the writer to be aware of any changes if the same index dir is used. It opens a new indexwriter when the index directory is completely changed/moved - and I don't see that going away anytime soon. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13679951",
+            "date": "2013-06-10T21:50:17+0000",
+            "content": "\nIt opens a new indexwriter when the index directory is completely changed/moved - and I don't see that going away anytime soon.\n\nThat makes sense - new physical directory, new writer - I would not expect that to change.\n\nit doesn't reopen the writer to be aware of any changes if the same index dir is used\n\nThat's not the behavior that is occurring when index deltas from the master are applied to the existing index directory. Here is a trace of the calls made in that case:\n\nSnapPuller.fetchLatestIndex(SolrCore core, forceReplication = false)\nSnapPuller.openNewWriterAndSearcher(isFullCopyNeeded = false) [isFullCopyNeeded is false as the index deltas are applied to the existing index directory]\nDirectUpdateHandler2.newIndexWriter(rollback = false) [isFullCopyNeeded is passed in as the value of the rollback parameter]\nDefaultSolrCoreState.newIndexWriter(SolrCore core, rollback = false)\nWith the value of rollback == false the writer is now closed and a new one is created, resulting in the loss of all segment-level caches. \n\nIt appears as if when isFullCopyNeeded == false, then the call to DefaultSolrCoreState.newIndexWriter should not be made, however if that is changed to not open a new writer a handful of the TestReplicationHandler tests then fail. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13679973",
+            "date": "2013-06-10T22:08:48+0000",
+            "content": "Ah, right. This how we are reopening the writer on the latest commit. May be a bit more difficult, bit there is the possibility it could be addressed.  "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13679979",
+            "date": "2013-06-10T22:15:38+0000",
+            "content": "Thanks for confirming my results Mark. I'll dig deeper into the test failures and come up with a few approaches to stop the loss of segment level caches on read-only slaves after replication. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13680065",
+            "date": "2013-06-11T00:00:46+0000",
+            "content": "As far as I remember, we used to commit to do this - which meant the same IndexWriter - I think I turned it into a reopen of the IW so that we wouldn't have a commit on the slave and cause versions/generations to no longer match the master (this type of thing was causing other problems). I guess ideally, we would be able to not commit, but reopen the latest commit point as if we had committed. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13680127",
+            "date": "2013-06-11T01:33:12+0000",
+            "content": "In experimenting with a fix I altered the SnapPuller to only open a new writer if it has moved to a new index directory (isFullCopyNeeded == true) or if the instance is configured to be a replication master, which made all of the existing tests pass except for doTestIndexAndConfigReplication. The failure occurs when comparing the index version retrieved from the replication handler via the commits in the 'details' command and the value returned from 'indexversion' command - indexversion returns the proper version however the details do not contain all of the commits as the IndexDeletionPolicy is not aware of them. I'm not sure what the potential side effects of this would be on a read-only slave. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13680414",
+            "date": "2013-06-11T14:26:19+0000",
+            "content": "It seems like it would be nicer if the solution worked for 'repeaters' as well, but that could solve things for the slave case - the likely side effects are probably confusion if a user see the numbers are different and they should align - i dont like that so much. But currently you have to commit or reopen the writer to pick up the newest commit. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13680817",
+            "date": "2013-06-11T23:38:11+0000",
+            "content": "Attached a fix that corrects the issue. Here is an overview of the fix:\n\nSimply having the slave not have a writer instance is not feasible as then old commit points would continue to pile up on the slave, eventually exhausting disk space. The writer is required to delete the old commit points via the deletion policy, and the only way for the writer to be aware of the new commit points retrieved from the master is to open a new writer, and if the reader is reopened with a different writer instance the segment-level caches are lost.\n\nTo change this behavior the reader is disconnected from the writer when explicitly configured to do so with a new parameter in the indexConfig section of the solr config named createReaderFromWriter which defaults to true to make the current behavior the default. If the value is explicitly set to false, which would normally only be done in a read-only slave, the reader is always initialized and re-opened from a directory instance and not a writer instance.\n\nThere is logic in SolrCore.openNewSearcher to open a new reader rather than re-open should the underlying directory instance in the current reader not match that of the new index writer as that means that a full copy of the index was downloaded into a new directory, as would happen during replication if the slave's version was ahead of the master's.\n\nThe patch was created on the lucene_solr_4_3 branch with all tests passing & I can create versions for other branches if needed. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13680821",
+            "date": "2013-06-11T23:41:27+0000",
+            "content": "the reader is always initialized and re-opened from a directory instance and not a writer instance.\n\nHave to consider this carefully considering SOLR-4764  likely aims to drop opening from a directory at all. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13680838",
+            "date": "2013-06-12T00:03:55+0000",
+            "content": "SOLR-4764 likely aims to drop opening from a directory at all.\n\nCould SOLR-4764 use the same config logic to determine how to open/re-open the reader? Default behavior would be to open the reader from the writer (as necessary for NRT), but explicitly configured non-NRT instances would not open from the writer. Short of adding a way to re-open an index writer on a new commit point without resulting in dumping existing segment caches, I'm not sure how else the replication slave case can be addressed. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13717464",
+            "date": "2013-07-23T18:48:19+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13742765",
+            "date": "2013-08-17T00:45:39+0000",
+            "content": "I've updated the patch to handle the changes made for SOLR-4764 (SOLR-4909_v2.patch). It works the same as the original patch I attached. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13742908",
+            "date": "2013-08-17T11:59:34+0000",
+            "content": "Hi Michael: \n\nSo the idea here is an explicit option that allows to not reopen from indexwriter for these replication slaves (because a new IW is created when replication happens?)\n\nThis piece one concerns me:\n\nThere is logic in SolrCore.openNewSearcher to open a new reader rather than re-open should the underlying directory instance in the current reader not match that of the new index writer as that means that a full copy of the index was downloaded into a new directory, as would happen during replication if the slave's version was ahead of the master's.\n\n\n+            // during a replication that pulls the complete index into a new physical directory\n+            // the reader cannot be reopened and must be newly opened using the same directory as the writer\n+            if(writer != null && !currentReader.directory().equals(writer.get().getDirectory())) {\n\n\n\nAre you sure this really does what you want? I don't think anybody implements/tests equals() on Directory implementations, and if so I'm not sure what the semantics would be. Looking at other stuff around this code that tries to do similar things, it seems they are comparing strings (representing the directory path). "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13742915",
+            "date": "2013-08-17T12:48:02+0000",
+            "content": "By the way (since i now look at your new config variable and i feel i somewhat made this situation worse/more confusing with SOLR-4764), i think its not ideal to have two config variables:\n1. reopenReaders \n2. createReaderFromWriter\n\notherwise this would create 4 possibilities of behavior and I dont see a use case for 2 of them. (even if you are not using NRT and opening straight from the directory, why would you not want to reuse same segments when its possible)\n\nI think it would be much easier if there was just a single config variable like \"nrt=true/false\" and this determines if new readers are opened from the directory or indexwriter (IndexReaderFactory.newReader(Directory) vs IndexReaderFactory.newReader(IndexWriter), and otherwise DirectoryReader.doOpenIfChanged(existingReader) is always called (which does the right thing because it remembers its 'type').\n\nThis could also prevent further user confusion: e.g. if nrt=false, errors should be issued if someone tries to do softcommit or configure autosoftcommit in solrconfig.xml.  "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13744078",
+            "date": "2013-08-19T18:12:06+0000",
+            "content": "Thanks for the feedback Robert Muir! The use of a single config variable would be the simplest fix & I'll update my patch this week. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13755057",
+            "date": "2013-08-30T19:30:30+0000",
+            "content": "Updated patch attached (SOLR-4909_v3.patch)\n\nI re-named the 'reopenReaders' in the index config to 'nrtMode'. When nrtMode is set to true (the default), readers are opened from the writer. When set to false, readers are (re)opened from the directory.\n\nPatch applies to branch_4x. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13755212",
+            "date": "2013-08-30T22:37:46+0000",
+            "content": "Thanks Michael!\n\nI added some tests to your patch (just expanded TestNRTOpen a bit, and added a non-NRT version of it called TestNonNRTOpen). I will think about some more tests to add (i wanted to get it back to you for now), like to assert its actually fixing what you want to fix and that segments are shared  But for now i wanted some simple explicit tests in both cases for all the hair here, e.g. we arent going backwards on core reload, etc etc\n\nThis seemed to find a directory leak during core reload: I think it was due to the logic in the patch:\n\n\nif(getSolrConfig().nrtMode) {\n  // if in NRT mode, need to open from the previous writer\n  return DirectoryReader.open(iw, true);\n} else {\n  // if not NRT, need to create a new reader from the directory\n  String indexDir = getDirectoryFactory().normalize(getNewIndexDir());\n  return DirectoryReader.open(directoryFactory.get(indexDir, DirContext.DEFAULT, getSolrConfig().indexConfig.lockType));\n}\n\n\n\nI changed the logic to the following and it seems to resolve the issue, since this code is only invoked when the iw != null anyway:\n\nif(getSolrConfig().nrtMode) {\n  // if in NRT mode, need to open from the previous writer\n  return DirectoryReader.open(iw, true);\n} else {\n  // if not NRT, need to create a new reader from the directory\n  return DirectoryReader.open(iw.getDirectory());\n}\n\n\n\nI think this is still technically wrong: since we are opening \"new readers\" we should be calling indexReaderFactory.newReader methods here? "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13755220",
+            "date": "2013-08-30T22:46:24+0000",
+            "content": "Thanks Robert Muir, is the updated patch you attached for a different issue? It contains changes for TestPostingsHighlighterRanking.java and PassageScorer.java... "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13755222",
+            "date": "2013-08-30T22:49:41+0000",
+            "content": "uh oh... its likely i screwed this up. Lemme fix  "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13755224",
+            "date": "2013-08-30T22:50:48+0000",
+            "content": "attached SOLR-4909.patch not LUCENE! "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13755252",
+            "date": "2013-08-30T23:22:52+0000",
+            "content": "Thanks for the feedback Robert, I'll look into the additional tests as well. "
+        },
+        {
+            "author": "Michael Garski",
+            "id": "comment-13757193",
+            "date": "2013-09-03T22:51:04+0000",
+            "content": "I've updated the patch to include the initial directory opened via the cores indexReaderFactory & included a test that verifies the value of the core cache key's hash code after a commit. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13757924",
+            "date": "2013-09-04T16:26:40+0000",
+            "content": "Thanks Michael: at a glance the patch looks good to me.\n\nI wonder if we can improve the test: I'm a bit concerned with random merge policies that it might sporatically fail. Maybe we can change the test to use LogDocMergePolicy in its configuration and explicitly assert the segment structure.\n\nI'll take a closer look as soon as I have a chance: its not your fault, the code around here is just a bit scary. "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13763216",
+            "date": "2013-09-10T16:53:51+0000",
+            "content": "Updated patch: I beefed up tests for both nrt/non-NRT case.\n\nThis is ready. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13763257",
+            "date": "2013-09-10T17:19:10+0000",
+            "content": "Commit 1521556 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1521556 ]\n\nSOLR-4909: Use DirectoryReader.openIfChanged in non-NRT mode "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13763292",
+            "date": "2013-09-10T17:53:28+0000",
+            "content": "Commit 1521563 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1521563 ]\n\nSOLR-4909: Use DirectoryReader.openIfChanged in non-NRT mode "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13763295",
+            "date": "2013-09-10T17:54:27+0000",
+            "content": "Thank you Michael! "
+        },
+        {
+            "author": "Adrien Grand",
+            "id": "comment-13787079",
+            "date": "2013-10-05T10:19:05+0000",
+            "content": "4.5 release -> bulk close "
+        }
+    ]
+}

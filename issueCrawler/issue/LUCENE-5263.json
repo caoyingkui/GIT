@@ -1,0 +1,111 @@
+{
+    "id": "LUCENE-5263",
+    "title": "Deletes may be silently lost if an IOException is hit and later not hit (e.g., disk fills up and then frees up)",
+    "details": {
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [
+            "4.5.1",
+            "4.6",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "This case is tricky to handle, yet I think realistic: disk fills up\ntemporarily, causes an exception in writeLiveDocs, and then the app\nkeeps using the IW instance.\n\nMeanwhile disk later frees up again, IW is closed \"successfully\".  In\ncertain cases, we can silently lose deletes in this case.\n\nI had already committed\nTestIndexWriterDeletes.testNoLostDeletesOnDiskFull, and Jenkins seems\nhappy with it so far, but when I added fangs to the test (cutover to\nRandomIndexWriter from IndexWriter, allow IOE during getReader, add\nrandomness to when exc is thrown, etc.), it uncovered some real/nasty\nbugs:\n\n\n\tReaderPool.dropAll was suppressing any exception it hit, because\n    \n\nif (priorE != null)\n\n should instead be \n\nif (priorE == null)\n\n\n\n\n\n\tAfter a merge, we have to write deletes before committing the\n    segment, because an exception when writing deletes means we need\n    to abort the merge\n\n\n\n\n\tSeveral places that were directly calling deleter.checkpoint must\n    also increment the changeCount else on close IW thinks there are\n    no changes and doesn't write a new segments file.\n\n\n\n\n\tcloseInternal was dropping pooled readers after writing the\n    segments file, which would lose deletes still buffered due to a\n    previous exc.",
+    "attachments": {
+        "LUCENE-5263.patch": "https://issues.apache.org/jira/secure/attachment/12607261/LUCENE-5263.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-10-07T23:05:29+0000",
+            "content": "Patch, I think it's ready. ",
+            "author": "Michael McCandless",
+            "id": "comment-13788678"
+        },
+        {
+            "date": "2013-10-08T06:25:01+0000",
+            "content": "These are nice catches . Few comments:\n\n\n\tThis is not only about disk-full, but about any transient IOE (e.g. ran out of file handles temporarily) that occur. So maybe change the issue's description (and also the CHANGES entry text)?\n\n\n\n\n\tIn TestIndexWriterReader I see this:\n\n     r1.close();\n+    assertTrue(r2.isCurrent());\n     writer.close();\n     assertTrue(r2.isCurrent());\n\n\nDid you intend to check r2.isCurrent before and after writer.close?\n\n\n\n\n\tYou think maybe we should move FakeIOE to MDW so that other tests can use it? I use it in two other places already.\n\n\n\n\n\tIn ReaderPool.release: why don't you call writer.checkpoint()? It calls both deleter.checkpoint() and increments changed++. Did you want to avoid it also notifying sis.changed()? If so, maybe drop a comment why we don't do it?\n\t\n\t\tIf you choose to keep the code like that, there's a place in release() which calls deleter then increments changeCount, where in all other places the order is reverse. Maybe change it to be consistent? I don't know if it's an issue that changeCount isn't incremented, if e.g. deleter.checkpoint throws an ex?\n\t\n\t\n\n\n\n\n\tSeparately, I think it will be a useful utility to have a method like Utils.throwEx(Throwable t) which does the \"if instanceof\" logic (checking for IOE, RuntimeE, Error etc.).\n\n\n\nOtherwise looks good! ",
+            "author": "Shai Erera",
+            "id": "comment-13788959"
+        },
+        {
+            "date": "2013-10-08T07:13:46+0000",
+            "content": "One other comment \u2013 I think you can move the newIWC call to inside the 'if (w == null)'. ",
+            "author": "Shai Erera",
+            "id": "comment-13789001"
+        },
+        {
+            "date": "2013-10-08T07:25:45+0000",
+            "content": "I ported this test to verify NDV updates aren't lost under such conditions, and I implemented the TODO about sub-classing CMS. Perhaps you'll want to include that in your patch as well:\n\n\nfinal MergeScheduler ms = iwc.getMergeScheduler();\nif (ms instanceof ConcurrentMergeScheduler) {\n  final ConcurrentMergeScheduler suppressFakeIOE = new ConcurrentMergeScheduler() {\n    @Override\n    protected void handleMergeException(Throwable exc) {\n      // suppress FakeIOExceptions\n      if (!(exc instanceof FakeIOException)) {\n        super.handleMergeException(exc);\n      }\n    }\n  };\n  final ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler) ms;\n  suppressFakeIOE.setMaxMergesAndThreads(cms.getMaxMergeCount(), cms.getMaxThreadCount());\n  suppressFakeIOE.setMergeThreadPriority(cms.getMergeThreadPriority());\n  iwc.setMergeScheduler(suppressFakeIOE);\n  iwc.setMergeScheduler(suppressFakeIOE);\n}\n\n ",
+            "author": "Shai Erera",
+            "id": "comment-13789009"
+        },
+        {
+            "date": "2013-10-08T11:58:39+0000",
+            "content": "Thanks Shai, great feedback; I folded it all in.\n\nThis is not only about disk-full, but about any transient IOE (e.g. ran out of file handles temporarily) that occur. So maybe change the issue's description (and also the CHANGES entry text)?\n\nI'll fix the issue description, and I added a CHANGES.txt entry.\n\nIn TestIndexWriterReader I see this:\n\nYes, this is intentional (it was helpful debugging to see exactly\nwhere I broke r2.isCurrent()).\n\nYou think maybe we should move FakeIOE to MDW so that other tests can use it?\n\nI moved it, and shared from TestIndexWriterReader.java and\nTestIndexWriterDelete.java.\n\nIn ReaderPool.release: why don't you call writer.checkpoint()?\n\nRight, I needed to increment changeCount (so that the writer writes a\nnew segments file), plus checkpoint with IFD (so it knows about the\nnew .del file) but NOT increment SIS.version (because there was in\nfact no \"actual\" change to the index contents, just moving state from\nRAM to disk).  I put a comment explaining this, and also factored out\na new method.\n\nSeparately, I think it will be a useful utility to have a method like Utils.throwEx(Throwable t)\n\nGood idea!  I factored that out.\n\nI think you can move the newIWC call to inside the 'if (w == null)'.\n\nOK I fixed that.\n\nI implemented the TODO about sub-classing CMS. Perhaps you'll want to include that in your patch as well:\n\nI folded this in too ... thanks!\n\nAlso, separately, I managed to re-attach the fang I previously removed\nfrom testThreadInterruptDeadlock/testTwoThreadsInterruptDeadlock, by\nfixing IW.ReaderPool.dropAll to throw any exceptions it hits when save\nis true, rather than suppressing them and dropping all readers from\nthe pool.  I think there was another bug lurking there, because the\npool would lose changes previously if an exc was hit writing deletes\non close, and the app then called close again, and it succeeded.\n\nI also fixed a few tests to clean up their static fields ... they were\nsometimes angry during distributed beasting! ",
+            "author": "Michael McCandless",
+            "id": "comment-13789145"
+        },
+        {
+            "date": "2013-10-08T12:24:02+0000",
+            "content": "Patch looks great.\n\n\n\tI like IOUtils.reThrow - takes away a lot of code .\n\tThere's a typo I think in FakeIOException: @code _u_IOException\n\tYou call iwc.setMergeScheduler() twice in a raw \u2013 I believe it's an error from my example above.\n\n\n\nI will separately look at adding field updates to the test by randomly delete/update/both (I'll do it under LUCENE-5189).\n\n+1 to commit. ",
+            "author": "Shai Erera",
+            "id": "comment-13789159"
+        },
+        {
+            "date": "2013-10-08T20:25:31+0000",
+            "content": "Commit 1530414 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1530414 ]\n\nLUCENE-5263: fix cases where transient IOExc (e.g. due to disk full, file descriptor exhaustion) in IndexWriter could lead to silently losing deletions ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13789651"
+        },
+        {
+            "date": "2013-10-08T20:38:58+0000",
+            "content": "Commit 1530416 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1530416 ]\n\nLUCENE-5263: fix cases where transient IOExc (e.g. due to disk full, file descriptor exhaustion) in IndexWriter could lead to silently losing deletions ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13789671"
+        },
+        {
+            "date": "2013-10-09T18:11:26+0000",
+            "content": "Commit 1530741 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1530741 ]\n\nLUCENE-5263: remove extra deleter.checkpoint ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13790677"
+        },
+        {
+            "date": "2013-10-10T02:46:46+0000",
+            "content": "Commit 1530845 from Robert Muir in branch 'dev/branches/lucene_solr_4_5'\n[ https://svn.apache.org/r1530845 ]\n\nLUCENE-4998, LUCENE-5242, LUCENE-5254, LUCENE-5262, LUCENE-5263, LUCENE-5264: svn merge -c 1522723 -c 1525896 -c 1529136 -c 1529141 -c 1530063 -c 1530416 -c 1530657 ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13791128"
+        },
+        {
+            "date": "2013-10-14T10:12:21+0000",
+            "content": "Commit 1531836 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1531836 ]\n\nLUCENE-5263: if merge hits exc when releasing merged reader then drop changes and remove it from the pool, since the merge will be aborted ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794024"
+        },
+        {
+            "date": "2013-10-14T10:13:30+0000",
+            "content": "Commit 1531837 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1531837 ]\n\nLUCENE-5263: fix comment ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794025"
+        },
+        {
+            "date": "2013-10-14T10:16:37+0000",
+            "content": "Commit 1531838 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1531838 ]\n\nLUCENE-5263: if merge hits exc when releasing merged reader then drop changes and remove it from the pool, since the merge will be aborted ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794026"
+        },
+        {
+            "date": "2013-10-14T10:17:11+0000",
+            "content": "Commit 1531839 from Michael McCandless in branch 'dev/branches/lucene_solr_4_5'\n[ https://svn.apache.org/r1531839 ]\n\nLUCENE-5263: if merge hits exc when releasing merged reader then drop changes and remove it from the pool, since the merge will be aborted ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794027"
+        }
+    ]
+}

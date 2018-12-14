@@ -1,0 +1,95 @@
+{
+    "id": "LUCENE-5333",
+    "title": "Support sparse faceting for heterogeneous indices",
+    "details": {
+        "components": [
+            "modules/facet"
+        ],
+        "fix_versions": [],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "New Feature",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "In some search apps, e.g. a large e-commerce site, the index can have\na mix of wildly different product categories and facet dimensions, and\nthe number of dimensions could be huge.\n\nE.g. maybe the index has shirts, computer memory, hard drives, etc.,\nand each of these many categories has different attributes.\n\nIn such an index, when someone searches for \"so dimm\", which should\nmatch a bunch of laptop memory modules, you can't (easily) know up\nfront which facet dimensions will be important.\n\nBut, I think this is very easy for the facet module, since ords are\nstored \"row stride\" (each doc lists all facet labels it has), we could\nsimply count all facets that the hits actually saw, and then in the\nend see which ones \"got traction\" and return facet results for these\ntop dims.\n\nI'm not sure what the API would look like, but conceptually this\nshould work very well, because of how the facet module works.\nYou shouldn't have to state up front exactly which facet dimensions\nto count...",
+    "attachments": {
+        "LUCENE-5333.patch": "https://issues.apache.org/jira/secure/attachment/12613015/LUCENE-5333.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-11-07T19:05:02+0000",
+            "content": "A simple way to achieve that is to write an AllFacetsAccumulator which:\n\n\n\tWraps a FacetsAccumulator and takes no FacetRequests\n\tCreates FacetRequests for each child of ROOT (by asking for the children of ROOT)\n\tDelegates .accumulate() to the wrapped FacetsAccumulator\n\tIn the end it goes of the List<FacetResult> and removes any FRes which has no children (meaning no interesting facets were returned).\n\n\n\nSome drawbacks to this:\n\n\n\tIt's currently not clear how you can get the children of ROOT with SortedSetDocValues since it doesn't implement a TaxonomyReader. Maybe SSDVReaderState could have a getAllDims() method?\n\tSortedSetDVAccumulator only does counting, but if you pass a TaxonomyFA, you might be interested to do other aggregations. I guess we could at first only do counting and think about other aggregation methods later on, but that means it needs to create CountingFR explicitly.\n\tIt may not be very efficient if e.g. you have 10s or 100s of dimensions, with a total number of categories that's huge, because what the method does is it will traverse the children of each dimension, cause it cannot tell up front if a dimension had or not any children. We could resolve that later.\n\n\n\nWhat do you think? ",
+            "author": "Shai Erera",
+            "id": "comment-13816282"
+        },
+        {
+            "date": "2013-11-08T11:20:01+0000",
+            "content": "Hmm if we wrap another FacetsAccumulator, is it the user's job to first create that accumulator (with no facet requests)?  But then how do we then create another one, with all the facet requests we derived from ROOT?  I guess we could just switch on the N types we have?  But then maybe we should just add static methods to each to make this \"All\" accumulator for each? ",
+            "author": "Michael McCandless",
+            "id": "comment-13817196"
+        },
+        {
+            "date": "2013-11-08T15:06:12+0000",
+            "content": "Duh, good point! .\n\nI think then an AllFacetsAccumulator.create() with two variants - one that takes the members required to create TaxonomyFA and another to create SortedSetFA, and then return a FacetsAccumulator which extends either of the two, would work better ... but limited to CountingFacetRequest. I think, since it's so simple, we may not even need to bother with other aggregation functions, as this will be an example to how to achieve this functionality at all, and then an app could copy the code to create other FacetRequests (e.g. SumScoreFacetRequest)? ",
+            "author": "Shai Erera",
+            "id": "comment-13817327"
+        },
+        {
+            "date": "2013-11-09T23:24:52+0000",
+            "content": "Initial patch, just adds sparse faceting to SortedSetDVAccumulator.\n\nI didn't add any new AllFacetsAccumulator; I think this is sort of overkill?  Instead I added another ctor to SortedSetDVA that takes no FacetSearchParams and just takes the int number of top labels to return per dim. ",
+            "author": "Michael McCandless",
+            "id": "comment-13818299"
+        },
+        {
+            "date": "2013-11-10T06:51:15+0000",
+            "content": "Why is it an overkill? Same AllFacetsAccumulator can be used for SortedSet as well as Taxonomy based faceting. We don't need to duplicate the logic between them. Also, I think that adding that directly to SSDVAccumulator or TaxonomyFacetsAccumulator kind of makes \"sparse faceting\" the norm rather than the outlier. I don't think it's that common usecase and having a dedicated accumulator seems better to me. It certainly keeps those accumulators' code focused on what they're supposed to do, not complicating their code (to the casual reader).\n\nIt should be a very simple accumulator, like what you did in .accumulate(), only will allow us to improve things in the future. We could even factor the logic into FA.create(), if it receives a null list of requests it allocates the proper AllFacetsAccumulator.\n\nSo I'm curious - did you try a dedicated class and ran into troubles?\n\nAbout the code in the patch:\n\n\n\tIs there a reason to not allocating the CFRs up front and setting them on the FSP? I mean, the only difference between that and what you do now is that the CFRs now are allocated transiently, but I don't think that should be an issue in general (like how many dims will those apps have?). Also, it might allow in the future to extend this support to sampling too.\n\n\n\n\n\tYou sort the FacetResult based on the FResNode.value (their root). Does SortedSet always assign a value to the root of a FacetResult.node?\n\n\n\nIf you don't feel like handling the Taxonomy case at the moment, that's fine. I still think we should add an AllFacetsAccumulator with a .create() which wraps an SSDV. We can add Taxonomy faceting to it later (though I hope it's just means another .create()). ",
+            "author": "Shai Erera",
+            "id": "comment-13818379"
+        },
+        {
+            "date": "2013-11-10T15:23:21+0000",
+            "content": "Why is it an overkill?\n\nWell, I think the facet module already has too many classes /\nabstractions: aggregators, accumulators, ordinal policies, search\nparams, indexing params, cat paths, encoders, decoders, etc.  I think\nthis (huge API surface area) is a big impediment to users adopting it\nand devs contributing to it.\n\nSo, I really don't want to make this worse, by adding yet another\nAccumulator, that has static factory methods, to create yet other\nAccumulators that are subclasses of existing Accumulators.  I think\nit's too much.\n\nI also don't like separating concerns: I think that's a sign that\nsomething is wrong.  I don't think a single class (AllFA) should be\nexpected to handle both taxonomy based and SSDV based cases.\n\nWe already have classes that count facets using those two methods, so\nI think we should just add this capability to each of those classes.\n\nAnd, if we add the enum facet method (and others), then the natural\nplace to add sparse handling for it would be to its own class, I\nthink.\n\nSo I'm curious - did you try a dedicated class and ran into troubles?\n\nNo, I haven't tried: I just didn't really like that approach... so I\nfocused on the impl instead ...\n\nIs there a reason to not allocating the CFRs up front and setting them on the FSP?\n\nI really don't like the approach of \"create CFR for every possible\ndim\".  I realize this is a simple way to implement it, but it seems\nwrong.  And I especially don't want the API to expose that we are\nsomehow doing this: it's an impl detail.\n\nSo I wanted to get \"closer\" to not creating all CFRs up-front, and\ndoing it \"transiently\" seemed at least a bit better than bringing the\nentire list into existence.\n\nBut I think I can improve on the patch so that we don't even make a\nCFR until we see that any labels had non-zero count ... I'll work\ntowards that.\n\nYou sort the FacetResult based on the FResNode.value (their root). Does SortedSet always assign a value to the root of a FacetResult.node?\n\nYes, it does, in the sparse case (I ignore the ord policy). ",
+            "author": "Michael McCandless",
+            "id": "comment-13818458"
+        },
+        {
+            "date": "2013-11-10T16:07:30+0000",
+            "content": "Well, I think the facet module already has too many classes\n\nThat's unrelated. It's like saying Lucene has many APIs: IndexWriter, IndexWriterConfig, Document, Field, MergePolicy, Query, QueryParser, Collector, IndexReader, IndexSearcher... just to name a few . What's important here is FacetAccumulator and FacetRequest .. that's it. The rest are totally unrelated.\n\nThis scenario fits into another accumulator. Or else, we'll end up with facet code diverging left and right. Even now, for really no good reason, if you choose to index facets using SortedSetDV, you can only count them. Why? What prevents these ords from weighted by SumScore or a ValueSource? Nothing I think? So I'm worried that if you add this to only SortedSetDV, it will increase the difference between the two.\n\nRather, I prefer to pick the right API. We say that FacetsAccumulator is your entry point to accumulating facets. So far we've made FacetsAccumulator.create adhere to all existing FacetRequests and accumulators and return the proper one. I think that's a good API? And if all an AllFA needs to do is create dummy requests and filter out the not interesting ones, why complicate the code of all other accumulators (existing and future ones)? Won't it be simpler to add EnumFacetsAccumulator support to AllFA?\n\nLook, this is not a rocket science feature. Besides that I don't think it's such an important or common feature, I think the app doesn't really need to go out of its way to support it \u2013 it can easily create all possible FRs using very simple API, and filter out FacetResults whose FRN.subResults is empty. Can we make a simple utility for these apps - I'm all for it! But I prefer that we don't complicate the code of existing FAs. ",
+            "author": "Shai Erera",
+            "id": "comment-13818466"
+        },
+        {
+            "date": "2013-11-10T19:08:53+0000",
+            "content": "Here's the simple way I thought about - AllFacetsAccumulator takes no requests, has two ctors - one for SSDV and another for TaxoReader and initializes the proper FA underneath. To which it delegates the .accumulate, and later filters out any FRes with no children.\n\nIt's just a means for showing how I think it should be done. Still need to integrate it into FA.create, if we want to simplify an app's life even more, though I'd prefer to wait for some feedback from anyone that actually uses it first. ",
+            "author": "Shai Erera",
+            "id": "comment-13818521"
+        },
+        {
+            "date": "2013-11-10T19:29:55+0000",
+            "content": "There's also a third option:\n\n\n\tWe add the getDimensions API to SSDVReaderState\n\tWe put an example under demo/ExploreFacetsExample (or better name)\n\t\n\t\tWe basically demonstrate how to create a List<FR> for all available dimensions using either TaxoReader or SSDVReaderState\n\t\tAnd we show how to filter out the empty ones\n\t\n\t\n\n\n\nIf one day someone will ask how to do it and the example won't be enough, we can think about porting it as an FA or inlined into the other FAs. But until then, it's really a simple example. ",
+            "author": "Shai Erera",
+            "id": "comment-13818525"
+        },
+        {
+            "date": "2013-11-11T09:46:35+0000",
+            "content": "I talked with Gilad about it and he suggested a nice solution, with some limitations \u2013 you can create whatever FacetRequest, e.g. CountFacetRequest over the ROOT category and set its depth to 2. That way, if we ask for numResults=10, you basically say \"give me the top-10 dimensions (children of ROOT) and for each its top-10 children\".\n\nThis isn't perfect as if you want to get all available dimensions you have to guess what numResults should be set to. And if you ask for a high number, e.g. 100, you ask for the top-100 children of ROOT, and for each its top-100 children. Still, you might not get all dimensions, but it's a very easy way to do this. No need for any custom code. Another limitation is that this is currently supported by TaxonomyFacetsAccumulator, but SortedSetDVAccumulator limits the depth to 1 for all given requests.\n\nIn that spirit, I can propose another solution - write a FacetResultsHandler which skips the first level of children and returns a FacetResult which has a tree structure, such that the first level are the dimensions and the second level are the actual children. That way, doing new CountFacetRequest(ROOT, 10).setDepth(2) will result in all available dimensions in the first level, but top-10 for each in the second level. To implement such FacetResultsHandler we'd need to iterate over ROOT's children and compute the top-K for each, using e.g. DepthOneFacetResultsHandler... ",
+            "author": "Shai Erera",
+            "id": "comment-13818801"
+        },
+        {
+            "date": "2013-11-11T10:24:24+0000",
+            "content": "Patch add AllDimensionsFacetResultsHandler as a quick prototype to how this can be done. I also modified testTaxonomy to use it instead of AllFacetsAccumulator, and it passes.\n\nIf we want to proceed with this approach, we can do the following:\n\n\n\tAdd a new AllDimensionsFacetRequest which either:\n\t\n\t\tExtends CountFacetRequest, but then we limit it to counting only\n\t\tWraps another FacetRequest so that you can do any aggregation that you want.\n\t\tIt setDepth(2) internally.\n\t\n\t\n\tMove FacetResultsHandler into FacetRequest, instead of TaxonomyFacetsAccumulator.createFacetResultsHandler. I'll admit that originally that's where it was (in FR), but I moved it to FA in order to simplify FR implementations. But perhaps it does belong w/ FR...\n\n\n\nThe only non-trivial part of this is that you get back a FacetResult, whose children are the actual results, so you cannot simply iterate on res.subResults, but need to realize you should iterate on each subResults.subResults. I don't know if this is considered as complicated or not (I didn't find it very complicating, but maybe I'm biased ).\n\nAll-in-all, I think this is somewhat better than the accumulator approach, as it's more intuitive to define a FacetRequest, I think. In the faceted search module, FacetRequest == Query (in the content search jargon), and therefore more user-level than the underlying accumulator.\n\nThe downside is that it's not automatically supported by SortedSetDVAccumulator, since the latter doesn't respect any FacetRequest, only CountFacetRequest, and also does not let you specify your own FacetResultsHandler, but I think that that's solvable. ",
+            "author": "Shai Erera",
+            "id": "comment-13818833"
+        },
+        {
+            "date": "2013-11-11T10:35:25+0000",
+            "content": "Actually, if we move FacetResultsHandler to FacetRequest and create the new AllDimensionsFR, it doesn't need to setDepth() at all, only override createFacetResultsHandler. And we can add a flattenResults() method to AllDimsFR which takes a FacetResult and returns a List<FacetResult>, to simplify app's life. Just an idea. ",
+            "author": "Shai Erera",
+            "id": "comment-13818844"
+        }
+    ]
+}

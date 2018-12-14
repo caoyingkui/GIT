@@ -1,0 +1,55 @@
+{
+    "id": "SOLR-9091",
+    "title": "Solr index restore silently copies the corrupt segments in the backup",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "The Solr core restore functionality uses following criteria to decide if a given file is copied from backup directory or from current index directory.\n\ncase 1] File is available in both backup and current index directory\n--> Compare the checksum and file length\n  --> If checksum and length matching, copy the file from current working directory.\n --> If the checksum and length doesn't match, copy the file from backup directory. \n\ncase 2] File is available in only in backup directory (This can happen for a newly created core without any data).\n--> Copy the file from backup directory. \n\nNow the problem here is that we intentionally catch and ignore the error while reading the checksum for a file in the backup directory. Hence in case (2), it will result into restoration of a file without appropriate \"checksum\".\n\nHere is the relevant code snippet,\nhttps://github.com/apache/lucene-solr/blob/a5586d29b23f7d032e6d8f0cf8758e56b09e0208/solr/core/src/java/org/apache/solr/handler/RestoreCore.java#L82-L95",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-05-09T19:27:48+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "BTW Lucene uses CRC32 algorithm for computing checksum (LUCENE-2446). CRC32 is a just \"error detection\" code unlike MD5 (which produces one-way hash-codes).\n\nWhat it means is that CRC32 checksum value could be same for two files with different contents and hence we should never compare CRC32 checksums for two different files. (You can do that in case of MD5. e.g. during user registration - store the MD5 hash of the password in the database. When user attempts to login, you compute MD5 hash and check if it is \"equal\" to the one stored in the database).\n\nHere is a good discussion on this topic, http://www.dslreports.com/forum/r13525942-File-Integrity-Checksum-Algorithms-CRC32-vs-MD5\n\nThis problem will affect the \"restore\" operation as follows,\n\n-> User backs up index files for Core A\n-> User creates a new core (Core B) and index DIFFERENT documents.\n-> Unfortunately the CRC32 code for an index file in core B match exactly with CRC32 code of a similarly named file in the BACKUP copy (Difficult but not impossible to happen).\n-> User runs restore operation of core B using previously created BACKUP (Of Core A)\n-> After restore user still sees SAME documents even though they were not part of original BACKUP (or Lucene can throw index corruption exception depending upon how many/which files were copied from backup directory vs current index directory).\n\nHence I think we should NOT compare checksum of a file in the backup directory against the one in the current index directory. This checksum should ONLY be used to verify it the CRC32 hash of the file contents match the stored checksum (in the SAME file).\n\n\n\n\n\n ",
+            "id": "comment-15276867"
+        },
+        {
+            "date": "2016-05-09T19:36:17+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Another problem is that following code will throw an NPE if \"backupIndexFileChecksum\" parameter is NULL (which is possible when the checksum is not available in the calling method).\n\nhttps://github.com/apache/lucene-solr/blob/7571e747c3506ee93d63c9bd3534254944b5caa7/solr/core/src/java/org/apache/solr/handler/IndexFetcher.java#L922 ",
+            "id": "comment-15276878"
+        },
+        {
+            "date": "2016-05-09T19:46:45+0000",
+            "author": "Uwe Schindler",
+            "content": "Every segment in an index also had a unique identifier written into the file. So you can compare both, the checksum for correctness of file (not modified) and the uuid to validate if it is really the same segment: CodecUtil.checkIndexHeader validates the UUID in the header of each file. Just make sure that they are identical.\n\nSee slides of talk about Lucene 5 last year: https://berlinbuzzwords.de/session/apache-lucene-5-new-features-and-improvements-apache-solr-and-elasticsearch, PDF file page 30 and 31.\nBoth the checksum and the unique segment ID are made exactly for the replication backup case.\n\nNo need to do any additional checks + time-I/O-intensive operations. Just compare 2 identifiers and you know the files are from same index, same segment and have same data contents. When you transfer them you can recalculate the CRC checksum after transfer to ensure the transfer was successful. ",
+            "id": "comment-15276897"
+        },
+        {
+            "date": "2016-05-09T21:58:07+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Uwe Schindler Thanks for the pointer.\n\nEvery segment in an index also had a unique identifier written into the file. So you can compare both, the checksum for correctness of file (not modified) and the uuid to validate if it is really the same segment\n\nAs per my understanding validating the checksum is necessary and sufficient to ensure the integrity of the restored index state. Per segment unique identifier is an optimization when we know that the two copies of index state are linked to each other (e.g. in case of replication the \"slave\" is bootstrapped by a \"master\") and hence avoiding copy of common segments does not result in any index integrity issues.\n\nOn the other hand it is a bit risky to assume that \"backup\" and \"current\" index state are always related to each other. e.g. consider the use-case I mentioned above,\n-> User backs up index files for Core A\n-> User creates a new core (Core B) and index DIFFERENT documents.\n-> User runs restore operation of core B using previously created BACKUP (Of Core A)\n\nIs it possible that the segment identifiers generated in core B may have an overlap with those in core A ? ",
+            "id": "comment-15277135"
+        },
+        {
+            "date": "2016-05-09T22:14:08+0000",
+            "author": "Uwe Schindler",
+            "content": "Is it possible that the segment identifiers generated in core B may have an overlap with those in core A ?\n\nUnlikely, but theoretically possible - this can be compared to the possibility of 2 different files could have the same SHA1 hash. If it ever happens, we have to revisit the random number generator behind it.\n\nJust to note: The identifiers are excatly there to prevent the problem you are describing. So please use them for that, no need to revisit this again. You can be 99.99999999999...% sure that 2 segment files with identical filename, identical identifier and identical hash are the same files. ",
+            "id": "comment-15277172"
+        },
+        {
+            "date": "2016-05-09T22:17:48+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Uwe Schindler\n\nThe identifiers are excatly there to prevent the problem you are describing. So please use them for that, no need to revisit this again. You can be 99.99999999999...% sure that 2 segment files with identical filename, identical identifier and identical hash are the same files.\n\nThanks for the comment. good to know  ",
+            "id": "comment-15277184"
+        }
+    ]
+}

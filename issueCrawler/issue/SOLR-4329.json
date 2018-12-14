@@ -1,0 +1,99 @@
+{
+    "id": "SOLR-4329",
+    "title": "Have DocumentBuilder give value collections to the FieldType",
+    "details": {
+        "affect_versions": "None",
+        "status": "Open",
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ],
+        "components": [
+            "update"
+        ],
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "I'd like to write a multi-value-configured FieldType that can return a DocValue Field from its createFields().  Since DocValues holds a single value per document for a field, you can only have one.  However FieldType.createFields() is invoked by the DocumentBuilder once per each value being indexed.\n\nFYI the reason I'm asking for this is for a multi-valued spatial field to store its points in DocValues.",
+    "attachments": {
+        "SOLR-4329.patch": "https://issues.apache.org/jira/secure/attachment/12637971/SOLR-4329.patch",
+        "DocumentBuilder.java": "https://issues.apache.org/jira/secure/attachment/12571726/DocumentBuilder.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "David Smiley",
+            "id": "comment-13558421",
+            "date": "2013-01-20T23:04:39+0000",
+            "content": "Can we have FieldType (and SchemaField) accept a collection?  It would look like:\n\npublic void createFieldsAndAddToDoc(Collection vals, float boost, Document doc);\n\n\nIt could have a default implementation that does what DocumentBuilder is doing now in addField(doc,field,val,boost) \u2013 basically calling createField(val) for each value. It would also need to be mindful to not over-boost for multiple values.  DocumentBuilder would call it if it's getting multiple values from the SolrInputDocument.  In the API I suggest above, it takes care of adding the fields to the document, thereby allowing the potential to avoid an array wrapper.  Though admittedly, the API would be more consistent if it was named createFields() and returned an array. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-13591294",
+            "date": "2013-03-02T04:38:29+0000",
+            "content": "DocumentBuilder, at least today, is used entirely via DocumentBuilder.toDocument(...) (a static method) \u2013 yet there are a bunch of old instance methods, fields, and constructor that are unused and thus only complicates what is going on.  The attached replacement for review removes all the old cruft, and refactors the code to use field instance state. I found that handy because I added a new optional FieldType interface \"DocumentBuilderAware\" with one method addFieldsToDocument(DocumentBuilder, boost) that takes the DocumentBuilder and can then access various state via getters.\n\nThe main use-case why I want this extension point is to add a single DocValues field to the Lucene document that has a byte array representation of each value the field will get (its multi-valued).\n\nAnother use-case is when the field value is pre-parsed from an URP or never was a string (EmbeddedSolrServer or perhaps DIH even), yet the value happens to implement Collection (e.g. a Spatial4j ShapeCollection).  This ShapeCollection needs to be seen by the FieldType yet the current DocumentBuilder will instead separately hand the FieldType each component shape value.\n\nThere are undoubtedly other creative use-cases (certainly non-spatial).  With access to the entire SolrInputDocument, a FieldType might want to look at another particular field to include it in some way.  Yet I can understand that tying FieldType to DocumentBuilder could be seen as a less than clean backwards dependency and so this is an optional interface.\n\n(the attached is the entire file because it was modified so heavily that a patch would be unintelligible)\n\nComments please! "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-13591295",
+            "date": "2013-03-02T04:42:53+0000",
+            "content": "One more thing... as part of looking over DocumentBuilder with a fine toothed comb, I noticed that schema.getCopyFieldsList(ifield.getName()) was being called for every field value. This method internally has to do a bunch of pattern matching to build up a list.  Quite wasteful.  I simply moved this out of the loop.  Another optimization that could be added is internal to that method implementation \u2013 return Collections.EMPTY_LIST if there are no copy fields, instead of constructing an ArrayList. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13593854",
+            "date": "2013-03-05T20:12:06+0000",
+            "content": "My chief concerns when thinking about this new approach for \"DocumentBuilder\" is that it increases the API surface of building up these documents in kind of a scary way.  In particular the wide open nature of DocumentBuilderAwareFieldType.addFieldsToDocument means a \"rouge\" or buggy FieldType could wreck all sorts of havoc.\n\nThat said: I understand smiley's motivation here with needing a way for robust and complex FieldTypes to have more control over the number/types of concrete \"Fields\" added to a Document based on the values found in the \"SolrInputDocument\", and i don't have any serious objections to the general idea, provided we do a decent job of labeling this new interface as expert and clearly documenting the overall lifecycle of things.\n\nSome specific comments (ignoring back compat for a moment)...\n\n\n\tseems like the DocumentBuilder class should be final (already defacto final since the constructor is private right?)\n\ti don't see why \"boost\" is being passed to addFieldsToDocument, why not make that a state variable on the DocumentBuilder with a public accesser just like ifield ?\n\tneed a lot more docs on a the lifecycle of things implementing DocumentBuilderAwareFieldType - in particular how many times addFieldsToDocument is called on a single instance (ie: once per SolrInputField, not once per SolrInputDocument, or once per SolrInputField.iterator())\n\talso need to decide if/how any order should be enforced in how SolrInputField's are iteratored beyond just the natural order of the docs \u2013 with a simpler DocumentBuilder this didn't matter, but now with DocumentBuilderAwareFieldType an impl's behavior might change based on what other fields are already in the target document (because of other DocumentBuilderAwareFieldTypes already processed, or other SolrInputField's processed by the current DocumentBuilderAwareFieldType) ... we need to ensure that there is consistent behavior regardless of what order the client happens to send different SolrInputFields\n\twe would definitely need a Mock impl of DocumentBuilderAwareFieldType to test that the document lifecycle rules are being obeyed (whatever they are)\n\n\n\nAs for backcompat...\n\nMy suggestion, should we definitely decide to go this route:\n\n\n\tdeprecate the entire DocumentBuilder class on 4x, and remove from trunk\n\tadd this new class with a new name (eg: SolrDocumentBuilder)\n\tchange all existing tests of DocumentBuilder.toDocument to call SolrDocumentBuilder.toDocument\n\ton 4x, update DocumentBuilder.toDocument to wrap SolrDocumentBuilder.toDocument\n\n\n\n "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-13593896",
+            "date": "2013-03-05T20:53:38+0000",
+            "content": "Thanks for the thorough review Hoss.\n\nI find your chief/only concern odd: buggy code is by definition buggy and unsurprisingly could wreak havoc.  And if rogue untrusted code is getting into your app then I think you're screwed.  But, I think in a nutshell you're saying this is perhaps too much flexibility to hang yourself with.  My approach of opening up the entire DocumentBuilder state and Lucene Document to the field type was perhaps an over-reach \u2013 It opens the door for creative use cases \u2013 use-cases that admittedly I don't have right now.  For example, honestly my use-cases don't need the entire SolrInputDocument \u2013 just the SolrInputField.  Maybe rename the interface to \"SolrInputFieldAware\" or \"InputFieldValuesAware\"?  Nor do my use-cases actually require the Lucene Document, so maybe the Fields could be returned just like what happens in createFields(...).  And at that point, heck, SolrInputFieldAware could even be a marker interface (doesn't have methods) and the SolrInputField could be supplied as the Object value to createFields(field,value,boost).  Maybe that last idea may be pushing it a little as it is non-obvious but it shows that the current FieldType API is sufficient depending on how it's called.\n\nI like all your suggestions as well as the next steps.  I held back on documenting this class even further at first because it would have been for not if the approach was unacceptable, and pending your thoughts above it might not be. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13593901",
+            "date": "2013-03-05T20:58:06+0000",
+            "content": "I find your chief/only concern odd: buggy code is by definition buggy and unsurprisingly could wreak havoc.\n\nI didn't quite follow that either. We could add a comment on the interface? \"With great power comes great responsibility!\" \n\nlabeling this new interface as expert and clearly documenting the overall lifecycle of things.\n\n+1 "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13594096",
+            "date": "2013-03-05T23:35:33+0000",
+            "content": "\nI find your chief/only concern odd: buggy code is by definition buggy and unsurprisingly could wreak havoc. And if rogue untrusted code is getting into your app then I think you're screwed. But, I think in a nutshell you're saying this is perhaps too much flexibility to hang yourself with.\n\nAgreed, Buggy code is buggy code, and it should not be surprising if buggy code wreaks havoc.  My concern is not so much that this much flexibility makes it easier for a FieldType to hang itself \u2013 I'm ok with advanced APIs making it easy to write broken plugins as long as Solr gives good visibility/exceptions about how the plugin is broken. \n\nMy concern is that this much flexibility makes it easy for a FieldType to hang a different FieldType, w/o any clear indication that such action at a distance has taken place, making it hard to track down what happened or where.\n\nFor example, honestly my use-cases don't need the entire SolrInputDocument ... Nor do my use-cases actually require the Lucene Document, ...\n\nI'm not picky on the details, but if you see a clear way to:\n\n\n\tachieve what's needed for all the use cases you can think of at the moment\n\tlimit the exposure of the Document internals so that DocumentBuilder's delegation to the FieldType doesn't let it muck with other fields\n\n\n\n..then that sounds like win to me. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13717257",
+            "date": "2013-07-23T18:47:38+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 "
+        },
+        {
+            "author": "Ishan Chattopadhyaya",
+            "id": "comment-13955966",
+            "date": "2014-04-01T01:03:10+0000",
+            "content": "Since its been a while on this issue, here's a patch to set the ball rolling again.\nThis is based on the refactoring of the FieldType's createFields() to now accept (SchemaField, Object[] vals, float[] boosts). As David mentioned in comment 1, it has an extra wrapper of array, but API-wise looks most consistent with what other field types are already doing.\n\n(All tests passing after this refactor)\n\nDavid Smiley, do you see any usecase that will be missed with this approach? "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-13955981",
+            "date": "2014-04-01T01:23:24+0000",
+            "content": "I need to look at it closer; but can you comment if there are any use-cases you have which triggered your interest in this issue? "
+        },
+        {
+            "author": "Ishan Chattopadhyaya",
+            "id": "comment-13955994",
+            "date": "2014-04-01T01:32:59+0000",
+            "content": "I am interested in unblocking the possible optimizations in spatial that would be possible if docValues from the multivalued shape field can be created and used. Specifically, I'm interested in a strategy that uses recursive spatial prefix tree as well as the docvalues to better resolve the boundary cases while matching shapes.  "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13971097",
+            "date": "2014-04-16T12:57:09+0000",
+            "content": "Move issue to Solr 4.9. "
+        }
+    ]
+}

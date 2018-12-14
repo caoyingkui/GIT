@@ -1,0 +1,187 @@
+{
+    "id": "SOLR-5468",
+    "title": "Option to notify client when desired replication factor not achieved for an update request.",
+    "details": {
+        "affect_versions": "4.5",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.9"
+        ],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "New Feature",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "I've been thinking about how SolrCloud deals with write-availability using in-sync replica sets, in which writes will continue to be accepted so long as there is at least one healthy node per shard.\n\nFor a little background (and to verify my understanding of the process is correct), SolrCloud only considers active/healthy replicas when acknowledging a write. Specifically, when a shard leader accepts an update request, it forwards the request to all active/healthy replicas and only considers the write successful if all active/healthy replicas ack the write. Any down / gone replicas are not considered and will sync up with the leader when they come back online using peer sync or snapshot replication. For instance, if a shard has 3 nodes, A, B, C with A being the current leader, then writes to the shard will continue to succeed even if B & C are down.\n\nThe issue is that if a shard leader continues to accept updates even if it loses all of its replicas, then we have acknowledged updates on only 1 node. If that node, call it A, then fails and one of the previous replicas, call it B, comes back online before A does, then any writes that A accepted while the other replicas were offline are at risk to being lost. \n\nSolrCloud does provide a safe-guard mechanism for this problem with the leaderVoteWait setting, which puts any replicas that come back online before node A into a temporary wait state. If A comes back online within the wait period, then all is well as it will become the leader again and no writes will be lost. As a side note, sys admins definitely need to be made more aware of this situation as when I first encountered it in my cluster, I had no idea what it meant.\n\nMy question is whether we want to consider an approach where SolrCloud will not accept writes unless there is a majority of replicas available to accept the write? For my example, under this approach, we wouldn't accept writes if both B&C failed, but would if only C did, leaving A & B online. Admittedly, this lowers the write-availability of the system, so may be something that should be tunable?\n\nFrom Mark M: Yeah, this is kind of like one of many little features that we have just not gotten to yet. I\u2019ve always planned for a param that let\u2019s you say how many replicas an update must be verified on before responding success. Seems to make sense to fail that type of request early if you notice there are not enough replicas up to satisfy the param to begin with.",
+    "attachments": {
+        "SOLR-5468.patch": "https://issues.apache.org/jira/secure/attachment/12642864/SOLR-5468.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13830833",
+            "date": "2013-11-24T02:12:13+0000",
+            "content": "  Specifically, when a shard leader accepts an update request, it forwards the request to all active/healthy replicas and only considers the write successful if all active/healthy replicas ack the write.\n\nIn fact, because we add locally first, we expect a remote fail means the remote node has to recover, and so we consider that success as far as the user is concerned. Internally, we also try and force a recovery on the remote node that failed. We presume it's screwed and has to recover and we try to ensure it by trying to tell it to recover in case it's still up. I want to add more to this, see SOLR-5495. SOLR-4992 is also important.\n\nThis JIRA issue is an important addition to the current design though.\n\nIn the code, this is doc'd as:\n\n\n    // if its a forward, any fail is a problem - \n    // otherwise we assume things are fine if we got it locally\n    // until we start allowing min replication param\n\n\n\nOf course, we don't just assume things are fine - we also try and put the node that rejected the update into recovery. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13983016",
+            "date": "2014-04-28T13:50:03+0000",
+            "content": "Starting to work on this ...\n\nFirst, I think \"majority quorum\" is too strong for what we really need at the moment; for now it seems sufficient to let users decide how many replicas a write must succeed on to be considered successful. In other words, we can introduce a new, optional integer property when creating a new collection - minActiveReplicas (need a better name), which defaults to 1 (current behavior). If >1, then an update won't succeed unless it is ack'd by at least that many replicas. Activating this feature doesn't make much sense unless a collection has RF > 2.\n\nThe biggest hurdle to adding this behavior is the asynchronous / streaming based approach leaders use to forward updates on to replicas. The current implementation uses a callback error handler to deal with failed update requests (from leader to replica) and simply considers an update successful if it works on the leader. Part of the complexity is that the leader processes the update before even attempting to forward on to the replica so there would need to be some \"backing out\" work to remove an update that succeeded on the leader but failed on the replicas. This is starting to get messy \n\nAnother key point here is this feature simply moves the problem from the Solr server to the client application, i.e. it's a fail-faster approach where a client indexing app gets notified that writes are not succeeding on enough replicas to meet the desired threshold. The client application still has to decide what to do when writes fail. \n\nLastly, batches! What happens if half of a batch (sent by a client) succeeds and the other half fails (due to losing a replica in the middle of processing the batch)? Another idea I had is maybe this isn't a collection-level property, maybe it is set on a per-request basis? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13983035",
+            "date": "2014-04-28T14:17:33+0000",
+            "content": "for now it seems sufficient to let users decide how many replicas a write must succeed on to be considered successful.\n\nI agree that that is the low hanging fruit. We just have to let the user know exactly what we are trying to promise.\n\nthere would need to be some \"backing out\" work to remove an update that succeeded on the leader but failed on the replicas. \n\nYup - that will be the hardest part of doing this how we would really like and a large reason it was punted on in all the initial work. Even if the leader didn't process the doc first (which is likely a doable optimization at some point), I still think it's really hard.\n\nLastly, batches! What happens if half of a batch (sent by a client) succeeds and the other half fails (due to losing a replica in the middle of processing the batch)? \n\nBatches and streaming really don't make sense yet in SolrCloud other than for batch loading. We need to implement better, fine grained error responses first. When that happens, it should all operate the same as single update per request. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13983138",
+            "date": "2014-04-28T16:00:31+0000",
+            "content": "Thanks for the quick feedback. Do think this should be an update request parameter or collection level setting? Just re-read your original comment about this and sounds like you were thinking a parameter with each request. I like that since it gives the option to by-pass this checking when doing large bulk loads of the collection and only apply it when it makes sense.\n\nIn terms of fine-grained error response handling, looks like this is captured in: https://issues.apache.org/jira/browse/SOLR-3382\n\n "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13983153",
+            "date": "2014-04-28T16:18:02+0000",
+            "content": "Do think this should be an update request parameter or collection level setting?\n\nYeah, I think it's common to allow passing this per request so the client can vary it depending on the data. I'm sure configurable defaults are probably worth looking at too though. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13986727",
+            "date": "2014-05-01T16:21:29+0000",
+            "content": "Here is a patch that should be classified as exploratory / discovery into this topic. It has a little overlap with the patch I posted for SOLR-5495, but not to worry on that as I plan to commit SOLR-5495 first so the overlap will get worked out shortly.\n\nAs I dug into this idea in more detail, it became pretty clear that what we can accomplish in the area of providing stronger enforcement of replication during update processing is fairly limited by our architecture. Of course this is not a criticism of the current architecture as I feel it\u2019s fundamentally sound.\n\nThe underlying concept in this feature is a client application wants to ensure a write succeeds on more than just the leader. For instance in a collection with RF=3, the client may want to say don\u2019t consider an update request is successful unless it succeeds on 2 of the 3 replicas, vs. how it works today is an update request is considered successful if it succeeds on the leader only. The problem is that there\u2019s no consistent way to \u201cback out\u201d an update without some sort of distributed transaction coordination among the replicas, which I\u2019m pretty sure we don\u2019t want to even go down that road. Backing out an update seems doable (potentially) if we\u2019re just talking about the leader but what happens when the client wants minRF=3 and the update only works on the leader and one of the replicas? Now we\u2019re needing to back out an update from the leader and one of the replicas. Gets ugly fast \u2026\n\nSo what is accomplished in this patch? First, a client application has the ability to request information back from the cluster on what replication factor was achieved for an update request by sending the min_rf parameter in the request. This is the hint to the leader to keep track of the success or failure of the request on each replica. As that implies some waiting to see the result, the client can also send the max_rfwait parameter that tells the leader how long it should wait to collect the results from the replicas (default is 5 seconds). This is captured in the ReplicationFactorTest class.\n\nThis can be useful for client applications that have idempotent updates and thus decide to retry the updates if the desired replication factor was not achieved. What we can\u2019t do is fail the request if the desired min_rf is not achieved as that leads to the aforementioned backing out issues. There is one case where we can fail the request and avoid the backing out issue is if we know the min_rf can\u2019t be achieved before we do the write locally on the leader first. This patch doesn\u2019t have that solution in place as I wasn\u2019t sure if that\u2019s desired? If so, it will be easy to add that. Also, this patch doesn\u2019t have anything in place for batch processing, ie. only works with single update requests as I wanted to get some feedback before going down that path any further. Moreover, there\u2019s a pretty high cost in terms of slowing down update request processing in SolrCloud by having the leader block until it knows the result of the request on the replicas. In other words, this functionality is not for free but may still be useful for some applications?\n\nTo me, at the end of the day, what\u2019s really needed is to ensure that any update requests that were ack\u2019d back to the client are not lost. This could happen under the current architecture if the leader is the only replica that has a write and then fails and doesn\u2019t recover before another replica recovers and resumes the leadership role (after waiting too long to see the previous leader come back). Thus, from where I sit, our efforts are better spent on continuing to harden the leader failover and recovery processes and applications needing stronger guarantees should have more replicas. SolrCloud should then just focus on only allowing in-sync replicas to become the leader using strategies like what was provided with SOLR-5495. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13989664",
+            "date": "2014-05-05T16:16:09+0000",
+            "content": "So I've thought about this some more and am not sure it's even worth pursuing any further?\n\nEnabling this feature incurs a cost because it layers a synchronous blocking action (CountDownLatch.await) on top of an asynchronous process (replication from leader to N replicas). So given there's a cost, what's the benefit? On the surface, it seems like a reasonable idea to tell a client application the level of replication that was achieved for an update request, but the best a client application can do is retry the update once the problem that caused degraded replication is resolved (only if it's an idempotent update at that). However, that's exactly what happens automatically when a previously partitioned replica is healed. Specifically, the replica will be marked DOWN (see SOLR-5495) and then it must recover before becoming active, which gives the same result as the client application re-trying a request.\n\nLastly, I thought more about Mark's point on failing fast when we know that a request cannot meeting the desired RF requested by the client. In this one case, we won't have to worry about any backing out because we'd catch the problem before the local add/update on the leader. However, this sort of lulls the client into a false security in that we really can't \"fail fast\" if a replica goes down after the local add/update on the leader. So that would mean two different behaviors depending on timing which I don't think we want. Again, I think we should focus on hardening the out-of-sync replica recovery and leader failover scenarios. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13989724",
+            "date": "2014-05-05T17:19:37+0000",
+            "content": "I won't be able to catch up to this in a competent way for a week or two but a quick comment:\n\nFirst, this is def a hard problem. It's something I have thought a bit about, but have not cracked yet.\n\nHowever, that's exactly what happens automatically \n\nI'm not sure 'exactly' fits. I think it's probably important to let the client know that an update only made it to one replica for example. That mean's you are in a position to possibly lose the update. One possibility is to define the fail the same way as a leader fail in the middle of your update. You don't know what happened in that case - the doc may be in or not. If we do the same here, the client will know, hey, this didn't make it to 2 or 3 replicas - it may be in the cluster, but we can't count on it's durability to the level we requested. The client can then choose how to handle this - accept what happened or take another action.\n\nJust spit balling at a conference, but I think there is a way to define the semantics here so that it's easier on us, but still gives the client the info they need to understand how durable that update was. This would not be the only case a fail does not mean the update is for sure not in the cluster - you can't get around that on fails of the leader in the middle of an update anyway. "
+        },
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13990144",
+            "date": "2014-05-06T00:43:17+0000",
+            "content": "I just skimmed the comments here the other day.  I could be wrong, but aren't you guys describing Hinted Handoff?  If so, haven't applications like Voldemort and Cassandra and maybe others already dealt with this and may have code or at least approaches that that has been in production for a while and that could be followed/used?   Maybe ES deals with this too, though I can't recall at the moment.  Rafa\u0142 Ku\u0107 do you know? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13990164",
+            "date": "2014-05-06T01:07:24+0000",
+            "content": "No, hinted hand off is for when a shard is not being served. Less of a interest of mine because auto replica failover with hdfs should be a much better solution for that.  "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13994294",
+            "date": "2014-05-10T19:40:43+0000",
+            "content": "Here's an updated patch that may prove useful for client applications that wish to be notified (via responseHeader) that a desired level of replication was or was not achieved for an update request.\n\nSince this is not something that all client applications would need, it must be explicitly activated by passing the min_rf=N where N>1, e.g. .../update?min_rf=2 will activate this feature. The actual value of the min_rf is only meaningful to the client application and server code will simply report what level was achieved. Originally I was thinking that DistributedUpdateProcessor only needed to block until the desired level was achieved but it turns out that it blocks until all replicas are tried anyway.\n\nThe responseHeader would then include the minimum achieved replication factor for that request, such as:\n\n<response>\n<lst name=\"responseHeader\"><int name=\"rf\">2</int><int name=\"min_rf\">2</int><int name=\"status\">0</int><int name=\"QTime\">127</int></lst>\n</response>\n\nTo be clear, it is the client application's responsibility to read this information from the responseHeader and act accordingly. To help out with this, esp if using CloudSolrServer, client applications call call CloudSolrServer.getMinAchievedReplicationFactor, which will return the minimum achieved replication factor across all shards for a request. Of course, for single doc update requests, there will only be one shard involved.\n\nAdmittedly, this code might look a bit cumbersome just to produce a simple count, see: DistributedUpdateProcess.RequestReplicationTracker inner class. This approach is needed to support batch update requests, including those that don't come in from directUpdates from CloudSolrServer (hence the need for the outer Map to keep track of replication outcomes per shard).\n\nWanted to solicit some feedback here before committing but the overall impact to existing code is minimal as this optional feature must be activated intentionally by the client and only introduces minimal overhead. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13998379",
+            "date": "2014-05-15T02:06:28+0000",
+            "content": "Hoping to commit this in the next couple of days. Any feedback before then would be appreciated. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14002546",
+            "date": "2014-05-19T23:04:56+0000",
+            "content": "Commit 1596092 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596092 ]\n\nSOLR-5468: report replication factor that was achieved for an update request if requested by the client application. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14002551",
+            "date": "2014-05-19T23:06:30+0000",
+            "content": "Committed this one today. Unit test and code updated to verify both single updates and batches are supported in direct update and non-direct update modes. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14003206",
+            "date": "2014-05-20T13:20:29+0000",
+            "content": "Commit 1596234 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596234 ]\n\nSOLR-5468: Add wait loop to see replicas become active after restoring partitions; to address intermittent Jenkins test failures. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14003639",
+            "date": "2014-05-20T17:04:22+0000",
+            "content": "Commit 1596315 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596315 ]\n\nSOLR-5495: Re-arrange location of SOLR-5495 and SOLR-5468 in CHANGES.txt "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14005099",
+            "date": "2014-05-21T18:57:00+0000",
+            "content": "Commit 1596652 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596652 ]\n\nSOLR-5468: Improve reporting of cluster state when assertions fail; to help diagnose cause of Jenkins failures. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14005319",
+            "date": "2014-05-21T22:19:04+0000",
+            "content": "Commit 1596703 from Timothy Potter in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1596703 ]\n\nSOLR-5468: report replication factor that was achieved for an update request if requested by the client application; port from trunk "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14006105",
+            "date": "2014-05-22T16:33:46+0000",
+            "content": "Commit 1596916 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596916 ]\n\nSOLR-5468: Add a little wait for state to propagate after healing partitions; to address intermittent Jenkins failures. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14006120",
+            "date": "2014-05-22T16:51:36+0000",
+            "content": "Commit 1596918 from Timothy Potter in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1596918 ]\n\nSOLR-5468: add a short wait after healing the partitions for state to propagate to address intermittent Jenkins failures. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007531",
+            "date": "2014-05-23T18:39:12+0000",
+            "content": "Commit 1597149 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1597149 ]\n\nSOLR-5468: Now in 4.9 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007541",
+            "date": "2014-05-23T18:51:05+0000",
+            "content": "Commit 1597156 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1597156 ]\n\nMove SOLR-5468 to new features section. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007543",
+            "date": "2014-05-23T18:53:42+0000",
+            "content": "Commit 1597157 from Timothy Potter in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1597157 ]\n\nMove SOLR-5468 to new features section "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14037942",
+            "date": "2014-06-19T21:45:50+0000",
+            "content": "Moved my last (now gone) comment to where it was meant for: SOLR-5495 "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14039012",
+            "date": "2014-06-20T16:47:01+0000",
+            "content": "I've renamed this ticket as the previous name was misleading as to what the actual solution is doing. If you're interested in this subject, I encourage you to read my comments above. Basically, Solr's replication mechanism isn't well suited for enforcing a majority quorum before accepting a write. In a nutshell, if you can't rollback a write that succeeds on some nodes if the majority isn't reached, then you can't enforce it  The solution in this ticket is very basic. It allows a client to request that Solr return the achieved replication factor for a given update request (single or batch). All this allows is for the client application to take some additional measures, such as resending the updates, if so desired. Put simply, this moves the problem out to the client. It's useful for environments that have RF>=3 and if 2 of the replicas are down, then there is a risk of losing writes if the leader fails and doesn't come back. This gives the client application the ability to know which writes were accepted by a degraded shard and perhaps re-try them in the future if needed. That's it! "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-16080491",
+            "date": "2017-07-10T15:23:14+0000",
+            "content": "I'm a bit confused about min_rf.  I understand it gives the client more information so that it might retry the document or do something else.  The documentation (and Tim's comments here) seems to indicate that this doesn't change SolrCloud's behavior; instead it's purely about exposing what the replication factor was (a result).  Although reading of the code suggests this isn't quite true (Distributed URP, checks this and avoids a LIR) so I'm not quite sure what to think.  Does the integer input vary the potential response in some way if this parameter is (mostly) just informative?  If not, and if it's not supposed to change behavior, then it could have been a boolean. "
+        },
+        {
+            "author": "Ayon Sinha",
+            "id": "comment-16119261",
+            "date": "2017-08-09T00:53:16+0000",
+            "content": "How do I set the minRf for the entire Cluster? I don't want individual clients deciding things when hosting the cluster. The most common desire is for us to have RF >= 3 and have a minRF >=2 roughly translates to N/2 + 1 quorum. Ideally if I have large number of replicas like 5 or even 300, I would still want minRF to be low like 2 or 3 such that writes are not painfully slow. Like ZK, I'd never want my minRf to be more than 4 after which performance degraded towards non-availability. "
+        }
+    ]
+}

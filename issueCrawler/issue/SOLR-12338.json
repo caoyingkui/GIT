@@ -1,0 +1,234 @@
+{
+    "id": "SOLR-12338",
+    "title": "Replay buffering tlog in parallel",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "7.4",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Since updates with different id are independent, therefore it is safe to replay them in parallel. This will significantly reduce recovering time of replicas in high load indexing environment.",
+    "attachments": {
+        "SOLR-12338.patch": "https://issues.apache.org/jira/secure/attachment/12922777/SOLR-12338.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-05-10T03:15:37+0000",
+            "content": "There are some situations where if in-place updates and DBQs are re-ordered, then the entire document needs to be fetched from the leader. This is fine when we have an active leader, but in case of tlog replay, we would need to apply those updates in the same order.\n\nI think if DBQs are executed in the right order (i.e. all updates before a DBQ was updated before the DBQ, and all updates after the DBQ are executed after the DBQ), then we can run the other updates in parallel.\n\nExample:\n\nadd1\nadd2\nadd3\ndbq1\nadd4\nadd5\nadd6\n..\nadd20\ndbq2\n\n\nHere, add# are either full document updates or in-place updates. I suggest: we run updates add1-add3 in parallel, and then wait till they are done before executing db1, and then add4-add20 parallely and then wait and execute dbq2. This should be fine, I think. (CC Hoss Man, wdyt?) ",
+            "author": "Ishan Chattopadhyaya",
+            "id": "comment-16469869"
+        },
+        {
+            "date": "2018-05-10T08:54:57+0000",
+            "content": "Hi Ishan Chattopadhyaya yeah I think this is a good idea to do that. It may not solve the case when a dbq1 already re-ordered to ahead of add2 or add3 in the tlog. But It won't make things worse than today. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16470098"
+        },
+        {
+            "date": "2018-05-10T09:02:12+0000",
+            "content": "Attached a patch for this ticket, here are some notes:\n\n\tThanks to OrderedExecutor, all updates belong to same docId, it will be executed sequentially. Updates belong to different docId, will be executed in parallel.\n\tThe patch adds a new test in TestRecovery, which ensure that even updates are executed in parallel we will have the same index as before.\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16470110"
+        },
+        {
+            "date": "2018-05-10T15:05:40+0000",
+            "content": "This OrderedExecutor thing is nifty. It needs class-level documentation.\n I have doubts on the use of a new ArrayBlockingQueue<>(1) per doc ID hash bucket. What if the client adds a Runnable for doc1, then immediately adds another Runnable for doc1. You're intending for the second runnable to block until the first completes to achieve the per-doc ID serialization. But this may not happen; a thread may start on the first runnable (which frees up the second runnable to be submitted), then the thread doesn't get CPU time, and then the other Runnable zooms ahead out-of-order. See what I mean?\n\nInstead of creating a new ArrayBlockingQueue<>(1) per doc ID hash bucket, lets create an array of Locks. When execute() is called, it immediately grabs the lock, potentially blocking. Then you can submit the provided Runnable with a wrapping Runnable that unlocks when done. This can be made simpler via using FutureTask subclass to override done(). \u00a0To be safe, catch a RejectedExecutionException from execute() to cancel the futuretask. \u00a0With this scheme, you might initialize the doc ID hash bucket array size to be larg-ish at 32, even if there are fewer threads (less accidental hash collision contention). \u00a0A Lock is light-weight.\n\nThe test uses System.currentTimeMillis() but should probably use nanos which the JVM guarantees to be sequential? ",
+            "author": "David Smiley",
+            "id": "comment-16470518"
+        },
+        {
+            "date": "2018-05-10T15:13:51+0000",
+            "content": "Also if you submit without an ID, then it should probably proceed right to the delegate Executor. \u00a0Why does it pick an ID at random? ",
+            "author": "David Smiley",
+            "id": "comment-16470528"
+        },
+        {
+            "date": "2018-05-11T02:23:14+0000",
+            "content": "I have doubts on the use of a new ArrayBlockingQueue<>(1) per doc ID hash bucket. What if the client adds a Runnable for doc1, then immediately adds another Runnable for doc1. You're intending for the second runnable to block until the first completes to achieve the per-doc ID serialization. But this may not happen; a thread may start on the first runnable (which frees up the second runnable to be submitted), then the thread doesn't get CPU time, and then the other Runnable zooms ahead out-of-order. See what I mean?\nIt is per threads (which is small), not per bucket. If I understand correctly, what you mean here is two threads waiting for a lock to be released, the one who come late win the lock. This seems can be solve by set the fair flag of ArrayBlockingQueue to true, right?\n\n\nAlso if you submit without an ID, then it should probably proceed right to the delegate Executor. \u00a0Why does it pick an ID at random?\nThis can help us to\u00a0know how many threads are running (pending). Therefore OrderedExecutor does not execute more than\u00a0{{numThreads\u00a0}}in parallel. It also solves the case\u00a0when ExecutorService's queue is full it will throw\u00a0RejectedExecutionException. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16471392"
+        },
+        {
+            "date": "2018-05-11T04:31:53+0000",
+            "content": "\n+  private OrderedExecutor replayUpdatesExecutor = new OrderedExecutor(\n+      Runtime.getRuntime().availableProcessors(),\n+      ExecutorUtil.newMDCAwareCachedThreadPool(\n+          Runtime.getRuntime().availableProcessors(),\n+          new DefaultSolrThreadFactory(\"replayUpdatesExecutor\")));\n\n\n\nGiven that some machines these days have dozens of cores and you might have many SolrCores recovering, we may want to cap the number of threads at some number or make it configurable or something.\n\nThis seems can be solve by set the fair flag of ArrayBlockingQueue to true\n\nYeah, you need that to ensure FIFO.\n\nI like how this gives us some control to throttle, I wonder how efficient it is as documents keep thundering in though - do we gobble up threads and connections waiting? That is where it's a bummer it's hard to limit those resources. What are you going to do though? Those requests have to wait somewhere or we have to start dropping them - and hopefully with NIO2 it's somewhat efficient to wait on IO.\n\nI think what David is getting at is that you are ensuring that tasks are kicked off in order, but once they are kicked off, you can't guarantee order. So task1 gets taken off the queue, then task 2 is taken, now task 2 gets executed first when task 1 has it's thread unluckily scheduled by the OS. At least that's how I read it. But that is not an issue right? Because you don't run an item from the queue until the one in front of it is fully run right? ",
+            "author": "Mark Miller",
+            "id": "comment-16471481"
+        },
+        {
+            "date": "2018-05-11T05:02:44+0000",
+            "content": "\nGiven that some machines these days have dozens of cores and you might have many SolrCores recovering, we may want to cap the number of threads at some number or make it configurable or something.\n{{replayUpdatesExecutor }} is shared through all the SolrCores, therefore how many SolrCores are recovering won't affect the max number of threads will be used. Although, make it configurable is a good idea.\n\n\nYeah, you need that to ensure FIFO.\nYeah, but we do not need that flag for the case of LogReplayer, right? Because we are calling execute method in single-thread.\n\n\nI think what David is getting at is that you are ensuring that tasks are kicked off in order, but once they are kicked off, you can't guarantee order. So task1 gets taken off the queue, then task 2 is taken, now task 2 gets executed first when task 1 has it's thread unluckily scheduled by the OS. At least that's how I read it. But that is not an issue right? Because you don't run an item from the queue until the one in front of it is fully run right?\nOrderedExecutor ensuring that tasks are kicked off in order for a same id. Yeah, task1 get taken off the queue only after it finishes.\n\n\nI like how this gives us some control to throttle, I wonder how efficient it is as documents keep thundering in though - do we gobble up threads and connections waiting? That is where it's a bummer it's hard to limit those resources. What are you going to do though? Those requests have to wait somewhere or we have to start dropping them - and hopefully with NIO2 it's somewhat efficient to wait on IO.\nI think we will throttle the incoming updates properly by doing SOLR-12305.  ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16471495"
+        },
+        {
+            "date": "2018-05-11T05:13:21+0000",
+            "content": "Yeah, but we do not need that flag for the case of LogReplayer, right? Because we are calling execute method in single-thread.\n\nTechnically that sounds right, but I'm not sure I read the contract explicitly promises that. If we have good testing, it's not much of a concern.\n\nOrderedExecutor ensuring that tasks are kicked off in order for a same id. Yeah, task1 get taken off the queue only after it finishes.\n\nYeah, so I don't think I spot an open issue for a race.\n\nI think we will throttle the incoming updates properly by doing SOLR-12305.\n\nAh right, had been looking at that issue recently too and had it on my mind. That is more where that comment belongs. I was thinking these queues would work with documents coming in and getting buffered, but they won't get held up from dropping off the document to the tlog. But anyway, I think that natural throttling is a good first step. I think at the end of the day, we will want to end up with a Filter though that can do QOS and intelligent throttling based on data, but I'm pro whatever gets us out of infinite tlog replay soonest short term.\n ",
+            "author": "Mark Miller",
+            "id": "comment-16471502"
+        },
+        {
+            "date": "2018-05-14T21:40:11+0000",
+            "content": "I looked at this again (after a few days of vacation) and I withdraw my concern that there's a bug. \u00a0The use of ArrayBlockingQueue(1) is acting as a sort of Lock in the same way I suggested to use a Lock. \u00a0Couldn't you simply replace it with a Lock? \u00a0The put() becomes a lock(), and the poll() becomes an unlock(); see what I mean?. \u00a0I think this is clearer since it's a simpler mechanism than an ArrayBlockingQueue, and the use of ABQ in this specific way (size 1)\u00a0could lend itself to misuse later if someone thinks increasing its size or type gains us parallelism. \u00a0And I don't think the fairness setting matters here. \u00a0And although you initialized the size of this array of ABQ to be the number of threads, I think we ought to\u00a0use a larger array to prevent collisions (prevent needlessly blocking on different docIDs that hash to the same thread).\n\nI also was thinking of a way to have more \"on-deck\" runnables for a given docID, waiting in-line. \u00a0The Runnable we submit to the delegate could be some inner class OrderedRunnable that has a \"next\" pointer to the next OrderedRunnable. \u00a0We could maintain a parallel array of the top\u00a0OrderedRunnable (parallel to an array of Locks). \u00a0Manipulating the OrderedRunnable chain requires holding the lock. \u00a0To ensure we bound these things waiting in-line, we could use one Semaphore for the whole OrderedExecutor instance. \u00a0There's more to it than this. \u00a0Of course this adds complexity, but the current approach (either ABQ or Lock) can unfortunately block needlessly if the doc ID is locked yet soon more/different dock IDs will be submitted next and there are available threads. \u00a0Perhaps this is overthinking it (over optimization / complexity) as this will not be the common case? \u00a0This would be even more needless if we increase the Lock array to prevent collisions so nevermind I guess.\n\n\u00a0\n(RE Submit without ID) This can help us to\u00a0know how many threads are running (pending). Therefore OrderedExecutor does not execute more than\u00a0{{numThreads\u00a0}}in parallel. It also solves the case\u00a0when ExecutorService's queue is full it will throw\u00a0RejectedExecutionException.\nIsn't this up to how the backing delegate is configured? \u00a0If it's using a fixed thread pool, then there won't be more threads running. \u00a0Likewise for RejectedExecutionException. ",
+            "author": "David Smiley",
+            "id": "comment-16474832"
+        },
+        {
+            "date": "2018-05-15T07:42:05+0000",
+            "content": "David Smiley an annoying problem with ExecutorService is that when the number of threads reaches maximumPoolSize caller we meet RejectedExecutionException instead of waiting for threads to be available (https://stackoverflow.com/questions/44541784/synchronousqueue-does-not-block-when-offered-task-by-threadpoolexecutor). The easy solution then is using https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ThreadPoolExecutor.CallerRunsPolicy.html. \nIn current OrderedExecutor we won't experience that problem, the caller in that case will just wait. \n\nBut you are right about the collision may affect the performance! ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16475423"
+        },
+        {
+            "date": "2018-05-15T13:18:22+0000",
+            "content": "Upload a patch that makes a change from using an array of lock into a SetBlockingQueue. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16475814"
+        },
+        {
+            "date": "2018-05-15T15:01:56+0000",
+            "content": "Interesting result, when I change from SetBlockingQueue to guava Striped class (its implementation is like an array of lock). The performance is decreased (from 4341ms to 8227ms), if I increase the number of stripes (size of the lock array) to numThreads * 1000, they will eventually run in the same amount of time.  It is a sign that collision does affect the performance! ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16475965"
+        },
+        {
+            "date": "2018-05-17T01:38:37+0000",
+            "content": "David Smiley What do you think about the new patch? ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16478357"
+        },
+        {
+            "date": "2018-05-17T13:51:59+0000",
+            "content": "Upload a patch that makes a change from using an array of lock into a SetBlockingQueue.\nBTW I've twice gotten confused in this issue conversation when you referred to things I didn't know existed before because it was unclear if I simply didn't know about it or if you were adding/introducing some new mechanism.  It would be helpful to me if you try to clarify that new things are new things, e.g. \"(added in this patch)\" or \"added a new ...\" or some-such.\n\nIt's super tempting to simply use Striped as it's difficult to write & review concurrent control structures such as this.  I have a bunch of pending commentary/review for your SetBlockingQueue but are you choosing to not use it because the numThreads * 1000 is too much internal memory/waste? ",
+            "author": "David Smiley",
+            "id": "comment-16479083"
+        },
+        {
+            "date": "2018-05-17T14:28:45+0000",
+            "content": "BTW I've twice gotten confused in this issue conversation when you referred to things I didn't know existed before because it was unclear if I simply didn't know about it or if you were adding/introducing some new mechanism. It would be helpful to me if you try to clarify that new things are new things, e.g. \"(added in this patch)\" or \"added a new ...\" or some-such.\nYeah, sorry about that, I was just to lazy with the detail.\n\nIt's super tempting to simply use Striped as it's difficult to write & review concurrent control structures such as this. I have a bunch of pending commentary/review for your SetBlockingQueue but are you choosing to not use it because the numThreads * 1000 is too much internal memory/waste?\nI think current SetBlockingQueue is quite effective and compact. Can you mention some comments/reviews for SetBlockingQueue? ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16479131"
+        },
+        {
+            "date": "2018-05-17T15:18:43+0000",
+            "content": "Maybe you can propose SetBlockingQueue (or whatever name we settle on) to Guava?  Even if it's not accepted ultimately; there might be some great feedback and/or pointers to something similar that proves useful, as this stuff is hard so the more eyes the better.\n\nI like that you've avoided hash collisions altogether by not doing hashes!  Use of ConcurrentHashMap<Integer,...> makes sense to me for such an approach.  However it appears we have some complexity to deal with since keys need to be added and removed on demand, safely, which seems to be quite tricky.\n\n\n\tI think the \"hash\" variable should not be called this to avoid confusion as there is no hashing.  Maybe just \"id\" or \"lockId\"\n\tDo we still need the Random stuff?\n\tMaybe rename your \"SetBlockingQueue\" to \"SetSemaphore\" or probably better \"SetLock\" as it does not hold anything (Queues hold stuff)\n\tCan \"Semaphore sizeLock\" be renamed to \"sizeSemaphore\" or \"sizePermits\" is it does not extend Lock?\n\tCan the \"closed\" state be removed from SetBlockingQueue altogether?  It's not clear it actually needs to be \"closed\".  It seems wrong; other concurrent mechanisms don't have this notion (no Queue, Lock, or Semaphore does, etc.)  FWIW I stripped this from the class and the test passed.\n\tPerhaps its better to acquire() the size permit first in add() instead of last to prevent lots of producing threads inserting keys into a map only to eventually wait.  Although it might add annoying try-finally to add() to ensure we put the permit back if there's an exception after (e.g. interrupt).  Heck; maybe that's an issue no matter what the sequence is.\n\tCan the value side of the ConcurrentHashMap be a Lock (I guess ReentrantLock impl)?  It seems like the most direct concept we want; Semaphore is more than a Lock as it tracks permits that we don't need here?\n\tThe hot while loop of map.putIfAbsent seems fishy to me.  Even if it may be rare in practice, I wonder if we can do something simpler?  You may get luck with map.compute* methods on ConcurrentHashMap which execute the lambda atomically.  Though I don't know if it's bad to block if we try to acquire a lock within there.  I see remove() removes the value of the Map but perhaps it the value were a mechanism that tracked that there's a producer pending, then we should not remove the value from the lock?  If we did this, then maybe that would simplify add()?  I'm not sure.\n\n\n\nPerhaps a simpler approach would involve involve a Set of weakly referenced objects, and thus we don't need to worry about removal.  In such a design add() would need to return a reference to the member of the set, and that object would have a \"release()\" method when done.  I'm not sure if in practice these might be GC'ed fast enough if they end up being usually very temporary?  Shrug. ",
+            "author": "David Smiley",
+            "id": "comment-16479197"
+        },
+        {
+            "date": "2018-05-17T20:38:35+0000",
+            "content": "I haven't been following this issue, but the need to order things caught my eye, primarily because we have a bunch of logic already that handles reordered updates.  I guess the issue is that buffered updates may not have a version (if they haven't been through a leader?)  If that's the case, perhaps an easier path would be to assign a version and then let the existing reorder logic do it's thing.  I don't have the full picture here, so it's just some input to consider. ",
+            "author": "Yonik Seeley",
+            "id": "comment-16479675"
+        },
+        {
+            "date": "2018-05-18T03:14:55+0000",
+            "content": "Yonik Seeley The need to order things come from how we currently handle reordered in-place updates. Currently, if a replica receives in-place update u2 which point to in-place update u1 which does not arrive yet, the replica will fetch the full document from the leader. This is a very costly/risky logic to handle reordered updates (ie: what if there are no leader to ask for the full document). Luckily for us that reorder is not a common case right now, but if we replay updates in a parallel and non-order way, above case can happen much more frequently. Therefore In my opinion, it should be avoided.  ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16480078"
+        },
+        {
+            "date": "2018-05-18T03:32:41+0000",
+            "content": "This is a very costly/risky logic to handle reordered updates\nIndeed.\u00a0 As an aside, my vote for the long term\u00a0continues to be: \"don't reorder\u00a0updates between leader and replica\"  ",
+            "author": "Yonik Seeley",
+            "id": "comment-16480089"
+        },
+        {
+            "date": "2018-05-28T08:37:11+0000",
+            "content": "Thanks a lot for your review David Smiley, I was too busy recently.\n\n\n\tI think the \"hash\" variable should not be called this to avoid confusion as there is no hashing. Maybe just \"id\" or \"lockId\"\n\tDo we still need the Random stuff?\n\tMaybe rename your \"SetBlockingQueue\" to \"SetSemaphore\" or probably better \"SetLock\" as it does not hold anything (Queues hold stuff)\n\tCan \"Semaphore sizeLock\" be renamed to \"sizeSemaphore\" or \"sizePermits\" is it does not extend Lock?\n\tCan the \"closed\" state be removed from SetBlockingQueue altogether? It's not clear it actually needs to be \"closed\". It seems wrong; other concurrent mechanisms don't have this notion (no Queue, Lock, or Semaphore does, etc.) FWIW I stripped this from the class and the test passed.\n\n\n+1\n\n\nPerhaps its better to acquire() the size permit first in add() instead of last to prevent lots of producing threads inserting keys into a map only to eventually wait. Although it might add annoying try-finally to add() to ensure we put the permit back if there's an exception after (e.g. interrupt). Heck; maybe that's an issue no matter what the sequence is.\nI don't think we should do that. sizeLock kinda like the number of maximum threads, if we reached that number, it seems better to let them wait before trying to enqueue more tasks.\n\n\nCan the value side of the ConcurrentHashMap be a Lock (I guess ReentrantLock impl)? It seems like the most direct concept we want; Semaphore is more than a Lock as it tracks permits that we don't need here?\nWe can't. Lock or ReetrantLock only allows us to lock and unlock in the same thread. In the OrderedExecutor, we lock first then unlock in the thread of delegate executor.\n\n\nThe hot while loop of map.putIfAbsent seems fishy to me. Even if it may be rare in practice, I wonder if we can do something simpler? You may get luck with map.compute* methods on ConcurrentHashMap which execute the lambda atomically. Though I don't know if it's bad to block if we try to acquire a lock within there. I see remove() removes the value of the Map but perhaps it the value were a mechanism that tracked that there's a producer pending, then we should not remove the value from the lock? If we did this, then maybe that would simplify add()? I'm not sure.\nI will think more about this. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16492410"
+        },
+        {
+            "date": "2018-05-28T11:04:46+0000",
+            "content": "\nThe hot while loop of map.putIfAbsent seems fishy to me. Even if it may be rare in practice, I wonder if we can do something simpler? You may get luck with map.compute* methods on ConcurrentHashMap which execute the lambda atomically. Though I don't know if it's bad to block if we try to acquire a lock within there. I see remove() removes the value of the Map but perhaps it the value were a mechanism that tracked that there's a producer pending, then we should not remove the value from the lock? If we did this, then maybe that would simplify add()? I'm not sure.\nAfter putting more thought on this, Change the remove method to this one seems to solve the problem.\n\n    public void remove(T t) {\n      // There can be many threads are waiting for this lock\n      map.remove(t).release(Integer.MAX_VALUE);\n      sizeLock.release();\n    }\n\n\nIn short of the idea of SetBlockingQueue.add(T t) is \n\n\tall participations will try to call map.putIfAbsent(t, myLock),\n\tonly one will win, other participations will have to wait for the lock of the winner\n\twhen the winner get removed from the set, it also release + remove its lock\n\tback to 1.\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16492538"
+        },
+        {
+            "date": "2018-05-28T14:35:15+0000",
+            "content": "Attached a patch base on David Smiley's review. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16492749"
+        },
+        {
+            "date": "2018-05-29T07:29:59+0000",
+            "content": "The latest patch for this ticket. Including some cleanup and fixed precommit.\nIf there are no objection, I will commit the patch soon. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16493180"
+        },
+        {
+            "date": "2018-05-29T19:59:20+0000",
+            "content": "Please consider this alternative utility class:\n\n\n/** A set of locks by a key {@code T}, kind of like Google Striped but the keys are sparse/lazy. */\nprivate static class SparseStripedLock<T> {\n  private final Semaphore sizeSemaphore;\n  private ConcurrentHashMap<T, CountDownLatch> map = new ConcurrentHashMap<>();\n\n  SparseStripedLock(int maxSize) {\n    this.sizeSemaphore = new Semaphore(maxSize);\n  }\n\n  void add(T t) throws InterruptedException {\n    if (t != null) {\n      CountDownLatch myLock = new CountDownLatch(1);\n      while (true) {\n        CountDownLatch existingLock = map.putIfAbsent(t, myLock); // returns null if no existing\n        if (existingLock == null) {\n          break;// myLock was successfully inserted (and is pre-locked) already locked, was successfully inserted\n        }\n        existingLock.await();// wait for existing lock/permit to become available (see remove() below)\n        // we will most likely exit in next loop, though if contended then possibly not\n      }\n    }\n\n    // won the lock\n    sizeSemaphore.acquire();  //nocommit do at start of add()?\n  }\n\n  void remove(T t) {\n    if (t != null) {\n      map.remove(t).countDown(); // remove and signal to any \"await\"-ers\n    }\n    \n    sizeSemaphore.release();\n  }\n}\n\n\n\nNotice the comments, the loop, the new name, use of CountDownLatch, and the one nocommit/question. ",
+            "author": "David Smiley",
+            "id": "comment-16494162"
+        },
+        {
+            "date": "2018-05-29T20:04:33+0000",
+            "content": "ah; I think I can see why we acquire the size semaphore after getting the striped lock.  we don't want to use up a permit that might lock on an ID first.  But then I wonder if we can move the sizeSemaphore.release to before the countDown?  The principle at play here is to release locks in the reverse order that they were acquired.  That's how it's normally done to, I think, prevent deadlock cases, though I'm not sure it's possible here as-coded. ",
+            "author": "David Smiley",
+            "id": "comment-16494172"
+        },
+        {
+            "date": "2018-05-29T23:56:45+0000",
+            "content": "But then I wonder if we can move the sizeSemaphore.release to before the countDown? The principle at play here is to release locks in the reverse order that they were acquired. That's how it's normally done to, I think, prevent deadlock cases, though I'm not sure it's possible here as-coded.\nThe order or unlocking here does not matter. To call remove a thread must hold both locks. Therefore won't cause deadlock.\nah; I think I can see why we acquire the size semaphore after getting the striped lock. we don't want to use up a permit that might lock on an ID first.\u00a0\nCorrect, multiple threads\u00a0on\u00a0a\u00a0lockId can eat up size semaphore.\n\nThanks David Smiley, the replacement of using CountDownlatch and javadocs\u00a0is good. But I don't\u00a0see any improvement of using a\u00a0new loop?\u00a0 ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16494504"
+        },
+        {
+            "date": "2018-05-30T00:10:17+0000",
+            "content": "Attached a new patch for this ticket. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16494515"
+        },
+        {
+            "date": "2018-05-30T03:10:15+0000",
+            "content": "My intention with changing the loop is to reduce duplication of the putIfAbsent line. But it's not a big deal as it's one line and not long.\n Overall, looks good now. Only one small nitpick:\n@param lockId of the {@code command}, if null then a random hash will be generated\nThe \"random hash\" part is no longer accurate.\n\n+1 commit at will. ",
+            "author": "David Smiley",
+            "id": "comment-16494618"
+        },
+        {
+            "date": "2018-05-30T03:32:27+0000",
+            "content": "Thank David Smiley ! ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16494631"
+        },
+        {
+            "date": "2018-05-30T04:06:03+0000",
+            "content": "Commit 6084da559c5466551af68c114b7310356c989dec in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6084da5 ]\n\nSOLR-12338: Replay buffering tlog in parallel ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16494650"
+        },
+        {
+            "date": "2018-05-30T04:12:14+0000",
+            "content": "Commit 04e1b19743e330ce66d199c4dc40bbf394be9ed7 in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=04e1b19 ]\n\nSOLR-12338: Replay buffering tlog in parallel ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16494652"
+        },
+        {
+            "date": "2018-06-08T15:50:20+0000",
+            "content": "Commit eb7bb2d90654ec15d25ba947e287bf7d96e07900 in lucene-solr's branch refs/heads/master from Cassandra Targett\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=eb7bb2d ]\n\nSOLR-12338: State default value more directly ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16506166"
+        },
+        {
+            "date": "2018-06-08T15:50:51+0000",
+            "content": "Commit 13cad54a3efb179fdb4da7528d3448b03989c75e in lucene-solr's branch refs/heads/branch_7x from Cassandra Targett\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=13cad54 ]\n\nSOLR-12338: State default value more directly ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16506171"
+        },
+        {
+            "date": "2018-06-08T15:51:11+0000",
+            "content": "Commit d1dbef5e4d1a1b2bfac75a59496f86d6edbbc16f in lucene-solr's branch refs/heads/branch_7_4 from Cassandra Targett\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d1dbef5 ]\n\nSOLR-12338: State default value more directly ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16506172"
+        }
+    ]
+}

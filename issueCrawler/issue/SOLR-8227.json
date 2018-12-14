@@ -1,0 +1,127 @@
+{
+    "id": "SOLR-8227",
+    "title": "Recovering replicas should be able to recover from any active replica",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "Currently when a replica goes into recovery it uses the leader to recover. It first   tries to do a PeerSync. If thats not successful it does a replication. Most of the times it ends up doing a full replication because segment merging, autoCommits causing segments to be formed differently on the replicas ( We should explore improving that in another issue ) . \n\nBut when many replicas are recovering and hitting the leader, the leader can become a bottleneck. Since Solr is a CP system , we should be able to recover from any of the 'active' replicas instead of just the leader.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-11-06T22:00:26+0000",
+            "author": "Sandeep J",
+            "content": "We are using 4.10.3 in our production environment and I have been working to patch it up for our solr environment. I have fix checked in at https://github.com/sjangra-git/lucene-solr. I will create a patch file and attach it on this ticket for review.\n\nThis is the logic that has been tried in this fix:\n\n1. At the recovery time, we get the list of active replicas (including the leader) from the cluster state. \n2. This list of active replicas is shuffled.\n3. Pick the first node from the shuffled list.\n4. If the replica node selected in #3 is the same as the current recovering node then continue with step #1\n5. Else, select the replica and try recovery from it. \n\nThe only thing that changed is that instead of picking the leader always for recovery, we randomly pick one active replica for recovery. ",
+            "id": "comment-14994535"
+        },
+        {
+            "date": "2015-11-06T22:22:45+0000",
+            "author": "Varun Thacker",
+            "content": "Hi Sandeep,\n\nIt will be good if your patch compiles against trunk  ",
+            "id": "comment-14994569"
+        },
+        {
+            "date": "2015-11-06T22:50:43+0000",
+            "author": "Sandeep J",
+            "content": "Varun - Yes, I will take that into consideration once I start working on it. ",
+            "id": "comment-14994617"
+        },
+        {
+            "date": "2015-11-06T23:43:10+0000",
+            "author": "Timothy Potter",
+            "content": "one question that comes to mind is what happens if the replica I'm recovering from goes into recovery? I guess a related question is what happens today if the leader changes? ",
+            "id": "comment-14994723"
+        },
+        {
+            "date": "2015-11-07T00:31:29+0000",
+            "author": "Varun Thacker",
+            "content": "That should not be a problem no? At point X when the replica starts recovering from a leader the leader has the latest data . The replica also starts accepting documents while it it recovering so even if the leader changes at this point it would still have the latest data. ",
+            "id": "comment-14994776"
+        },
+        {
+            "date": "2015-11-07T03:34:45+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\nThat should not be a problem no? At point X when the replica starts recovering from a leader the leader has the latest data . The replica also starts accepting documents while it it recovering so even if the leader changes at this point it would still have the latest data.\n\nThere could be a scenario that the recovering replica is partitioned away from the leader, but not from the non-leader replica it is recovering from. In this case, while the recovery is going on, the recent updates are lost on this replica. Do you think it will lead to out-of-sync replica?\n\nI think after recovering from another active non-leader replica, we should again do a peer sync with the leader just to be sure we haven't missed an update, e.g. in the event of a partition from the leader. ",
+            "id": "comment-14995003"
+        },
+        {
+            "date": "2015-11-07T03:46:44+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Do you think it will lead to out-of-sync replica?\nWill LIR take care of this scenario? ",
+            "id": "comment-14995010"
+        },
+        {
+            "date": "2015-11-07T04:19:10+0000",
+            "author": "Yonik Seeley",
+            "content": "There is coordination between replica and leader for recovery to happen seamlessly...\nThe replica tells the leader it is going to recover, so the leader starts forwarding updates to the replica (which the replica starts buffering), and then does a hard commit that the replica can use to copy from.  This ensures overlap so no updates are lost.  Introducing a 3rd party into this would really complicate things, and it's not clear how we would maintain that same overlap to ensure no updates are lost. ",
+            "id": "comment-14995021"
+        },
+        {
+            "date": "2015-11-07T22:55:08+0000",
+            "author": "Sandeep J",
+            "content": "Very valid concerns/comments.\n\nBy design Solr is a CP model, so theoretically speaking we should be able to recover from any active replica. But to make it happen without leaving the system in an inconsistent state (i.e without compromising \u2018C\u2019) is an implementation level discussion in my opinion.\n\nThe main problem that we have seen in our prod environment is that during peak traffic if few nodes go into recovery and SnapPuller gets into action we get an \u2018Oh Snap\u2019 moment  So what I am trying to say is that Peer Syncs are light weight as compared to full replication.\n\nI understand the co-ordination concept that Yonik mentioned that goes on between leader and recovering node, but that seems to apply for live updates isn\u2019t it? Or I am missing something. In full replication, I would believe that index files(which is hard committed data) are being copied from source to destination, so if somehow this heavy duty operation can be offloaded from the leader it will help.\n\nAlso, full replication can take minutes to complete depending on the size of the index, traffic and network. In an environment where we have one leader and 20 replicas, all the recovering nodes go to the leader who is also busy with reads/writes. During this time window of recovery the leader can also change or go into recovery, as mentioned by Tim. So even today after full replication from the leader the recovered node should perform some kind of sanity check with the latest leader, just to make sure that it has not missed any updates. Piggy backing on Ishan\u2019s proposal.\n\nIf we put this sanity check or peer sync from the latest leader after the replication then even if we do replication from active replica I think we should be good. So here is the new refined proposal:\n\n1. Recovering node gets an active replica (it could be leader)\n2. After the peer sync, replication is started from the active replica found in #1\n3. Once replication is complete, recovering node gets the leader node from the cluster state.\n4. Recovering node performs a check with the leader.\n5. If the number of missed updates is small such that there is no need for full recovery, recovering node takes the updates from the leader.\n6. If the number of missed updates is still large and it needs full recovery, go back to step #1. Though likelihood of this scenario is less and it can be avoided by having a larger size of \u2018UpdateLog\u2019. Ref: https://issues.apache.org/jira/browse/SOLR-6359 .\n\nVarun mentioned earlier that even during recovery phase the node gets updates from the leader, so the likelihood of running into #5, #6 seems bleak but it could happen with network partitions or long recovery times.\n\nNow this proposal is based on my minimal knowledge of how a solr node identifies that it has missed some updates, if someone can shed some light on it that would really help me understand how step #4 takes place. ",
+            "id": "comment-14995439"
+        },
+        {
+            "date": "2015-11-11T04:28:19+0000",
+            "author": "Ayon Sinha",
+            "content": "Hi Yonik Seeley,\nWe have found that \"the leader starts forwarding updates to the replica\" is extremely bad for the cluster. In a large cluster, when even one replica goes into recovery due to heavy load, the leader simply waits forever for an ack from that replica for every update and the updates back up very fast.\n\nDue to SolrCloud following a strict CP model where every update has to be ack-ed by every replica before leader calls it done, recovering from a leader or replica must be identical in behavior.\n\nLet me find the JIRA for the leader-to-recovering-replica that either Varun Thacker or Tim Potter has filed. ",
+            "id": "comment-14999928"
+        },
+        {
+            "date": "2015-11-11T05:06:21+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Let me find the JIRA for the leader-to-recovering-replica that either Varun Thacker or Tim Potter has filed.\nSOLR-8225 ? ",
+            "id": "comment-14999946"
+        },
+        {
+            "date": "2015-11-11T05:42:18+0000",
+            "author": "Ayon Sinha",
+            "content": "Thanks Ishaan. ",
+            "id": "comment-14999967"
+        },
+        {
+            "date": "2015-11-11T06:00:30+0000",
+            "author": "Ayon Sinha",
+            "content": "If these two fixes are combined, a leader will be completely out of the loop for a recovering node. So there will be no third-party. The question does arise that how will a replica recover if the rate of index is much higher than the recovering node is getting the updates from the replica. If the rate of indexing is that high, the leader will actually not be able to apply the updates anyway as it is currently implemented because the recovering replica is  too busy to respond to the leader's update request. ",
+            "id": "comment-14999979"
+        },
+        {
+            "date": "2015-12-09T04:39:11+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "It occurred to me, and I may be grossly misunderstanding the feasibility of doing this, that we might be able to make peer sync faster by:\n\n\tGet the list of updates to apply from leader\n\tBut, fetch the individual updates from all the active replicas in parallel (and if a non-leader doesn't have a particular update, retry the leader with those).\n\n\n\nThis might save some cycles on the leader, and also parallel requests might help speed up the recovery of the replica.\nDoes this make any sense? ",
+            "id": "comment-15048016"
+        },
+        {
+            "date": "2015-12-09T06:21:31+0000",
+            "author": "Ayon Sinha",
+            "content": "\"if a non-leader doesn't have a particular update\" When can this happen in a CP-system where all replicas are consistent with the leader at all times unless they are in \"recovering\" state.\n\nWhat is the real difference between recovering from leader vs non-leader?\n\nIf I am a \"copy\" of an active replica, I should also become an active replica, is it not? ",
+            "id": "comment-15048124"
+        },
+        {
+            "date": "2015-12-09T06:28:04+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "if a non-leader doesn't have a particular update\nI meant \"if a non-leader doesn't have a particular update in its tlog\". An update here could be an Add or a Delete. The effect of an update will always be same in the index in the form of a document (or absence of it), but peer sync works when updates are streamed from leader to recovering replica. ",
+            "id": "comment-15048131"
+        },
+        {
+            "date": "2015-12-09T07:01:18+0000",
+            "author": "Ayon Sinha",
+            "content": "According to the principles of C,P or CAP, a write by a leader is complete only when all replicas have ack-ed an update to its tlog. i.e. unless the update (add/delete) shows up on all active replicas the write is not complete (this is exactly what is documented in SOLR-8225, leader gets stuck). This means that any recovering replica whether it gets the updates from leader or an active replica will be trailing them updates until completely caught up.\n\nPlease explain the condition under which a leader has a successful update where an active replica does not. ",
+            "id": "comment-15048176"
+        },
+        {
+            "date": "2015-12-09T07:47:17+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I think you misunderstand the difference between an update command in the update log / transaction log (which is passed on during peersync) and a document in the index. It is guaranteed that after an update is ack'ed by the leader to the client, the effect would be the same on the indexes across all replicas (barring bugs). However, it may be possible that the update logs / transaction logs are different across the replicas (as the commit commands are not versioned when distributed, so they could be in slightly different points in time). That would mean not exactly same set of update commands are in the update log / transaction log for every replica. Does that answer your question? ",
+            "id": "comment-15048224"
+        }
+    ]
+}

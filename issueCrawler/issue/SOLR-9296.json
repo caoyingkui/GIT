@@ -1,0 +1,63 @@
+{
+    "id": "SOLR-9296",
+    "title": "Examine SortingResponseWriter with an eye towards removing extra object creation",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "6.2,                                            7.0",
+        "status": "Resolved",
+        "resolution": "Invalid",
+        "priority": "Major"
+    },
+    "description": "Assigning to myself just to keep from losing track it. Anyone who wants to take it, please feel free!\n\nWhile looking at SOLR-9166 I noticed that SortingResponseWriter does a toString for each field it writes out. At a very preliminary examination it seems like we create a lot of String objects that need to be GC'd. Could we reduce this by using some kind of CharsRef/ByteBuffer/Whatever?\n\nI've only looked at this briefly, not quite sure what the gotchas are but throwing it out for discussion.\n\nSome initial thoughts:\n1> for the fixed types (numerics, dates, booleans) there's a strict upper limit on the size of each value so we can allocate something up-front.\n2> for string fields, we already get a chars ref so just pass that through?\n3> must make sure that whatever does the actual writing transfers all the bytes before returning.\n\nI'm sure I won't get to this for a week or perhaps more, so grab it if you have the bandwidth.",
+    "attachments": {
+        "SOLR-9296.patch": "https://issues.apache.org/jira/secure/attachment/12835711/SOLR-9296.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-07-14T15:45:04+0000",
+            "author": "Erick Erickson",
+            "content": "Some preliminary results:\n\nI'm particularly interested in any pointers any of the Lucene people have. Now that I've poked at this enough to understand the issues I may be able to appreciate any pointers you have to offer.\n\n\"Bottom line\". I've instrumented the SortingResponseWriter class to \n1> not write to the client for testing\n2> try to reduce object creation\n3> report summary results only.\n\non 10M rows (see table below) I'm seeing 0-11% improvements in rows/second with one outlier (mv bool fields) showing 5% worse performance. See below. I'm also seeing a bit spiker response time with the old way of doing things, but probably within the margin of error of my measurements.\n\n4M fewer char[] objects created (Visual VM)\nRoughly the same number of other types of objects created.\n40M total objects created. NOTE: I had to stop looking after 2.16M rows were processed since VisualVM was slowing the system to a crawl.\n\nStill some work to go to see if I can understand why there were roughly the same number of String objects created, this is encouraging enough to pursue though I think.\n\nFirst, any suggestions for the most vexing thing of all? Let's say I have to convert an integer to a char[] to output it. Currently that can be done with a formatter that takes an \"Appendable\". Great, I can reuse one StringBuilder/StringBuffer resetting the length to 0 each time. Unfortunately, there's no way to get to the underlying char[] buffer without copying it around. The OpenStringBuilder class that I'd like to use (lucene utility class) doesn't work because the formatter checks for instanceof StringBuffer and/or StringBuilder or asserts. So I wind up copying to a char[] (which I have one of per field) and writing.\n\nI have a char[] cbuf  that I can reuse for the entire export (for each field), so it looks like this\n\nformat(val, StringBuffer) // StringBuffer/StringBuilder, depending on what the formatters require)\nStringBuilder.getChars(into cbuf)\nwriter.write(cbuf, 0, StringBuilder.length());\n\nWhereas I'd like to avoid the getChars(...) call.\n\nI'm traveling today so I won't post the code until perhaps tomorrow. So far:\nI've taken out a bunch of conversions to String and created some classes that re-use a char[] to move data around. I created a \"null writer\" to remove the variable of the client having to read 10M rows for testing purposes.\n\nOn a preliminary run (exporting 10M rows of various types (int, long, string) the number of allocated objects reduced by about 4M char[] (of 40M total objects) while most of the other object counts remained about the same. I was surprised that the number of String objects stayed similar, I expected that to drop so I need to dig at that some more.\n\nSpeed wise I'm seeing up to an 11% improvement in throughput mostly in the single-valued case. Why mv should be different I'm not sure yet. writing mv fields varies from being 5% or so worse (boolfield) to 10% or so better.\n\nThese measurements were taken with a null writer that just threw the bits on the floor and added a bit of instrumentation to return the aggregate. I took three runs, each exporting all 10.2M docs (No VisualVM attached, that was just for object counting and gets in the way of perf... badly). You'll notice in the following that all the tries return int_sv which I used as the sort criteria, figuring that would stay constant. Numbers are new/old in thousands, so the first entry says \"for returning 10.2M single valued string and integer fields, the new code returned 170K/second and the old code processed 152K/second\". Before taking any of these I did a full export of all the fields to try to remove loading and the like from the measurements and for each row below exported three times. The times for each of the three runs reported below were very similar\n\nstr_sv,int_sv \n170/152\n\nint_sv \n193/175\n\nlong_sv,int_sv \n176/165\n\ndate_sv,int_sv \n167/145\n\nbool_sv,int_sv \n186/172\n\ndouble_sv,int_sv \n171/156\n\nstr_mv,int_sv \n131/122\n\nint_mv,int_sv  \n149/138\n\nlong_mv,int_sv \n146/147\n\ndate_mv,int_sv \n120/120\n\nbool_mv,int_sv \n174/183\n\ndouble_mv,int_sv \n124/125\n\nstr_sv,int_sv,date_sv,bool_sv,double_sv,str_mv,int_mv,date_mv,bool_mv,double_mv \n55/55\n\n ",
+            "id": "comment-15377139"
+        },
+        {
+            "date": "2016-07-15T18:44:13+0000",
+            "author": "Erick Erickson",
+            "content": "Here's what the patch looks like. If you want to play with it be aware of a couple of things:\n\nThere's a bunch of instrumentation in here that'll be removed. As it stands, these two vars are set up for measurement:\n  static boolean reuseBuffers = true;\n  static boolean justMeasure = true;\n\nreuseBuffers is for comparing the new paths that try to minimize object creating, set to false if you want to see the older behavior.\n\njustMeasure uses the (nocommit) NullWriter to avoid writing to the client for perf measurements, except you will get one summary tuple back at the very end.\n\nPosting here for any comments people want to make. In particular I have these ReusableWriters as yet more local classes, unsure whether they'd be useful on their own and should be moved to some utility class (suggestions?).\n\nMore when I have time. ",
+            "id": "comment-15379888"
+        },
+        {
+            "date": "2016-11-17T16:58:58+0000",
+            "author": "Erick Erickson",
+            "content": "What do people think about this? I'm thinking of updating this for ExportWriter, but don't want to bother if this seems like a bad idea. That said, if it's save I can't imagine why we wouldn't want to do this unless there's some grand scheme that'll make it irrelevant. And for much the parallel stuff, the effects are multiplied by the number of times the writer is used cluster-wide.\n\nLet me know before I start wasting time please  ",
+            "id": "comment-15674235"
+        },
+        {
+            "date": "2016-11-17T21:39:05+0000",
+            "author": "Erick Erickson",
+            "content": "Looks like \"Never mind\".\n\nNoble Paul I'm curious what your take is...\n\nMy original motivation was seeing that SortingResponseWriter had a bunch of toString() entries that seemed unnecessary, things like:\n\nout.write(Integer.toString((int) vals.get(docId)));\n\nSo I was put this patch together to measure if, indeed, this was something that could be made more efficient. It seems to me like with the work already done with MapWriter and the future work linked to this JIRA that this particular JIRA now seems obsolete,  \n\nI'll close it tomorrow unless people think it's valuable.. I confess I haven't measured object creation...\n\n ",
+            "id": "comment-15674880"
+        },
+        {
+            "date": "2016-11-18T06:49:11+0000",
+            "author": "Noble Paul",
+            "content": "The PushWriter interface and the associated MapWriter/IteratorWriter interfaces are created to avoid creating objects and stream bytes out as soon as they are available. The binary implementation is already taking advantage of that. The json implementation doesn't. However, it is easy to make json efficient as well. Soon (with SOLR-9721) the communication can be totally switched to binary format which is far more efficient on the wire as well as writing/reading. However, at the client side, the reading is not designed to be efficient on object creation. The way tuples are created makes it unnecessarily inefficient. Anyway, I'll choose to fight that battle another day.  ",
+            "id": "comment-15675970"
+        },
+        {
+            "date": "2016-11-18T14:49:55+0000",
+            "author": "Erick Erickson",
+            "content": "As per Noble's comment. ",
+            "id": "comment-15676882"
+        },
+        {
+            "date": "2016-11-18T14:53:11+0000",
+            "author": "Erick Erickson",
+            "content": "This was an exploratory bit of hacking to see whether there was unnecessary object creation. Other approaches (see the linked JIRAs and Noble's comments) are more general and address this in a more elegant way so closing. ",
+            "id": "comment-15676889"
+        }
+    ]
+}

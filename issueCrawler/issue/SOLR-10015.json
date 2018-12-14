@@ -1,0 +1,63 @@
+{
+    "id": "SOLR-10015",
+    "title": "Remove strong reference to Field Cache key (optional) so that GC can release some Field Cache entries when Solr is under memory pressure",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "In current Field Cache (FC) implementation, a WeakHashMap is used, supposedly designed to allow GC to release some Field Cache entries when Solr is under memory pressure. \n\nHowever, in practice, FC entry releasing seldom happens. Even worse, sometime Solr goes OOM and heap dump shows large amount of memory is actually used by FC. It's a sign that GC is not able to release FC entries even WeakHashMap is used.\n\nThe reason is that FC is using SegmentCoreReaders as the key to the WeakHashMap. However, SegmentCoreReaders is usually strong referenced by SegmentReader. A strong reference would prevent GC to release the key and therefore the value. Therefore GC can't release entries in FC's WeakHashMap. \n\nThe JIRA is to propose a solution to remove the strong reference mentioned above so that GC can release FC entries to avoid long GC pause or OOM. It needs to be optional because this change is a tradeoff, trading more CPU cycles for low memory footage. User can make final decision depending on their use cases.\n\nThe prototype attached use a combination of directory name and segment name as key to the WeakHashMap, replacing the SegmentCoreReaders. Without change, Solr doesn't release any FC entries after a GC is manually triggered. With the change, FC entries are usually released after GC.\n\nHowever, I am not sure if it's the best way to solve this problem. Any suggestions are welcome.",
+    "attachments": {
+        "SOLR-10015-prototype.patch": "https://issues.apache.org/jira/secure/attachment/12848626/SOLR-10015-prototype.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-20T21:58:11+0000",
+            "content": "I may be showing my ignorance here, but I have a question.\n\nWould this prune individual items from within a larger field cache entry, or prune an entire set of items at once?  The latter sounds OK, but the former seems like a very bad idea.  If one of those large entries in the cache were to have a percentage of its elements removed by GC, I think that search results would be incorrect.\n\nI don't know enough about Lucene internals to be able to answer my question by looking at the patch.\n\nAssuming my worry above is unfounded, I think this is only likely to delay OOM instead of preventing it, and even if it did prevent it, a low memory situation would probably involve constant eviction (by GC) and recreation (by queries) of FC entries, which I would expect to have strong performance implications. ",
+            "author": "Shawn Heisey",
+            "id": "comment-15832469"
+        },
+        {
+            "date": "2017-01-20T22:19:45+0000",
+            "content": "If one of those large entries in the cache were to have a percentage of its elements removed by GC, I think that search results would be incorrect.\nIt won't create incorrect result. If any entry is pruned by GC, it would be simply regenerated which should be the identical to the original one.\n\nI think this is only likely to delay OOM instead of preventing it, and even if it did prevent it, a low memory situation would probably involve constant eviction (by GC) and recreation (by queries) of FC entries, which I would expect to have strong performance implications.\nIt's probably highly workload dependent. If most of cached items are reused frequently and there is not enough memory, Solr may need to keep recreation and uses more CPU cycles. However, if cached items are not reused too frequently, the change can help.\n\nI agree with you that there is performance implications. The WeakHashMap idea is basically a tradeoff, trading more CPU cycles for lower memory footprint, as mentioned in JIRA description. That's why I propose it to be optional. It's intended to be a tuning knob for user to decide depending on their use cases.\n\n ",
+            "author": "Michael Sun",
+            "id": "comment-15832496"
+        },
+        {
+            "date": "2017-01-20T22:27:07+0000",
+            "content": "Honestly, I would prefer a degradation of performance that an OOM (where you will lost your cache anyway ...) ",
+            "author": "Yago Riveiro",
+            "id": "comment-15832512"
+        },
+        {
+            "date": "2017-01-20T22:44:58+0000",
+            "content": "Does SOLR-9810 address the same problem in a different way or are the two approaches complimentary? ",
+            "author": "Mike Drob",
+            "id": "comment-15832543"
+        },
+        {
+            "date": "2017-01-23T18:02:11+0000",
+            "content": "Does SOLR-9810 address the same problem in a different way or are the two approaches complimentary?\nhmm, I think this JIRA and SOLR-9810 are orthogonal improvements which users can decide to apply both of them or either of them depending on their use cases. Of course, both of two JIRAs belongs to the same category of memory optimization, as many other JIRAs. ",
+            "author": "Michael Sun",
+            "id": "comment-15834963"
+        },
+        {
+            "date": "2017-01-26T16:30:14+0000",
+            "content": "Removing the strong references means that cache entries that are hugely expensive to build can be dropped without warning (and not even in response to memory pressure... just dropped because of any old GC event).\nSmall changes from test to production could lead to wildly different behavior.  If we want more control over field cache memory, it makes more sense to create a bounded cache (like other Solr caches) that can be controlled by size (number of elements or RAM usage).\n\nIn current Field Cache (FC) implementation, a WeakHashMap is used, supposedly designed to allow GC to release some Field Cache entries when Solr is under memory pressure.\n\nThat was never it's purpose (and it would not work).  A WeakHashMap was used to prevent actual memory leaks, nothing more.  It's just because of how the FieldCache was originally designed in Lucene... it was decoupled, so a reader had no knowledge that there were associated cache entries.   The system (IndexReader+FieldCache) as a whole was designed as an unbounded cache.  Once an entry was instantiated for a reader, it was never removed until the reader itself went away. ",
+            "author": "Yonik Seeley",
+            "id": "comment-15839958"
+        },
+        {
+            "date": "2017-01-30T18:42:22+0000",
+            "content": "Removing the strong references means that cache entries that are hugely expensive to build can be dropped without warning (and not even in response to memory pressure... just dropped because of any old GC event).\nThanks Yonik Seeley for your insight. The original intention of this JIRA is to 'enable' the weakhashmap used in field cache (FC) but it's good to know that WeakHashMap is not intended to release memory during GC. In that case, soft reference would be a better choice in general.\n\nit makes more sense to create a bounded cache (like other Solr caches) that can be controlled by size (number of elements or RAM usage).\nThe LRU cache in Solr caches is a good choice. Meanwhile I would argue that the idea of soft reference is also creating a 'sort' of bounded cache which is bounded by available heap, which has its own eviction policy.\n\nOnce an entry was instantiated for a reader, it was never removed until the reader itself went away.\nCan you tell us more details about this design? More importantly, if FC is further optimized, is there any reason to keep the cache design in this way.\n\n\n\n ",
+            "author": "Michael Sun",
+            "id": "comment-15845657"
+        }
+    ]
+}

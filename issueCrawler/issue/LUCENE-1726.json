@@ -1,0 +1,164 @@
+{
+    "id": "LUCENE-1726",
+    "title": "IndexWriter.readerPool create new segmentReader outside of sync block",
+    "details": {
+        "labels": "",
+        "priority": "Trivial",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "2.4.1",
+        "resolution": "Won't Fix",
+        "status": "Closed"
+    },
+    "description": "I think we will want to do something like what field cache does\nwith CreationPlaceholder for IndexWriter.readerPool. Otherwise\nwe have the (I think somewhat problematic) issue of all other\nreaderPool.get* methods waiting for an SR to warm.\n\nIt would be good to implement this for 2.9.",
+    "attachments": {
+        "LUCENE-1726.trunk.test.patch": "https://issues.apache.org/jira/secure/attachment/12412884/LUCENE-1726.trunk.test.patch",
+        "LUCENE-1726.patch": "https://issues.apache.org/jira/secure/attachment/12412424/LUCENE-1726.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-07-02T21:54:06+0000",
+            "content": "We don't block accessing readers in the IW.readerPool when a new\nsegmentReader is being warmed/instantiated. This is important\nwhen new segmentReaders on large new segments are being accessed\nfor the first time. Otherwise today IW.getReader may wait while\nthe new SR is being created.\n\n\n\tIW.readerPool map values are now of type MapValue\n\n\n\n\n\tWe synchronize on the MapValue in methods that access the SR\n\n\n\n\n\tsynchronize for the entire readerPool.get method is removed.\n\n\n\n\n\tAll tests pass\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12726700"
+        },
+        {
+            "date": "2009-07-06T15:04:01+0000",
+            "content": "Can we make the MapValue strongly typed?  Eg name it SegmentReaderValue, and it has a single member \"SegmentReader reader\".\n\ngetIfExists has duplicate checks for null (mv != null is checked twice and mv.value != null too).\n\nI think there is a thread hazard here, in particular a risk that one thread decrefs a reader just as another thread is trying to get it, and the reader in fact gets closed while the other thread has an mv.reader != null and illegally increfs that.  I think you'll have to do the sr.incRef inside the synchronized(this), but I don't think that entirely resolves it.\n\nI'm going to move this out out 2.9; I don't think it should block it. ",
+            "author": "Michael McCandless",
+            "id": "comment-12727567"
+        },
+        {
+            "date": "2009-07-06T18:54:28+0000",
+            "content": "\n\tNew SRMapValue is strongly typed\n\n\n\n\n\tAll tests pass\n\n\n\nI think there is a thread hazard here, in particular a\nrisk that one thread decrefs a reader just as another thread is\ntrying to get it, and the reader in fact gets closed while the\nother thread has an mv.reader != null and illegally increfs\nthat. I think you'll have to do the sr.incRef inside the\nsynchronized(this), but I don't think that entirely resolves\nit.\n\nAre you referring to a decref on a reader outside of IW? The\nasserts we have did help in catching synchronization errors.\nIt's unclear to me how to recreate the use case described such\nthat it breaks things. We need a test case that fails with the\ncurrent patch? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12727696"
+        },
+        {
+            "date": "2009-07-06T22:18:52+0000",
+            "content": "The hazard is something like this, for a non-NRT IndexWriter (ie, no\npooling):\n\n\n\tThread #1 is a merge; it checks out a reader & starts running\n\n\n\n\n\tThread #2 is applyDeletes (or opening an NRT reader); it calls\n    readerPool.get, enters the first sync block to pull out the\n    SRMapValue which has non-null reader, then leaves the sync block\n\n\n\n\n\tThread #1 calls release, which decRefs the reader & closes it\n\n\n\n\n\tThread #2 resumes, sees it has a non-null mv.reader and incRefs\n    it, which is illegal (reader was already closed).\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12727813"
+        },
+        {
+            "date": "2009-07-06T22:43:19+0000",
+            "content": "Shouldn't we be seeing an exception in TestStressIndexing2 (or\nanother test class) when the mv.reader.incRef occurs and the\nreader is already closed? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12727823"
+        },
+        {
+            "date": "2009-07-07T00:08:15+0000",
+            "content": "Yes, we should eventually see a failure; I think it's just rare.  Maybe try making a new test that constantly indexes docs, w/ low merge factor & maxBufferedDocs (so lots of flushing/merging happens) in one thread and constantly opens an NRT reader in another thread, to tease it out? ",
+            "author": "Michael McCandless",
+            "id": "comment-12727843"
+        },
+        {
+            "date": "2009-07-07T02:28:38+0000",
+            "content": "When I moved the sync block around in readerPool.get, tests\nwould fail and/or hang. I'm not sure yet where we'd add the\nsync(this) block. \n\nI'll work on reproducing the above mentioned issue, thanks for\nthe advice. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12727882"
+        },
+        {
+            "date": "2009-07-08T00:04:46+0000",
+            "content": "Added a test case (for now a separate test class) that runs for\n5 minutes, mergeFactor 2, maxBufferedDocs 10, 4 threads\nalternately adding and deleting docs. I haven't seen the error\nwe're looking for yet. CPU isn't maxing out (probably should,\nindicating possible blocking?) and may need to allow it run\nlonger? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12728435"
+        },
+        {
+            "date": "2009-07-08T00:30:44+0000",
+            "content": "Each thread in the test only performs adds or deletes (rather than both) and now we get a \"MockRAMDirectory: cannot close: there are still open files\" exception.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12728441"
+        },
+        {
+            "date": "2009-07-08T16:46:34+0000",
+            "content": "I tried the test on trunk and get the same error. They're all\ndocstore related files so maybe extra doc stores are being\nopened?\n\n\n \n   [junit] MockRAMDirectory: cannot close: there are still open\nfiles: {_s4.fdt=2, _g2.fdx=2, _s4.fdx=2, _g2.tvf=2, _dw.fdx=2,\n_g2.tvd=2, _g2.tvx=2, _ks.tvf=2, _n9.tvx=2, _ks.tvx=2,\n_n9.fdx=2, _ks.fdx=2, _dw.cfx=1, _n9.tvf=2, _cp.cfx=1,\n_s4.tvf=2, _dw.tvx=2, _87.fdx=2, _fr.tvx=2, _87.tvf=2,\n_fr.tvd=2, _87.fdt=2, _ks.tvd=2, _s4.tvd=2, _dw.tvd=2,\n_n9.fdt=2, _g2.fdt=2, _87.tvd=2, _fr.fdt=2, _dw.fdt=2,\n_dj.cfx=1, _s4.tvx=2, _ks.fdt=2, _n9.tvd=2, _fr.tvf=2,\n_fr.fdx=2, _dw.tvf=2, _87.tvx=2} [junit]\njava.lang.RuntimeException: MockRAMDirectory: cannot close:\nthere are still open files: {_s4.fdt=2, _g2.fdx=2, _s4.fdx=2,\n_g2.tvf=2, _dw.fdx=2, _g2.tvd=2, _g2.tvx=2, _ks.tvf=2,\n_n9.tvx=2, _ks.tvx=2, _n9.fdx=2, _ks.fdx=2, _dw.cfx=1,\n_n9.tvf=2, _cp.cfx=1, _s4.tvf=2, _dw.tvx=2, _87.fdx=2,\n_fr.tvx=2, _87.tvf=2, _fr.tvd=2, _87.fdt=2, _ks.tvd=2,\n_s4.tvd=2, _dw.tvd=2, _n9.fdt=2, _g2.fdt=2, _87.tvd=2,\n_fr.fdt=2, _dw.fdt=2, _dj.cfx=1, _s4.tvx=2, _ks.fdt=2,\n_n9.tvd=2, _fr.tvf=2, _fr.fdx=2, _dw.tvf=2, _87.tvx=2} [junit]\n\tat\norg.apache.lucene.store.MockRAMDirectory.close(MockRAMDirectory.j\nava:278) [junit] \tat\norg.apache.lucene.index.Test1726.testIndexing(Test1726.java:48)\n[junit] \tat\norg.apache.lucene.util.LuceneTestCase.runTest(LuceneTestCase.java\n:88)\n\n ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12728787"
+        },
+        {
+            "date": "2009-07-08T17:58:40+0000",
+            "content": "Hmm... I'll dig into this test case. ",
+            "author": "Michael McCandless",
+            "id": "comment-12728824"
+        },
+        {
+            "date": "2009-07-08T18:12:18+0000",
+            "content": "Mike,\n\nI was wondering if you can recommend techniques or tools for\ndebugging this type of multithreading issue? (i.e. how do you go\nabout figuring this type of issue out?)  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12728833"
+        },
+        {
+            "date": "2009-07-08T19:07:14+0000",
+            "content": "I don't have any particular tools...\n\nFirst I simplify the test as much as possible while still hitting the\nfailure (eg this failure happens w/ only 2 threads), then see if the\nerror will happen if I turn on IndexWriter's infoStream (it doesn't\nfor this, so far).  If so, I scrutinize the series of events to find\nthe hazard; else, I turn off infoStream and add back in a small number\nof prints, as long as failure still happens.\n\nOften I use a simple Python script that runs the test over & over\nuntil a failure happens, saving the log, and then scrutinize that.\n\nIt's good to start with a rough guess, eg this failure is w/ only doc\nstores so it seems likely the merging logic that opens doc stores just\nbefore kicking off the merge may be to blame. ",
+            "author": "Michael McCandless",
+            "id": "comment-12728853"
+        },
+        {
+            "date": "2009-07-08T20:37:03+0000",
+            "content": "OK the problem happens when a segment is first opened by a merge that\ndoesn't need to merge the doc stores; later, an NRT reader is opened\nthat separately opens the doc stores of the same [pooled]\nSegmentReader, but then it's the merge that closes the read-only clone\nof the reader.\n\nIn this case the separately opened (by the NRT reader) doc stores are\nnot closed by the merge thread.  It's the mirror image of LUCENE-1639.\n\nI've fixed it by pulling all shared readers in a SegmentReader into a\nseparate static class (CoreReaders).  Cloned SegmentReaders share the\nsame instance of this class so that if a clone later opens the doc\nstores, any prior ancestor (that the clone was created from) would\nalso close those readers if it's the reader to decRef to 0.\n\nI did something similar for LUCENE-1609 (which I'll now hit conflicts\non after committing this... sigh).\n\nI plan to commit in a day or so. ",
+            "author": "Michael McCandless",
+            "id": "comment-12728889"
+        },
+        {
+            "date": "2009-07-08T21:23:54+0000",
+            "content": "The test now passes, needs to go in the patch, perhaps in\nTestIndexWriterReader? Great work on this, it's easier to\nunderstand SegmentReader now that all the shared objects are in\none object (CoreReaders). It should make debugging go more\nsmoothly. \n\nIs there a reason we're not synchronizing on SR.core in\nopenDocStores? Couldn't we synchronize on core for the cloning\nmethods?  ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12728909"
+        },
+        {
+            "date": "2009-07-08T22:25:05+0000",
+            "content": "Is there a reason we're not synchronizing on SR.core in openDocStores?\n\nI was going to say \"because IW sychronizes\" but in fact it doesn't,\nproperly, because when merging we go and open doc stores in\nunsynchronized context.  So I'll synchronize(core) in\nSR.openDocStores.\n\nCouldn't we synchronize on core for the cloning methods?\n\nI don't think that's needed?  The core is simply carried over to the\nnewly cloned reader.\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12728938"
+        },
+        {
+            "date": "2009-07-09T03:04:48+0000",
+            "content": "I don't think that's needed? The core is simply carried\nover to the newly cloned reader.\n\nRight however wouldn't it be somewhat cleaner to sync on core\nfor all clone operations given we don't want those to occur\n(external to IW) at the same time? Ultimately we want core to be\nthe controller of it's resources rather than the SR being cloned?\n\nI ran the test with the SRMapValue sync code, (4 threads) with\nthe sync on SR.core in openDocStore for 10 minutes, 2 core\nWindows XML laptop Java 6.14 and no errors. Then same with 2\nthreads for 5 minutes and no errors. I'll keep on running it to\nsee if we can get an error.\n\nI'm still a little confused as to why we're going to see the bug\nif readerPool.get is syncing on the SRMapValue. I guess there's\na slight possibility of the error, and perhaps a more randomized\ntest would produce it. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12729024"
+        },
+        {
+            "date": "2009-07-09T11:23:15+0000",
+            "content": "Attached new patch (the patch is worse than it looks, because many\nthings moved into the CoreReaders class):\n\n\n\tMoved more stuff into CoreReaders (fieldInfos, dir, segment, etc.)\n    and moved methods down as well (ctor, openDocStores, decRef).\n\n\n\n\n\tMade members final when possible, else synchronized access to\n    getting them (to avoid running amok of JMM).\n\n\n\n\nRight however wouldn't it be somewhat cleaner to sync on core\nfor all clone operations given we don't want those to occur\n(external to IW) at the same time? Ultimately we want core to be\nthe controller of it's resources rather than the SR being cloned?\n\nIn fact, I'm not sure why cloning/reopening a segment needs to be\nsynchronized at all.\n\nSure it'd be weird for an app to send multiple threads down,\nattempting to reopen/clone the same SR or core at once, but from\nLucene's standpoint there's nothing \"wrong\" with doing so, I think?\n\n(Though, DirectoryReader does need its sync when its transferring the\nwrite lock due to reopen on a reader w/ pending changes).\n\n\nI ran the test with the SRMapValue sync code, (4 threads) with\nthe sync on SR.core in openDocStore for 10 minutes, 2 core\nWindows XML laptop Java 6.14 and no errors. Then same with 2\nthreads for 5 minutes and no errors. I'll keep on running it to\nsee if we can get an error.\n\nYou could try inserting a testPoint (see the other testPoints in\nIndexWriter) after the SRMapValue is pulled from the hash but before\nwe check if its reader is null, and then modify the threads in your\ntest to randomly yield on that testPoint (by subclassing IW)?  Ie\n\"exacerbate\" the path that exposes the hazard.\n\n\nI'm still a little confused as to why we're going to see the bug\nif readerPool.get is syncing on the SRMapValue. I guess there's\na slight possibility of the error, and perhaps a more randomized\ntest would produce it.\n\nThe hazard exists because there's a time when no synchronization is\nheld.  Ie, you retrieve SRMapValue from the hash while sync'd on\nReaderPool.  You then leave that sync entirely (this is where hazard\ncomes in), and next you sync on the SRMapValue.  Another thread can\nsneak in and close the SRMapValue.reader during the time that no sync\nis held. ",
+            "author": "Michael McCandless",
+            "id": "comment-12729199"
+        },
+        {
+            "date": "2009-07-11T17:27:53+0000",
+            "content": "try inserting a testPoint (see the other testPoints in\nIndexWriter) after the SRMapValue is pulled from the hash but before\nwe check if its reader is null\n\nI added the test point, but tested without the yield, the method\nitself was enough of a delay to expose the exception.   ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12730009"
+        },
+        {
+            "date": "2009-07-11T18:19:19+0000",
+            "content": "I haven't really figured out a clean way to move the reader\ncreation out of the reader pool synchronization. It turns out to\nbe somewhat tricky, unless we redesign our synchronization. \n\nOne thing that came to mind is passing a lock object to SR's\ncore (which would be the same lock on SRMapValue), which the\nincref/decref could sync on as well. Otherwise we've got\nsynchronization in many places, IW, IW.readerPool, SR, SR.core.\nIt would seem to make things brittle? Perhaps listing out the\nvarious reasons we're synchronizing, to see if we can\nconsolidate some of them will help? ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12730010"
+        },
+        {
+            "date": "2009-07-12T00:18:43+0000",
+            "content": "Another idea is instantiate the SR.core.ref outside of the\nIW.readerPool, and pass it into the newly created reader. Then\nwhen we obtain SRMapValue, incref so we're keeping track of it's\nusage, which (I believe) should be inline with the normal usage\nof SR.ref (meaning don't close the reader if SRMV is checked\nout). This way we know when the SRMV is in use and different\nthreads don't clobber each other creating and closing SRs using\nreaderPool. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12730030"
+        },
+        {
+            "date": "2009-07-13T09:57:21+0000",
+            "content": "\nI haven't really figured out a clean way to move the reader\ncreation out of the reader pool synchronization. It turns out to\nbe somewhat tricky, unless we redesign our synchronization.\n\nMaybe we should simply hold off for now?\n\nI don't think this sync is costing much in practice, now.\nIe, IndexReader.open is not concurrent when opening its segments; nor\nwould we expect multiple threads to be calling IndexWriter.getReader\nconcurrently.\n\nThere is a wee bit of concurrency we are preventing, ie for a merge or\napplyDeletes to get a reader just as an NRT reader is being opened,\nbut realistically 1) that's not very costly, and 2) we can't gain that\nconcurrency back anyway because we synchronize on IW when opening the\nreader. ",
+            "author": "Michael McCandless",
+            "id": "comment-12730272"
+        },
+        {
+            "date": "2009-07-13T17:48:55+0000",
+            "content": "I was thinking the sync on all of readerPool could delay someone\ntrying to call IW.getReader who would wait for a potentially\nlarge new segment to be warmed. However because IW.mergeMiddle\nisn't loading the term index, IW.getReader will pay the cost of\nloading the term index. So yeah, it doesn't seem necessary. ",
+            "author": "Jason Rutherglen",
+            "id": "comment-12730424"
+        }
+    ]
+}

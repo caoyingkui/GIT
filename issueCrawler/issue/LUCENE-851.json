@@ -1,0 +1,58 @@
+{
+    "id": "LUCENE-851",
+    "title": "Pruning",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index",
+            "core/search"
+        ],
+        "type": "New Feature",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Duplicate",
+        "status": "Closed"
+    },
+    "description": "Greets,\n\nA thread on java-dev a couple of months ago drew my attention to a technique used by Nutch for cutting down the number of hits that have to be processed:  if you have an algorithm for ordering documents by importance, and you sort them so that the lowest document numbers have the highest rank, then most of your high-scoring hits are going to occur early on in the hit-collection process.  Say you're looking for the top 100 matches \u2013 the odds are pretty good that after you've found 1000 hits, you've gotten most of the good stuff.  It may not be necessary to score the other e.g. 5,000,000 hits.\n\nTo pull this off in Nutch, they run the index through a post process whereby documents are re-ordered by page score using the IndexSorter class.  Unfortunately, post-processing does not live happily with incremental indexing.  \n\nHowever, if we ensure that document numbers are ordered according to our criteria within each segment, that's almost as good.\n\nSay we're looking for 100 hits, as before; what we do is collect a maximum of 1000 hits per segment.  If we are dealing with an index made up of 25 segments, that's 25,000 hits max we'll have to process fully \u2013 the rest we can skip over.  That's not as quick as only processing 1000 hits then stopping in a fully optimized index, but it's a lot better than churning through all 5,000,000 hits.\n\nA lot of those hits from the smallest segments will be garbage; we'll get most of our good hits from a few large segments most of the time.  But that's fine \u2013 the cost to process any one segment is small.\n\nWriting a low-level scoring loop which implements pruning per segment is straightforward.  KinoSearch's version (in C) is below.\n\nTo control the amount of pruning, we need a high-level Searcher.setPruneFactor API, which sets a multiplier; the number of hits-per-segment which must be processed is determined by multiplying the number of hits you need by pruneFactor.  Here's code from KS for deriving hits-per-seg:\n\n\n\tprocess prune_factor if supplied\n    my $seg_starts;\n    my $hits_per_seg = 2**31 - 1;\n    if ( defined $self->\n{prune_factor} and defined $args{num_wanted} ) {\n        my $prune_count = $self->{prune_factor}\n * $args\n{num_wanted}\n;\n\n\n\n        if ( $prune_count < $hits_per_seg ) \n{    # don't exceed I32_MAX\n            $hits_per_seg = $prune_count;\n            $seg_starts   = $reader->get_seg_starts;\n        }\n    }\n\nWhat I have not yet written is the index-time mechanism for sorting documents.  \n\nIn Nutch, they use the norms from a known indexed, non-tokenized field (\"site\").  However, in Lucene and KS, we can't count on any existing fields.  Document boost isn't stored directly, either.  The obvious answer is to start storing it, which would suffice for Nutch-like uses.  However, it may make sense to to avoid coupling document ordering to boost in order to influence pruning without affecting scores.\n\nThe sort ordering information needs a permanent home in the index, since it will be needed whenever segment merging occurs.  The fixed-width per-document storage in Lucene's .fdx file seems like a good place.  If we use one float per document, we can simply put it before or after the 64-bit file pointer and seek into the file after multiplying the doc num by 12 rather than 8.  \n\nDuring indexing, we'd keep the ordering info in an array; after all documents for a segment have been added, we create an array of sorted document numbers.  When flushing the postings, their document numbers get remapped using the sorted array.  Then we rewrite the .fdx file (and also the .tvx file), moving the file pointers (and ordering info) to remapped locations.  The fact that the .fdt file is now \"out of order\" is isn't a problem \u2013 optimizing sequential access to that file isn't important.\n\nThis issue is closely tied to LUCENE-843, \"Improve how IndexWriter uses RAM to buffer added documents\", and LUCENE-847, \"Factor merge policy out of IndexWriter\".  Michael McCandless, Steven Parks, Ning Li, anybody else... comments?  Suggestions?\n\nMarvin Humphrey\nRectangular Research\nhttp://www.rectangular.com/\n\n--------------------------------------------------------------------\n\nvoid\nScorer_collect(Scorer *self, HitCollector *hc, u32_t start, u32_t end,\n               u32_t hits_per_seg, VArray *seg_starts)\n{\n    u32_t seg_num          = 0;\n    u32_t doc_num_thresh   = 0;\n    u32_t hits_this_seg    = 0;\n    u32_t hits_thresh      = hits_per_seg;\n\n    /* get to first doc */\n    if ( !Scorer_Skip_To(self, start) )\n        return;\n\n    /* execute scoring loop */\n    do {\n        u32_t doc_num = Scorer_Doc(self);\n        Tally *tally;\n\n        if (hits_this_seg >= hits_thresh || doc_num >= doc_num_thresh) {\n            if (doc_num >= end) \n{\n                /* bail out of loop if we've hit the user-spec'd end */\n                return;\n            }\n            else if (seg_starts == NULL || seg_starts->size == 0) \n{\n                /* must supply seg_starts to enable pruning */\n                hits_thresh    = U32_MAX;\n                doc_num_thresh = end;\n            }\n            else if (seg_num == seg_starts->size) \n{\n                /* we've finished the last segment */\n                return;\n            }\n            else {\n                /* get start of upcoming segment */\n                Int this_start = (Int)VA_Fetch(seg_starts, seg_num);\n                Int next_start = (Int)VA_Fetch(seg_starts, seg_num + 1);\n                u32_t this_seg_start = this_start->value;\n                seg_num++;\n\n                /* skip docs as appropriate if we're pruning */\n                if (doc_num < this_seg_start) \n{\n                    if ( Scorer_Skip_To(self, this_seg_start) )\n                        doc_num = Scorer_Doc(self);\n                    else\n                        return;\n                }\n\n                /* set the last doc_num we'll score this upcoming segment */\n                doc_num_thresh = next_start == NULL\n                    ? end  /* last segment */\n                    : next_start->value;\n            }\n\n            /* start over counting hits for the new segment */\n            hits_this_seg = 0;\n        }\n\n        /* this doc is in range, so collect it */\n        tally = Scorer_Tally(self);\n        hc->collect(hc, doc_num, tally->score);\n        hits_this_seg++;\n    } while (Scorer_Next(self));\n}",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2007-03-26T21:31:05+0000",
+            "content": "If this is what I think, then it is really cool and can be very interesting for indices with a (one) static natural order, for instance publishing date of news articles. I know people have implemented this by reverting norms to a true float (32 bits rather than 8 bits) and by incrementing the value been using that as the natural order, a somewhat crazy solution if you ask me.  ",
+            "author": "Karl Wettin",
+            "id": "comment-12484234"
+        },
+        {
+            "date": "2007-03-26T22:27:33+0000",
+            "content": "That suggests an implementation derived from how sorting is currently done in Lucene/KS. You would need to specify a primary sort field.  (In KS, this can be achieved by adding a sort_field property to the Schema, which must name an indexed, non-tokenized field). If you wanted to store boost as a field, you could use that. But you could also use publication date, price, or whatever.  \n\nDoing things that way wouldn't require any index format changes. ",
+            "author": "Marvin Humphrey",
+            "id": "comment-12484248"
+        },
+        {
+            "date": "2007-03-26T22:43:38+0000",
+            "content": "I did not mean it should be used for primary sorting, but rather as you describe it as priority thingy: in the n first hits collected, the m (say n/10 as you guessed in the description of the issue) most relevant (in this case relevant would mean the most recent dates) would probably have been collected and thus the collection process could be stopped. Or so. Or? Then the crazy norms ordering I described could be skipped and the standard Lucene field sort would be applied. ",
+            "author": "Karl Wettin",
+            "id": "comment-12484253"
+        },
+        {
+            "date": "2007-03-26T23:14:53+0000",
+            "content": "On Mar 26, 2007, at 3:45 PM, Karl Wettin (JIRA) wrote:\n\n> I did not mean it should be used for primary sorting, but \n> rather as you describe it as priority thingy: in the n first \n> hits collected, the m (say n/10 as you guessed in the \n> description of the issue) most relevant (in this case relevant \n> would mean the most recent dates) would probably have been \n> collected and thus the collection process could be stopped. \n\nRight.  I was referring to the as-yet unresolved issue of how to implement index-time sorting.\n\nWhat I'll probably do in KS is create a SortExternal object and feed it strings which have the (provisional) document number tacked on to the end of the value for the sort field. The sortex object's sorting routine will be set to ignore the document number part of the serialized string. Then, when finish() is called, the array of remapped document numbers can be allocated, and doc nums read into it as sorted elements are pulled from the sortex pool.\n\nUsing an external sorter is better than accumulating those strings in an array, then sorting in-memory.  The strings can be of arbitrary length, yet memory usage will be capped by the external sorter's memory threshold no matter how many documents get added to the segment during the indexing session. ",
+            "author": "Marvin Humphrey",
+            "id": "comment-12484258"
+        },
+        {
+            "date": "2010-09-24T01:00:09+0000",
+            "content": "Marvin: is this functionality addressed with LUCENE-2482 ? ",
+            "author": "Robert Muir",
+            "id": "comment-12914304"
+        },
+        {
+            "date": "2010-09-24T01:18:22+0000",
+            "content": "Yes, LUCENE-2482 introduces the index sorter from Nutch that I referred to in\nthis issue. The termination mechanism is slightly different\n(TimeLimitedCollector vs. X hits per segment), but it's the sorter that really\nmatters.\n\nI'm closing as Duplicate. Thanks for digging this up! ",
+            "author": "Marvin Humphrey",
+            "id": "comment-12914308"
+        }
+    ]
+}

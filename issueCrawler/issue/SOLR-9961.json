@@ -1,0 +1,53 @@
+{
+    "id": "SOLR-9961",
+    "title": "RestoreCore needs the option to download files in parallel.",
+    "details": {
+        "components": [
+            "Backup/Restore"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "6.2.1",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "My backup to cloud storage (Google cloud storage in this case, but I think this is a general problem) takes 8 minutes ... the restore of the same core takes hours. The restore loop in RestoreCore is serial and doesn't allow me to parallelize the expensive part of this operation (the IO from the remote cloud storage service). We need the option to parallelize the download (like distcp). \n\nAlso, I tried downloading the same directory using gsutil and it was very fast, like 2 minutes. So I know it's not the pipe that's limiting perf here.\n\nHere's a very rough patch that does the parallelization. We may also want to consider a two-step approach: 1) download in parallel to a temp dir, 2) perform all the of the checksum validation against the local temp dir. That will save round trips to the remote cloud storage.",
+    "attachments": {
+        "SOLR-9961.patch": "https://issues.apache.org/jira/secure/attachment/12847341/SOLR-9961.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-13T14:29:19+0000",
+            "author": "Timothy Potter",
+            "content": "Patch is not ready for commit. We need to think about how to provide some config options like max time to wait and number of threads. Right now, I get the number of threads from a sys prop, but I think it should probably come through a marker interface that specific backup repos can implement ... will post up a better version later today. ",
+            "id": "comment-15821860"
+        },
+        {
+            "date": "2017-01-13T19:10:31+0000",
+            "author": "Timothy Potter",
+            "content": "The other thing I found here is HdfsDirectory is closing a shared FileSystem object because HdfsBackupRepository uses try with resources:\n\n\n  @Override\n  public void copyFileTo(URI sourceRepo, String fileName, Directory dest) throws IOException {\n    try (HdfsDirectory dir = new HdfsDirectory(new Path(sourceRepo), NoLockFactory.INSTANCE,\n        hdfsConfig, HdfsDirectory.DEFAULT_BUFFER_SIZE * 10)) {\n      dest.copyFrom(dir, fileName, fileName, DirectoryFactory.IOCONTEXT_NO_CACHE);\n    }\n  }\n\n\n\nThis closes the FileSystem object that was retrieved with FileSystem.get. Because of this (I think), I'm seeing lots of errors like the following while doing the restore:\n\nWARN  - 2017-01-13 14:09:44.249; [   ] org.apache.solr.handler.RestoreCore; Exception while restoring the backup index \njava.lang.RuntimeException: Problem creating directory: gs://hd-fusion/aggr_solr/myAggr3/snapshot.shard1\n        at org.apache.solr.store.hdfs.HdfsDirectory.<init>(HdfsDirectory.java:91)\n        at org.apache.solr.core.backup.repository.HdfsBackupRepository.copyFileTo(HdfsBackupRepository.java:175)\n        at org.apache.solr.handler.RestoreCore.downloadFile(RestoreCore.java:196)\n        at org.apache.solr.handler.RestoreCore.access$000(RestoreCore.java:47)\n        at org.apache.solr.handler.RestoreCore$1.call(RestoreCore.java:101)\n        at org.apache.solr.handler.RestoreCore$1.call(RestoreCore.java:99)\n        at java.util.concurrent.FutureTask.run(FutureTask.java:266)\n        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)\n        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)\n        at java.lang.Thread.run(Thread.java:745)\nCaused by: java.io.IOException: GoogleHadoopFileSystem has been closed or not initialized.\n        at com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystemBase.checkOpen(GoogleHadoopFileSystemBase.java:1802)\n        at com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystemBase.getFileStatus(GoogleHadoopFileSystemBase.java:1284)\n        at org.apache.hadoop.fs.FileSystem.exists(FileSystem.java:1424)\n        at org.apache.solr.store.hdfs.HdfsDirectory.<init>(HdfsDirectory.java:83)\n        ... 9 more\n\n\n\nThere's a handy prop that allows you to disable the cache (add to core-site.xml), which makes this error go away:\n\n  <property>\n    <name>fs.gs.impl.disable.cache</name>\n    <value>true</value>\n  </property>\n\n ",
+            "id": "comment-15822190"
+        },
+        {
+            "date": "2017-01-13T19:37:11+0000",
+            "author": "Timothy Potter",
+            "content": "Here's an updated patch (created against 6.3.0 tag) -p0 style that adds an option for BackupRepository implementations to download in parallel using a thread pool. But as stated in the description, this now causes the various FileSystem already closed issue, so would need to be used with hdfs cache disabled.\n\nI've tested this on a 10G index in Google cloud storage and it completed in ~30 mins vs. hours or not at all. ",
+            "id": "comment-15822235"
+        },
+        {
+            "date": "2017-01-13T20:16:02+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Timothy Potter I think this is a great improvement! Couple of comments,\n\nBut as stated in the description, this now causes the various FileSystem already closed issue, so would need to be used with hdfs cache disabled.\n\nI think the root cause of this problem is the fact that HdfsDirectory is using FileSystem.get(...) API. If we change that to FileSystem.newInstance(...) that problem will most likely go away. I think this would be a better solution than disabling HDFS caching. Mark Miller any thoughts?\n\nadds an option for BackupRepository implementations to download in parallel using a thread pool.\n\nIt seems a bit odd to add this configuration to BackupRepository interface. If we can ensure that all BackupRepository implementations to support concurrent copy operations then we can make the thread-pool and time out configurations global. For this to be feasible, the BackupRepository implementation just needs to make sure that the client state kept separate for each copy operation (which I think is doable)\n\nThe other approach could be to add another API in BackupRepository interface which accepts a list of files to be copied. The implementation of this API can choose to use multi-threaded (or a sequential) execution. This can even benefit backup operation. What do you think ?\n\nAlso as a minor comment, did you think about using CompletionService to fetch the results of completed tasks? Seems a bit cleaner...\n ",
+            "id": "comment-15822297"
+        },
+        {
+            "date": "2018-11-30T20:44:19+0000",
+            "author": "Tim Owen",
+            "content": "We considered using this patch locally, but actually found the problem was in slow HDFS restores because of an undersized copy buffer. See SOLR-13029 for our change to alleviate that. Since we had lots of collections to restore, we did those in parallel instead of making the file restore parallelised. But the buffer patch made each file restore about 10x faster, with a 256kB buffer instead of 4k. ",
+            "id": "comment-16705257"
+        }
+    ]
+}

@@ -1,0 +1,125 @@
+{
+    "id": "LUCENE-887",
+    "title": "Interruptible segment merges",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index"
+        ],
+        "type": "New Feature",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Duplicate",
+        "status": "Resolved"
+    },
+    "description": "Adds the ability to IndexWriter to interrupt an ongoing merge. This might be necessary when Lucene is e. g. running as a service and has to stop indexing within a certain period of time due to a shutdown request.\n\nA solution would be to add a new method shutdown() to IndexWriter which satisfies the following two requirements:\n\n\tif a merge is happening, abort it\n\tflush the buffered docs but do not trigger a merge\n\n\n\nSee also discussions about this feature on java-dev:\nhttp://www.gossamer-threads.com/lists/lucene/java-dev/49008",
+    "attachments": {
+        "ExtendedIndexWriter.java": "https://issues.apache.org/jira/secure/attachment/12358593/ExtendedIndexWriter.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2007-05-31T07:14:09+0000",
+            "content": "Here is the code I originally wrote to add a shutdown function to IndexWriter.\n\nThis patch contains a class called ExtendedIndexWriter that (as you might \nguess  ) extends IndexWriter and adds a shutdown() method. This method\nmay always be called by some thread, no matter if other threads are \ncurrently adding documents.\n\nThree scenarios might happen:\n1) Shutdown() is called while there is no ongoing merge or addDocument:\n   In this case the buffered documents are flushed to disk without \n   triggering cascading merges. (I will commit a protected method\n   flushRamSegments(boolean triggerMerge) to IndexWriter to support this.\n\n2) Shutdown() is called while there is an ongoing merge:\n   In this case an IOException is thrown by the extended FSOutputStream\n   which makes the IndexWriter rollback the transaction. Thereafter\n   flushRamSegments(false) is called to flush buffered docs if there are\n   any.\n\n3) Shutdown() is called while other threads are in addDocument:\n   This is the tricky one. We don't want to throw the IOException before\n   the addDocument has finished analyzing and indexing the document,\n   because otherwise this document would be lost. Since buildDocument()\n   is not synchronized we can not rely on IndexWriters mutex to wait for\n   those threads to finish addDocument. Therefore I add a variable that\n   counts how many threads are in addDocument(). A different mutex is\n   used to increment, decrement and check this variable. Shutdown wait\n   until indexing of those docs is done and continues like in case 1) or 2).\n\n\nI suggest whoever is interested should just look at the code. I'm sure\nthere will be a lot of questions. There's still a lot of work that has\nto be done here, like writing testcases and examining how this works in\nthe new autoCommit=false mode (I wrote this code before that new feature\nwas committed). And we still have to decide whether this shutdown\nfunctionality should go into the Lucene core. ",
+            "author": "Michael Busch",
+            "id": "comment-12500301"
+        },
+        {
+            "date": "2007-05-31T19:20:39+0000",
+            "content": "\nThis looks great to me!\n\nI think we should keep it out of core (ie, as subclasses as you've done\nhere) for now?\n\nSo, if a shutdown request comes in then currently running addDocument\ncalls are allowed to complete but if a new addDocument call tries to\nrun it will hit an \"IndexWriter already closed\" IOException.  Once the\nin-flight addDocument calls finish you then flush the ram segments\nwithout allowing cascading merge.\n\nThis actually means you can potentially have too many \"level 0\" (just\nflushed) segments in the index but that should not be a big deal since\nthe next merge would clean it up.  And it should be rare.\n\nIn shutdown(), after you call waitForAddDocument(), why not call\nclearInterrupt before calling flushRamSegments?  Isn't the\nflushRamSegments() call guaranteed to hit the\nIndexWriterInterruptException if it's using an ExtendedFSDirectory and\nthere are > 0 buffered docs?\n\nAlso I think it's possible that the addDocument() call from another\nthread will hit the IndexWriterInterruptException, right?  So those\nother threads should catch this and ignore it (since their doc was in\nfact succesfully added and only the followon merge was interrupted)? ",
+            "author": "Michael McCandless",
+            "id": "comment-12500457"
+        },
+        {
+            "date": "2007-06-01T01:50:06+0000",
+            "content": "> This looks great to me!\n\nThanks for reviewing!\n\n> So, if a shutdown request comes in then currently running addDocument\n> calls are allowed to complete but if a new addDocument call tries to\n> run it will hit an \"IndexWriter already closed\" IOException.  Once the\n> in-flight addDocument calls finish you then flush the ram segments\n> without allowing cascading merge.\n\nExactly.\n\n> This actually means you can potentially have too many \"level 0\" (just\n> flushed) segments in the index but that should not be a big deal since\n> the next merge would clean it up.  And it should be rare.\n\nYes, unless another shutdown request comes while the first merge after\nrestarting the system is happening (which should be very unlikely), this\nwill be cleaned up. Also, once the system is up again the IndexWriter \nwill delete left over file fragments from an aborted merge.\n\n> In shutdown(), after you call waitForAddDocument(), why not call\n> clearInterrupt before calling flushRamSegments?  Isn't the\n> flushRamSegments() call guaranteed to hit the\n> IndexWriterInterruptException if it's using an ExtendedFSDirectory and\n> there are > 0 buffered docs?\n\nHmm I think I did it this way in case we aren't using an \nExtendedFSDirectory, because then the flush would just succeed without \nan IndexWriterInterruptException and we safe an instanceof check here. \nBut you are right, we can just call clearInterrupt, but only if \n(d instanceof ExtendedFSDirectory) == true. That's probably simpler. \nThereafter it is safe to call close() because the buffer is empty, so \nthe call of flushRamSegments in close() won't do anything.\n\n> Also I think it's possible that the addDocument() call from another\n> thread will hit the IndexWriterInterruptException, right?  So those\n> other threads should catch this and ignore it (since their doc was in\n> fact succesfully added and only the followon merge was interrupted)?\n\nHmm I'm not sure if I understand this. I catch the \nIndexWriterInterruptException in addDocument() and in the catch block\nflushAfterInterrupt() is called which clears the interrupt flag. So\nIndexWriterInterruptException shouldn't be thrown again and addDocument()\nshould just return normally? Or am I missing something. Could you give \nan example? ",
+            "author": "Michael Busch",
+            "id": "comment-12500550"
+        },
+        {
+            "date": "2007-06-01T09:13:07+0000",
+            "content": "> > This actually means you can potentially have too many \"level 0\" (just\n> > flushed) segments in the index but that should not be a big deal since\n> > the next merge would clean it up. And it should be rare.\n> \n> Yes, unless another shutdown request comes while the first merge\n> after restarting the system is happening (which should be very\n> unlikely), this will be cleaned up. Also, once the system is up\n> again the IndexWriter will delete left over file fragments from an\n> aborted merge.\n\nActually the leftover files from the aborted merge should be deleted\nin the finally clause in mergeSegments, on hitting the original\nIndexWriterInterruptedException.  Ie once shutdown is complete, your\nindex should have none of the partially written files left, I think?\n\n\n> > Also I think it's possible that the addDocument() call from another\n> > thread will hit the IndexWriterInterruptException, right? So those\n> > other threads should catch this and ignore it (since their doc was in\n> > fact succesfully added and only the followon merge was interrupted)?\n> \n> Hmm I'm not sure if I understand this. I catch the\n> IndexWriterInterruptException in addDocument() and in the catch\n> block flushAfterInterrupt() is called which clears the interrupt\n> flag. So IndexWriterInterruptException shouldn't be thrown again and\n> addDocument() should just return normally? Or am I missing\n> something. Could you give an example?\n\nWoops \u2013 sorry, I missed that you indeed catch the\nIndexWriterInterruptException coming out of all addDocument calls, so\nI think that will work correctly and the caller will never see the\nexception.  Good!\n\nHmm, here's another possible issue .. thread safety sure is difficult.\n\nSay there are 2 addDocument calls in-flight, and the first one tries\nto flush buffered docs but hits the IndexWRiterInterruptException.\nYou catch this, clear the interrupt flag but before you then call\nflushRAMSegments(false) the other addDocument thread get scheduled and\nenters the synchronized block in addDocument and then kicks off a\nflush with a merge.  I think at this point the merge would happily run\nto completion because the interrupt flag got cleared? ",
+            "author": "Michael McCandless",
+            "id": "comment-12500634"
+        },
+        {
+            "date": "2007-06-01T17:15:35+0000",
+            "content": "> Actually the leftover files from the aborted merge should be deleted\n> in the finally clause in mergeSegments, on hitting the original\n> IndexWriterInterruptedException.  Ie once shutdown is complete, your\n> index should have none of the partially written files left, I think?\n\nOh yes, you're right.\n\n> Hmm, here's another possible issue .. thread safety sure is difficult.\n\nIt is!\n\n> Say there are 2 addDocument calls in-flight, and the first one tries\n> to flush buffered docs but hits the IndexWRiterInterruptException.\n> You catch this, clear the interrupt flag but before you then call\n> flushRAMSegments(false) the other addDocument thread get scheduled and\n> enters the synchronized block in addDocument and then kicks off a\n> flush with a merge.  I think at this point the merge would happily run\n> to completion because the interrupt flag got cleared?\n\nHmm... yes I understand. Actually do we even have to call\nflushAfterInterrupt() in the catch clause of addDocument()? The \nIndexWriterInterruptException is only thrown in case shutdown() has\nbeen called, and in that case shutdown() waits anyways for all \nin-flight addDocument() calls to complete and flushes the buffered docs\nthen. Right? Or maybe I'm completely confused now...  ",
+            "author": "Michael Busch",
+            "id": "comment-12500766"
+        },
+        {
+            "date": "2007-06-01T17:47:36+0000",
+            "content": "> > Say there are 2 addDocument calls in-flight, and the first one tries\n> > to flush buffered docs but hits the IndexWRiterInterruptException.\n> > You catch this, clear the interrupt flag but before you then call\n> > flushRAMSegments(false) the other addDocument thread get scheduled and\n> > enters the synchronized block in addDocument and then kicks off a\n> > flush with a merge. I think at this point the merge would happily run\n> > to completion because the interrupt flag got cleared?\n>\n> Hmm... yes I understand. Actually do we even have to call\n> flushAfterInterrupt() in the catch clause of addDocument()? The\n> IndexWriterInterruptException is only thrown in case shutdown() has\n> been called, and in that case shutdown() waits anyways for all\n> in-flight addDocument() calls to complete and flushes the buffered\n> docs then. Right? Or maybe I'm completely confused now... \n\nI think you are right: just removing the call to flushAfterInterrupt()\nin the catch clause of addDocument() should correct this.  That way\nthere is only one place&time (inside shutdown()) where the\nflushAfterInterrupt() is called and this should properly prevent any\nmerging from taking place.  Phew!\n\nBest to make a super stressful thread test case and run in on an N>1\nCPU/core machine to be really sure the different concurrency paths are\nwell explored  ",
+            "author": "Michael McCandless",
+            "id": "comment-12500780"
+        },
+        {
+            "date": "2007-06-01T18:19:38+0000",
+            "content": "> I think you are right: just removing the call to flushAfterInterrupt()\n> in the catch clause of addDocument() should correct this.  That way\n> there is only one place&time (inside shutdown()) where the\n> flushAfterInterrupt() is called and this should properly prevent any\n> merging from taking place.  Phew!\n\nCool. I will update the patch.\n\n> Best to make a super stressful thread test case and run in on an N>1\n> CPU/core machine to be really sure the different concurrency paths are\n> well explored   \n\nAgree. I will work on a test case as well. I can use a 4 core Xeon\nmachine to run the tests on. ",
+            "author": "Michael Busch",
+            "id": "comment-12500794"
+        },
+        {
+            "date": "2007-06-01T18:28:46+0000",
+            "content": "> I think we should keep it out of core (ie, as subclasses as you've done\n> here) for now? \n\nWe could also add new methods (not abstract) to Directory:\n  boolean isInterruptable();\n  void interrupt();\n  void clearInterrupt();\n\nBy default isInterruptable() would return false and the other two wouldn't\ndo anything. Only some Directory implementations should then overwrite these\nmethods, like FSDirectory.\n\nWhat I don't like about this is that we would have to make those methods\npublic, because IndexWriter has to call them.  ",
+            "author": "Michael Busch",
+            "id": "comment-12500802"
+        },
+        {
+            "date": "2007-06-02T08:24:09+0000",
+            "content": "I too am nervous about making this as a public API change to\nDirectory.\n\nI'm also nervous that such a broad change expands the API of Directory\nto achieve a fairly specific functionality in IndexWriter (stop a\nmerge).\n\nAlso, looking forward to LUCENE-843, I think we will need a\ndifferent approach anyways (I think one that specifically targets the\nmerging, at a higher level).  Because with LUCENE-843, IndexWriter\ndirectly streams stored fields & vectors to disk and so you'd have to\nbe extremely careful not to interrupt that IO (vs the IO being done\nfor merging). ",
+            "author": "Michael McCandless",
+            "id": "comment-12500933"
+        },
+        {
+            "date": "2007-06-02T22:31:50+0000",
+            "content": "> I'm also nervous that such a broad change expands the API of Directory\n> to achieve a fairly specific functionality in IndexWriter (stop a\n> merge).\n\nI agree. Adding public methods to Directory with javadocs saying\n\"Please don't call me!\" is probably not very desirable.\n\n> Also, looking forward to LUCENE-843, I think we will need a\n> different approach anyways (I think one that specifically targets the\n> merging, at a higher level). Because with LUCENE-843, IndexWriter\n> directly streams stored fields & vectors to disk and so you'd have to\n> be extremely careful not to interrupt that IO (vs the IO being done\n> for merging).\n\nOK I understand. Right, this approach would interrupt those streams as \nwell. I'm not very familiar with your 843 patch yet, hopefully after 2.2\nis out I'll have some time... ",
+            "author": "Michael Busch",
+            "id": "comment-12500971"
+        },
+        {
+            "date": "2007-10-16T21:47:43+0000",
+            "content": "I think we can close this issue because we have a concurrent MergeScheduler now and a close() method that can abort running merges:\n\n\n  /**\n   * Closes the index with or without waiting for currently\n   * running merges to finish.  This is only meaningful when\n   * using a MergeScheduler that runs merges in background\n   * threads.\n   * @param waitForMerges if true, this call will block\n   * until all merges complete; else, it will abort all\n   * running merges and return right away\n   */\n  public void close(boolean waitForMerges) throws CorruptIndexException, IOException;\n\n\n\nThe only restriction is that an application that wants to be able to stop merges immediately has to use a concurrent MergeScheduler, but I think this is acceptable? ",
+            "author": "Michael Busch",
+            "id": "comment-12535357"
+        },
+        {
+            "date": "2007-10-16T23:03:13+0000",
+            "content": "Just to confirm: close(false) only aborts running merges, but waits for in-flight addDocument() calls and flush, right? That would mean that we can never loose data with close(false), just some merge work? ",
+            "author": "Michael Busch",
+            "id": "comment-12535366"
+        },
+        {
+            "date": "2007-10-16T23:17:42+0000",
+            "content": "That's right.\n\nClose calls flush() and flush() waits for any in-flight addDocument() calls to finish. ",
+            "author": "Michael McCandless",
+            "id": "comment-12535369"
+        },
+        {
+            "date": "2007-11-22T08:03:19+0000",
+            "content": "close(false) does not \"kill\" a merge thread right? So actually\nthere is no guarantee that close(false) will return within x minutes?\n\nE. g. if a cascading merge is running, then close(false) will wait\nfor the current merge job to finish, and then abort, meaning not\nperform other planned merge jobs of the cascading merge?\nBut if the current merge job is very big, with huge segments\ninvolved, then it can still take a long time for close(false) to\nreturn? ",
+            "author": "Michael Busch",
+            "id": "comment-12544724"
+        },
+        {
+            "date": "2007-11-22T11:03:16+0000",
+            "content": "\nI believe close(false) marks all still-running merges as aborted\n(calls OneMerge.abort()) and then returns immediately without waiting\nfor them to finish?\n\nHowever, you're right, those merge threads are not \"killed\" in that\nthey keep running until they \"notice\" they were aborted (typically\nwhen the merge tries to commit its results).  Right now we don't make\nany effort to have the merging process notice sooner that it was\naborted and abort the thread.\n\nIf we could somehow reach in & find all FSIndexOutputs that are\npresently opened by SegmentMerger, and forcefully close them (forcing\nan IOException which ConcurrentMergeScheduler catches & ignores if the\nmerge was aborted) that'd give us a fast way to have the threads stop\nworking.\n\nOh, one issue is we are failing to setDaemon(true) on these threads,\nwhich means the JVM will not exit until they complete.  I'll fix\nthat. ",
+            "author": "Michael McCandless",
+            "id": "comment-12544769"
+        },
+        {
+            "date": "2007-11-22T17:46:25+0000",
+            "content": "\nI believe close(false) marks all still-running merges as aborted\n(calls OneMerge.abort()) and then returns immediately without waiting\nfor them to finish?\nOK I got it. So if Lucene runs as a service and a shutdown request is\nreceived, then a call to close(false) will cause the IndexWriter to mark\nthe running merges as aborted, flush the buffer and return once \nflush+commit is done. Then the caller knows that it is safe now to\nshutdown the JVM, which will also stop the running merge thread\n(because it's a daemon thread now). \nWe should probably add a testcase that tests such a shutdown \nscenario.\n\n \nIf we could somehow reach in & find all FSIndexOutputs that are\npresently opened by SegmentMerger, and forcefully close them (forcing\nan IOException which ConcurrentMergeScheduler catches & ignores if the\nmerge was aborted) that'd give us a fast way to have the threads stop\nworking.\nThe fact that the background merge thread keeps running doesn't hurt\nus, but the advantage would be to reduce system load and thus to\npossibly speedup the flush+commit that the other thread is doing.\nMaybe for now we could also set the priority of the background thread\nto a minimum value, as soon as close(false) is called?\n\n\nOh, one issue is we are failing to setDaemon(true) on these threads,\nwhich means the JVM will not exit until they complete. I'll fix\nthat.\nCool, thanks! W/o this the above explained shutdown scenario wouldn't\nwork. ",
+            "author": "Michael Busch",
+            "id": "comment-12544854"
+        },
+        {
+            "date": "2007-12-21T10:33:41+0000",
+            "content": "LUCENE-1097 solves this nicely! ",
+            "author": "Michael Busch",
+            "id": "comment-12553921"
+        }
+    ]
+}

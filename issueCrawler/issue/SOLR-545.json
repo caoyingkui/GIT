@@ -1,0 +1,138 @@
+{
+    "id": "SOLR-545",
+    "title": "remove MultiCore \"default\" core / cleanup DispatchHandler",
+    "details": {
+        "affect_versions": "1.3",
+        "status": "Closed",
+        "fix_versions": [
+            "1.3"
+        ],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "MultiCore should require a core name in the URL.  If the core name is missing, there should be a 404, not a valid core.  That is:\nhttp://localhost:8983/solr/select?q=*:*  should return 404.\n\nWhile we are at it, we should cleanup the DispatchHandler.  Perhaps the best approach is to treat single core as multicore with only one core?  As is the tangle of potential paths is ugly.",
+    "attachments": {
+        "SOLR-545-path-access.patch": "https://issues.apache.org/jira/secure/attachment/12387866/SOLR-545-path-access.patch",
+        "solr-545.patch": "https://issues.apache.org/jira/secure/attachment/12387637/solr-545.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mike Klaas",
+            "id": "comment-12602839",
+            "date": "2008-06-05T23:09:05+0000",
+            "content": "assigning 1.3 multicore stuff to Ryan "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12620041",
+            "date": "2008-08-05T21:08:25+0000",
+            "content": "Perhaps the best approach is to treat single core as multicore with only one core?\n\n+1 "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12620078",
+            "date": "2008-08-05T22:53:46+0000",
+            "content": "Not knowing how advanced Ryan is on solving the whole issue, I might be completely off-base...\n\nAs far as I remember, we had a \"default\" attribute that could be applied to one core (in the multicore case); this part is gone.\nThe current SolrDispatchFilter behavior is to let the filter chain handle any URL that is not a request that solr can recognize as valid. We may add as a default that the chain ends in 404 in the 'unhandlable' case but that default fall through behavior should remain opened/overridable (multiple core spanning/joining requests could be handled in another filter for instance). \n\nIf we treat single core as multicore with only one core AND there is no default core:\nThe current test for what would be that \"single-core\" multicore situation looks like (multicore == null || multicore.isEnabled() == false); the ability to let users derive MultiCore (for serialization purpose at least) and  let them allocate it (through SolrDispatchFilter.initMultiCore()) should be kept (we are trying to avoid reintroducing a singleton here).\n If so & as is, this \"single-core\" multicore can not (should not be able to?) create new cores (nor can it swap cores since it can't create a new one) and probably should not attempt to read the multicore.properties (by-product of solr-646); this implies some new checks must be performed at the multicore level & dealing with a 'null' core name will still have to be considered & tested.\nThe risk - with my current understanding/knowledge - does not seem worth the (shallow) gain.\n\nBack to the issue description:\n\"MultiCore should require a core name in the URL; If the core name is missing, there should be a 404\": +1 as long as this can be changed (\"not a valid core\" is already out of the equation)\n\"...treat single core as multicore with only one core? As is the tangle of potential paths is ugly..\": although the code is more complex than we'd like (at least the SolrDispatchFilter code), it is fairly well documented and I'm not completely sure there is a lot to gain (considering the null core name & 1.3 delays and that the simplest action could be to deprecate \"single core\" altogether). So, -1 "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12620250",
+            "date": "2008-08-06T13:47:55+0000",
+            "content": "About the fall-through behavior of the filter, the default/example Jetty configuration still declares the (deprecated) servlet.\nThe net effect is that hitting 'http://.../select' (instead of http://.../corename/select') still works since the servlet will use the SolrCore.getCore() to find a core.\n\nAs a tentative workaround, this small patch introduces the SolrDispatchFilter 'strict' parameter.\nIf 'strict' is set to true, the filter will not fall through the chain and thus disallow any other filter/servlet to handle the request.\nBy default, if unspecified, the filter is 'strict' in multicore and lenient (not strict) in 'single core'. "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12620524",
+            "date": "2008-08-07T07:02:29+0000",
+            "content": "The SolrDispatchFilter (& EmbeddedSolrServer) need to protect against core closing while queries are executing. "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12620590",
+            "date": "2008-08-07T10:35:35+0000",
+            "content": "New version of the patch integrates solr-647 (ref counting for SolrCore) & modifies SolrDispatchFilter/EmbeddedSolrServer to protect running queries.\nAlso fixes the 'strict' filter parameter that was not properly consumed if set though the web.xml. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12620616",
+            "date": "2008-08-07T13:06:22+0000",
+            "content": "It seems like this type of reference counting still has a race (either that, or it's a form of  optimistic locking that must be re-tried in a loop which is currently missing from the code).\n\nCould this be simplified?\nSolrCore has a refCount... simply increment it in MultiCore (while in the sync block anyway) and decrement it on a SolrCore.release().... the SolrCore.Reference class wouldn't be needed. "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12620771",
+            "date": "2008-08-07T22:07:15+0000",
+            "content": "Revisited version with latest version of solr-647 included in.\n\nRegarding ref-counting, the SolrCore.Reference now delegates most of the real work to SolrCore; it's only a convenience class that makes it easy not to forget to close.\nThe locking code is the following & I believe it does not allow race conditions:\n\n...\n  public final SolrCore open() {\n    int count;\n    do {\n      count = refCount.get();\n      // this core can not be acquired since it is clos{ed,ing}\n      if (count <= 0)\n        return null;\n    } while (!refCount.compareAndSet(count, count + 1));\n    return this;\n  }\n\n  public void close() {\n    int count;\n    do {\n      count = refCount.get();\n      if (count <= 0)\n        return;\n    } while (!refCount.compareAndSet(count, count - 1));\n    // the count must be 1 which is the value at creation time\n    // if count <= 0, we've already closed it\n    // if count > 1, we must not close it\n    if (count != 1) {\n      //log.fine(logid+\" CLOSING SolrCore postponed, refcount: \" + (count - 1));\n      return;\n    }\n    log.info(logid+\" CLOSING SolrCore now!\");\n   // ...perform real close....\n}\n\n "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12620958",
+            "date": "2008-08-08T15:33:52+0000",
+            "content": "The locking code is the following & I believe it does not allow race conditions:\n\nNo, but as I said, it does allow the failure to aquire, and thus client code (DispatchFilter) would need to poll or something. "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12620995",
+            "date": "2008-08-08T18:05:20+0000",
+            "content": "Took me some time to understand, sorry Yonik.\nThere was a \"hole\" between finding a core and acquiring it.\nI hope I got it right this time... "
+        },
+        {
+            "author": "Ryan McKinley",
+            "id": "comment-12621124",
+            "date": "2008-08-09T07:27:03+0000",
+            "content": "Henri - thanks for your help on this.... a couple comments.\n\nIt would be nice to keep solr-647 as in independent issue.  I would rather have Yonik verify all the ref counted stuff.\n\nI'm not a big fan of adding the 'strict' parameter to web.xml \u2013 the behavior should be well defined simply from the external configs (multicore(solr).xml / solrconfig.xml) \n\nCurrently, I see two problems with the RequestDispatcher:\n\n1. it has a lot of crazy path checking\n2. It has incorrect behavior for /select and /admin/ in a \"multicore\" environment\n\nThe attached patch only helps with #2 and does not make #1 worse \u2013  In the deprecated SolrServlet, it checks the existance of multicore.xml (soon to be solr.xml) and throws an error if it exists.  For the /admin side, we throw an error if the DispatchFilter does not set the core "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12621187",
+            "date": "2008-08-09T20:59:34+0000",
+            "content": "I've not fully diciphered the dispatch filter, but my first thought was that multi-core could always be there (no enabled/disabled).\nThe only difference could be in the DispatchFilter which if a core of name \"\" exists, it uses paths w/o a core name and the other cores would be unreachable. That would enable core reloading, etc, for the single-core scenario. "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12621190",
+            "date": "2008-08-09T21:37:53+0000",
+            "content": "Ryan, glad  I could. \n\nOn solr-647, or more precisely \"The SolrDispatchFilter (& EmbeddedSolrServer) need to protect against core closing while queries are executing\", should we then create another specific issue (solved in the 1.3 timeframe) ?\n\nOn solr-545 itself, I agree your solution is better & simpler than introducing the 'strict' parameter.\nOne comment, shouldn't the deprecated servlet check for the existence of the 'org.apache.solr.MultiCore' request attribute though?\nYou can instantiate multicore in other/derived ways through the servlet filter & could still inadvertently go through the servlet.\n\nOn the \"crazy path checking\", I'm currently trying to refactor/merge SolrDipatchFilter & EmbeddedSolrServer to both derive from one \"SolrFilter\" .\nTell me if  this is a bad idea or if this should be also another issue (that could be fixed later than 1.3).\n\nThanks\n\n "
+        },
+        {
+            "author": "Henri Biestro",
+            "id": "comment-12621195",
+            "date": "2008-08-09T22:17:59+0000",
+            "content": "Yonik,\nGood catch!\nI'm gonna give it a try. "
+        },
+        {
+            "author": "Ryan McKinley",
+            "id": "comment-12621316",
+            "date": "2008-08-10T22:35:19+0000",
+            "content": "I just committed SOLR-545-path-access.patch \u2013 that should fix the behavior when things fall through to /admin/ or /select (via the SolrServlet)\n\nWe still need to clean up the DispatchFilter path \u2013 henri, i like the idea of a single code path for SolrDipatchFilter & EmbeddedSolrServer "
+        },
+        {
+            "author": "Lars Kotthoff",
+            "id": "comment-12621337",
+            "date": "2008-08-11T01:54:59+0000",
+            "content": "Throwing an exception in the JSP causes the error page to look like an error page that's generated when the JSP can't be compiled. This might be confusing and should probably be replaced with a \"nicer\" error page. "
+        },
+        {
+            "author": "Ryan McKinley",
+            "id": "comment-12621339",
+            "date": "2008-08-11T02:02:20+0000",
+            "content": "how about:\n\n\n--- src/webapp/web/admin/_info.jsp\t(revision 684615)\n+++ src/webapp/web/admin/_info.jsp\t(working copy)\n@@ -29,7 +29,8 @@\n   // \n   SolrCore  core = (SolrCore) request.getAttribute(\"org.apache.solr.SolrCore\");\n   if (core == null) {\n-    throw new SolrException( SolrException.ErrorCode.BAD_REQUEST, \"missing core name\" );\n+    response.sendError( 400, \"missing core name in path\" );\n+    return;\n   }\n\n "
+        },
+        {
+            "author": "Lars Kotthoff",
+            "id": "comment-12621342",
+            "date": "2008-08-11T02:06:33+0000",
+            "content": "I like that idea, but how about returning a 404 instead of a 400? Technically the request isn't malformed, it's just that it doesn't specify a core name and the requested page cannot be found because of that. "
+        },
+        {
+            "author": "Ryan McKinley",
+            "id": "comment-12621343",
+            "date": "2008-08-11T02:15:41+0000",
+            "content": "done. thanks Lars "
+        }
+    ]
+}

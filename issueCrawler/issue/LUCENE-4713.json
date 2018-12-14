@@ -1,0 +1,212 @@
+{
+    "id": "LUCENE-4713",
+    "title": "SPI: Allow fallback to default ClassLoader if Thread#getContextClassLoader fails",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.3",
+            "4.2.1",
+            "6.0"
+        ],
+        "affect_versions": "4.0,                                            4.1,                                            4.2",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "NOTE: This issue has been renamed from:\n\"Replace calls to Thread#getContextClassLoader with the ClassLoader of the current class\"\nbecause the revised patch provides a clean fallback path.\n\n\nI am not sure whether it is a design decision or if we can indeed consider this a bug:\n\nIn core and analysis-common some classes provide on-demand class loading using SPI. In NamedSPILoader, SPIClassIterator, ClasspathResourceLoader and AnalysisSPILoader there are constructors that use the Thread's context ClassLoader by default whenever no particular other ClassLoader was specified.\n\nUnfortunately this does not work as expected when the Thread's ClassLoader can't see the required classes that are instantiated downstream with the help of Class.forName (e.g., Codecs, Analyzers, etc.).\n\nThat's what happened to us here. We currently experiment with running Lucene 2.9 and 4.x in one JVM, both being separated by custom ClassLoaders, each seeing only the corresponding Lucene version and the upstream classpath.\n\nWhile NamedSPILoader and company get successfully loaded by our custom ClassLoader, their instantiation fails because our Thread's Context-ClassLoader cannot find the additionally required classes.\n\nWe could probably work-around this by using Thread#setContextClassLoader at construction time (and quickly reverting back afterwards), but I have the impression this might just hide the actual problem and cause further trouble when lazy-loading classes later on, and potentially from another Thread.\n\nRemoving the call to Thread#getContextClassLoader would also align with the behavior of AttributeSource.DEFAULT_ATTRIBUTE_FACTORY, which in fact uses Attribute#getClass().getClassLoader() instead.\n\nA simple patch is attached. All tests pass.",
+    "attachments": {
+        "LuceneContextClassLoader.patch": "https://issues.apache.org/jira/secure/attachment/12566155/LuceneContextClassLoader.patch",
+        "LUCENE-4713.patch": "https://issues.apache.org/jira/secure/attachment/12566266/LUCENE-4713.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-01-23T20:35:25+0000",
+            "content": "I bet there are people who need the exact opposite (context class loader lookup as opposed to defining class's class loader lookup). If you perform classloader isolation I think you'll have to switch the context classloader accordingly, much like servlet containers to it when handling requests? Just my opinion, I'm not saying this is a wrong idea. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13561069"
+        },
+        {
+            "date": "2013-01-23T21:49:26+0000",
+            "content": "I disagree about the issue. The Java specification of ServiceLoader mandates that the context class loader is used by default: http://docs.oracle.com/javase/6/docs/api/java/util/ServiceLoader.html#load(java.lang.Class) - We are doing nothing different here, we just have a own implementation of ServiceLoader, because the Java 6 one has some bugs and inconsistencies on several JVM vendors.\n\nIn fact, if you want classloader isolation, you should also separate threads and give every thread the corresponding isolated classloader, like Dawid said (Tomcat and Jetty are doing this, too). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13561126"
+        },
+        {
+            "date": "2013-01-23T22:10:48+0000",
+            "content": "Good point, Uwe.\n\nBut maintaining separated, ClassLoader-specific Threads seems like real overkill here.\nCouldn't we at least fall-back on the default ClassLoader if the Thread's Context-ClassLoader fails to load the class/resource?\n\nThis way, it will work for both cases.\n\nWhat do you think? ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13561148"
+        },
+        {
+            "date": "2013-01-23T23:33:02+0000",
+            "content": "I don't think you have a chance to not set the correct context classloader... Lucene is not the only this that relies on this (XML parser SPIs, java.security, imaging file formats, Charsets, ...)\n\nUsing more than one class loader to lookup SPIs is possible but violates the spec. It also slows down, because you have to do several lookups, filter duplicates and so on.\n\nOne thing you can do is: Codec.reloadCodescs(yourClassloader), PostingFormat.reloadPostingsFormats(yourClassLoader) before using Lucene (and the same for the other SPIs in Lucene). This will rescan the given classloader and add new, additional codecs found to the internal list. Solr is doing the same after initializing the SolrResourceLoader (to allow codecs be loaded from the Solr plugins folder).\n\nI already have the plans to add one Util class that does this for all SPIs, Lucene uses (currently you have to do this separately for all of them). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13561231"
+        },
+        {
+            "date": "2013-01-24T07:18:40+0000",
+            "content": "Revised patch.\n\nNow uses Thread#getContextClassLoader and falls back to the default ClassLoader on ClassNotFoundException/missing resource only, with the help of a lightweight FallbackClassLoader.\nThis should not incur any slowdowns, does not require filtering, etc.\n\nRegarding your suggestion concerning Codecs.reload, etc.: I would definitely not want to have these rather-internal calls in the application code. So providing an Util class that hides the SPI details would be essential.\n\nPractically, what you describe may boil down to a static Lucene bootstrap method, e.g. a \"Lucene.init()\". I am not really sure if this is a good idea, especially if the only benefit is that we abide by the SPI spec to the very last word.  ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13561463"
+        },
+        {
+            "date": "2013-01-30T20:48:49+0000",
+            "content": "Uwe,\n\nI have tried your suggested workaround. Unfortunately it does not work.\n\nThe Codec class has a static field that already requires a working SPI setup:\n\nprivate static Codec defaultCodec = Codec.forName(\"Lucene41\");\n\nCalling Codec.reloadCodecs with my ClassLoader will use the Thread-context ClassLoader (via Codec#loader) and thus fails with\n\njava.lang.IllegalArgumentException: A SPI class of type org.apache.lucene.codecs.Codec with name 'Lucene40' does not exist. You need to add the corresponding JAR file supporting this SPI to your classpath.The current classpath supports the following names: []\n\tat org.apache.lucene.util.NamedSPILoader.lookup(NamedSPILoader.java:104)\n\tat org.apache.lucene.codecs.Codec.forName(Codec.java:95)\n\tat org.apache.lucene.codecs.Codec.<clinit>(Codec.java:122)\n\t... 28 more\n(stack trace from Lucene 4.0, still valid for 4.1).\n\nI could resolve this by moving Codec.forName into Codec#getDefault:\n\n\n\nprivate static Codec defaultCodec = null;\n  \n  /** expert: returns the default codec used for newly created\n   *  {@link IndexWriterConfig}s.\n   */\n  // TODO: should we use this, or maybe a system property is better?\n  public static Codec getDefault() {\n    if(defaultCodec == null) {\n      defaultCodec = Codec.forName(\"Lucene40\");      \n    }\n    return defaultCodec;\n  }\n\n\n\nMoreover, it is important to call PostingsFormat#reloadPostingsFormats before Codec#reloadCodecs, because the Lucene40 codec looks up the PostingFormat class...\n\nAs you can see, fixing this easily becomes a mess \u2013 we would have to find a specific order of what to load first. Finally, in the case of AnalysisSPILoader there is no static method to call...\n\nI am pretty sure that it is safer to use the fall-back ClassLoader I provided in the patch. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13566884"
+        },
+        {
+            "date": "2013-02-14T09:59:40+0000",
+            "content": "We hit the same issue when using Lucene via Ant. After upgrading from Lucene 3.x to 4.0, our Lucene-related Ant tasks stopped working because the class loader returned by Thread.currentThread().getContextClassLoader() does not see META-INF/services/org.apache.lucene.codecs.Codec.\n\n\njava.lang.ExceptionInInitializerError\n        at org.apache.lucene.index.LiveIndexWriterConfig.<init>(LiveIndexWriterConfig.java:118)\n        at org.apache.lucene.index.IndexWriterConfig.<init>(IndexWriterConfig.java:145)\n        [.....left out.....]\n        at com.xhive.anttasks.XhiveTask.execute(XhiveTask.java:180)\n        at org.apache.tools.ant.UnknownElement.execute(UnknownElement.java:291)\n        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:39)\n        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)\n        at java.lang.reflect.Method.invoke(Method.java:597)\n        at org.apache.tools.ant.dispatch.DispatchUtils.execute(DispatchUtils.java:106)\n        at org.apache.tools.ant.Task.perform(Task.java:348)\n        at org.apache.tools.ant.Target.execute(Target.java:390)\n        at org.apache.tools.ant.Target.performTasks(Target.java:411)\n        at org.apache.tools.ant.Project.executeSortedTargets(Project.java:1399)\n        at org.apache.tools.ant.Project.executeTarget(Project.java:1368)\n        at org.apache.tools.ant.helper.DefaultExecutor.executeTargets(DefaultExecutor.java:41)\n        at org.apache.tools.ant.Project.executeTargets(Project.java:1251)\n        at org.apache.tools.ant.Main.runBuild(Main.java:809)\n        at org.apache.tools.ant.Main.startAnt(Main.java:217)\n        at org.apache.tools.ant.launch.Launcher.run(Launcher.java:280)\n        at org.apache.tools.ant.launch.Launcher.main(Launcher.java:109)\nCaused by: java.lang.IllegalArgumentException: A SPI class of type org.apache.lucene.codecs.Codec with name 'Lucene40' does not exist. You need to add the corresponding JAR file supporting this SPI to your classpath.The current classpath supports the following names: []\n        at org.apache.lucene.util.NamedSPILoader.lookup(NamedSPILoader.java:104)\n        at org.apache.lucene.codecs.Codec.forName(Codec.java:95)\n        at org.apache.lucene.codecs.Codec.<clinit>(Codec.java:122)\n        ... 34 more\n\n\n\nThe build file looks like this:\n\n\n<project>\n\n  ...\n\n  <path id=\"classpath\">\n    <fileset dir=\"${xhive.dir}\">\n       <!-- contains, among others, lucene.jar -->\n      <include name=\"lib/xhivedb/**/*.jar\"/>\n      <!-- contains, among others, our custom Ant tasks -->\n      <include name=\"build/jarfiles/plain/xhive.jar\"/>\n    </fileset>\n  </path>\n\n  ...\n\n  <target name=\"build\">\n    <taskdef classpathref=\"classpath\"\n             resource=\"com/xhive/anttasks/tasks.properties\"/>\n\n    <!-- this custom task fails after migration to Lucene 4.x -->\n    <our-lucene-related-task .../>\n  </target>\n\n</project>\n\n\n\nWhat happens is that inside the task Thread.currentThread().getContextClassLoader() does not return the Ant class loader (which knows the full classpath).\n\nDoing something like this:\n\n\npublic NamedSPILoader(Class<S> clazz) {\n  this(clazz, clazz.getClassLoader());\n}\n\n\n\nwould fix it, but given the previous comments on the issue, I am not sure it would be the best fix. ",
+            "author": "Vojt\u011bch Toman",
+            "id": "comment-13578264"
+        },
+        {
+            "date": "2013-03-12T08:51:28+0000",
+            "content": "Use Codecs.reloadCodecs(antClassLoader) in your application initialization code. The same method exists for PostingsFormats, Unfortunately there is no method to automatically reload all SPIs in Lucene. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599837"
+        },
+        {
+            "date": "2013-03-12T09:01:11+0000",
+            "content": "From my persepctive, Christian Kohlsch\u00fctters suggestion is nice to have. We should at least enforce that the classloader that loaded the lucene-core.jar file is also scanned, regardless what the context class loader is - this would somehow \"emulate\" what the JDK does wth its own extensions like XML parsers. In any case, we would need to decide, what to do first (the Lucene class loader or the context one).\n\nI will provide a patch. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599842"
+        },
+        {
+            "date": "2013-03-12T09:29:38+0000",
+            "content": "This is the easiest patch possible. Still lacks some documentation (to actually document that the Lucene class loader is scanned), but ensures that at least all SPIs shipped with Lucene are visible.\n\nIf a user has additional SPIs outside Lucene core, then its his turn to make them correctly available.\n\nThe Lucene classloader is scanned before the context one, because the classes shipped with lucene should take precedence. On the other hand, this makes it impossible to \"override\" Lucene's default codec unless you place the jar file next to lucene-core.jar in same classloader. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599858"
+        },
+        {
+            "date": "2013-03-12T10:16:25+0000",
+            "content": "Thanks, Uwe! Looks good and works well in our setup.\n\nRegarding overriding Lucene's default codec implementations:\nWe anyways have to place any other modified, non-SPI Lucene classes in the same ClassLoader, so I really appreciate that this patch enforces this. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13599885"
+        },
+        {
+            "date": "2013-03-12T10:21:15+0000",
+            "content": "Hi Christian,\nanother patch, with some optimization. The clazz's classloader is only scanned, if its not a parent or the same. If the Lucene's clazz' classloader is a parent of the context one, it does not need to scan it.\nThis also works around the problems with \"hiding\" classes. To override the Lucene core codecs, e.g. Tomcat's classloader (J2EE) will use parent-last semantics, and in that case the precedence goes to the webapp.\nOnly if the lucene classloader is not at all related to the context one, it is scanned.\n\nCan you try this, too? Unfortunately its hard to write a good testcase without some fake classes in separate compilation units which complicates the Lucene build  ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599891"
+        },
+        {
+            "date": "2013-03-12T10:51:20+0000",
+            "content": "Regarding overriding Lucene's default codec implementations: We anyways have to place any other modified, non-SPI Lucene classes in the same ClassLoader, so I really appreciate that this patch enforces this.\n\nOverriding default Lucene Codecs doesn't need to necessarily use the same class name. Codecs are identified by their \"name\" as written into the index files (e.g., \"Lucene42\"). If you implement another subclass of Codec with the same name, but different class name, it is also taken into account. But in any case, the class file must be listed before the lucene-core.jar one in classpath (btw, this is used in Lucene 4.x, to allow a READ/WRITE variant of the Lucene3x codec for testing only. The test-framework.jar simply exposes another class, extending the original READONLY Lucene3x codec to support WRITE, but makeing it available also with the \"Lucene3x\" name to the loader). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599912"
+        },
+        {
+            "date": "2013-03-12T11:06:39+0000",
+            "content": "Works for me, too. Those corner cases...\n\nOne thing that I stumbled upon was that Thread#getContextClassLoader may actually return null.\nWe currently throw an IllegalArgumentException in this case, which can be considered a bug by itself.\n\nIf we decide that a fix for this bug is to check for null and use the classes' default ClassLoader instead, we would actually call #reload twice (because isParentClassLoader will return false if child==null).\n\nSee the attached patch for a proposed fix. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13599920"
+        },
+        {
+            "date": "2013-03-12T11:19:05+0000",
+            "content": "There is another problem: The abstract clazz' classloader may be null, too (although this never happens in recent JDKs): The bootstrap class loader may be null. But we don't have the problem here, as Lucene classes are never ever loaded through the boot class loader (but e.g. String.class.getClassLoader() may return null).\n\nI dont like hooking also into reload(), I will think of another more elegant solution). But to mention: If the context class loader is null (which cannot happen unless you explicitly set it to null), Java's own classloading for SPIs would be broken, too (see the implementation of java.util.ServiceLoader). (EDIT: Java's ServiceLoader uses SystemClassLoader if context loader is null) ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599927"
+        },
+        {
+            "date": "2013-03-12T11:26:19+0000",
+            "content": "This patch keeps #reload untouched. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13599929"
+        },
+        {
+            "date": "2013-03-12T11:43:48+0000",
+            "content": "Here is the patch that mimics what the \"original\" java.util.ServiceLoader does:\nIf the classloader (e.g. the context classloader) is null, it uses the system classloader. The exception on null classloader was removed.\n\nThe patch then also adds some null checks, so the \"fallback\" case is only used if both possible loaders are != null.\nIf all class loaders are null, the system loader is used, which should never happen, as Lucene is not part of rt.jar.\n\nI think this is ready. Unfortunately we had some overlap, Christian  ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599941"
+        },
+        {
+            "date": "2013-03-12T11:58:56+0000",
+            "content": "Sorry, again a new patch.\n\nNow the case where the context class loader is null is handled correctly. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599960"
+        },
+        {
+            "date": "2013-03-12T12:02:23+0000",
+            "content": "Just for reference: see line 336+ of http://www.docjar.com/html/api/java/util/ServiceLoader.java.html ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599965"
+        },
+        {
+            "date": "2013-03-12T12:09:16+0000",
+            "content": "Overlap and coverage, Uwe \nLooks good to me!\n\nNit: What you could do to be 100% safe that we're using the \"correct\" ClassLoader is to check for loader==null in SPIClassIterator and assign it to ClassLoader.getSystemClassLoader() in this case. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13599968"
+        },
+        {
+            "date": "2013-03-12T12:32:26+0000",
+            "content": "I also opened LUCENE-4823 to make the reloading (which is done on Solr startup to load codecs from plugin folders) more centralized. This is not really related but might move the isParentClassLoader helper method into the new base class for all SPILoaders (and hide it). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599975"
+        },
+        {
+            "date": "2013-03-12T12:34:38+0000",
+            "content": "Nit: What you could do to be 100% safe that we're using the \"correct\" ClassLoader is to check for loader==null in SPIClassIterator and assign it to ClassLoader.getSystemClassLoader() in this case.\n\nI want to keep as close to Java's original. This is not a problem at all: Class.forName(name, ..., NULL) loads automatically using the bootstrap / system loader. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13599977"
+        },
+        {
+            "date": "2013-03-12T21:55:08+0000",
+            "content": "Hi Christian,\nafter some investigation I found out why the java.util.ServiceLoader simply uses \"null\" but still always uses the system classloader: The reason is simple: java.util.ServiceLoader is itsself loaded by the system classloader (as its in rt.jar), so getCallerClassLoader() inside Class.forName() returns the system classloader. So there is no need to have a special case in java.\n\nThe attached patch uses the system classloader if SPIClassIterator gets a null one, so its 100% consistent.\n\nBut the change is not really needed, as Lucene's classloader is always != null, because its no system class so we will never get into this detail. I just changed it to be consistent.\n\nPlease note: getSystemClassLoader may return null - I am not sure if this ever happens, the java code talks about compilation of rt.jar and such funny things, so i think the null checks in the Class implementation is more for bootstrapping the JVM, user code will never see a null system classloader.\n\nIn either case, there is no problem with the current code if it returns null: its never called (haha) and it uses Class.forName, which supports null as classloader. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13600527"
+        },
+        {
+            "date": "2013-03-12T22:04:07+0000",
+            "content": "Hi Uwe,\n\nThanks for investigating this!\n\nLucene is repeatedly hitting Java's inner and outer boundaries, also in this case.\nI agree that we're safe here. And if not, there's this issue's comments section for posterity  ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-13600545"
+        },
+        {
+            "date": "2013-03-13T10:14:51+0000",
+            "content": "Thanks Christian! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13601006"
+        },
+        {
+            "date": "2013-03-13T13:08:19+0000",
+            "content": "[branch_4x commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1455863\n\nMerged revision(s) 1455860 from lucene/dev/trunk:\nLUCENE-4713: The SPI components used to load custom codecs or analysis components were fixed to also scan the Lucene ClassLoader in addition to the context ClassLoader, so Lucene is always able to find its own codecs. The special case of a null context ClassLoader is now also supported.\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13601104"
+        },
+        {
+            "date": "2013-03-13T13:08:33+0000",
+            "content": "[trunk commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1455860\n\nLUCENE-4713: The SPI components used to load custom codecs or analysis components were fixed to also scan the Lucene ClassLoader in addition to the context ClassLoader, so Lucene is always able to find its own codecs. The special case of a null context ClassLoader is now also supported. ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13601113"
+        },
+        {
+            "date": "2013-03-18T10:12:31+0000",
+            "content": "As Lucene 4.2.1 is coming, I backported to 4.2 branch in revision: 1457695 ",
+            "author": "Uwe Schindler",
+            "id": "comment-13604976"
+        },
+        {
+            "date": "2013-03-18T10:42:39+0000",
+            "content": "[branch_4x commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1457699\n\nMerged revision(s) 1457697 from lucene/dev/trunk:\nLUCENE-4713: Move changes entry ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13604999"
+        },
+        {
+            "date": "2013-03-18T10:42:44+0000",
+            "content": "[trunk commit] Uwe Schindler\nhttp://svn.apache.org/viewvc?view=revision&revision=1457697\n\n LUCENE-4713: Move changes entry ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13605000"
+        },
+        {
+            "date": "2013-05-10T10:34:10+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13654141"
+        }
+    ]
+}

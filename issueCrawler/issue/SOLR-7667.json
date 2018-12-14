@@ -1,0 +1,217 @@
+{
+    "id": "SOLR-7667",
+    "title": "If more cores are loaded at startup than the transient core size, cores become unavailable.",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "4.10.3",
+        "status": "Resolved",
+        "resolution": "Won't Fix",
+        "priority": "Major"
+    },
+    "description": "Edwin Lee from the user's list caught this, the original post is titled \"loadOnStartup & transientCoreSize & BUG Report on CoreContainer.java\"\n\nNice catch Edwin!\n\nMore details to follow:",
+    "attachments": {
+        "SOLR-7667-test-fails.patch": "https://issues.apache.org/jira/secure/attachment/12739782/SOLR-7667-test-fails.patch",
+        "SOLR-7667-test.patch": "https://issues.apache.org/jira/secure/attachment/12740037/SOLR-7667-test.patch",
+        "SOLR-7667-with-CoreAdmin-create-fail.patch": "https://issues.apache.org/jira/secure/attachment/12739439/SOLR-7667-with-CoreAdmin-create-fail.patch",
+        "SOLR-7667.patch": "https://issues.apache.org/jira/secure/attachment/12739429/SOLR-7667.patch",
+        "CoreContainer.java": "https://issues.apache.org/jira/secure/attachment/12739426/CoreContainer.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-06-12T15:44:26+0000",
+            "author": "Junhao Li",
+            "content": "A situation like this,\n\n    transientSize=2\n    create 6 transient cores, and all of them are loadOnStarup=True\n    Restart solr.\n\n    Then, you will find 2 cores loaded, let say core5, core6. They work fine.\n    But you cannot access core1, core2, core3, core4. There is no failure, no error message. But you just need to keep waiting\u2026 Forever.\n\n    What make thing even funnier, you open the JConsole, you will find 6 core\u2019s metrics are there \u2014 In a normal situation, there should only be two cores metrics. ",
+            "id": "comment-14583586"
+        },
+        {
+            "date": "2015-06-12T15:45:37+0000",
+            "author": "Junhao Li",
+            "content": "Reason:\n-----------------------\nRead the log, you will find core1, core2, core3, core4 are closing \u2014- But actually they are not.\nIn Solr code, you will find core1-4 are just remove from the list in core container. But the actual closing operation are not done. Because the closer thread are hang!\n\nHow to bypass it:\n-----------------------\nThere may be plenty ways to bypass this bug. And I am listing the 1 way:\n\n    make sure there is at lease one transient core(let call it \u201cSaviorCore\u201d) who is loadOnStarup=False\n    When the Situation described above happen, send luke/mbean/any request to load \u201cSaviorCore\u201d. Then you will find core1, core2, core3, core4 are actually closed in the JConsole.\n\n\u200b ",
+            "id": "comment-14583587"
+        },
+        {
+            "date": "2015-06-12T15:48:14+0000",
+            "author": "Junhao Li",
+            "content": "The code involved are SolreCores.java allowCateLazyCores() and CoreContainer.java CloserThread.run()\n---------------------------------------------------------------------------------------\nI modify the solr code to confirm my conclusion. I give the wait a time out by\n\n     log.info(\"Edwin's Log: We are trying to fix the startup problem\");\n     solrCores.getModifyLock().wait(1000);\n     log.info(\"end waiting.\");\n--------------------------------------------------------------------------------------\nSituation gone. But that is only a proof of concept. It is hard to specify a reasonable timeout value on which every one agree. ",
+            "id": "comment-14583590"
+        },
+        {
+            "date": "2015-06-12T15:58:20+0000",
+            "author": "Junhao Li",
+            "content": "Erik Eriksson Thanks for your help to set this up.\n\nI think it is a classical producer/consumer scenario,  a right place for the BlockingQueue. But it involves several code modification and the modifylock hold us back. \n\nI am only also thinking whether we can expand the modifylock scope to include the actual core close operation, like it. But it didn't work.\n\n  @Override\n  public void run() {\n    while (! container.isShutDown()) {\n      synchronized (solrCores.getModifyLock()) { // need this so we can wait and be awoken.\n        try \n{\n          solrCores.getModifyLock().wait();\n        }\n catch (InterruptedException e) \n{\n          // Well, if we've been told to stop, we will. Otherwise, continue on and check to see if there are\n          // any cores to close.\n        }\n      }\n      for (SolrCore removeMe = solrCores.getCoreToClose();\n           removeMe != null && !container.isShutDown();\n           removeMe = solrCores.getCoreToClose()) {\n        try \n{\n          removeMe.close();\n        }\n finally \n{\n          solrCores.removeFromPendingOps(removeMe.getName());\n        }\n      }\n    }\n  }\n\n\nSince Solr is new to me, it is a chance for me to look into the CoreContainer code.  I will think of a unit test case to cover the situation as you suggested in the mail.\n\nThank you. And I would like to engaging the contribution to such a wonderful project.\n ",
+            "id": "comment-14583603"
+        },
+        {
+            "date": "2015-06-12T18:19:37+0000",
+            "author": "Shawn Heisey",
+            "content": "An alternate idea is to detect the configuration where the transient cache is too small as an invalid config and stop loading cores entirely, with a nice red error message in the admin UI.  If it's possible to get a loadOnStartup count before any core loading starts, Solr could refuse to start ANY cores.  I'm a fan of the \"fail fast and fail hard\" approach. ",
+            "id": "comment-14583832"
+        },
+        {
+            "date": "2015-06-12T21:20:43+0000",
+            "author": "Hoss Man",
+            "content": "I'm a fan of the \"fail fast and fail hard\" approach.\n\nWhile I share this philosophy in general, it's doesn't really make sense here...\n\nConsider specifically how a system can get in a situation like this:\n\n\n\ta completley new solr install, with no cores/collections\n\tuser configures transientSize=2\n\tuser adds 2 cores which are loadOnStartup=true.  everything is happy\n\tuser adds some more cores which are loadOnStartup=false. everything is still happy. the transient cache has automatically closes/opens cores as needed\n\tuser restarts solr. everything is still happy - the 2 loadOnStartup=true cores are loaded.\n\tas requests come in, the transient cache closes/opens cores as needed\n\ta user adds 1 more new loadOnStartup=true core.  everything is still happy\n\tas requests come in, the transient cache closes/opens cores as needed\n\tuser restarts solr \u2013 suddenly, solr complains about a configuration error ... WTF? the configuration hasn't changed? Solr was operating just fine before restart, now it says transientSize is too small for the number of cores i have? WTF?!?!?!\n\n\n\n...the philosophy of \"fail fast and fail hard\" just doesn't apply here \u2013 unless you're going to fail fast and hard in the CoreAdmin and not even let a new core be created with loadOnStartup=true unless you count all the loadOnStartup=true cores (even the ones that may not currently be loaded due to either the trnasient cache or due to the user explicitly closing them).\n\n\n\nI think the only sane behavior here is that if transientSize is used, the Core discovery should prioritize initializing loadOnStartup=true cores and if there are more of those then the transientSize=N, it should just pick N to load and log a warning about: \"Core foo not initialized even though it is loadOnStartup=true because transientSize=N exceeded.\" ",
+            "id": "comment-14584105"
+        },
+        {
+            "date": "2015-06-13T14:48:40+0000",
+            "author": "Junhao Li",
+            "content": "In my understanding,\n1. when loadOnStarup transientCores > transientCacheSize, I think it is a reasonable configuration. In our project, we would like to monitor the solr core state, we have to load the core one by one to get the snapshot of it. So load it one by one make sense to us.\n2. The loadOnStartup is only one of the problem of it. The problem is \"improper core close\" operation. This bug is haunting solr whenever there is core closing involved.\n\nAnd...\n\nThe reason why it keep happenning on \"loadOnStartup=true\" mainly because the closeThread initialize after the all of transient cores creation.\n\nIn CoreContainter.java\n\n      try \n{\n        coreLoadExecutor.invokeAll(creators);\n      }\n      catch (InterruptedException e) \n{\n        throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE, \"Interrupted while loading cores\");\n      }\n\n      // Start the background thread\n      backgroundCloser = new CloserThread(this, solrCores, cfg);\n      backgroundCloser.start();\n\n    } finally \n{\n      ExecutorUtil.shutdownNowAndAwaitTermination(coreLoadExecutor);\n    } ",
+            "id": "comment-14584630"
+        },
+        {
+            "date": "2015-06-13T14:55:00+0000",
+            "author": "Junhao Li",
+            "content": "Erik Eriksson\n\nHi Erick,\n\nAfter discussion with my colleagues, we come up a solution like it.\nAlthough I like using blockingqueue for this scenario, it involve several code modification. \nRight now, I think that is a simple and long term fix.\n\nWe just need to replace the code in CoreContainter.CloserThread.run() to the code below.\nBy the way, can this fix back port the solr 4.10.3 ? Thank you.\n\n    public void run() {\n      while (! container.isShutDown()) {\n        SolrCore removeMe = null;\n        synchronized (solrCores.getModifyLock()) { // need this so we can wait and be awoken.\n          removeMe = solrCores.getCoreToClose();\n          if( removeMe == null ) { // no use while because closer might have to wake up when container is down.\n              try \n{\n                 solrCores.getModifyLock().wait();\n              }\n catch (InterruptedException e) \n{\n                 // Well, if we've been told to stop, we will. Otherwise, continue on and check to see if there are\n                // any cores to close.\n              }\n              continue;\n          }\n        }\n\n        for (;\n             removeMe != null && !container.isShutDown();\n             removeMe = solrCores.getCoreToClose()) {\n          try {\n            removeMe.close();\n            log.info(\"Transient Core[{}] is closed.\", removeMe.getName());\n          } finally \n{\n            solrCores.removeFromPendingOps(removeMe.getName());\n          }\n        }\n      }\n    } ",
+            "id": "comment-14584636"
+        },
+        {
+            "date": "2015-06-13T15:36:13+0000",
+            "author": "Shawn Heisey",
+            "content": "While I share this philosophy in general, it's doesn't really make sense here... Consider specifically how a system can get in a situation like this:\n\nThat was a scenario I had not considered, and that is a good reason to not fail the way I described.  Doing so would not conform to another design philosophy \u2013 the \"principle of least surprise.\"\n\nDuring startup, if cores have been asked to load that exceed the transient size, it could be handled one of two ways:\n\n\n\tTreat them just like a manual core load \u2013 and unload one of the cores that got loaded previously.\n\tSkip the automatic load entirely, rather than do the partial load that causes the buggy state.\n\n\n\nunless you're going to fail fast and hard in the CoreAdmin and not even let a new core be created with loadOnStartup=true unless you count all the loadOnStartup=true cores\n\nAnother great idea from Hoss.  Fail core creation with a useful error message in the exception.\n\nBy the way, can this fix back port the solr 4.10.3 ?\n\nWe can certainly backport the fix to the 4_10 branch, but this is a problem with a simple workaround, so I don't think it will lead to an actual 4.10.3 release.\n\nAre there any errors or warnings in the log when this problem happens?  If there are, they should be documented here so that others can find this issue by searching for those messages. ",
+            "id": "comment-14584665"
+        },
+        {
+            "date": "2015-06-13T15:48:36+0000",
+            "author": "Junhao Li",
+            "content": "We propose a solution here to refer.\n\nMainly, I only change the code in CloserThread.run().\nAnd also, I add protected static final Logger log = LoggerFactory.getLogger(CloserThread.class); to add more logs on CloserThread.\n\nOur colleague suggest adding the timeout.\nIt will not hurt the performance to add the timeout. Concurrent issue is hard to predict sometime. Just in case.\nI don't add it into this file because I don't know which value is proper. ",
+            "id": "comment-14584673"
+        },
+        {
+            "date": "2015-06-13T15:51:27+0000",
+            "author": "Junhao Li",
+            "content": "No error printed. It drove us crazy. I think it would better to add some log in the closer thread. And just in case, perhaps add the timeout. It won't hurt the performance. Thx. ",
+            "id": "comment-14584678"
+        },
+        {
+            "date": "2015-06-13T16:01:59+0000",
+            "author": "Shawn Heisey",
+            "content": "We very much prefer patches to full source files, unless they're entirely new files.\n\nWhich code branch did you modify to create this new source file? ",
+            "id": "comment-14584685"
+        },
+        {
+            "date": "2015-06-13T16:04:41+0000",
+            "author": "Junhao Li",
+            "content": "I simply attach the file here. CoreContainer.java\nI don't know how to submit patch yet... Sorry... Would you help me to submit it? Thx. ",
+            "id": "comment-14584686"
+        },
+        {
+            "date": "2015-06-13T16:22:39+0000",
+            "author": "Shawn Heisey",
+            "content": "It looks like you applied this to either the 4_10 branch or the 4_10_2 tag.  Attaching a patch created by replacing the CoreContainer.java file in tags/lucene_solr_4_10_2 with the file included here. ",
+            "id": "comment-14584691"
+        },
+        {
+            "date": "2015-06-13T16:23:28+0000",
+            "author": "Erick Erickson",
+            "content": "See: http://wiki.apache.org/solr/HowToContribute.\n\nThe short form is that if you checked the code out with subversion, just to go the top-level directory and type\nsvn diff > SOLR-7667.patch\nGit has it's own diff generation that's usable too.\n\nAnd if you use IntelliJ, there's a menu choice VCS>>Create Patch.\nI'm sure that other IDEs have equivalents.\n\nDo note that if, say, you decide to create a second (or third or fourth) patch because you think of something else, name them all SOLR-7667.patch and upload them. Multiple copies of a patch with the same name are the most convenient, the JIRA will gray out all the older ones, making it easy to know exactly what the latest patch is.\n\nThanks! ",
+            "id": "comment-14584692"
+        },
+        {
+            "date": "2015-06-13T16:23:50+0000",
+            "author": "Shawn Heisey",
+            "content": "Is there any chance that you can write a test that fails without your change and passes once it's applied? ",
+            "id": "comment-14584695"
+        },
+        {
+            "date": "2015-06-13T16:50:29+0000",
+            "author": "Junhao Li",
+            "content": "Ok. I will follow the instructions of the link.\nThx. ",
+            "id": "comment-14584708"
+        },
+        {
+            "date": "2015-06-13T16:54:18+0000",
+            "author": "Shawn Heisey",
+            "content": "Updated patch against branch_5x.  The patch wouldn't apply cleanly, had to do it manually. ",
+            "id": "comment-14584711"
+        },
+        {
+            "date": "2015-06-13T16:54:21+0000",
+            "author": "Junhao Li",
+            "content": "Ok. It may take days, since I am new to Solr, configuration and code still confuse me sometime.\nI just found CoreContainerCoreInitFailuresTest.java in test package might be a good reference.\nI will do the work based upon 4.10.3. It will be OK, right? ",
+            "id": "comment-14584712"
+        },
+        {
+            "date": "2015-06-13T17:05:08+0000",
+            "author": "Shawn Heisey",
+            "content": "It would be better against trunk or branch_5x, but you should do it where you are comfortable, and we will adjust if we must. ",
+            "id": "comment-14584721"
+        },
+        {
+            "date": "2015-06-13T17:07:26+0000",
+            "author": "Shawn Heisey",
+            "content": "I mentioned a 4.10.3 release above, but forgot that we are already up to 4.10.4, so that would in fact be a 4.10.5 release. ",
+            "id": "comment-14584723"
+        },
+        {
+            "date": "2015-06-13T17:13:10+0000",
+            "author": "Shawn Heisey",
+            "content": "Erick Erickson, you're much more familiar with the CoreContainer code due to your LotsOfCores work.  Does Junhao Li's patch look good, or would you tackle it another way?\n\nI have started working on getting it incorporated, but I am willing to step aside and let you handle it if that interests you. ",
+            "id": "comment-14584725"
+        },
+        {
+            "date": "2015-06-13T18:03:40+0000",
+            "author": "Shawn Heisey",
+            "content": "Patch against 5x that includes code in CoreAdminHandler to fail core creation when the number of cores set to load on startup equals or exceeds transientCacheSize.\n\nThe added code doesn't feel very elegant to me.  Part of that is the length of the error messages, but I wonder if maybe CoreContainer should keep track of statistics like the number of cores set to load on startup. ",
+            "id": "comment-14584748"
+        },
+        {
+            "date": "2015-06-15T13:19:00+0000",
+            "author": "Shawn Heisey",
+            "content": "I made a slight adjustment to the patch where CoreAdmin fails to create a core when the number of cores with loadOnStartup would exceed transientCacheSize.\n\nThis patch does cause one test failure that I've seen so far \u2013 here's the point in the test run where it logs the warning before throwing the exception:\n\n\n   [junit4]   2> 80803 WARN  (TEST-TestLazyCores.testCreateTransientFromAdmin-seed#[63584E21E9EC83F]) [    x:core2] o.a.s.h.a.CoreAdminHandler 4 cores already marked to load on startup, with a transient cache size of 4.  Raise transientCacheSize in solr.xml.\n\n\n\nHere's the exception:\n\n\n   [junit4] ERROR   0.24s J0 | TestLazyCores.testCreateTransientFromAdmin <<<\n   [junit4]    > Throwable #1: org.apache.solr.common.SolrException: Core creation failed.  Number of cores marked to load on startup would exceed transient cache size.  Raise transientCacheSize in solr.xml and try again.\n\n ",
+            "id": "comment-14585906"
+        },
+        {
+            "date": "2015-06-16T05:10:21+0000",
+            "author": "Erick Erickson",
+            "content": "I can reproduce this on 4.10, but not on 5x or trunk. Part of deprecating the old solr.xml format where cores were defined in solr.xml involved lots of simplification in the whole core loading/discovery process. I suspect that this problem went away with that simplification, although I also think this was serendipitous.\n\nI'll attached a test case that fails in 4.10 and succeeds in both 5x and trunk and I'll change the \"affected versions\" to 4.10.3 (I suspect this has been around forever so probably affects releases much earlier than 4.10). The \"failure mode\" in these tests is it hangs forever, which is what I believe you're reporting.\n\nThere are really no plans to release any new 4.10 versions at present, and this the first report of this. So I'm afraid there's little chance of releasing a fix specifically for 4.10 and it's unnecessary (apparently) for 5.x+\n\nSo  if you really need this, I think you'll have to patch it locally I'm afraid, unless we can show it happening on 5.x+. ",
+            "id": "comment-14587488"
+        },
+        {
+            "date": "2015-06-16T05:11:53+0000",
+            "author": "Erick Erickson",
+            "content": "Failure for this on 4.10.3. Test case succeeds on 5.x and trunk ",
+            "id": "comment-14587490"
+        },
+        {
+            "date": "2015-06-16T17:25:52+0000",
+            "author": "Shawn Heisey",
+            "content": "I'll attached a test case that fails in 4.10 and succeeds in both 5x and trunk\n\n+1 to committing the new test in trunk and 5x, and leaving 4.10 as it is.  It's a problem with an easy config fix, and now we are aware of it, so it will be part of our troubleshooting arsenal. ",
+            "id": "comment-14588406"
+        },
+        {
+            "date": "2015-06-16T17:29:04+0000",
+            "author": "Erick Erickson",
+            "content": "Yeah, adding the test case occurred to me after I unassigned it. I took it back and I'll commit it sometime Real Soon Now. ",
+            "id": "comment-14588415"
+        },
+        {
+            "date": "2015-06-17T04:23:52+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1685930 from Erick Erickson in branch 'dev/trunk'\n[ https://svn.apache.org/r1685930 ]\n\nSOLR-7667: If more cores are loaded at startup than the transient core size, cores become unavailable. This is a test for this case to guard against regression. This test will fail in 4.x and succeeds in 5x/trunk ",
+            "id": "comment-14589273"
+        },
+        {
+            "date": "2015-06-17T04:40:24+0000",
+            "author": "Erick Erickson",
+            "content": "Patch against 5x (because I forgot to take the diff on trunk before committing). But it's simple and doesn't really fix anything. It just fails on 4.x but succeeds on 5x and trunk so it's here to guard against regression. ",
+            "id": "comment-14589284"
+        },
+        {
+            "date": "2015-06-17T04:40:57+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1685931 from Erick Erickson in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1685931 ]\n\nSOLR-7667: If more cores are loaded at startup than the transient core size, cores become unavailable. This is a test for this case to guard against regression. This test will fail in 4.x and succeeds in 5x/trunk ",
+            "id": "comment-14589286"
+        },
+        {
+            "date": "2015-06-17T04:41:45+0000",
+            "author": "Erick Erickson",
+            "content": "This is not a problem in 5x and trunk so closing as \"won't fix\". If we re-open 4.x for more releases we can reconsider. ",
+            "id": "comment-14589288"
+        }
+    ]
+}

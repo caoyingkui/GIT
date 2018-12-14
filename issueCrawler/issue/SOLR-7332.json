@@ -1,0 +1,164 @@
+{
+    "id": "SOLR-7332",
+    "title": "Seed version buckets with max version from index",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Sub-task",
+        "labels": "",
+        "fix_versions": [
+            "5.2",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "See full discussion with Yonik and I in SOLR-6816.\n\nThe TL;DR of that discussion is that we should initialize highest for each version bucket to the MAX value of the _version_ field in the index as early as possible, such as after the first soft- or hard- commit. This will ensure that bulk adds where the docs don't exist avoid an unnecessary lookup for a non-existent document in the index.",
+    "attachments": {
+        "SOLR-7332.patch": "https://issues.apache.org/jira/secure/attachment/12708552/SOLR-7332.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-03-31T23:08:05+0000",
+            "author": "Timothy Potter",
+            "content": "First pass at a patch that seeds the version buckets with the max value from the index as early as possible. This patch also includes the fix for SOLR-6820 as I found the two solutions combined give the best performance. Specifically, with this patch, I was able to index 9,992,262 docs into a 3x2 collection in 439 seconds (on branch5x), which is roughly 22,761 docs/sec. To compare, branch5x without this patch takes 758 seconds (13,182 docs/sec), the speed up is substantial. What's more is that the CPU load of leaders and replicas are very similar, previously, replicas CPU's were nearly maxed and the leader was only about half utilized. So with this fix, you can push Solr harder as well.\n\nAll tests pass with this patch and I added a basic unit test but would welcome more suggestions on how to test this better esp. edge cases I may not be aware of as I'm not too familiar with the version code.\n\nThe basic approach is to set the highest for all version buckets based on the max version value from the index. As coded, this doesn't happen until the first soft- or hard- commit is triggered, so there's a short window where the version buckets will be set to 0. The issue I found is that there isn't a searcher available yet when VersionInfo is first initialized. I also re-fetch the max after a core reload and after replaying tlogs for the core.\n\nThere's also a little more complexity for dealing with differences in how _version_ could be configured in the schema (with or without docValues).\n\nI'd love to get this in for 5.1 since it gives such a big improvement in performance but it's more important to get this right and not introduce any regression in this all important code path. ",
+            "id": "comment-14389614"
+        },
+        {
+            "date": "2015-04-01T20:46:34+0000",
+            "author": "Yonik Seeley",
+            "content": "Wow, nice results!\n\nWe still have some correctness issues though (but fixing them should not impact performance).\nVersionBucket.highest must be greater or equal to the highest version encountered for that bucket.\nHaving a bucket value too high will only cause a few unnecessary lookups, but having a value too low will cause correctness issues.\n\nPrimary issue: commits happen concurrently with other updates, so attempting to initialize bucket versions from an \"active\" index will mean that we will sometimes set a version too low. \"As coded, this doesn't happen until the first soft- or hard- commit is triggered\" sounds like the index will indeed be active.\n\nSecondary issue: there is a race in setting the bucket version.  VersionBucket.updateHighest will be called with the monitor held, but between the test and the set, VersionInfo.seedBucketVersionHighestFromIndex can change \"highest\".  Or vice-versa. ",
+            "id": "comment-14391417"
+        },
+        {
+            "date": "2015-04-01T22:47:20+0000",
+            "author": "Timothy Potter",
+            "content": "Thanks for the review Yonik Seeley! I'll get these issues fixed up ASAP ...  ",
+            "id": "comment-14391660"
+        },
+        {
+            "date": "2015-04-01T23:19:51+0000",
+            "author": "Timothy Potter",
+            "content": "Yonik Seeley for the first issue, I'm curious if you think trying to initialize the buckets during core initialization (after there is a searcher but before updates are accepted) is the way to go? That was my first thought, but maybe it would be better to invoke the initialization from the DistributedUpdateProcessor#versionAdd method, which is where it is needed. The incoming update will block until the query returns, but that should only be once. Of course that would add a synchronization point for every doc, which isn't ideal either. ",
+            "id": "comment-14391729"
+        },
+        {
+            "date": "2015-04-02T16:32:32+0000",
+            "author": "Timothy Potter",
+            "content": "Here's an updated patch that isn't ready for commit (needs more concurrent unit tests), but takes the approach of seeding the version buckets during core initialization. Two main changes:\n\n1) On first searcher (during core initialization), SolrCore calls a new method in UpdateLog called onFirstSearcher. This does the lookup of the max from the index.\n\nbtw - I actually tried just having UpdateLog implement SolrEventListener, but then that led down a rabbit hole of needing UpdateLog to be SolrCoreAware (to avoid a concurrent mod exception)\n\nOne thing I'm seeing with this approach is a multiple on-deck searcher warning after a core reload, so still tracking that issue down. Wanted to vet out this new approach before doing that though ...\n\n2) If the version is not found in the index, I seed it with the new clock value ...  ",
+            "id": "comment-14392918"
+        },
+        {
+            "date": "2015-04-03T15:42:09+0000",
+            "author": "Timothy Potter",
+            "content": "Ignore that previous - it had a dead-lock condition in it when doing core reloads \n\nI think this updated patch is close to commit for trunk. I've added a distributed test that uses multiple threads to send docs, reload the collection, and commit data - beast passes 20 of 20. However, there are 2 areas that need review:\n\n1) How I'm calling UpdateLog.onFirstSearcher in SolrCore. I was getting a multiple on-deck searcher warning during a core reload because the getSearcher method gets called twice during a reload and if the max version lookup took a little time, then the warning would occur. So I'm calling this as part of the main thread vs. in the background executor. This is of course will block the reload until it finishes but I think given the importance of getting the version buckets seeded correctly, that's OK. Let me know if there's a better way.\n\n2) Originally, I was synchronizing the seedBucketVersionHighestFromIndex method in UpdateLog, but that led to dead-lock when doing reloads because updates continue to flow in while reload occurs (and DistributedUpdateProcessor versionAdd gets the lock on versionBuckets and calls synchronized methods on UpdateLog). So I've switched to using the versionInfo.blockUpdates while looking up the max version from the index, see: UpdateLog.onFirstSearcher. My thinking here is that we actually want to block updates briefly after a reload when getting the max from the index so that we don't end up setting the version too low.\n\nAlso, minor, but I removed the SortedNumericDocValues stuff from the VersionInfo#seedBucketVersionHighestFromIndex method from the previous patch since Solr doesn't have support for that yet and it was a mis-understanding on my part of how that type of field works. So now the lookup of max either uses terms if version is indexed or a range query if not indexed. ",
+            "id": "comment-14394585"
+        },
+        {
+            "date": "2015-04-04T14:36:25+0000",
+            "author": "Yonik Seeley",
+            "content": "Thanks, I'll try to get to reviewing this soonish.  I also want to think about it in the context of SOLR-7347\n\nI've switched to using the versionInfo.blockUpdates\nYep, that's the correct way (to block updates while we're doing something update related).\n\nupdates continue to flow in while reload occurs\nI have less experience with the core reload code, but why do we need to re-find the highest version here?\n\nI also want to think a bit about deletes... we actually can't get the highest version from the index if those versions happened to be deletes.\nConsider the following:\n1) add doc A, version 5\n2) delete doc A, version 10\n3) add doc A, version 8\n\nCurrently, to get the last version for a document, we look in the tlog (which has deletes).  If it's not there, we look in the index.  If it's not there, then we check UpdateLog.oldDeletes (which keeps a list of the last 1000 deletes).  We just need to make sure that the version seeding/checking does re-open a hole due to deletes.  I think this means just making sure we get the highest version from all sources (i.e. the tlog as well).   Making sure we never go backwards in versions is essentially SOLR-7347. ",
+            "id": "comment-14395751"
+        },
+        {
+            "date": "2015-04-06T20:59:18+0000",
+            "author": "Yonik Seeley",
+            "content": "Things good good in general.\nI uploaded a version that should be faster with docvalues (although I haven't tested it for performance).  Maintaining even a 1 element priority queue (as using search will do) will be more expensive, esp since it will be natural to find a more competitive hit as we go through the index.\n\nI do wonder if in the future we can make the get-version-from-index asynchronous (i.e. put it in another thread).  Seems like it should be fine as long as the VersionInfo write lock is held (blocking updates). ",
+            "id": "comment-14481920"
+        },
+        {
+            "date": "2015-04-07T15:04:11+0000",
+            "author": "Timothy Potter",
+            "content": "but why do we need to re-find the highest version here?\n\nI was thinking that was safest to cover operations like merging indexes into the current one but may be overkill ... I'll dig a little deeper into whether that's really necessary because it'll be better if we don't have to re-fetch the max after a reload.\n\nif those versions happened to be deletes\n\nI'll need to think about this more too ... I thought I've seen something about deletes having negative versions? Again, will dig deeper to understand this better as version management around deletes is an area of weakness in my understanding of the codebase.\n\nuploaded a version that should be faster \n\nThanks! That's cool code! I'll post back after I've dug deeper into ^^ ",
+            "id": "comment-14483321"
+        },
+        {
+            "date": "2015-04-07T15:07:39+0000",
+            "author": "Yonik Seeley",
+            "content": "I thought I've seen something about deletes having negative versions?\n\nYep, but it's pretty irrelevant... one just needs to remember to take the absolute value when comparing \"before/after\" and when tracking highest versions. ",
+            "id": "comment-14483326"
+        },
+        {
+            "date": "2015-04-08T17:14:23+0000",
+            "author": "Timothy Potter",
+            "content": "Hi Yonik Seeley just need to clarify something ... in your example above,\n\n\n1) add doc A, version 5\n2) delete doc A, version 10\n3) add doc A, version 8\n\nwe should seed the version buckets with the value of 10, correct? that way when the add with version 8 comes in, we know it's not the latest operation for doc A and would be dropped ... I think i get it now, but just want to be sure  ",
+            "id": "comment-14485568"
+        },
+        {
+            "date": "2015-04-08T19:00:38+0000",
+            "author": "Yonik Seeley",
+            "content": "we should seed the version buckets with the value of 10, correct?\n\nYep.\n\nthat way when the add with version 8 comes in, we know it's not the latest operation for doc A and would be dropped ..\n\nOr to be more precise, we know that there could be a re-order and thus we check what the last version of \"A\" was... first checking in order\n1. the tlog maps not covered by the \"realtime searcher\"\n2. the realtime searcher (in case we didn't find in step #1)\n3. a list of recent deletes (because we can't actually \"see\" deletes in an index)\n ",
+            "id": "comment-14485809"
+        },
+        {
+            "date": "2015-04-08T19:42:20+0000",
+            "author": "Timothy Potter",
+            "content": "Ok, so follow-up question is whether you think it is sufficient to only look in the ulog.getRecentUpdates() for the max version (in addition to the query to the index), or do we need to scan over ulog.map, prevMap, prevMap2, oldDeletes? I was thinking since we're just after the max, recent updates should be sufficient. ",
+            "id": "comment-14485880"
+        },
+        {
+            "date": "2015-04-08T19:49:03+0000",
+            "author": "Yonik Seeley",
+            "content": "Yeah, recentUpdates should be fine... on startup, the other stuff like oldDeletes is populated via recentUpdates.\n ",
+            "id": "comment-14485888"
+        },
+        {
+            "date": "2015-04-09T18:17:29+0000",
+            "author": "Timothy Potter",
+            "content": "Patch that consults ulog.getRecentUpdates() in addition to the index when determining the max version during startup. I also added some deletes to the unit test but to be clear, there's no re-ordering of updates to the same doc between leader and replica in that test ... curious how we might simulate that? ",
+            "id": "comment-14487837"
+        },
+        {
+            "date": "2015-04-22T16:51:48+0000",
+            "author": "Timothy Potter",
+            "content": "Been running some larger-scale perf tests in Ec2 with this, same basic setup as described here: https://lucidworks.com/blog/introducing-the-solr-scale-toolkit/\n\nPreviously, I indexed 130M docs into a 10x2 (10 shards, rf=2) collection using 10 r3.2xlarge instances at an avg. rate of 34,881 docs/sec using Solr 4.8.1. With branch5x with the latest patches for SOLR-7332 and SOLR-7333 applied, the same test resulted in 74,713 docs/sec, which is better than 2x improvement. The results repeated several times \n\nNext, I tried increasing the number of reducers I was using to see how hard I could push Solr and unfortunately, I ended up with 2 shards that had replicas that were out-of-sync with their leader. I'm digging into what may have caused that (proving hard to reproduce now) ... Yonik Seeley can you think of a case where docs could be dropped with this new version bucket seeding stuff? My test is all new adds into an empty collection, no deletes, no updates. At first I was thinking it may be due to the seeding of the highest using the new clock from VersionInfo when the index is empty.\n\n+      long maxVersion = Math.max(maxVersionFromIndex, maxVersionFromRecent);\n+      if (maxVersion == 0L) {\n+        maxVersion = versions.getNewClock();\n+        log.warn(\"Could not find max version in index or recent updates, using new clock {}\", maxVersion);\n+      }\n\n\n\nBut I can't see how that would cause an issue with this logic in DistributedUpdateProcessor's versionAdd method (which is the only code I see that drops requests on a replica):\n\n\n            if (bucketVersion != 0 && bucketVersion < versionOnUpdate) {\n              // we're OK... this update has a version higher than anything we've seen\n              // in this bucket so far, so we know that no reordering has yet occurred.\n              bucket.updateHighest(versionOnUpdate);\n            } else {\n              // there have been updates higher than the current update.  we need to check\n              // the specific version for this id.\n              Long lastVersion = vinfo.lookupVersion(cmd.getIndexedId());\n              if (lastVersion != null && Math.abs(lastVersion) >= versionOnUpdate) {\n                // This update is a repeat, or was reordered.  We need to drop this update.\n                log.debug(\"Dropping add update due to version {}\", idBytes.utf8ToString());\n                return true;\n              }\n\n              // also need to re-apply newer deleteByQuery commands\n              checkDeleteByQueries = true;\n            }\n\n\n\nSeems to me like if the leader and replica's clocks are out-of-sync, then for a new add, either the replica's highest is too low so the if block applies or too high and the else block applies, but since the doc doesn't exist, lastVersion == null. I'll know more once I reproduce it again, but wanted to let you know the current status of this and see if anything jumped out at you as to what could cause the replica to be out-of-sync with the leader. ",
+            "id": "comment-14507393"
+        },
+        {
+            "date": "2015-04-22T21:29:11+0000",
+            "author": "Yonik Seeley",
+            "content": "Next, I tried increasing the number of reducers I was using to see how hard I could push Solr and unfortunately, I ended up with 2 shards that had replicas that were out-of-sync with their leader. \n\nWere there any recoveries or change of leaders during the run?\nIn a way, this is great that you saw this!  Only new adds should significantly narrow what this could be.  Hopefully you'll be able to reproduce.\n\ncan you think of a case where docs could be dropped with this new version bucket seeding stuff?\n\nNo... if we accidentally set the version too high, there are no correctness issues, just extra checks.\nIf we accidentally set the version too low, then we can fail to drop repeated or reordered updates.  But in your test run, this shouldn't be an issue since it's only adds.  Any old repeats won't change the number of docs (and which docs) are in the index.\n\nedit: additionally, it can't be SOLR-7347 since that requires updates to the same document(s) ",
+            "id": "comment-14507943"
+        },
+        {
+            "date": "2015-04-29T14:42:11+0000",
+            "author": "Timothy Potter",
+            "content": "Haven't been able to reproduce this with many stress tests on EC2 and it's starting to get expensive \n\nWere there any recoveries or change of leaders during the run?\n\nThere definitely could have been some recoveries but I'm not sure. I'm taking a snapshot of cluster state before I run my tests to compare to after in case I do reproduce this. Yesterday I pushed it very hard with 48 reducers from Hadoop, which led to some network issue between leader and replica and the leader put the replica into recovery, see SOLR-7483. However, the replica eventually recovered and was in-sync with the leader at the end, which is goodness.\n\nNo... \n\nThanks for confirming. I was thinking that maybe it had something to do with this patch resetting the max after replaying the tlog:\n\nFrom UpdateLog:\n\n@@ -1247,6 +1269,12 @@\n         // change the state while updates are still blocked to prevent races\n         state = State.ACTIVE;\n         if (finishing) {\n+\n+          // after replay, update the max from the index\n+          log.info(\"Re-computing max version from index after log re-play.\");\n+          maxVersionFromIndex = null;\n+          getMaxVersionFromIndex();\n+\n           versionInfo.unblockUpdates();\n         }\n\n\n\nBut since updates are blocked while this happens, it seems like the right thing to do.\n\nI'm going to run this a few more times using same setup as when it occurred the first time and then I think we should commit this to trunk and see how it behaves for a few days, as the performance improvement is a big win. ",
+            "id": "comment-14519457"
+        },
+        {
+            "date": "2015-05-18T21:50:08+0000",
+            "author": "Timothy Potter",
+            "content": "Ran my test suite in Ec2 about 10 more times and wasn't able to reproduce it. Also, I've run branch5x with the patches for this and 7333 applied using Shalin's Jepsen test suite and no data loss there as well. I'd like to get this in for 5.2 so please give one last look ASAP. ",
+            "id": "comment-14549298"
+        },
+        {
+            "date": "2015-05-20T16:52:39+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1680639 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1680639 ]\n\nSOLR-7332: Initialize the highest value for all version buckets with the max value from the index or recent updates to avoid unnecessary lookups to the index to check for reordered updates when processing new documents. ",
+            "id": "comment-14552654"
+        },
+        {
+            "date": "2015-05-20T18:23:08+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1680648 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1680648 ]\n\nSOLR-7332: Initialize the highest value for all version buckets with the max value from the index or recent updates to avoid unnecessary lookups to the index to check for reordered updates when processing new documents. ",
+            "id": "comment-14552829"
+        },
+        {
+            "date": "2015-05-20T19:47:37+0000",
+            "author": "Timothy Potter",
+            "content": "Calling this one good since I wasn't able to reproduce any data-loss under heavy load on EC2 (10+ runs) and with Shalin's Jepsen tests. ",
+            "id": "comment-14552971"
+        },
+        {
+            "date": "2015-06-15T21:43:13+0000",
+            "author": "Anshum Gupta",
+            "content": "Bulk close for 5.2.0. ",
+            "id": "comment-14586837"
+        }
+    ]
+}

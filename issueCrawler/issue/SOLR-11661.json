@@ -1,0 +1,75 @@
+{
+    "id": "SOLR-11661",
+    "title": "New HDFS collection reuses unremoved data from a deleted HDFS collection with same name causes inconsistent view of documents",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.3",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "While testing SOLR-11458, Andrzej Bialecki  ran into an interesting failure which resulted in different document counts between leader and replica. The test is MoveReplicaHDFSTest on jira/solr-11458-2 branch.\n\nThe failure is rare but reproducible on beasting:\n\nreproduce with: ant test  -Dtestcase=MoveReplicaHDFSTest -Dtests.method=testNormalFailedMove -Dtests.seed=161856CB543CD71C -Dtests.slow=true -Dtests.locale=ar-SA -Dtests.timezone=US/Michigan -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n   [junit4] FAILURE 14.2s | MoveReplicaHDFSTest.testNormalFailedMove <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: expected:<100> but was:<56>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([161856CB543CD71C:31134983787E4905]:0)\n   [junit4]    > \tat org.apache.solr.cloud.MoveReplicaTest.testFailedMove(MoveReplicaTest.java:305)\n   [junit4]    > \tat org.apache.solr.cloud.MoveReplicaHDFSTest.testNormalFailedMove(MoveReplicaHDFSTest.java:69)\n\n\n\nThe root problem here is when the old replica is not live during deletion of a collection, the correspond HDFS data of that replica is not removed therefore when a new collection with the same name as the deleted collection is created, new replicas will reuse the old HDFS data. This leads to many problems in leader election and recovery",
+    "attachments": {
+        "11458-2-MoveReplicaHDFSTest-log.txt": "https://issues.apache.org/jira/secure/attachment/12898437/11458-2-MoveReplicaHDFSTest-log.txt",
+        "SOLR-11661.patch": "https://issues.apache.org/jira/secure/attachment/12906314/SOLR-11661.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-11-20T08:51:39+0000",
+            "content": "Full logs attached.\n\nDat and I analyzed the logs and we found this problem:\n\n# New collection called MoveReplicaHDFSTest_failed_coll is being created. New replicas core_node7 and core_node8 for shard are in process of being created.\n# New core MoveReplicaHDFSTest_failed_coll_shard2_replica_n4 core_node7 tries to become leader, asks MoveReplicaHDFSTest_failed_coll_shard2_replica_n6 core_node8 to sync\n# Sync fails because core_node8 has no versions\n# core_node7 becomes leader and asks core_node8 to recover\n# core_node8 gets a request to recover and starts recovery thread recoveryExecutor-53-thread-1-processing-n:127.0.0.1:61049_solr\n# core_node8 enters buffering state\n# core_node8 sends prep recovery command to core_node7 and publishes itself in recovery state\n# core_node7 has a thread in WaitForState and sees core_node8 as down currently\n# At t=70388, some DataStreamer Exception is reported from DFSClient and leader core_node7 logs that  it could not close the HDFS transaction log due to no more good datanodes being available -- these look like they aren't relevant to the problem\n# core_node7 (leader) publishes itself as active\n# core_node7 create core is complete\n# core_node8 create thread (qtp1713789948-2124) sees that there is a leader and publishes itself as active, skipping recovery\n# core_node8 create core command is successful\n# collection create is finished\n# core_node7 remains tied in WaitForState because from now on it only sees core_node8 in active but not in recovery\n# the recovery thread in core_node8 remains waiting in prep recovery\n# New documents are added to the collection but they aren't visible to searchers because core_node8 is buffering and therefore ignores commit requests\n\n\n\nSo there is a race between the core create thread publishing local as active after the leader has asked said core to recover. This is a side effect of SOLR-9566 which skips recovery for replicas which are being created as part of a new collection. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16258955"
+        },
+        {
+            "date": "2017-11-20T11:59:24+0000",
+            "content": "Actually, Dat pointed out to me privately that the recovery thread is created because of core_node8 losing leader election. The request to recover made by core_node7 to core_node8 becomes a no-op because a recovery is already underway. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16259155"
+        },
+        {
+            "date": "2017-12-09T07:27:36+0000",
+            "content": "This bug relates to HDFS lease recovery. When tlog files of a replica (core_node7 in this case) get deleted and get recovered when a new collection of the same name gets created.\n\nMark Miller : for newly created core, should we skip lease recovery?? ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16284644"
+        },
+        {
+            "date": "2018-01-17T01:42:32+0000",
+            "content": "Attached a patch for reproduce the problem 100%, the case here is \n\n\twhen a node get down in DELETECOLLECTION, the correspond cores in that node is never being cleanup ( the core.properties, the index dir and tlog dir )\n\tafter that if a core with same name and same collection get created on different node, it will reuse the old stale tlog and index dir which leads to many problems\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16328125"
+        },
+        {
+            "date": "2018-01-24T07:55:25+0000",
+            "content": "A patch for this ticket, this patch solve the problem by do not remove the counter node in case of failures, hence even when a new collection with same name is created, the core node name will be different -> the data dir will be different on HDFS. ( this solution is found after a discussion with Shalin Shekhar Mangar, thanks! )\n\nThis require some changes in several places\n\n\tClusterStateUpdater only remove state.json of a collection, the rest data on ZK will be deleted by DeleteCollectionCmd.\n\tOverseerCollectionMessageHandler.collectionCmd will return a list of replicas which did not online to receive the request\n\n ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16337088"
+        },
+        {
+            "date": "2018-01-25T10:34:34+0000",
+            "content": "The test passed so I will commit tomorrow if there are no objection\nNoble Paul Shalin Shekhar Mangar ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16339045"
+        },
+        {
+            "date": "2018-01-30T04:30:47+0000",
+            "content": "Commit c56d774eb6555baa099fec22f290a9b5640a366d in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c56d774 ]\n\nSOLR-11661: New HDFS collection reuses unremoved data from a deleted HDFS collection with same name causes inconsistent view of documents ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16344485"
+        },
+        {
+            "date": "2018-01-30T04:32:12+0000",
+            "content": "Commit 3527fa5979f6d4fded58767d84ffb0988734acd2 in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3527fa5 ]\n\nSOLR-11661: New HDFS collection reuses unremoved data from a deleted HDFS collection with same name causes inconsistent view of documents ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16344487"
+        }
+    ]
+}

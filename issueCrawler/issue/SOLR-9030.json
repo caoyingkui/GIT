@@ -1,0 +1,245 @@
+{
+    "id": "SOLR-9030",
+    "title": "The 'downnode' command can trip asserts in ZkStateWriter",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.5.2",
+            "5.6",
+            "6.0.1",
+            "6.1",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "While working on SOLR-9014 I came across a strange test failure.\n\n\n   [junit4] ERROR   16.9s | AsyncCallRequestStatusResponseTest.testAsyncCallStatusResponse <<<\n   [junit4]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=46, name=OverseerStateUpdate-95769832112259076-127.0.0.1:51135_z_oeg%2Ft-n_0000000000, state=RUNNABLE, group=Overseer state updater.]\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([91F68DA7E10807C3:CBF7E84BCF328A1A]:0)\n   [junit4]    > Caused by: java.lang.AssertionError\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([91F68DA7E10807C3]:0)\n   [junit4]    > \tat org.apache.solr.cloud.overseer.ZkStateWriter.writePendingUpdates(ZkStateWriter.java:231)\n   [junit4]    > \tat org.apache.solr.cloud.Overseer$ClusterStateUpdater.run(Overseer.java:240)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n\n\nThe underlying problem can manifest by tripping the above assert or a BadVersionException as well. I found that this was introduced in SOLR-7281 where a new 'downnode' command was added.",
+    "attachments": {
+        "SOLR-9030.patch": "https://issues.apache.org/jira/secure/attachment/12802302/SOLR-9030.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-04-22T13:44:27+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Although it can be reproduced in many tests rarely, I found it in AsyncCallRequestStatusResponseTest. Beasting this test finds the failure pretty often. ",
+            "id": "comment-15253949"
+        },
+        {
+            "date": "2016-04-22T17:23:29+0000",
+            "author": "Mark Miller",
+            "content": "Why does that assert even exist? ",
+            "id": "comment-15254262"
+        },
+        {
+            "date": "2016-04-22T17:29:16+0000",
+            "author": "Mark Miller",
+            "content": "or a BadVersionException as well\n\nAnd shouldn't we expect that that can happen and deal with it appropriately? (A retry or something?)\n\nNot that something else might not be off, but it just seems like that assert is strange, and we should handle the case when the setData fails due to a version conflict - seems odd to specify a version to expect to update and then not deal with a failure. ",
+            "id": "comment-15254280"
+        },
+        {
+            "date": "2016-04-22T17:34:46+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "It exists to ensure that we do not update/overwrite a cluster state if we had no idea of its previous znode version. Also the default value of znode in a DocCollection is -1. If left unchecked, ZK will overwrite the value in the state without the CAS checks that we rely on.\n\nAnd shouldn't we expect that that can happen and deal with it appropriately? (A retry or something?)\n\nYes and it does recover automatically. A BadVersionException will cause the complete cluster state to be re-fetched from ZK and the operation is retried. In production environments, the BadVersionException will not be a problem but the overwriting of state can be. ",
+            "id": "comment-15254288"
+        },
+        {
+            "date": "2016-04-26T00:11:48+0000",
+            "author": "Scott Blum",
+            "content": "Can you try making DocCollection.znodeVersion be private final int?  It's currently marked as non-final, which makes no sense because it's never updated.  It's a long shot, but setting a final instance variable in a constructor gives a stronger concurrency / visibility guarantee than setting a non-final instance var. ",
+            "id": "comment-15257309"
+        },
+        {
+            "date": "2016-04-26T00:13:06+0000",
+            "author": "Scott Blum",
+            "content": "BTW, can you paste in the beast command you're using?  I can try it also. ",
+            "id": "comment-15257312"
+        },
+        {
+            "date": "2016-04-26T13:06:38+0000",
+            "author": "Mark Miller",
+            "content": "Can you try making DocCollection.znodeVersion be private final int? It's currently marked as non-final, which makes no sense because it's never updated. It's a long shot, but setting a final instance variable in a constructor gives a stronger concurrency / visibility guarantee than setting a non-final instance var.\n\nThat should not be true should it? An effectively immutable field should have the same thread safety as a final field? ",
+            "id": "comment-15258043"
+        },
+        {
+            "date": "2016-04-26T13:21:29+0000",
+            "author": "Mark Miller",
+            "content": "Of course we should make that final anyway, I'm just trying to make sure I understand - we should be fine with effectively immutable because clusterState is published via volatile right? Final is required when you share an object across threads and don't safely publish it somehow. ",
+            "id": "comment-15258071"
+        },
+        {
+            "date": "2016-04-26T13:47:21+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "You can reproduce using:\n\nant -Dtestcase=AsyncCallRequestStatusResponseTest -Dbeast.iters=50 beast\n\n\n\nThis particular assert is tripped when the following hold true:\n\n\tcontrol_collection is in state format 1\n\tcollection1 is in state format 2\n\tcollection1 is created but not written to ZK \u2013 znode version is -1\n\tdownnode modifies at least two collections (in the above test, it modifies control_collection and collection1)\n\tmaybeFlushBefore logic is tripped when modifying control_collection (because it is in a different state format) \u2013 this flushes collection1 \u2013 znode version is now 0\n\tnow the change made by downnode to collection1 trips the assert because when 'downnode' was executed, the returned ZkWriteCommand had collection1 with version -1 but now it is 0.\n\n\n\nOne way to solve this problem i.e. to avoid the overwriting would be to use a sentinel value other than -1 for znodeVersion because ZK considers -1 as any version in CAS. If we can use, say Integer.MAX_VALUE then the logic to retry on version conflict will automatically take care of this problem and we can remove the assert too. ",
+            "id": "comment-15258110"
+        },
+        {
+            "date": "2016-04-26T17:58:10+0000",
+            "author": "Scott Blum",
+            "content": "The final keyword conveys special thread-safety semantics in the JMM.\nhttps://docs.oracle.com/javase/specs/jls/se7/html/jls-17.html#jls-17.5\n\nI don't know that this is actually the bug, but because DocCollection initializes znodeVersion to -1 before subsequently setting it to the 'correct' value, it's not out of the question that this could expose a data race that marking the field 'final' would have prevented.  We should make that change anyway.  Here's another description with a code example:\n\nhttp://www.cs.umd.edu/~pugh/java/memoryModel/jsr-133-faq.html#finalRight\n\nI don't think \"effectively final\" has any special meaning for instance fields; the compiler can infer that local variables are effectively final through static analysis, but the compiler can't know whether or not you might modify a non-final instance field via reflection. ",
+            "id": "comment-15258560"
+        },
+        {
+            "date": "2016-04-26T18:03:24+0000",
+            "author": "Scott Blum",
+            "content": "Nice digging!  Can I just say for the record, I'm not a huge fan of ZkStateWriter in its current formulation.  Would love to chat sometime about its design and how we could improve it. ",
+            "id": "comment-15258571"
+        },
+        {
+            "date": "2016-04-26T22:24:24+0000",
+            "author": "Mark Miller",
+            "content": "Like I said though, those thread-safety semantics apply when you share an object across threads without safe publication. We do safe publication in this case.\n\nWhen DocCollection is shared across threads, it's container object (clusterstate) is published with a volatile (or an atomicreference now?), and any member fields of that volatile object will be fully initialized and sharable across threads as long as they are effectively immutable.\n\nIf we wanted to just share a DocCollection across threads and there was no memory barrier, then they would have to be final and take advantage of the special thread safety semantics in the JVM. ",
+            "id": "comment-15259068"
+        },
+        {
+            "date": "2016-04-26T23:59:26+0000",
+            "author": "Scott Blum",
+            "content": "I did say it was a long shot. \nStill, any reason for me not to do the 1-liner and make it final? ",
+            "id": "comment-15259219"
+        },
+        {
+            "date": "2016-04-28T15:49:23+0000",
+            "author": "Mark Miller",
+            "content": "Of course we should make that final anyway\n\nI just wanted to make sure my understanding was correct - I was less sure when I first commented, going by memory, did a lot of reading by the time of my second comment. Pretty confident in my assessment currently. It's just important, because if I was wrong, we should try and fix a bunch of faulty code, as I'm sure there is more code like this. As it is, final is better, but not required. You can count on a volatile field having it's constructor run and all of it's fields being initialized as if it all happened in a single thread. ",
+            "id": "comment-15262376"
+        },
+        {
+            "date": "2016-04-28T22:06:14+0000",
+            "author": "Scott Blum",
+            "content": "Glad you wrote back to clarify, this got me to go do some reading as well and I agree with your conclusions. ",
+            "id": "comment-15263124"
+        },
+        {
+            "date": "2016-05-04T10:51:27+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Yeah you have said that before. I am all for simplifying and improving it but I don't have an idea right now. I'd be happy to hear your thoughts. ",
+            "id": "comment-15270465"
+        },
+        {
+            "date": "2016-05-04T15:54:07+0000",
+            "author": "Scott Blum",
+            "content": "ZkStateWriter is basically a write cache.  It should be much simpler than it is.  A few things that bug me in no particular order:\n\n1) Tracking lastStateFormat / lastCollectionName and in general having a maybeFlushBefore / maybeFlushAfter makes no real sense to me.  If ZkStateWriter were capable of operating as a perfect write cache, the content of what's being written should never force a flush.  It should be able to just always keep queuing operations until the desired time delay is hit, or it's flushed from the outside.\n\n2) ZkStateWriter's ClusterState liveNodes should probably be a view on ZkStateReader's ClusterState liveNode.\n\n3) ZkWriteCallback - the one place this is used is the Overseer stateUpdateQueue handling.  I think the way that loop works would ZkStateWriter could be done a little better.  Ideally, I would want to peek up to N children at a time from that queue, send them all through ZkStateWriter in succession, flush, then remove those N items from the stateUpdateQueue.   If the flush failed from some reason, it could return a count of items committed so we could remove that many items from the stateUpdateQueue.  It seems a little nuts to have a second workQueue in operation the way it is today.  I get that in some situations we'd end up doing more net cluster state writes, but I think we'd still do fewer net writes to ZK since we do so much queue management. ",
+            "id": "comment-15270875"
+        },
+        {
+            "date": "2016-05-04T22:57:57+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Patch which uses Integer.MAX_VALUE as the default znodeVersion and removes the assert in ZkStateWriter. The 'downnode' still has the problem that I described above but with this patch it will cause a BadVersionException which the Overseer is designed to recover from. ",
+            "id": "comment-15271600"
+        },
+        {
+            "date": "2016-05-04T23:05:07+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Regarding #1, somebody still has to determine when to flush, maybe we just always do it time-based. In that case the logic can move (back) to Overseer. This flushing logic used to live in Overseer initially but it made things complicated so I moved it out to ZkStateWriter to simplify the overseer loop.\n\nFor #2 \u2013 the ZkStateWriter's live nodes aren't used anywhere. It is only for correctness that I always copy over live nodes from the ZkStateReader. I don't mind doing this though.\n\nFor #3 \u2013 I never liked ZkWriteCallback even though I wrote that bit. It was always a hack. I like your idea of peeking N items at a time.\n\nLet's create separate issues to track these improvements. ",
+            "id": "comment-15271607"
+        },
+        {
+            "date": "2016-05-04T23:45:13+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I made the znode version final as well. I'll commit this now. ",
+            "id": "comment-15271647"
+        },
+        {
+            "date": "2016-05-04T23:46:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit c2662f24ac171c38aa17c0b7bbae0fd6b43652b5 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c2662f2 ]\n\nSOLR-9030: The 'downnode' overseer command can trip asserts in ZkStateWriter ",
+            "id": "comment-15271650"
+        },
+        {
+            "date": "2016-05-04T23:48:38+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 827573b1a7bda2ae853f03c518f313e5992c1a7c in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=827573b ]\n\nSOLR-9030: Added a code comment as to why we use Integer.MAX_VALUE instead of -1 ",
+            "id": "comment-15271654"
+        },
+        {
+            "date": "2016-05-05T10:28:41+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 29f69975022e6937e75091237e884fead444d07b in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=29f6997 ]\n\nSOLR-9030: The 'downnode' overseer command can trip asserts in ZkStateWriter\n(cherry picked from commit c2662f2) ",
+            "id": "comment-15272166"
+        },
+        {
+            "date": "2016-05-05T10:33:44+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ee45e83439a69e67037413304c32e3caf0bfb1d2 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ee45e83 ]\n\nSOLR-9030: Added a code comment as to why we use Integer.MAX_VALUE instead of -1\n\n(cherry picked from commit 827573b1a7bda2ae853f03c518f313e5992c1a7c) ",
+            "id": "comment-15272170"
+        },
+        {
+            "date": "2016-05-05T10:51:14+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I renamed the issue to remove the part about BadVersionException because that is to be expected with the current design but handled already.\n\nLet's create separate issues for ZkStateWriter/Overseer improvements.\n\nThanks Mark and Scott! ",
+            "id": "comment-15272190"
+        },
+        {
+            "date": "2016-05-09T22:01:07+0000",
+            "author": "Hoss Man",
+            "content": "\nManually correcting fixVersion per Step #S5 of LUCENE-7271 ",
+            "id": "comment-15277139"
+        },
+        {
+            "date": "2016-05-20T21:23:41+0000",
+            "author": "Steve Rowe",
+            "content": "Reopening to backport to 6.0.1. ",
+            "id": "comment-15294253"
+        },
+        {
+            "date": "2016-05-20T21:24:28+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 4330710c114b6161ca78a0d92adaa273b92fad88 in lucene-solr's branch refs/heads/branch_6_0 from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4330710 ]\n\nSOLR-9030: The 'downnode' overseer command can trip asserts in ZkStateWriter\n(cherry picked from commit c2662f2) ",
+            "id": "comment-15294257"
+        },
+        {
+            "date": "2016-05-20T21:24:29+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit a6adc681be2514f61d8e785ca360c204c2c60131 in lucene-solr's branch refs/heads/branch_6_0 from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a6adc68 ]\n\nSOLR-9030: Added a code comment as to why we use Integer.MAX_VALUE instead of -1\n\n(cherry picked from commit 827573b1a7bda2ae853f03c518f313e5992c1a7c) ",
+            "id": "comment-15294258"
+        },
+        {
+            "date": "2016-05-28T13:38:26+0000",
+            "author": "Steve Rowe",
+            "content": "Bulk close issues included in the 6.0.1 release. ",
+            "id": "comment-15305369"
+        },
+        {
+            "date": "2016-06-17T20:56:45+0000",
+            "author": "Steve Rowe",
+            "content": "Reopening to backport to 5.6 and 5.5.2. ",
+            "id": "comment-15336933"
+        },
+        {
+            "date": "2016-06-17T20:57:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit fb6f42a7bc311f7cb95653db6718c6eac94090c1 in lucene-solr's branch refs/heads/branch_5_5 from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fb6f42a ]\n\nSOLR-9030: The 'downnode' overseer command can trip asserts in ZkStateWriter\n(cherry picked from commit c2662f2) ",
+            "id": "comment-15336934"
+        },
+        {
+            "date": "2016-06-17T20:57:22+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit e62e6c4b79cfe297d1b34c26bd1911ec5d448ca4 in lucene-solr's branch refs/heads/branch_5x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e62e6c4 ]\n\nSOLR-9030: The 'downnode' overseer command can trip asserts in ZkStateWriter\n(cherry picked from commit c2662f2) ",
+            "id": "comment-15336935"
+        },
+        {
+            "date": "2016-06-17T20:59:05+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 71a28b100712706a002eb364bcaa88b81b86a04e in lucene-solr's branch refs/heads/branch_5_5 from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=71a28b1 ]\n\nSOLR-9030: Added a code comment as to why we use Integer.MAX_VALUE instead of -1\n\n(cherry picked from commit 827573b1a7bda2ae853f03c518f313e5992c1a7c) ",
+            "id": "comment-15336940"
+        },
+        {
+            "date": "2016-06-17T20:59:06+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 394822de751f93cd39d01f26b352f299193ee31c in lucene-solr's branch refs/heads/branch_5x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=394822d ]\n\nSOLR-9030: Added a code comment as to why we use Integer.MAX_VALUE instead of -1\n\n(cherry picked from commit 827573b1a7bda2ae853f03c518f313e5992c1a7c) ",
+            "id": "comment-15336941"
+        },
+        {
+            "date": "2016-06-25T20:33:52+0000",
+            "author": "Steve Rowe",
+            "content": "Bulk close issues released with 5.5.2. ",
+            "id": "comment-15349803"
+        }
+    ]
+}

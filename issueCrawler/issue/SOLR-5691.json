@@ -1,0 +1,54 @@
+{
+    "id": "SOLR-5691",
+    "title": "Unsynchronized WeakHashMap in SolrDispatchFilter causing issues in SolrCloud",
+    "details": {
+        "affect_versions": "4.6.1",
+        "status": "Closed",
+        "fix_versions": [
+            "4.7",
+            "6.0"
+        ],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "I have a large SolrCloud setup, 7 nodes, each hosting few 1000 cores (leaders/replicas of same shard exist on different nodes), which is maybe making it easier to notice the problem.\n\nNode can randomly get into a state where it \"stops\" responding to PeerSync /get requests from other nodes. When that happens, threaddump of that node shows multiple entries like this one (one entry for each \"blocked\" request from other node; they don't go away with time):\n\n\"http-bio-8080-exec-1781\" daemon prio=5 tid=0x440177200000 nid=0x25ae  [ JVM locked by VM at safepoint, polling bits: safep ]\n   java.lang.Thread.State: RUNNABLE\n        at java.util.WeakHashMap.get(WeakHashMap.java:471)\n        at org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:351)\n        at org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:201)\n        at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:243)\n        at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:210)\n\nWeakHashMap's internal state can easily get corrupted when used in unsynchronized way, in which case it is known to enter infinite loop in .get() call. It is very likely that this happens here too. The reason why other maybe don't see this issue could be related to huge number of cores I have in this system. The problem is usually created when some node is starting. Also, it doesn't happen with each start, it obviously depends on \"correct\" timing of events which lead to map's corruption.\n\nThe fix may be as simple as changing:\n\nprotected final Map<SolrConfig, SolrRequestParsers> parsers = new WeakHashMap<SolrConfig, SolrRequestParsers>();\n\nto:\n\n  protected final Map<SolrConfig, SolrRequestParsers> parsers = Collections.synchronizedMap(\n      new WeakHashMap<SolrConfig, SolrRequestParsers>());\n\nbut there may be performance considerations around this since it is entrance into Solr.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13891055",
+            "date": "2014-02-04T19:22:56+0000",
+            "content": "Hmm...what if we put the parser on the solrconfig object as a volatile? Volatiles that don't change are very fast and we avoid the ugly weakhashmap altogether:\n\n\nIndex: solr/core/src/java/org/apache/solr/core/SolrConfig.java\n===================================================================\n--- solr/core/src/java/org/apache/solr/core/SolrConfig.java\t(revision 1564426)\n+++ solr/core/src/java/org/apache/solr/core/SolrConfig.java\t(working copy)\n@@ -18,6 +18,7 @@\n package org.apache.solr.core;\n \n import static org.apache.solr.core.SolrConfig.PluginOpts.*;\n+\n import org.apache.solr.common.SolrException;\n import org.apache.solr.common.SolrException.ErrorCode;\n import org.apache.solr.schema.IndexSchemaFactory;\n@@ -28,11 +29,11 @@\n import org.apache.solr.request.SolrRequestHandler;\n import org.apache.solr.response.QueryResponseWriter;\n import org.apache.solr.response.transform.TransformerFactory;\n-\n import org.apache.solr.search.CacheConfig;\n import org.apache.solr.search.FastLRUCache;\n import org.apache.solr.search.QParserPlugin;\n import org.apache.solr.search.ValueSourceParser;\n+import org.apache.solr.servlet.SolrRequestParsers;\n import org.apache.solr.update.SolrIndexConfig;\n import org.apache.solr.update.UpdateLog;\n import org.apache.solr.update.processor.UpdateRequestProcessorChain;\n@@ -40,10 +41,8 @@\n import org.apache.lucene.search.BooleanQuery;\n import org.apache.lucene.index.IndexDeletionPolicy;\n import org.apache.lucene.util.Version;\n-\n import org.slf4j.Logger;\n import org.slf4j.LoggerFactory;\n-\n import org.w3c.dom.Node;\n import org.w3c.dom.NodeList;\n import org.xml.sax.InputSource;\n@@ -89,6 +88,8 @@\n   private boolean handleSelect;\n \n   private boolean addHttpRequestToContext;\n+\n+  private volatile SolrRequestParsers solrRequestParsers;\n   \n   /** Creates a default instance from the solrconfig.xml. */\n   public SolrConfig()\n@@ -324,6 +325,13 @@\n     }\n     return result;\n   }\n+  \n+  public SolrRequestParsers getRequestParsers() {\n+    if (solrRequestParsers == null) {\n+      solrRequestParsers = new SolrRequestParsers(this);\n+    }\n+    return solrRequestParsers;\n+  }\n \n   /* The set of materialized parameters: */\n   public final int booleanQueryMaxClauseCount;\nIndex: solr/core/src/java/org/apache/solr/servlet/SolrDispatchFilter.java\n===================================================================\n--- solr/core/src/java/org/apache/solr/servlet/SolrDispatchFilter.java\t(revision 1564426)\n+++ solr/core/src/java/org/apache/solr/servlet/SolrDispatchFilter.java\t(working copy)\n@@ -103,7 +103,6 @@\n \n   protected String pathPrefix = null; // strip this from the beginning of a path\n   protected String abortErrorMessage = null;\n-  protected final Map<SolrConfig, SolrRequestParsers> parsers = new WeakHashMap<SolrConfig, SolrRequestParsers>();\n   \n   private static final Charset UTF8 = Charset.forName(\"UTF-8\");\n \n@@ -348,12 +347,7 @@\n         if( core != null ) {\n           final SolrConfig config = core.getSolrConfig();\n           // get or create/cache the parser for the core\n-          SolrRequestParsers parser = null;\n-          parser = parsers.get(config);\n-          if( parser == null ) {\n-            parser = new SolrRequestParsers(config);\n-            parsers.put(config, parser );\n-          }\n+          SolrRequestParsers parser = config.getRequestParsers();\n \n           // Handle /schema/* paths via Restlet\n           if( path.startsWith(\"/schema\") ) {\n\n "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13893027",
+            "date": "2014-02-06T04:47:45+0000",
+            "content": "Commit 1565069 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1565069 ]\n\nSOLR-5691: Sharing non thread safe WeakHashMap across thread can cause problems. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13893028",
+            "date": "2014-02-06T04:48:46+0000",
+            "content": "Commit 1565070 from Mark Miller in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1565070 ]\n\nSOLR-5691: Sharing non thread safe WeakHashMap across thread can cause problems. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13893029",
+            "date": "2014-02-06T04:49:18+0000",
+            "content": "Die WeakHashMap, die!\n\nThanks Bojan! "
+        },
+        {
+            "author": "Bojan Smid",
+            "id": "comment-13893200",
+            "date": "2014-02-06T09:18:26+0000",
+            "content": "Thanks for fixing! "
+        }
+    ]
+}

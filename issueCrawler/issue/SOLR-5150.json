@@ -1,0 +1,132 @@
+{
+    "id": "SOLR-5150",
+    "title": "HdfsIndexInput may not fully read requested bytes.",
+    "details": {
+        "affect_versions": "4.4",
+        "status": "Closed",
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Patrick Hunt noticed that our HdfsDirectory code was a bit behind Blur here - the read call we are using may not read all of the requested bytes - it returns the number of bytes actually written - which we ignore.\n\nBlur moved to using a seek and then readFully call - synchronizing across the two calls to deal with clones.\n\nWe have seen that really kills performance, and using the readFully call that lets you pass the position rather than first doing a seek, performs much better and does not require the synchronization.\n\nI also noticed that the seekInternal impl should not seek but be a no op since we are seeking on the read.",
+    "attachments": {
+        "SOLR-5150.patch": "https://issues.apache.org/jira/secure/attachment/12597970/SOLR-5150.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13739664",
+            "date": "2013-08-14T13:33:09+0000",
+            "content": "Nice catch! As there is a positioned readFully we can handle that in a good way without loosing performance. Otherwise I would have suggested to use an approach like done in NIOFSDir (we using chunking + a while (remaining) loop and update the position pointer).\n\nI also noticed that the seekInternal impl should not seek but be a no-op since we are seeking on the read.\n\nRight! I dont know why seekInternal in the BufferedIndexInput is still there. IMHO, it should be removed from the base class, as it is no longer used anywhere (at least it should default to an empty method). No IndexInput in Lucene is implementing it anymore, because with positional reads it is not applicable and in the case of separate seek/read, the seek and read must be synchronized because of clones (unless every IndexInput has a separate file descriptor). "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13742432",
+            "date": "2013-08-16T17:37:16+0000",
+            "content": "I've held off on committing this because some performance tests indicate the upstream blur patch may have been more performant for merging/flushing while the current patch is much more performant for queries.\n\nWe might be able to use one or the other based on the IOContext.\n\nI'm waiting until I can get some more results and testing done though - I've seen lots of random deadlock situations in some of my testing with the upstream blur fix (synchronization around two calls). "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13742433",
+            "date": "2013-08-16T17:37:45+0000",
+            "content": "Patrick Hunt was on vacation, but is now back and may have some thoughts on this issue as well. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13742441",
+            "date": "2013-08-16T17:44:58+0000",
+            "content": "To describe that more fully: not deadlock - just really long pauses - no cpu or harddrive usage by either hdfs processes or solr for a long time - threads hanging out in socket waits of some kind it seemed.\n\nThat is how I first saw the slowdown with the blur fix - I was running one of the HdfsDirectory tests on my mac and it took 10 min instead of 14 seconds. On linux, the test was still fast. Some other perf tests around querying took a nose dive on linux as well though. Meanwhile, some tests involving indexing sped up.\n\nThe current patch sped that test back up on my mac and fixed the query perf test.\n\nWe might be able to get the best of both worlds, or the synchronized version might not be worth it. "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13742465",
+            "date": "2013-08-16T17:59:30+0000",
+            "content": "Hi Mark,\nI think your version should be preferred in both cases. The Apache Blur upstream version looks like SimpleFSIndexInput (which has synchronization on the RandomAccessFile). The difference is here, that reading from a real file has no network involved (at least not for local filesystems) so the time spent in the locked code block is shorter. Still SimpleFSDir is bad for queries.\nWhen merging the whole stuff works single-threaded per file so you would see no difference in both approaches. If the positional readFully approach would be slower, then this would be clearly a bug in Hdfs.\nAnother alternative would be: When cloning a file also clone the underlying Hdfs connection. With RandomAccessFile we cannot do this in the JDK (we have no dup() for file descriptors), but if Hdfs supports some dup() like approach with delete on-last close semantics (the file could already be deleted when you dup the file descriptor) you could create 2 different connection for each thread.\nThe backside: Lucene never closes clones - one reason why I gave up on implementig a Windows-Optimized directory that would clone underlying file descriptor: The clone would never close the dup  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13742831",
+            "date": "2013-08-17T04:02:03+0000",
+            "content": "If the positional readFully approach would be slower, then this would be clearly a bug in Hdfs.\n\nRight - if that turns out to be the case, I'd raise an issue with the hdfs team. The performance difference actually looks fairly large on first glance though, so it might be worth working around for a while if possible. I don't really know yet.\n "
+        },
+        {
+            "author": "Patrick Hunt",
+            "id": "comment-13743168",
+            "date": "2013-08-18T07:02:43+0000",
+            "content": "Hi Mark Miller, thanks for filing this while I was out. I was trying to track down another issue and happened across it while reviewing code (then noticed that blur had changed from the original).\n\nI realized the seekInternal change while on vacation, was going to mention that but it looks like you fixed it already. \n\nI reviewed the HDFS client code for readInternal with a member of our HDFS team before generating the original patch. Based on the feedback I got the understood was that doing the seek followed by the readFully should have been highest performance. It's interesting that the query performance was so negatively impacted. We should followup with those folks again, perhaps you could provide more insight (than I) into how lucene accesses the underlying filesystem for query based reads vs other access patterns? Might help get more insight from the HDFS devs. Perhaps there is some way to trace those accesses...\n\nWe have not yet tried \"short circuit local HDFS client reads\" (see 12.11.2 here http://hbase.apache.org/book/perf.hdfs.html) but we should at some point (soon) and that will further complicate things. Based on the results other clients have seen we should see significant performance benefits from that (at least when the blocks are indeed local). "
+        },
+        {
+            "author": "Aaron McCurry",
+            "id": "comment-13743215",
+            "date": "2013-08-18T14:12:45+0000",
+            "content": "First off I'm really happy to see other people trying to improve performance of the HDFSDirectory.  So I will offer some reasons as to why I have landed on the current implementation in Blur.\n\nWhy Blur doesn't clone the HDFS file handle for clone in Lucene.\n\n\tMainly because since Lucene 4 cloned file handles don't seem to get closed all the time.  So I didn't want to have all those objects hanging around for long periods of time and not being closed.  Related: Also for those that are interested, Blur has Directory reference counter so that files that are deleted by Lucene stick around long enough for running queries to finish.\n\n\n\nWhy Blur doesn't use the read[Fully](position,buf,off,len) method instead of the seek plus read[Fully](buf,off,len).\n\n\tWhen accessing the local file system with the call would take a huge amount of time because of some internal setup the Hadoop was doing for every call.  This didn't seem to be an issue when using HDFS, but if you start using short-circuit reads it might become a problem.  I have not tested this for 6 months, so this may have been improved in the newer versions of Hadoop.\n\n\n\nWhy Blur uses readFully versus read.\n\n\tLaziness?  Not sure, I'm sure that I thought that a single call to seek + read from the filesystem would be better (even if it was more operations) than multiple calls with multiple seeks + reads.  Perhaps though it would be better to not use the readFully as you all are discussing because of the sync call.\n\n\n\nHow would I really like to implement it?\n\n\tI would like to implement the file access system as a pool of file handles for each file.  So that each file would have up to N (configured by default to 10 or something like that) file handles open and all the accesses from the base file objects and clones would check out the handle and release it when finished.  So that way there is some limit to the number of handles but some parallel accesses are allowed.\n\n\n\nHope this helps to explain why Blur has the implementation that is does.\n\nAaron "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13743289",
+            "date": "2013-08-18T17:13:48+0000",
+            "content": "Based on the feedback I got the understood was that doing the seek followed by the readFully should have been highest performance.\n\nThat would go along with speed improvements we saw in indexing. As Uwe said, that does seem kind of weird or buggish, but the numbers seem to bear it out.\n\nI think the issue is, in the indexing case, it's one thread dong the reading - and our perf tests do show it to be faster quite a bit faster. But the sync simply kills concurrent query reads. We see qps drop from like 38 qps to 3 qps. Totally unacceptable performance.\n\nThis is why I've been looking at doing the synched seek + read or just the read based on the IO context. "
+        },
+        {
+            "author": "Aaron McCurry",
+            "id": "comment-13743306",
+            "date": "2013-08-18T17:54:46+0000",
+            "content": "Just as a FYI the IOContext won't give the expected behavior, because if the writer already has a index input open for searching it won't reopen the file.  If my memory is correct it will just clone the existing index input that was open with a IOContext of Default (or whatever it uses for searching).  So if you are doing NRT updates you may never see a IOContext of merge in the directory implementation.  I know this was true in 4.2ish but I haven't reviewed the code for this situation lately.\n\nAaron "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13743319",
+            "date": "2013-08-18T18:20:31+0000",
+            "content": "Michael McCandless, do you have any insight into the above comment? "
+        },
+        {
+            "author": "Michael McCandless",
+            "id": "comment-13743347",
+            "date": "2013-08-18T20:00:05+0000",
+            "content": "That's correct: if IndexWriter already has a SegmentReader open on that segment because it's pooling readers, in turn because an NRT reader was pulled, then if that segment is merged it will re-use that already opened SegmentReader rather than open a new one. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13743814",
+            "date": "2013-08-19T13:38:00+0000",
+            "content": "But the sync simply kills concurrent query reads. \n\nSorry, I was not being very careful with my words. The 'sync' option (with the seek + read) kills concurrent query reads - but I don't think it's the sync at all. The first perf tests I looked at with just a readFully had a sync as well - which seems to make sense because this is not an NRT test or anything. Everything seems to be related to the hdfs calls. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13768381",
+            "date": "2013-09-16T14:56:56+0000",
+            "content": "I'm just going to commit the current fix and worry about any performance improvements in another issue. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13768387",
+            "date": "2013-09-16T15:06:29+0000",
+            "content": "Commit 1523693 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1523693 ]\n\nSOLR-5150: HdfsIndexInput may not fully read requested bytes. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13768393",
+            "date": "2013-09-16T15:11:32+0000",
+            "content": "Commit 1523694 from Mark Miller in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1523694 ]\n\nSOLR-5150: HdfsIndexInput may not fully read requested bytes. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13768400",
+            "date": "2013-09-16T15:17:51+0000",
+            "content": "Commit 1523698 from Mark Miller in branch 'dev/branches/lucene_solr_4_5'\n[ https://svn.apache.org/r1523698 ]\n\nSOLR-5150: HdfsIndexInput may not fully read requested bytes. "
+        },
+        {
+            "author": "Adrien Grand",
+            "id": "comment-13787110",
+            "date": "2013-10-05T10:19:16+0000",
+            "content": "4.5 release -> bulk close "
+        }
+    ]
+}

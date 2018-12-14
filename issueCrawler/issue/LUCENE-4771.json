@@ -1,0 +1,97 @@
+{
+    "id": "LUCENE-4771",
+    "title": "Query-time join collectors could maybe be more efficient",
+    "details": {
+        "components": [
+            "modules/join"
+        ],
+        "fix_versions": [],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I was looking @ these collectors on LUCENE-4765 and I noticed:\n\n\n\tSingleValued collector (SV) pulls FieldCache.getTerms and adds the bytes to a bytesrefhash per-collect.\n\tMultiValued  collector (MV) pulls FieldCache.getDocTermsOrds, but doesnt use the ords, just looks up each value and adds the bytes per-collect.\n\n\n\nI think instead its worth investigating if SV should use getTermsIndex, and both collectors just collect-up their per-segment ords in something like a BitSet[maxOrd]. \n\nWhen asked for the terms at the end in getCollectorTerms(), they could merge these into one BytesRefHash.\n\nOf course, if you are going to turn around and execute the query against the same searcher anyway (is this the typical case?), this could even be more efficient: No need to hash or instantiate all the terms in memory, we could do postpone the lookups to SeekingTermSetTermsEnum.accept()/nextSeekTerm() i think... somehow",
+    "attachments": {
+        "LUCENE-4771_prototype.patch": "https://issues.apache.org/jira/secure/attachment/12568878/LUCENE-4771_prototype.patch",
+        "LUCENE-4771_prototype_without_bug.patch": "https://issues.apache.org/jira/secure/attachment/12568879/LUCENE-4771_prototype_without_bug.patch",
+        "LUCENE-4771-prototype.patch": "https://issues.apache.org/jira/secure/attachment/12570782/LUCENE-4771-prototype.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-02-11T20:03:32+0000",
+            "content": "here's a prototype... it seems to mostly work but there is a bug eventually in the random test \n\nits against branches/lucene4765 because thats just what i was working with. ",
+            "author": "Robert Muir",
+            "id": "comment-13576064"
+        },
+        {
+            "date": "2013-02-11T20:10:37+0000",
+            "content": "updated patch without the bug. now the random test passes always. ",
+            "author": "Robert Muir",
+            "id": "comment-13576072"
+        },
+        {
+            "date": "2013-02-11T20:29:52+0000",
+            "content": "for this to be fast the BitsFilteredTermsEnum would have to seek to nextSetBit or whatever... I think thats easy to fix.\n\nAnother thing i dont like is that then the Query returned by JoinUtil then depends on the old reader.\n\nBut i think it demonstrates the idea... a faster collect() and not having to hash and load up all the term bytes in RAM. ",
+            "author": "Robert Muir",
+            "id": "comment-13576092"
+        },
+        {
+            "date": "2013-02-12T11:08:32+0000",
+            "content": "+1 this looks very compelling! ",
+            "author": "Michael McCandless",
+            "id": "comment-13576546"
+        },
+        {
+            "date": "2013-02-12T22:11:46+0000",
+            "content": "+1 Very nice improvement.\n\nAnother thing i dont like is that then the Query returned by JoinUtil then depends on the old reader.\nI thought about it and the only solution I can come up with is to just keep the reference of the reader around. Just put the atomic reader somewhere in the BytesRefIterable impl during the first phase. ",
+            "author": "Martijn van Groningen",
+            "id": "comment-13577095"
+        },
+        {
+            "date": "2013-02-12T22:19:05+0000",
+            "content": "hmm I think there are alternative solutions: but we have to change the API.\n\nReally the TermsQuery generated here is not good, because it holds reader-dependent state (its like a already-rewritten multitermquery).\nThen its allowed to have a 'delayed rewrite'.\n\nA simple solution could be to take the 'target reader' as a parameter too, and rewrite it ourselves, returning what TermsQuery rewrites to back to the user (e.g. ConstantScore or whatever).   ",
+            "author": "Robert Muir",
+            "id": "comment-13577105"
+        },
+        {
+            "date": "2013-02-12T22:32:54+0000",
+            "content": "A simple solution could be to take the 'target reader' as a parameter too, and rewrite it ourselves, returning what TermsQuery rewrites to back to the user (e.g. ConstantScore or whatever).\nAdding the `toSearcher` as parameter to JoinUtil, seems like a good idea. If we do this then we can automatically enable the second optimisation you mentioned in the issue description (postpone lookups).  ",
+            "author": "Martijn van Groningen",
+            "id": "comment-13577117"
+        },
+        {
+            "date": "2013-02-25T12:56:38+0000",
+            "content": "Updated patch with the current trunk codebase. ",
+            "author": "Martijn van Groningen",
+            "id": "comment-13585837"
+        },
+        {
+            "date": "2013-02-25T18:58:44+0000",
+            "content": "Thanks for updating Martijn! I plan to look at this later tonight and work on pulling out the BitsFilteredTermsEnum and making it more efficient. After that, I think we should revisit the intersection (I started with something ultra-simple here) to make sure its optimal too.\n\nSomehow actually we should try to come up with a standard benchmark (luceneutil or similar) so that we can test the approach for the single-valued case there too. My intuition says I think it can be a win in both cases. ",
+            "author": "Robert Muir",
+            "id": "comment-13586137"
+        },
+        {
+            "date": "2013-02-25T20:28:40+0000",
+            "content": "I also think that this approach will improve single-valued joining too. Just collecting the ordinals and fetching the actual terms on the fly without hashing should be much faster.\n\nJust wondering how to make a standard benchmark. Usually when I test joining I generate random docs. Simple docs with with random `from` values and docs with matching `to` values and also have different `from` to `to` docs ratios. Maybe we can use the stackoverflow dataset (join questions and answers) as test dataset with relational like data. Not sure if this is possible licence wise.  ",
+            "author": "Martijn van Groningen",
+            "id": "comment-13586258"
+        },
+        {
+            "date": "2013-09-14T20:12:45+0000",
+            "content": "By the way, I havent gone further here but I think this approach here can be done even faster.\n\nThe patch here would simple reduce some hashing and ram-usage, but still be slow for each query if there are many terms, because its 'aligning' terms per-query.\n\ninstead, someone could simply make an OrdinalMap (it takes TermsEnum[]) of the fields they are joining, which will \"align\" terms across all those segments/fields into a global space, and the joining can just work on simple ords.\n\nthis way you only align terms per-reopen instead of per-query. I think this would be much faster. ",
+            "author": "Robert Muir",
+            "id": "comment-13767564"
+        },
+        {
+            "date": "2013-09-17T23:07:37+0000",
+            "content": "Yes, that would work really nice. The TermsCollector can than just collect global ordinals in a BitSet impl and the TermsQuery can just iterate from this BitSet. ",
+            "author": "Martijn van Groningen",
+            "id": "comment-13770130"
+        }
+    ]
+}

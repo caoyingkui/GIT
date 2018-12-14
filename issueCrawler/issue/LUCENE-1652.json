@@ -1,0 +1,77 @@
+{
+    "id": "LUCENE-1652",
+    "title": "Enhancements to Scorers following the changes to DocIdSetIterator",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "3.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Invalid",
+        "status": "Closed"
+    },
+    "description": "In LUCENE-1614, we changed the semantics of DocIdSetIterator's methods to return a sentinel NO_MORE_DOCS (= Integer.MAX_VALUE) when the iterator has exhausted. Due to backward compatibility issues, we couldn't implement that semantics in doc(). Therefore this issue, which can be introduced in 3.0 only will:\n\n\tImplement the new semantics in all extending classes, such that doc() will return NO_MORE_DOCS when the iterator has exhausted.\n\tChange BooleanScorer to take advantage of that by removing sub.done from SubScorer and operate under the assumption that NO_MORE_DOCS is larger than any doc ID (Integer.MAX_VALUE).\n\tChange ConjunctionScorer to operate under the same assumptions and remove 'more'.\n\tChange ReqExclScorer to not rely on reqScorer in doc(), since the latter may be null.\n\tMake more changes to ConjunctionScorer's init() and remove 'firstTime' to improve the performance of nextDoc(), score(), advance().\n\tAdd start()/finish() to DISI?\n\n\n\nA snippet from LUCENE-1614 regarding the change in BooleanScorer\n\n\nint doc = sub.done ? -1 : scorer.doc();\nwhile (!sub.done && doc < end) {\n  sub.collector.collect(doc);\n  doc = scorer.nextDoc();\n  sub.done = doc < 0;\n}\n\n\n\nTo this:\n\n\nint doc = scorer.doc();\nwhile (doc < end) {\n  sub.collector.collect(doc);\n  doc = scorer.nextDoc();\n}\n\n\n\nAnd in ConjunctionScorer, change this:\n\n\nwhile (more && (firstScorer=scorers[first]).doc() < (lastDoc=lastScorer.doc())) {\n  more = firstScorer.advance(lastDoc) >= 0;\n  lastScorer = firstScorer;\n  first = (first == (scorers.length-1)) ? 0 : first+1;\n}\nreturn more;\n\n\n\nTo this:\n\n\nwhile ((firstScorer=scorers[first]).doc() < (lastDoc=lastScorer.doc())) {\n  firstScorer.advance(lastDoc);\n  lastScorer = firstScorer;\n  first = (first == (scorers.length-1)) ? 0 : first+1;\n}\nreturn lastDoc != DOC_SENTINEL;",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-05-24T12:43:35+0000",
+            "content": "I hate to say this (heaping yet more limitations on our back-compat\n\"constraints\"), but... it makes me nervous making a runtime-only\nsemantic change to an API (DISI in this case), even in 3.0.\n\nLikewise, the \"doc() returns -1 before next/advance have been\ncalled\" would be a runtime only change.\n\nIf we did these, you could upgrade to 2.9, fix all deprecations, then\nupgrade to 3.0, recompile just fine, and hit weird problems since\nLucene is suddenly expecting different behavior from your DISI.doc().\n\nSuch \"semantics-only\" changes invite subtle bugs.  I'd much prefer to\nfind a migration path that's based on static checking, ie you get\ncatastrophic compilation errors if you've failed to migrate.\n\nIf external code is iterating through a Lucene DISI, these\nsemantics-only changes are harmless, since we are only defining\nbehavior \"outside\" the bounds of what's currently defined.  But if\nLucene is interacting w/ an external DISI, then we are in trouble.\n\nHowever, it's not clear to me what's the best way to make this\nmigration \"catastrophic\" ... maybe we add DISI.document(), with\nthe new semantics, and with a default impl in DISI that overlays our\nnew semantics?  (And deprecate doc()).  We could do this for 2.9. ",
+            "author": "Michael McCandless",
+            "id": "comment-12712549"
+        },
+        {
+            "date": "2009-05-25T14:43:24+0000",
+            "content": "If we did these, you could upgrade to 2.9, fix all deprecations, then upgrade to 3.0, recompile just fine ...\n\nI'm not sure about it. In 3.0, we'll make nextDoc() abstract (for sure, since the default impl calls next()) and probably advance() also. So when you upgrade to 2.9, you can switch to calling nextDoc() and advance(), but if you implemented DISI, you won't be required to implement nextDoc() and/or advance(), so when you upgrade to 3.0 your code won't compile.\n\nWhen upgrading, I think we should assume (or even require) users reading CHANGES. When they notice that DISI has changed and that they need to implement two new methods, they should also notice the change in semantics of doc().\n\nI take it that by \"catastrophic\" you mean that you're ok with people upgrading to 3.0 and don't compile, since that will force them to read CHANGES or javadocs and understand what they are now supposed to implement. Therefore if document() documents the new semantics, it is ok for us to rely on that, and if something fails, it's the user's problem.\n\nmaybe we add DISI.document(), with the new semantics\n\nIf we add document() (note the longer method name, compared to doc()) we can implement it following the new semantics and take advantage of that in 2.9 already (I think?). For example:\n\n\npublic abstract class DocIdSetIterator {\n\n  private int doc = -1;\n\n  public int document() { return doc; }\n\n  public int nextDoc() throws IOException {\n    if (next()) {\n       doc = doc();\n    } else {\n      doc = NO_MORE_DOCS;\n    }\n    return doc;\n  }\n\n  public int advance() throws IOException {\n    while ((doc = nextDoc()) < target) {}\n    return doc;\n  }\n}\n\n\n\nWe also move to call document() internally. I think this should work?\n\nIf this indeed should work, where should I do it - in this issue (I need 1614 to be committed first) or in 1614? ",
+            "author": "Shai Erera",
+            "id": "comment-12712733"
+        },
+        {
+            "date": "2009-05-25T16:27:31+0000",
+            "content": "I'm not sure about it. In 3.0, we'll make nextDoc() abstract (for sure, since the default impl calls next()) and probably advance() also. So when you upgrade to 2.9, you can switch to calling nextDoc() and advance(), but if you implemented DISI, you won't be required to implement nextDoc() and/or advance(), so when you upgrade to 3.0 your code won't compile.\n\nYou're right \u2013 on making nextDoc & advance abstract in 3.0, your code\nwon't compile on upgrading to 3.0 and you'd have to go fix any custom\nDISIs you have.  But: if we leave doc() as is, you wouldn't be forced\nto do anything on that.  You just implement nextDoc/advance and think\nyou're done...\n\nWhen upgrading, I think we should assume (or even require) users reading CHANGES. When they notice that DISI has changed and that they need to implement two new methods, they should also notice the change in semantics of doc().\n\nRelying only on this (seeing CHANGES.txt) is what makes me nervous.\n\nI take it that by \"catastrophic\" you mean that you're ok with people upgrading to 3.0 and don't compile, since that will force them to read CHANGES or javadocs and understand what they are now supposed to implement. Therefore if document() documents the new semantics, it is ok for us to rely on that, and if something fails, it's the user's problem.\n\nRight that's what I mean by \"catastrophic\" (note: Marvin used it\nfirst, but I like it  ) But: I want the catastrophe specifically to\napply to doc() as well, so that you are forced to make that a new\nmethod.  Ie, I'm hoping that the extra step of having a newly named\nmethod is enough to get you to go and understand that we subtly\nchanged its semantics.\n\nIf we add document() (note the longer method name, compared to doc()) we can implement it following the new semantics and take advantage of that in 2.9 already (I think?).\n\nExactly, another benefit of this approach (besides bringing\ncatastrophe) is that we can do all of this in 2.9, including taking\nadvantage of the new semantics.  Which is great.\n\nIf this indeed should work, where should I do it - in this issue (I need 1614 to be committed first) or in 1614?\n\nI think do this as another iteration of the patch on LUCENE-1614? ",
+            "author": "Michael McCandless",
+            "id": "comment-12712745"
+        },
+        {
+            "date": "2009-05-25T19:24:55+0000",
+            "content": "Ok. However, I don't like the name document() too much - it gives me a feeling as if I'm going to get a Document back. How about docid, curdoc, docId (or any other suggestion that would hint you're going to get a document ID and not a Document)? ",
+            "author": "Shai Erera",
+            "id": "comment-12712778"
+        },
+        {
+            "date": "2009-05-25T19:49:45+0000",
+            "content": "Good point, I agree. How about docID()? ",
+            "author": "Michael McCandless",
+            "id": "comment-12712782"
+        },
+        {
+            "date": "2009-05-26T03:20:53+0000",
+            "content": "Good. I'll work on it and post the patch in 1614 ",
+            "author": "Shai Erera",
+            "id": "comment-12712838"
+        },
+        {
+            "date": "2009-06-23T20:10:28+0000",
+            "content": "It looks like everything we mentioned here was taken care of as part of LUCENE-1614 and LUCENE-1630.\n\nOver in LUCENE-1630 we discussed TopScorer. Do you still think it's something we should do. If so, we can do it as part of this issue.\n\nI don't remember anything else that came up in the latest issues that we didn't list here. Do you? ",
+            "author": "Shai Erera",
+            "id": "comment-12723282"
+        },
+        {
+            "date": "2009-06-24T09:26:34+0000",
+            "content": "I think TopScorer is the only possibility... but let's hold off on that for now?  The only other things I see was maybe adding a DISI.start/done, but I think we should hold off on that too?  So I'll resolve this on as invalid... ",
+            "author": "Michael McCandless",
+            "id": "comment-12723511"
+        },
+        {
+            "date": "2009-06-24T09:27:02+0000",
+            "content": "The ideas in this issue were largely fixed under other issues... ",
+            "author": "Michael McCandless",
+            "id": "comment-12723512"
+        }
+    ]
+}

@@ -1,0 +1,151 @@
+{
+    "id": "SOLR-8988",
+    "title": "Improve facet.method=fcs performance in SolrCloud",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.1"
+        ],
+        "affect_versions": "5.5,                                            6.0",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "This relates to SOLR-8559 \u2013 which improves the algorithm used by fcs faceting when facet.mincount=1\n\nThis patch allows facet.mincount to be sent as 1 for distributed queries. As far as I can tell there is no reason to set facet.mincount=0 for refinement purposes . After trying to make sense of all the refinement logic, I cant see how the difference between no value and value=0 would have a negative effect.\n\nTest perf:\n\n\t~15million unique terms\n\tquery matches ~3million documents\n\n\n\nParams:\n\nfacet.mincount=1\nfacet.limit=500\nfacet.method=fcs\nfacet.sort=count\n\n\n\nAverage Time Per Request:\n\n\tBefore patch:  ~20seconds\n\tAfter patch: <1 second\n\n\n\n\nNote: all tests pass and in my test, the output was identical before and after patch.",
+    "attachments": {
+        "SOLR-8988.patch": "https://issues.apache.org/jira/secure/attachment/12798791/SOLR-8988.patch",
+        "Screen Shot 2016-04-25 at 2.54.47 PM.png": "https://issues.apache.org/jira/secure/attachment/12800600/Screen%20Shot%202016-04-25%20at%202.54.47%20PM.png",
+        "Screen Shot 2016-04-25 at 2.55.00 PM.png": "https://issues.apache.org/jira/secure/attachment/12800601/Screen%20Shot%202016-04-25%20at%202.55.00%20PM.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-04-14T19:26:35+0000",
+            "author": "Keith Laban",
+            "content": "I'm not sure who would be best to look at this. Maybe Yonik Seeley or Erik Eriksson would be more familiar with this code path. Is there any reason this wouldn't work? ",
+            "id": "comment-15241767"
+        },
+        {
+            "date": "2016-04-14T19:59:09+0000",
+            "author": "Scott Blum",
+            "content": "+1, we ran across this too, and couldn't think of any reason for the inefficiency here ",
+            "id": "comment-15241799"
+        },
+        {
+            "date": "2016-04-14T21:58:11+0000",
+            "author": "Hoss Man",
+            "content": "As far as I can tell there is no reason to set facet.mincount=0 for refinement purposes . After trying to make sense of all the refinement logic, I cant see how the difference between no value and value=0 would have a negative \n\ni haven't looked closely, but IIRC the justification for this comment...\n\n\n-          dff.initialMincount = 0; // TODO: we could change this to 1, but would\n-                                   // then need more refinement for small facet\n-                                   // result sets?\n\n\n\nis that if you get back a count of foo=0 from shardA, and if foo winds up being a candidate term for the final topN list because of it's count on other shards, then you know definitively that you don't have to ask shardA to provide a refinement value for \"foo\" - you already know it's count.\n\nwhich behavior is more performant in the most common cases? ... i have no idea off the top of my head ... i'd have ot really sit down and think about all the variables.\n\nwhat would probably make the most sense is to add an expert level option for controlling this (similar to the overrequest options) and leave the default as it is for now \u2013 that way people have one more knob they can try turning to tune performance, and if we decide later that the default behavior should be changed in the common case, it's easy to do. ",
+            "id": "comment-15241993"
+        },
+        {
+            "date": "2016-04-14T22:00:32+0000",
+            "author": "Hoss Man",
+            "content": "\n\n\t~15million unique terms\n\tquery matches ~3million documents\n\n\n\nOther key factors here are going to be:\n\n\tnum shards\n\tnum docs per shard\n\tnum terms in field\n\tnum terms with non-zero facet counts for docs matching query on a per shard basis\n\thow much variance there is in the num terms with non-zero facet counts for docs matching query on a per shard basis\n\n ",
+            "id": "comment-15241998"
+        },
+        {
+            "date": "2016-04-15T15:25:50+0000",
+            "author": "Keith Laban",
+            "content": "For clarity of this test:\n\nnum shards\n\n\t12\n\n\n\nnum docs per shard\n\n\t~70 million\n\n\n\nnum terms in field\n\n\t~15 million\n\n\n\nnum terms with non-zero facet counts for docs matching query on a per shard basis\n\n\t~90k\n\n\n\nhow much variance there is in the num terms with non-zero facet counts for docs matching query on a per shard basis\n\n\tevenly distributed\n\n\n\n\n\n...is that if you get back a count of foo=0 from shardA, and if foo winds up being a candidate term for the final topN list because of it's count on other shards, then you know definitively that you don't have to ask shardA to provide a refinement value for \"foo\" - you already know it's count.\n\nThis is the part that I would argue doesn't matter. Consider you asked for 10 terms from shardA with mincount =1 and you received only 5 terms back. Then you know that if foo was in shardB, but not in shardA the maximum count it could have had in shardA was 0, otherwise it would have been returned in the initial request. \n\nOn the other hand if you ask for 10 terms with mincount=1 and you get back 10 terms with a count >=1 well the response back would have been identical if mincount=0. \n\nLogic aids refinement pulled from \u2013 FacetComponent.DistributedFieldFacet \n\n    void add(int shardNum, NamedList shardCounts, int numRequested) {\n      // shardCounts could be null if there was an exception\n      int sz = shardCounts == null ? 0 : shardCounts.size();\n      int numReceived = sz;\n      \n      FixedBitSet terms = new FixedBitSet(termNum + sz);\n\n      long last = 0;\n      for (int i = 0; i < sz; i++) {\n        String name = shardCounts.getName(i);\n        long count = ((Number) shardCounts.getVal(i)).longValue();\n        if (name == null) {\n          missingCount += count;\n          numReceived--;\n        } else {\n          ShardFacetCount sfc = counts.get(name);\n          if (sfc == null) {\n            sfc = new ShardFacetCount();\n            sfc.name = name;\n            sfc.indexed = ftype == null ? sfc.name : ftype.toInternal(sfc.name);\n            sfc.termNum = termNum++;\n            counts.put(name, sfc);\n          }\n          sfc.count += count;\n          terms.set(sfc.termNum);\n          last = count;\n        }\n      }\n      \n      // the largest possible missing term is initialMincount if we received\n      // less than the number requested.\n      if (numRequested < 0 || numRequested != 0 && numReceived < numRequested) {\n        last = initialMincount;\n      }\n      \n      missingMaxPossible += last;\n      missingMax[shardNum] = last;\n      counted[shardNum] = terms;\n    }\n\n\n\nHowever I think this line block should also be changed.\n\n      if (numRequested < 0 || numRequested != 0 && numReceived < numRequested) {\n        last = Math.max(initialMincount-1, 0);\n      }\n\n ",
+            "id": "comment-15243103"
+        },
+        {
+            "date": "2016-04-19T23:52:12+0000",
+            "author": "Keith Laban",
+            "content": "Hoss Man can I convince you that this should be the default behavior? ",
+            "id": "comment-15248953"
+        },
+        {
+            "date": "2016-04-20T00:41:34+0000",
+            "author": "Hoss Man",
+            "content": "You've convinced me that i don't understand the point behind that existing TODO: we could change this to 1... comment, but I still want to review the code more thoroughly before i'm confident enough to concede your approach is better in all cases.\n\nThat said: If you updated your patch to make it optional based on a param w/some tests that randomly toggled the value (TestCloudPivotFacet, DistributedFacetPivotLongTailTest would be good ones) then i'd probably be game to commit even w/o being confident it's better in all cases, and we could worry about changing the default later.\n\nHowever I think this line block should also be changed.\n\nHmm, yeah ... that does smell like it could be optimized.\n\n(FWIW: we have a TrackingShardHandlerFactory that can be used in tests to make assertions about what per-shard requests solr triggers. That can be used along with some carefully crafted shards/docs/requests to verify that no unnecessary refinement is done in cases where you don't expect it \u2013 like with this initialMincount vs initialMincount-1 situation) ",
+            "id": "comment-15249046"
+        },
+        {
+            "date": "2016-04-25T18:59:12+0000",
+            "author": "Keith Laban",
+            "content": "Added second version of patch which has this feature disabled by default but can be enabled with facet.distrib.mco=true. \n\nI also did some benchmarking and under all scenarios tested the new way is either the same or way faster. The test was with 12 shards everything evenly distributed. \n\nTwo things to note about this test:\n\n\tAll terms have the same count which would be the worst case for refinement which is evident in the shape of each graph. Overrequesting is far more efficient.\n\tAll segments are evenly distributed however in the real world, the best performance gains for this patch would be seen when there are many segments which contain no relevant terms for the query.\n\n\n\nMore details about the test.\n\n\t2 node cloud running locally each with 4g\n\t12 shards without replication (only 12 total cores)\n\tterms were integers with doc values enabled\n\tinstances were restarted after each test to avoid lingering GC issues, however each test had some warmup queries before running the test\n\tThe Y-axis is average QTime(ms) over 100 test runs\n\n ",
+            "id": "comment-15256797"
+        },
+        {
+            "date": "2016-05-02T16:27:50+0000",
+            "author": "Keith Laban",
+            "content": "Hoss Man how does the updated patch look? ",
+            "id": "comment-15266916"
+        },
+        {
+            "date": "2016-05-17T13:25:09+0000",
+            "author": "Dennis Gove",
+            "content": "Hoss Man, do you still have concerns on this patch? I think it's a good change to make and I'm happy to take on the committing if you don't have any further concerns. ",
+            "id": "comment-15286602"
+        },
+        {
+            "date": "2016-05-17T16:44:52+0000",
+            "author": "Hoss Man",
+            "content": "I haven't had time to review it enough to be confident enough that I'd want to commit it myself \u2013 but if you have then go for it, i'm +0.\n\nMy one bit of feedback fro ma quick skim of the patch is that i don't understand the javadocs for \"FACET_DISTRIB_MCO\" at all ... it's a boolean param, but the docs describe it as \" The default mincount to request on distributed facet queries\" which makes it sound like a number, and the \"Default values\" bit of the javadocs don't relaly do anything to clarify that confusion since they also (appear to) talk about the (eventual) distributed mincount, and not the default value of the \"FACET_DISTRIB_MCO\" param itself ",
+            "id": "comment-15286979"
+        },
+        {
+            "date": "2016-05-20T20:29:48+0000",
+            "author": "Dennis Gove",
+            "content": "Keith Laban, could you explain the javadocs on FACET_DISTRIB_MCO a little bit more? I don't quite follow the documentation on it\n\n\n+  public static final String FACET_DISTRIB = FACET + \".distrib\";\n+\n+  /**\n+   * The default mincount to request on distributed facet queries.\n+   * This param only applies to COUNT sorted queries which have a limit &gt; -1\n+   *\n+   * Default values:\n+   * Sort COUNT and facet.limit = -1: Math.min(facet.minCount, 1)\n+   * Sort COUNT and facet.limit &gt; 0: 0\n+   * Sort INDEX and facet.mincount &lt;= 1: facet.mincount\n+   * Sort INDEX and facet.mincount &gt; 1: (int) Math.ceil((double) dff.minCount / rb.slices.length)\n+   *\n+   * EXPERT\n+   */\n+\n+  public static final String FACET_DISTRIB_MCO = FACET_DISTRIB + \".mco\";\n+\n\n ",
+            "id": "comment-15294136"
+        },
+        {
+            "date": "2016-05-23T14:20:51+0000",
+            "author": "Dennis Gove",
+            "content": "Added some comments around the use of dff.mco option. Still looking for clarification on the docs around FACET_DISTRIB_MCO. ",
+            "id": "comment-15296410"
+        },
+        {
+            "date": "2016-05-23T15:35:06+0000",
+            "author": "Keith Laban",
+            "content": "Fixed docs ",
+            "id": "comment-15296526"
+        },
+        {
+            "date": "2016-05-23T16:41:17+0000",
+            "author": "Dennis Gove",
+            "content": "Just to slightly rephrase the salient point here:\n\nConsider you asked for up to 10 terms from shardA with mincount=1 but you received only 5 terms back. In this case you know, definitively, that a term seen in the response from shardB but not in the response from shardA could have at most a count of 0 in shardA. If it had any other count in shardA then it would have been returned in the response from shardA.\n\nAlso, if you asked for up to 10 terms from shardA with mincount=1 and you get back a response with 10 terms having a count >= 1 then the response is identical to the one you'd have received if mincount=0. \n\nBecause of this, there isn't a scenario where the response would result in more work than would have been required if mincount=0. For this reason, the decrease in required work when mincount=1 is always either a moot point or a net win. ",
+            "id": "comment-15296621"
+        },
+        {
+            "date": "2016-05-23T16:48:17+0000",
+            "author": "Dennis Gove",
+            "content": "I'm going to commit this with the default left as is (facet.mincount=0) because this new option will be defaulted to false. I've entered SOLR-9152 to discuss and handle changing the default. I believe it is safe to do so. ",
+            "id": "comment-15296629"
+        },
+        {
+            "date": "2016-05-23T19:14:23+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit e4e990b993d6872f6345b7d064efb8ca22ee6556 in lucene-solr's branch refs/heads/master from Dennis Gove\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e4e990b ]\n\nSOLR-8988: Adds query option facet.distrib.mco which when set to true allows the use of facet.mincount=1 in cloud mode ",
+            "id": "comment-15296907"
+        },
+        {
+            "date": "2016-05-23T19:25:07+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ab87a0e75641d3e4076b9f4c247339f9d9c47103 in lucene-solr's branch refs/heads/branch_6x from Dennis Gove\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ab87a0e ]\n\nSOLR-8988: Adds query option facet.distrib.mco which when set to true allows the use of facet.mincount=1 in cloud mode ",
+            "id": "comment-15296924"
+        },
+        {
+            "date": "2016-05-23T19:35:03+0000",
+            "author": "Dennis Gove",
+            "content": "Patch as been applied to master and 6x for release in 6.1. Note that I have confirmed the patch does also apply to 5x if you should want to use this in a later Solr 5. ",
+            "id": "comment-15296941"
+        },
+        {
+            "date": "2016-05-26T05:20:47+0000",
+            "author": "David Smiley",
+            "content": "BTW references to SolrCloud or \"cloud mode\" here seem incorrect, right?  This is about distributed (aka \"sharded\") faceting.  I was confused by the title and a related issue mentioning SolrCloud and I wondered how on earth SolrCloud would affect faceting. ",
+            "id": "comment-15301550"
+        },
+        {
+            "date": "2016-05-26T16:57:43+0000",
+            "author": "Keith Laban",
+            "content": "Thats right. This affects all queries where isDistrib is true for any reason. ",
+            "id": "comment-15302430"
+        }
+    ]
+}

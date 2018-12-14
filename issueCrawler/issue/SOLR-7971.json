@@ -1,0 +1,191 @@
+{
+    "id": "SOLR-7971",
+    "title": "Reduce memory allocated by JavaBinCodec to encode large strings",
+    "details": {
+        "components": [
+            "Response Writers",
+            "SolrCloud"
+        ],
+        "type": "Sub-task",
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Minor"
+    },
+    "description": "As discussed in SOLR-7927, we can reduce the buffer memory allocated by JavaBinCodec while writing large strings.\n\nhttps://issues.apache.org/jira/browse/SOLR-7927?page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel&focusedCommentId=14700420#comment-14700420\n\nThe maximum Unicode code point (as of Unicode 8 anyway) is U+10FFFF (http://www.unicode.org/glossary/#code_point).  This is encoded in UTF-16 as surrogate pair \\uDBFF\\uDFFF, which takes up two Java chars, and is represented in UTF-8 as the 4-byte sequence F4 8F BF BF.  This is likely where the mistaken 4-bytes-per-Java-char formulation came from: the maximum number of UTF-8 bytes required to represent a Unicode code point is 4.\n\nThe maximum Java char is \\uFFFF, which is represented in UTF-8 as the 3-byte sequence EF BF BF.\n\nSo I think it's safe to switch to using 3 bytes per Java char (the unit of measurement returned by String.length()), like CompressingStoredFieldsWriter.writeField() does.",
+    "attachments": {
+        "SOLR-7971-directbuffer.patch": "https://issues.apache.org/jira/secure/attachment/12752446/SOLR-7971-directbuffer.patch",
+        "SOLR-7971-doublepass.patch": "https://issues.apache.org/jira/secure/attachment/12753302/SOLR-7971-doublepass.patch",
+        "SOLR-7971.patch": "https://issues.apache.org/jira/secure/attachment/12752266/SOLR-7971.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-08-25T16:29:01+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Without this patch, indexing the same 100MB JSON document mentioned in SOLR-7927:\n\n\tsucceeds on ./bin/solr  start -m 2100M\n\tfails on ./bin/solr  start -m 2000M\n\n\n\nAnd with this change:\n\n\tsucceeds on ./bin/solr  start -m 1900M with patch\n\tfails on ./bin/solr  start -m 1800M with patch\n\n ",
+            "id": "comment-14711572"
+        },
+        {
+            "date": "2015-08-25T16:32:48+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1697726 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1697726 ]\n\nSOLR-7971: Reduce memory allocated by JavaBinCodec to encode large strings by an amount equal to the string.length() ",
+            "id": "comment-14711584"
+        },
+        {
+            "date": "2015-08-25T16:37:35+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1697727 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1697727 ]\n\nSOLR-7971: Reduce memory allocated by JavaBinCodec to encode large strings by an amount equal to the string.length() ",
+            "id": "comment-14711591"
+        },
+        {
+            "date": "2015-08-26T11:11:18+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Here's another idea as a patch to further reduce heap requirement. In this patch I use a direct byte buffer to hold the encoded bytes and limit the intermediate on-heap buffer to 64KB only. This optimization kicks in only if the max bytes required by the string being serialized is greater than 64KB.\n\nWith this patch I can index the same 100MB JSON document with 1200MB of heap.\n\nYonik Seeley - Thoughts? ",
+            "id": "comment-14712943"
+        },
+        {
+            "date": "2015-08-26T13:20:31+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Shalin, \n\n\tcouldn't it turn that calling frequent call allocateDirect()&clear() takes too much time? in this case isn't it worth to reuse directBuffer across writeStr() calls as JavaBinCodec's field.\n\tI've got that buffering is necessary just because we need to calculate length of encoded bytes for starting tag, is it a big problem if we loop ByteUtils.UTF16toUTF8() twice, the first time to calculate the length and completely dropping the content, then writing content in the second time loop.\n\tjust curious, how much efforts does it take to extend javabin format by http-like chunks?\n\n ",
+            "id": "comment-14713398"
+        },
+        {
+            "date": "2015-08-26T13:44:09+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "couldn't it turn that calling frequent call allocateDirect()&clear() takes too much time? in this case isn't it worth to reuse directBuffer across writeStr() calls as JavaBinCodec's field.\n\nYes, allocateDirect() can be slower and we should reuse the buffer as much as possible. This was just an idea as a patch. I don't intend to commit it as it is.\n\nI've got that buffering is necessary just because we need to calculate length of encoded bytes for starting tag, is it a big problem if we loop ByteUtils.UTF16toUTF8() twice, the first time to calculate the length and completely dropping the content, then writing content in the second time loop.\n\nHmm, interesting idea. We could also have a method calcUTF16toUTF8Length which avoids all the bitwise operators and just returns the required length.\n\njust curious, how much efforts does it take to extend javabin format by http-like chunks?\n\nIt should be possible. We'll need a new chunked type and an upgrade to the JavaBin version. Or we may be able to get away with modifying only the LogCodec in TransactionLog. ",
+            "id": "comment-14713437"
+        },
+        {
+            "date": "2015-08-26T14:02:46+0000",
+            "author": "Yonik Seeley",
+            "content": "limit the intermediate on-heap buffer to 64KB only\n\nI only glanced at it, but it's probably a little too simplistic.  You can't cut UTF16 in random places, encode it as UTF8 and get the same bytes because of 2 char code points.\n\nI've got that buffering is necessary just because we need to calculate length of encoded bytes for starting tag\n\nYeah, the length is really the only reason we need to buffer and copy.\n\nWe should really consider returning to how v1 of the protocol handled things since it had to do no buffering at all since it simply used String.length().  We just need to consider how to handle back compat of course. ",
+            "id": "comment-14713470"
+        },
+        {
+            "date": "2015-08-26T16:34:22+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I only glanced at it, but it's probably a little too simplistic. You can't cut UTF16 in random places, encode it as UTF8 and get the same bytes because of 2 char code points.\n\nDuh, of course, I used to know that once and yet...\n\nWe should really consider returning to how v1 of the protocol handled things since it had to do no buffering at all since it simply used String.length(). We just need to consider how to handle back compat of course.\n\nUntil we go there, how about this patch which has a modified UTF16toUTF8 method that writes to ByteBuffer directly using an intermediate scratch array? ",
+            "id": "comment-14714476"
+        },
+        {
+            "date": "2015-08-26T21:20:45+0000",
+            "author": "Yonik Seeley",
+            "content": "Making 3 copies really feels heavyweight (the current code makes a single copy in the case of large strings).\nstring->scratch, scratch->off-heap-buffer, off-heap-buffer->scratch, scratch->write\nAnd this doesn't even use less system memory... just less heap memory.\n\nI wonder how it would do against Mikhail's idea of just calculating the UTF8 length first.\nIf we keep with DirectByteBuffer, we should at least eliminate one of the copies by encoding directly to it? ",
+            "id": "comment-14715540"
+        },
+        {
+            "date": "2015-08-27T07:44:17+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Yonik for reviewing.\n\nI wrote a small JMH benchmark between different approaches at https://github.com/shalinmangar/solr-jmh-tests\n\n\tJavaBinCodecBenchmark.testDefaultWriteStr measures unmodified JavaBinCodec\n\tJavaBinCodecBenchmark.testDirectBufferWriteStr is the direct buffer code which made 3 copies\n\tJavaBinCodecBenchmark.testDirectBufferNoScratchWriteStr is direct buffer code which writes to off-heap buffer without using an intermediate scratch. A 8KB scratch is used to write contents of off-heap buffer\n\tJavaBinCodecBenchmark.testDoublePassWriteStr uses Mikhail's double pass approach. We calculate the length first using a method which avoids all the bitwise operations and then writes the bytes directly to the FastOutputStream\n\n\n\nHere are the results:\n\n10 MB JSON\n------------------------------------------------------------------------------------------\n\njava -server -Xmx2048M -Xms2048M -jar target/benchmarks.jar -wi 3 -i 3 -gc true \".*JavaBinCodecBenchmark.*\"\n# Run complete. Total time: 00:05:31\n\nBenchmark                                                 Mode  Cnt   Score   Error  Units\nJavaBinCodecBenchmark.testDefaultWriteStr                thrpt   30  47.662 \u00b1 5.691  ops/s\nJavaBinCodecBenchmark.testDirectBufferNoScratchWriteStr  thrpt   30  43.079 \u00b1 2.693  ops/s\nJavaBinCodecBenchmark.testDirectBufferWriteStr           thrpt   30  28.578 \u00b1 1.290  ops/s\nJavaBinCodecBenchmark.testDoublePassWriteStr             thrpt   30  34.191 \u00b1 1.268  ops/s\n\n100 MB JSON\n------------------------------------------------------------------------------------------\n\njava -server -Xmx2048M -Xms2048M -jar target/benchmarks.jar -wi 3 -i 3 -gc true \".*JavaBinCodecBenchmark.*\"\n\n# Run complete. Total time: 00:06:38\n\nBenchmark                                                 Mode  Cnt  Score   Error  Units\nJavaBinCodecBenchmark.testDefaultWriteStr                thrpt   30  5.304 \u00b1 0.318  ops/s\nJavaBinCodecBenchmark.testDirectBufferNoScratchWriteStr  thrpt   30  4.890 \u00b1 0.514  ops/s\nJavaBinCodecBenchmark.testDirectBufferWriteStr           thrpt   30  3.274 \u00b1 0.091  ops/s\nJavaBinCodecBenchmark.testDoublePassWriteStr             thrpt   30  2.194 \u00b1 0.295  ops/s\n\n\n\nI am not sure how well JMH works with IO benchmarks but it seems that the double pass approach is too slow and using direct buffer without scratch works best. ",
+            "id": "comment-14716226"
+        },
+        {
+            "date": "2015-08-27T08:00:04+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This patch writes to a byte buffer directly. ",
+            "id": "comment-14716244"
+        },
+        {
+            "date": "2015-08-27T09:17:10+0000",
+            "author": "Mikhail Khludnev",
+            "content": "would you mind to share /home/shalin/temp/debug/lucenesolr-569/jimtests/input.14.json\nalso?  ",
+            "id": "comment-14716327"
+        },
+        {
+            "date": "2015-08-27T11:00:34+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "You can use this bash script to generate the test files: https://gist.github.com/shalinmangar/de8a9af5577ff000e556\n\nIt will download a book from gutenberg website and create two files input14.json (~10MB) and input140.json (~100MB). ",
+            "id": "comment-14716468"
+        },
+        {
+            "date": "2015-08-31T12:53:33+0000",
+            "author": "Noble Paul",
+            "content": "This issue is about reducing the memory consumption. Moving the memory used, from heap to off heap is just kicking the can. Let's use the double-pass option, which actually solves the problem. A person who is indexing huge documents is worried about out of memory than shaving of a couple of milliseconds from indexing time ",
+            "id": "comment-14723373"
+        },
+        {
+            "date": "2015-08-31T14:34:03+0000",
+            "author": "Mikhail Khludnev",
+            "content": "some off-top: \ni tried to reproduce a gain of allocating direct buffer. I restructured benchmark to call writeStr() in a loop for ten elements. And it shows no significant difference. \n\nJavaBinCodecBenchmark.testDefaultWriteStr                         thrpt   30  0.042 \u00b1 0.002  ops/s\nJavaBinCodecBenchmark.testDirectBufferNoScratchReuseBuffWriteStr  thrpt   30  0.038 \u00b1 0.002  ops/s\nJavaBinCodecBenchmark.testDirectBufferNoScratchWriteStr           thrpt   30  0.037 \u00b1 0.001  ops/s\n\n ",
+            "id": "comment-14723475"
+        },
+        {
+            "date": "2015-08-31T14:35:58+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Noble. I am myself coming around to the idea of using the double pass approach. A small performance hit may be better than going out of memory or interfering with the OS page cache in such use-cases. I'll put up a patch with the double pass approach. Does anyone have any opinions on the magic number (currently 64KB) over which the double pass approach should be used? ",
+            "id": "comment-14723479"
+        },
+        {
+            "date": "2015-08-31T15:02:01+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "SOLR-7971-doublepass.patch uses the double pass approach that Mikhail suggested while writing strings needing larger then 64KB buffers. ",
+            "id": "comment-14723517"
+        },
+        {
+            "date": "2015-08-31T19:08:30+0000",
+            "author": "Noble Paul",
+            "content": "another approach at counting size ",
+            "id": "comment-14723877"
+        },
+        {
+            "date": "2015-09-03T15:34:12+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I added Noble's patch to the JMH tests and I see the following results:\n\n10 MB JSON\n==========\nBenchmark                                                  Mode  Cnt   Score   Error  Units\nJavaBinCodecBenchmark.testDefaultWriteStr                 thrpt   30  28.846 \u00b1 1.247  ops/s\nJavaBinCodecBenchmark.testDirectBufferNoScratchWriteStr   thrpt   30  19.113 \u00b1 0.426  ops/s\nJavaBinCodecBenchmark.testDirectBufferWriteStr            thrpt   30  28.081 \u00b1 0.943  ops/s\nJavaBinCodecBenchmark.testDoublePassCountingOutputStream  thrpt   30  16.167 \u00b1 0.145  ops/s\nJavaBinCodecBenchmark.testDoublePassWriteStr              thrpt   30  22.230 \u00b1 0.506  ops/s\nJavaBinCodecBenchmark.testDoublePassWriteWithScratchStr   thrpt   30  24.608 \u00b1 0.246  ops/s\n\n100MB JSON\n===========\nBenchmark                                                  Mode  Cnt  Score   Error  Units\nJavaBinCodecBenchmark.testDefaultWriteStr                 thrpt   30  2.338 \u00b1 0.163  ops/s\nJavaBinCodecBenchmark.testDirectBufferNoScratchWriteStr   thrpt   30  1.762 \u00b1 0.088  ops/s\nJavaBinCodecBenchmark.testDirectBufferWriteStr            thrpt   30  2.934 \u00b1 0.161  ops/s\nJavaBinCodecBenchmark.testDoublePassCountingOutputStream  thrpt   30  1.613 \u00b1 0.036  ops/s\nJavaBinCodecBenchmark.testDoublePassWriteStr              thrpt   30  1.510 \u00b1 0.186  ops/s\nJavaBinCodecBenchmark.testDoublePassWriteWithScratchStr   thrpt   30  2.424 \u00b1 0.079  ops/s\n\n\n\nThe CountingNullOutputStream approach is consistently slower than others. Instead of writing directly to the output stream, using an intermediate scratch array is much faster. ",
+            "id": "comment-14729268"
+        },
+        {
+            "date": "2015-09-03T15:59:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Here's the double pass with scratch approach that appears to be the fastest. I'll commit this shortly. ",
+            "id": "comment-14729311"
+        },
+        {
+            "date": "2015-09-03T17:40:54+0000",
+            "author": "Yonik Seeley",
+            "content": "Rather than have two checks per loop iteration, I wonder if it would be faster to make an inner loop?\n\n+      if (upto > scratch.length - 4)  {\n+        // a code point may take upto 4 bytes and we don't have enough space, so reset\n+        totalBytes += upto;\n+        fos.write(scratch, 0, upto);\n+        upto = 0;\n+      }\n\n\n\nProb not a big deal though, it's going to be a predictable branch. ",
+            "id": "comment-14729449"
+        },
+        {
+            "date": "2015-09-03T19:32:22+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Yeah, I think it should be okay? I don't see how to write this logic as an inner loop without making it more complex. ",
+            "id": "comment-14729640"
+        },
+        {
+            "date": "2015-09-03T19:42:40+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1701115 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1701115 ]\n\nSOLR-7971: JavaBinCodec now uses a double pass approach to write strings larger than 64KB to avoid allocating buffer memory equal to string's UTF8 size ",
+            "id": "comment-14729654"
+        },
+        {
+            "date": "2015-09-03T20:52:35+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1701136 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1701136 ]\n\nSOLR-7971: JavaBinCodec now uses a double pass approach to write strings larger than 64KB to avoid allocating buffer memory equal to string's UTF8 size ",
+            "id": "comment-14729762"
+        },
+        {
+            "date": "2015-09-03T20:53:20+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks everyone! ",
+            "id": "comment-14729763"
+        },
+        {
+            "date": "2015-09-03T20:57:24+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1701137 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1701137 ]\n\nSOLR-7971: Mention output stream in javadoc instead of byte buffer ",
+            "id": "comment-14729770"
+        },
+        {
+            "date": "2015-09-03T20:58:01+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1701138 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1701138 ]\n\nSOLR-7971: Mention output stream in javadoc instead of byte buffer ",
+            "id": "comment-14729771"
+        }
+    ]
+}

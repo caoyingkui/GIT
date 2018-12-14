@@ -1,0 +1,302 @@
+{
+    "id": "SOLR-7361",
+    "title": "Main Jetty thread blocked by core loading delays HTTP listener from binding if core loading is slow",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.3",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "During server startup, the CoreContainer uses an ExecutorService to load cores in multiple back-ground threads but then blocks until cores are loaded, see: CoreContainer#load around line 290 on trunk (invokeAll). From the JavaDoc on that method, we have:\n\n\nExecutes the given tasks, returning a list of Futures holding their status and results when all complete. Future.isDone() is true for each element of the returned list.\n\nIn other words, this is a blocking call.\n\nThis delays the Jetty HTTP listener from binding and accepting requests until all cores are loaded. Do we need to block the main thread?\n\nAlso, prior to this happening, the node is registered as a live node in ZK, which makes it a candidate for receiving requests from the Overseer, such as to service a create collection request. The problem of course is that the node listed in /live_nodes isn't accepting requests yet. So we either need to unblock the main thread during server loading or maybe wait longer before we register as a live node ... not sure which is the better way forward?",
+    "attachments": {
+        "SOLR-7361.patch": "https://issues.apache.org/jira/secure/attachment/12725073/SOLR-7361.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-04-07T19:41:22+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Isn't it a problem that live_nodes is set up but the cores aren't, only when the core isn't marked down? I see currently that ZkController.preRegister happens async in the threadpool, if that happened synchronously, we should be free to block main jetty thread or free it up as we deem fit. At that point, might as well free it up, but I admit I am not an expert on if there are other interactions we need to worry about.. ",
+            "id": "comment-14483898"
+        },
+        {
+            "date": "2015-04-07T19:54:21+0000",
+            "author": "Timothy Potter",
+            "content": "Isn't it a problem that live_nodes is set up but the cores aren't, only when the core isn't marked down?\n\nYou're right about requests being sent to cores, but I think the problem here is admin type requests, such as those coming from the overseer to create a new collection. This is actually how we found this in a big cluster after a restart, some cores were slow to load (due the the suggester dictionary issue) and create collection requests started to fail.\n\nIn general, I don't think all cores should be blocked from being accessed until the slowest core is loaded, so I'm thinking we need to re-think how cores are loaded in the background in cloud mode. ",
+            "id": "comment-14483920"
+        },
+        {
+            "date": "2015-04-07T20:24:00+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "I think I have also seen cases where if we bounced two nodes holding two replicas of a particular collection/shard, then they both can't complete their recovery because they can't talk to each other. This fixes itself eventually when they time out waiting for each other, but before that happens they're basically \"deadlocked\". (Unfortunately I don't have logs to back that up anymore, so it's more of an anecdotal account.) ",
+            "id": "comment-14483985"
+        },
+        {
+            "date": "2015-04-07T21:49:03+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Tim, I understand. What I meant is that we can't currently let through any requests because you are not guaranteed that cores will be in a sensible state for accepting requests before the core loading threads finish. That's why at least the preRegister for all cores needs to finish (and that shouldn't take long) before we start accepting requests. Once that happens, I think cores can load up in the background (or at least we can try, stumble and fix  ) ",
+            "id": "comment-14484146"
+        },
+        {
+            "date": "2015-04-07T22:11:24+0000",
+            "author": "Timothy Potter",
+            "content": "Ramkumar Aiyengar ah ok, I misunderstood, what you're saying makes sense. I'll try to tackle this on Thursday or Friday this week as I'm focused on a couple of other issues first, so if someone else can pick this up sooner, that would be great. ",
+            "id": "comment-14484188"
+        },
+        {
+            "date": "2015-04-07T22:31:15+0000",
+            "author": "Mark Miller",
+            "content": "what you're saying makes sense. \n\n+1 ",
+            "id": "comment-14484225"
+        },
+        {
+            "date": "2015-04-08T05:49:48+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "preRegister for all cores needs to finish (that shouldn't take long) before we start accepting requests.\n\nThis should become even faster btw once we get to SOLR-7281.\n\nJessica: I have a feeling what you are saying might happen because of the same reason as above \u2013 if two nodes go down uncleanly as active, they would come back as live and active before the async core loading actually marks them as down.\n\nThis is the sequence I propose (again, without looking at the code too deeply, so I might have missed something)\n\n\n\tMark all cores down, also make sure direct requests from outside Solr for all cores suitably fail.\n\tAdd to live nodes\n\tStart accepting requests\n\tLoad cores in background and enable requests for cores as they finish loading.\n\n ",
+            "id": "comment-14484766"
+        },
+        {
+            "date": "2015-04-10T20:09:35+0000",
+            "author": "Timothy Potter",
+            "content": "heh - now tons of tests fail because the main thread isn't blocked and finishes before cores are initialized ... knee-jerk reaction would be to activate this true async loading method using a System property, e.g. solr.cloud.loadCoresAsync, which defaults to true but is set to false in most tests ... other ideas? ",
+            "id": "comment-14490285"
+        },
+        {
+            "date": "2015-04-10T21:22:33+0000",
+            "author": "Shawn Heisey",
+            "content": "I like the idea of having access to the admin UI responsive immediately on startup ... if nothing else, to be able to see the progress of the startup.\n\nObviously any requests to cores that are not yet started must fail, but cores that have started, as well as any functionality that doesn't depend on core startup, should work.\n\nThere's probably more to think about and tweak.  During startup, CoreAdmin and CollectionsAdmin requests will require careful vetting.  My thought here is that about the only operation that should be allowed on things that haven't yet started is DELETE, if we can find a way to do so safely.  If deleting a core can remove it from the startup queue entirely, it's a slight optimization.\n\nIf we aren't already doing so, this will require that we enumerate all the cores and/or the clusterstate before listening to any kind of request on CoreAdmin/CollectionsAdmin.\n\nA disabling property for tests is a good interim step, but I think that the long term goal should be to modify both the async startup and the tests so everything works right. ",
+            "id": "comment-14490391"
+        },
+        {
+            "date": "2015-04-10T21:35:08+0000",
+            "author": "Timothy Potter",
+            "content": "Actually, if we go with the idea that non-cloud mode continues to block the main thread until cores are loaded, then all tests pass. I think that makes sense anyway, since there isn't anything like replica state in non-cloud mode to determine if a core is active, so the listener not being up until cores are loaded seems like a good thing for non-cloud mode. For cloud mode, it appears that we don't need a flag for the tests to pass. ",
+            "id": "comment-14490404"
+        },
+        {
+            "date": "2015-04-10T21:59:48+0000",
+            "author": "Shawn Heisey",
+            "content": "If we can pull the same thing off in non-cloud mode, I would like that ... but cloud mode is where it's a big problem. ",
+            "id": "comment-14490437"
+        },
+        {
+            "date": "2015-04-11T00:32:20+0000",
+            "author": "Damien Kamerman",
+            "content": "Regarding loading the cores in the background, I've made a few tweaks to work with thousands of cores (See SOLR-7191):\n1. Load cores in fixed threadPool. Cores are registered in background threads, so no reason to load all cores at once!\n2. Register cores in corename order with a fixed 128 threadPool. This is to not flood the DistributedQueue.\n3. Publish an entire node as 'down' (4.10 branch)\n4. Cache ConfigSetService.createIndexSchema() in cloud mode.\n\nSo, my questions are:\nWhat threadPool size will be used to load the cores?\nWhat order will cores be loaded in?\nWill cores be registered as they are loaded, or offloaded to another threadPool?\n\nMy initial thought was to register as a live node after cores are loaded. ",
+            "id": "comment-14490623"
+        },
+        {
+            "date": "2015-04-11T11:27:55+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "May be provide for a method in CoreContainer to wait till cores are initialized? ",
+            "id": "comment-14490930"
+        },
+        {
+            "date": "2015-04-13T18:57:31+0000",
+            "author": "Timothy Potter",
+            "content": "damien kamerman All good questions, but this ticket is not intended to address any of those and it sounds like you're tackling them as part of SOLR-7191. I'm close to posting a patch for this, which will only address the problem of blocking the main thread (which activates the Jetty listener) during core loading. ",
+            "id": "comment-14492853"
+        },
+        {
+            "date": "2015-04-13T22:32:38+0000",
+            "author": "Timothy Potter",
+            "content": "Patch that blocks the main thread until cores are pre-registered with ZK, but then loads cores in the background, allowing the main thread to progress and activate the Jetty listener. Only works in SolrCloud mode; the main thread will continue to be blocked by core loading in non-cloud mode. Cores will come online asynchronously when they are loaded. ",
+            "id": "comment-14493203"
+        },
+        {
+            "date": "2015-04-14T06:57:49+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Looks like a good start..\n\n\n\tWhat does a client get back when sending a request to a core which is not yet loaded? It should be a sensible 5xx error, but would be good to test that..\n\tDo we still need the sysprop for tests? As I mention above, we could use a CoreContainer call to synchronize ourselves in tests..\n\n ",
+            "id": "comment-14493690"
+        },
+        {
+            "date": "2015-04-18T11:12:48+0000",
+            "author": "Mark Miller",
+            "content": "solr.cloud.loadCoresAsync, which defaults to true but is set to false in most tests ... other ideas?\n\nThat doesn't seem right - we end up testing the wrong stuff mostly then - I'm working on a similar problem - let me see if I can get something better. ",
+            "id": "comment-14501271"
+        },
+        {
+            "date": "2015-04-18T11:14:13+0000",
+            "author": "Mark Miller",
+            "content": "What does a client get back when sending a request to a core which is not yet loaded? It should be a sensible 5xx error, but would be good to test that..\n\nIf it doesn't block, it will be a behavior back compat break we have to think about. I don't want to make this an option, so just simulating the block may be one way to go. ",
+            "id": "comment-14501272"
+        },
+        {
+            "date": "2015-04-18T11:43:22+0000",
+            "author": "Mark Miller",
+            "content": "I breezed over this a while back and it didn't stick with me. Ran into a situation I needed to solve myself and started tackling this how I would approach it in SOLR-7416. Here is the patch I hacked out. I would actually still like to wait for quick loading cores in most cases for up to N seconds and just have slow loading stragglers come in later. I'd also like to avoid any switch around the behaviour if possible. We have enough complication and varying code paths in this area. ",
+            "id": "comment-14501303"
+        },
+        {
+            "date": "2015-04-18T12:21:39+0000",
+            "author": "Mark Miller",
+            "content": "Still a beta, but here is patch v2. ",
+            "id": "comment-14501329"
+        },
+        {
+            "date": "2015-04-18T13:35:09+0000",
+            "author": "Mark Miller",
+            "content": "Here is a good version for comment with passing tests. \n\nNote: I had to fix an issue with how UpdateLog gets closed. Been trying to track that one down for a while I think! ",
+            "id": "comment-14501358"
+        },
+        {
+            "date": "2015-04-18T13:57:37+0000",
+            "author": "Timothy Potter",
+            "content": "Thanks for picking this one up. I like this approach better as well, since it avoids the cloud vs. non-cloud switch. And sorry about leaving that flag in there on my last patch as that caused some confusion for you and Ram (it wasn't being used anymore). I'll kick the tires on this patch a bit myself but +1 to the approach. ",
+            "id": "comment-14501370"
+        },
+        {
+            "date": "2015-04-18T13:58:20+0000",
+            "author": "Timothy Potter",
+            "content": "Assigning to Mark as he's proposed a better solution for this moving forward. ",
+            "id": "comment-14501371"
+        },
+        {
+            "date": "2015-04-18T20:44:47+0000",
+            "author": "Mark Miller",
+            "content": "Here is another iteration that polishes up some areas. ",
+            "id": "comment-14501577"
+        },
+        {
+            "date": "2015-04-19T13:24:00+0000",
+            "author": "Mark Miller",
+            "content": "This does change behavior a bit of course - all of your cores were loaded when you came out of CC#load before. I think it does a good enough job of simulating the old behavior though. Attempting to access a loading core specifically will block until it's ready to serve. I think given that this does seem like a big enough limitation that it enters bug territory, it's well worth making the change. ",
+            "id": "comment-14501847"
+        },
+        {
+            "date": "2015-04-21T16:28:02+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Sorry for the late feedback.\n\nMy concern with this approach is that this can be trappy for client code. When you are developing/testing, you might always have the cores up and running by the time you issue requests \u2013 and then the edge case will be exposed one day on production when slow disk IO or a bad GC pause strikes..\n\nIf we are breaking compat anyway, why not always break it (instead of in some cases outside developer control \u2013 which imo is no better) and return immediately without sleeping? In any case, at the very minimum, we would want to do that in our tests so that we account for that situation.. ",
+            "id": "comment-14505218"
+        },
+        {
+            "date": "2015-04-21T17:17:47+0000",
+            "author": "Mark Miller",
+            "content": "you might always have the cores up and running by the time you issue requests\n\nOther requests will block until the core is ready - what will that break? That is how it works now if requests come in before the cores are loaded. Do you have a concrete example?\n\nIf we are breaking compat anyway, why not always break it\n\nIf the cores are just going to load quickly, I think it's simply nicer to wait for them to load and only have outliers straggle in later, as the system did work. Unless there are outliers, I think it's a nicer system experience. This is a simple simulation of that approach.\n\nIt doesn't matter how long that wait is - you can set it to 0 and all the tests will pass fine. You can certainly randomly set that to 0 in test runs. ",
+            "id": "comment-14505305"
+        },
+        {
+            "date": "2015-04-21T17:47:15+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "I haven't synthetically tried this to confirm, happy to do that, I am just away from keyboard this instant. But here's my concern..\n\nBefore: I would have got a 5xx error for unloaded cores since all load at once before Jetty binds, which every client should consider normal in a distributed setup at least and try alternatives.\n\nNow: I would block till the loading is done. This could trigger timeouts which usually is not normal (would usually indicate slow queries), or worse, backlog requests in a busy server if its using a threadpool and sync http requests \u2013 even if timeouts are not hit.\n\nAgain, my understanding might be off, let me confirm this soon, and I can update if I am spewing nonsense.. ",
+            "id": "comment-14505359"
+        },
+        {
+            "date": "2015-04-21T18:02:08+0000",
+            "author": "Mark Miller",
+            "content": "Before: I would have got a 5xx error for unloaded cores since all load at once before Jetty binds\n\nWould you? I thought the request just blocked until the SolrDispatchFilter was ready...we should confirm it's a 5xx error - if that is the case, that is what we should be emulating. ",
+            "id": "comment-14505387"
+        },
+        {
+            "date": "2015-04-29T17:25:18+0000",
+            "author": "Mark Miller",
+            "content": "Okay, with SolrCloud, if you hit a core that is loaded and one is not, you get:\n\n\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<response>\n<lst name=\"responseHeader\"><int name=\"status\">503</int><int name=\"QTime\">3</int><lst name=\"params\"/></lst><lst name=\"error\"><str name=\"msg\">no servers hosting shard: </str><int name=\"code\">503</int></lst>\n</response>\n\n\n\nIf you hit the core that is loading you get:\n\ncurl: (7) Failed to connect to localhost port 8902: Connection refused\n\nI'll work up a new patch. ",
+            "id": "comment-14519770"
+        },
+        {
+            "date": "2015-04-29T20:55:53+0000",
+            "author": "Mark Miller",
+            "content": "Made some good progress this afternoon. I'll post a patch relatively soon. ",
+            "id": "comment-14520221"
+        },
+        {
+            "date": "2015-04-30T11:55:09+0000",
+            "author": "Mark Miller",
+            "content": "Here is my current progress.\n\nBy default CoreContainer still waits on load, but has a new async load option.\n\nJettySolrServer still waits on load, but has a new async load option.\n\nSolrDispatchFilter turns on the async load option and also returns a 503 on request while a core is loading (though it seems perhaps you can get a 510 instead depending on timing due to the stateformat=2 stuff).\n\nI think that is back compat and gives us the new behavior we want. ",
+            "id": "comment-14521374"
+        },
+        {
+            "date": "2015-05-05T11:56:36+0000",
+            "author": "Mark Miller",
+            "content": "Any comments on the latest patch? ",
+            "id": "comment-14528318"
+        },
+        {
+            "date": "2015-05-05T20:07:07+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Sorry I started looking at this over weekend before getting distracted. +1 overall.\n\n\n\tDoes your test in TestMiniCloud assume that by the time you assert the loading wouldn't have async done? Seems like we are relying on a timing detail. May be we could at least check for if the core is loaded at that point (still a race since it won't be an atomic check but probably less likely to hit).\n\tMinor: Would be nice for JettyConfig to instead take a Integer waitForLoadingMs (can be null) so that it can be tweaked instead of a boolean. Its hard anyway to assume a default for this.\n\n ",
+            "id": "comment-14529182"
+        },
+        {
+            "date": "2015-05-05T20:57:08+0000",
+            "author": "Timothy Potter",
+            "content": "+1 LGTM ... although the recent dispatch filter refactoring has broken the latest patch on trunk ",
+            "id": "comment-14529254"
+        },
+        {
+            "date": "2015-05-15T19:50:54+0000",
+            "author": "Mark Miller",
+            "content": "Regaining a bit of use of my right hand for hunt and peck - I'll see if I can update this on Sunday. ",
+            "id": "comment-14546083"
+        },
+        {
+            "date": "2015-05-19T13:28:21+0000",
+            "author": "Mark Miller",
+            "content": "May be we could at least check for if the core is loaded at that point\n\nJust another timing detail with false fails?  ",
+            "id": "comment-14550427"
+        },
+        {
+            "date": "2015-05-19T13:36:17+0000",
+            "author": "Mark Miller",
+            "content": "Updated to trunk. ",
+            "id": "comment-14550444"
+        },
+        {
+            "date": "2015-05-19T13:44:04+0000",
+            "author": "Mark Miller",
+            "content": "I have to work out why TestMiniSolrCloudCluster#testBasics is failing due to 510, stale cluster state responses. Something off in the merge up or some change I pulled in altered behavior. ",
+            "id": "comment-14550456"
+        },
+        {
+            "date": "2015-05-19T13:50:56+0000",
+            "author": "Mark Miller",
+            "content": "Just another timing detail with false fails?\n\nI think I was misunderstanding. You are saying only do the check if the core is not loaded by then?  That almost seems like we are just adding nothing to that test then - it wouldn't fail without the change like the current one does. I think if we start seeing false fails in the jenkins cluster, we should do something more invasive.  ",
+            "id": "comment-14550467"
+        },
+        {
+            "date": "2015-05-19T14:43:34+0000",
+            "author": "Mark Miller",
+            "content": "Cleans up the remaining issues except the quality of the test. ",
+            "id": "comment-14550550"
+        },
+        {
+            "date": "2015-05-19T19:16:33+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "It would still check if you correctly return a 5xx when you are not loaded, but I see your point. In order to properly test for the async nature, you would need to pass down a latch which prevents completion till you release it from the test, aka the invasive bit you refer to  Okay, +1 from me then.. ",
+            "id": "comment-14551049"
+        },
+        {
+            "date": "2015-05-27T15:37:31+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682060 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1682060 ]\n\nSOLR-7361: Slow loading SolrCores should not hold up all other SolrCores that have finished loading from serving requests. ",
+            "id": "comment-14561158"
+        },
+        {
+            "date": "2015-05-27T15:50:18+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1682065 from Mark Miller in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1682065 ]\n\nSOLR-7361: Slow loading SolrCores should not hold up all other SolrCores that have finished loading from serving requests. ",
+            "id": "comment-14561175"
+        },
+        {
+            "date": "2015-05-29T14:29:21+0000",
+            "author": "Mark Miller",
+            "content": "Thanks all! This is a great improvement. ",
+            "id": "comment-14564888"
+        },
+        {
+            "date": "2015-08-26T13:06:08+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Bulk close for 5.3.0 release ",
+            "id": "comment-14713227"
+        }
+    ]
+}

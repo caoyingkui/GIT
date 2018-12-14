@@ -1,0 +1,118 @@
+{
+    "id": "SOLR-9389",
+    "title": "HDFS Transaction logs stay open for writes which leaks Xceivers",
+    "details": {
+        "components": [
+            "Hadoop Integration",
+            "hdfs"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.2.1",
+            "6.3",
+            "7.0"
+        ],
+        "affect_versions": "6.1,                                            7.0",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The HdfsTransactionLog implementation keeps a Hadoop FSDataOutputStream open for its whole lifetime, which consumes two threads on the HDFS data node server (dataXceiver and packetresponder) even once the Solr tlog has finished being written to.\n\nThis means for a cluster with many indexes on HDFS, the number of Xceivers can keep growing and eventually hit the limit of 4096 on the data nodes. It's especially likely for indexes that have low write rates, because Solr keeps enough tlogs around to contain 100 documents (up to a limit of 10 tlogs). There's also the issue that attempting to write to a finished tlog would be a major bug, so closing it for writes helps catch that.\n\nOur cluster during testing had 100+ collections with 100 shards each, spread across 8 boxes (each running 4 solr nodes and 1 hdfs data node) and with 3x replication for the tlog files, this meant we hit the xceiver limit fairly easily and had to use the attached patch to ensure tlogs were closed for writes once finished.\n\nThe patch introduces an extra lifecycle state for the tlog, so it can be closed for writes and free up the HDFS resources, while still being available for reading. I've tried to make it as unobtrusive as I could, but there's probably a better way. I have not changed the behaviour of the local disk tlog implementation, because it only consumes a file descriptor regardless of read or write.\n\nnb We have decided not to use Solr-on-HDFS now, we're using local disk (for various reasons). So I don't have a HDFS cluster to do further testing on this, I'm just contributing the patch which worked for us.",
+    "attachments": {
+        "SOLR-9389.patch": "https://issues.apache.org/jira/secure/attachment/12822277/SOLR-9389.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-08-25T15:11:05+0000",
+            "author": "Mark Miller",
+            "content": "I've spent some time reviewing and testing out this patch - it all looks reasonable to me and tests out well. I'll commit this change soon. ",
+            "id": "comment-15437052"
+        },
+        {
+            "date": "2016-08-26T19:22:02+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6bff06ce4fad8edbe2a45e9b3639dfc8d3d2bb87 in lucene-solr's branch refs/heads/master from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6bff06c ]\n\nSOLR-9389: HDFS Transaction logs stay open for writes which leaks Xceivers. ",
+            "id": "comment-15439628"
+        },
+        {
+            "date": "2016-08-29T14:04:03+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit aaee4c820556ca0f62d51f939e907864e4262a32 in lucene-solr's branch refs/heads/branch_6x from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=aaee4c8 ]\n\nSOLR-9389: HDFS Transaction logs stay open for writes which leaks Xceivers. ",
+            "id": "comment-15445964"
+        },
+        {
+            "date": "2016-08-29T14:14:07+0000",
+            "author": "Mark Miller",
+            "content": "Thanks Tim! ",
+            "id": "comment-15445993"
+        },
+        {
+            "date": "2016-08-30T08:13:11+0000",
+            "author": "Tim Owen",
+            "content": "Great, thanks for reviewing and testing this Mark  ",
+            "id": "comment-15448406"
+        },
+        {
+            "date": "2016-08-31T02:28:24+0000",
+            "author": "David Smiley",
+            "content": "100+ collections with 100 shards each, spread across 8 boxes \n\nTim Owen that would mean ~1250 shards/box; no?  ~312 per Solr process.   Wow! ",
+            "id": "comment-15450832"
+        },
+        {
+            "date": "2016-08-31T08:51:28+0000",
+            "author": "Tim Owen",
+            "content": "David Smiley We're now running 6 Solr JVMs per box, as the machines in production have 6 SSDs installed, so yeah it works out at around 200 Solr cores being served by each Solr JVM. That seems to run fine, and we've had our staging environment for another Solr installation with hundreds of cores per JVM for several years. The reason for many shards is that we do frequent updates and deletes, and want to keep the Lucene index size below a manageable level e.g. 5GB, to avoid a potentially slow merge that would block writes for too long. With composite routing, our queries never touch all shards in a collection - just a few.\n\nThe problem still is with SolrCloud and the Overseer/Zookeeper, which become overloaded with traffic once there's any kind of problem e.g. machine failure, or worse an entire rack losing power - this causes a flood of overseer queue events and all the nodes feverishly downloading state.json repeatedly. Happy to talk to anyone who's working on that problem! ",
+            "id": "comment-15451626"
+        },
+        {
+            "date": "2016-08-31T12:40:24+0000",
+            "author": "Mark Miller",
+            "content": "What version are you seeing that with? ",
+            "id": "comment-15452121"
+        },
+        {
+            "date": "2016-08-31T15:26:28+0000",
+            "author": "Tim Owen",
+            "content": "We're using Solr 6.1 (on local disk now, as mentioned). The first production cluster we had hoped to get stable was 40 boxes, each running 5 or 6 Solr JVMs, with a dedicated ZK cluster on 3 other boxes, and 100 shards per collection. That was problematic, we had a lot of Zookeeper traffic during normal writes, but especially whenever one or more boxes were deliberately killed as many Solr instances restarted all at once, leading to a large overseer queue and shards in recovery for a long time.\n\nRight now we're testing two scaled-down clusters: 24 boxes, and 12 boxes, with correspondingly reduced number of shards, to see at what point it can be stable when we do destructive testing by killing machines and whole racks, to see how it copes. 12 boxes is looking a lot more stable so far.\n\nWe'll have to consider running multiple of these smaller clusters instead of 1 large one - is that best practice? There was some discussion on SOLR-5872 and SOLR-5475 about scaling the overseer with large numbers of collections and shards, although it's clearly a tricky problem. ",
+            "id": "comment-15452531"
+        },
+        {
+            "date": "2016-08-31T18:33:30+0000",
+            "author": "David Smiley",
+            "content": "The reason for many shards is that we do frequent updates and deletes, and want to keep the Lucene index size below a manageable level e.g. 5GB, to avoid a potentially slow merge that would block writes for too long.\n\nThat's addressable easily enough by increasing the merge concurrency threads, and using higher mergeFactor (now split to two other options).  It's cool your queries only hit a couple shards on average but I think going up a factor of 10 (and using 1/10th number shards) is in a better better direction that truly massive shard counts like this. ",
+            "id": "comment-15452999"
+        },
+        {
+            "date": "2016-09-01T18:02:52+0000",
+            "author": "Tim Owen",
+            "content": "Thanks for the advice David, I'll take a look at the concurrency setting, we'll need to test out using fewer shards and see how that compares for our use-case. Since we create new collections weekly, we always have the option to increase the shard count later if we do hit situations of large merges happening.\n\nAlthough I'm a bit surprised that this model is considered 'truly massive' .. I'd have expected many large Solr installations will have thousands of shards across all their collections. ",
+            "id": "comment-15456179"
+        },
+        {
+            "date": "2016-09-02T03:48:39+0000",
+            "author": "David Smiley",
+            "content": "100 shards for any one collection isn't massive (although I do think it's high)... I mean the total number of shards you run per box.  I can see now you keep your shard size low, which makes it more feasible; and no doubt you have tons of RAM.  Most people go for bigger shards and fewer number of them, rather than small numerous shards.  A factor enabling you to do this is that your application allows for the very effective use of composite key doc routing.  Nonetheless I'm sure there's a high java heap overhead per-shard at these numbers, and it'd be nice to bring it down from the stratosphere  ",
+            "id": "comment-15457410"
+        },
+        {
+            "date": "2016-09-12T02:13:50+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Re-opened to back-port to 6.2.1 ",
+            "id": "comment-15482806"
+        },
+        {
+            "date": "2016-09-12T09:33:41+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 83cd8c12ecd53198eea51ff418c7e1901b4a9dde in lucene-solr's branch refs/heads/branch_6_2 from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=83cd8c1 ]\n\nSOLR-9389: HDFS Transaction logs stay open for writes which leaks Xceivers.\n\n(cherry picked from commit aaee4c8) ",
+            "id": "comment-15483625"
+        },
+        {
+            "date": "2016-09-21T03:03:29+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Closing after 6.2.1 release ",
+            "id": "comment-15508552"
+        }
+    ]
+}

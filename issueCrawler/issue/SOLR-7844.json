@@ -1,0 +1,283 @@
+{
+    "id": "SOLR-7844",
+    "title": "Zookeeper session expiry during shard leader election can cause multiple leaders.",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "affect_versions": "4.10.4",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "If the ZooKeeper session expires for a host during shard leader election, the ephemeral leader_elect nodes are removed. However the threads that were processing the election are still present (and could believe the host won the election). They will then incorrectly create leader nodes once a new ZooKeeper session is established.\n\nThis introduces a subtle race condition that could cause two hosts to become leader.\n\nScenario:\n\na three machine cluster, all of the machines are restarting at approximately the same time.\n\nThe first machine starts, writes a leader_elect ephemeral node, it's the only candidate in the election so it wins and starts the leadership process. As it knows it has peers, it begins to block waiting for the peers to arrive.\n\nDuring this period of blocking[1] the ZK connection drops and the session expires.\n\nA new ZK session is established, and ElectionContext.cancelElection is called. Then register() is called and a new set of leader_elect ephemeral nodes are created.\n\nDuring the period between the ZK session expiring, and new set of leader_elect nodes being created the second machine starts.\n\nIt creates its leader_elect ephemeral nodes, as there are no other nodes it wins the election and starts the leadership process. As its still missing one of its peers, it begins to block waiting for the third machine to join.\n\nThere is now a race between machine1 & machine2, both of whom think they are the leader.\n\nSo far, this isn't too bad, because the machine that loses the race will fail when it tries to create the /collection/name/leader/shard1 node (as it already exists), and will rejoin the election.\n\nWhile this is happening, machine3 has started and has queued for leadership behind machine2.\n\nIf the loser of the race is machine2, when it rejoins the election it cancels the current context, deleting it's leader_elect ephemeral nodes.\n\nAt this point, machine3 believes it has become leader (the watcher it has on the leader_elect node fires), and it runs the LeaderElector::checkIfIAmLeader method. This method DELETES the current /collection/name/leader/shard1 node, then starts the leadership process (as all three machines are now running, it does not block to wait).\n\nSo, machine1 won the race with machine2 and declared its leadership and created the nodes. However, machine3 has just deleted them, and recreated them for itself. So machine1 and machine3 both believe they are the leader.\n\nI am thinking that the fix should be to cancel & close all election contexts immediately on reconnect (we do cancel them, however it's run serially which has blocking issues, and just canceling does not cause the wait loop to exit). That election context logic already has checks on the closed flag, so they should exit if they see it has been closed.\n\nI'm working on a patch for this.",
+    "attachments": {
+        "SOLR-7844.patch": "https://issues.apache.org/jira/secure/attachment/12752587/SOLR-7844.patch",
+        "SOLR-7844-5x.patch": "https://issues.apache.org/jira/secure/attachment/12753799/SOLR-7844-5x.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-08-26T22:10:02+0000",
+            "author": "Mike Roberts",
+            "content": "Initial attempt at a patch.\n\nWhen we reconnect after a zookeeper session expiry we cancel any ongoing leader elections. The current ongoing election threads check status in a few places to ensure that no 'leader specific' operations are taken after the election has been canceled.\n\nI don't think this is bulletproof, but it does significantly reduce the size of the window in which this scenario can occur. ",
+            "id": "comment-14715613"
+        },
+        {
+            "date": "2015-08-27T12:50:20+0000",
+            "author": "Mark Miller",
+            "content": "Did you see this in the wild? Can you reproduce it?\n\nAny chance you can port this patch to trunk?\n\nThis looks like a good improvement.\n\nThis method DELETES the current /collection/name/leader/shard1 node\n\nWe need to audit that. We should be using that node to ensure only one leader in any case. ",
+            "id": "comment-14716604"
+        },
+        {
+            "date": "2015-08-27T12:53:37+0000",
+            "author": "Mark Miller",
+            "content": "We really want to remove the following and count on SOLR-5799. This is really a mistake. This patch probably also still makes sense as well though.\n\n\n       // first we delete the node advertising the old leader in case the ephem is still there\n      try {\n        zkClient.delete(context.leaderPath, -1, true);\n      }catch (KeeperException.NoNodeException nne){\n        //no problem\n      }catch (InterruptedException e){\n        throw e;\n      } catch (Exception e) {\n        //failed to delete the leader node\n        log.error(\"leader elect delete error\",e);\n        retryElection(context, false);\n        return;\n        // fine\n      } \n ",
+            "id": "comment-14716607"
+        },
+        {
+            "date": "2015-08-28T12:14:25+0000",
+            "author": "Mark Miller",
+            "content": "Here is a patch merging everything together for trunk.\n\nWe no longer delete the advertised leader node - too dangerous. We also do better at stopping elections from living across session expiration reconnects. ",
+            "id": "comment-14718432"
+        },
+        {
+            "date": "2015-08-28T16:21:13+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "Mark Miller, not sure if this is intended--looks like the newly added ShardLeaderElectionContextBase.cancelElection now blindly deletes the leader node, which sounds just as dangerous. From your comment it seems like you just wanted it to expire out, so I'm wondering if it's just a merge bug or something.\n\nIn general, I think it'd make a lot of sense to predicate the writing of the leader node on the election node still having the same session as the thread thinks (using the same zookeeper multi-transactional semantics as in ZkController.markShardAsDownIfLeader), so that a thread that went GCing before writing the leader node will fail when it comes back since its election node will have expired.  ",
+            "id": "comment-14720117"
+        },
+        {
+            "date": "2015-08-28T16:41:51+0000",
+            "author": "Mark Miller",
+            "content": "Mark Miller, not sure if this is intended--looks like the newly added ShardLeaderElectionContextBase.cancelElection now blindly deletes the leader node, which sounds just as dangerous. From your comment it seems like you just wanted it to expire out, so I'm wondering if it's just a merge bug or something.\n\nNo, it seems we need it because sometimes the leader is lost without an expiration. Some tests won't pass without. I think this is why that first delete was put in - a quick fix.\n\nWe do want to make sure we only remove our own registration though. We should be able to track that with the znode version and ensure we don't remove another candidate's entry with an optimistic delete?\n\n\nIn general, I think it'd make a lot of sense to predicate the writing of the leader node on the election node still having the same session as the thread thinks (using the same zookeeper multi-transactional semantics as in ZkController.markShardAsDownIfLeader), so that a thread that went GCing before writing the leader node will fail when it comes back since its election node will have expired.\n\nThat sounds like a good idea as well. ",
+            "id": "comment-14720206"
+        },
+        {
+            "date": "2015-08-28T16:50:16+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "We do want to make sure we only remove our own registration though. We should be able to track that with the znode version and ensure we don't remove another candidate's entry with an optimistic delete?\nSounds good!\n\nThanks for clarifying! ",
+            "id": "comment-14720220"
+        },
+        {
+            "date": "2015-08-28T17:02:14+0000",
+            "author": "Mark Miller",
+            "content": "using the same zookeeper multi-transactional semantics as in ZkController.markShardAsDownIfLeader)\n\nHmm ... is there an easy way to check session id this way though? Perhaps we should open up a new issue to try for this improvement. ",
+            "id": "comment-14720238"
+        },
+        {
+            "date": "2015-08-28T17:03:22+0000",
+            "author": "Mark Miller",
+            "content": "Another patch that only deletes a registered leader node if the current election context owns it. ",
+            "id": "comment-14720244"
+        },
+        {
+            "date": "2015-08-28T18:02:11+0000",
+            "author": "Mark Miller",
+            "content": "I'm also sad to not see a way to get the version back from a created node? Just the path? ",
+            "id": "comment-14720336"
+        },
+        {
+            "date": "2015-08-28T18:58:41+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "Ah, well, \"create\" means version is 0 (or whatever initial version is) right? Otherwise you get a NodeExists back. Hmm... ",
+            "id": "comment-14720410"
+        },
+        {
+            "date": "2015-08-28T19:15:07+0000",
+            "author": "Mark Miller",
+            "content": "I did not know you could count on that, but good point, I'll read up on versions again and work that in. ",
+            "id": "comment-14720425"
+        },
+        {
+            "date": "2015-08-28T19:48:59+0000",
+            "author": "Mark Miller",
+            "content": "Okay, here is a more bullet proof idea perhaps.\n\nWe use the multi to create the leader znode and get the cversion of the parent node of the leader znode.\n\nWe then conditionally delete on cancel with multi again, conditional on the parent nodes cversion.\n\nRough patch attached. ",
+            "id": "comment-14720466"
+        },
+        {
+            "date": "2015-08-28T20:59:39+0000",
+            "author": "Mark Miller",
+            "content": "No, they don't let you compare the cversion on the part where we use the multi to delete - darn. ",
+            "id": "comment-14720563"
+        },
+        {
+            "date": "2015-08-28T22:46:01+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "Since you're doing a setData on the parent (and thereby bumping the parent's version) each time  you create the leaderPath, you should be able to rely on the parent's version as well, instead of its cversion.\n\nSince you're doing the multi already, might as well add \"ops.add(Op.check(leaderSeqPath, -1));\" right before the Op.create? ",
+            "id": "comment-14720713"
+        },
+        {
+            "date": "2015-08-28T23:11:24+0000",
+            "author": "Mark Miller",
+            "content": "Yeah, I tried that trick after some googling, but the parent version and cversion seem to move out of the sync. I have not spotted why yet, but it seems to tricky to enforce or test. Running low on options though. ",
+            "id": "comment-14720759"
+        },
+        {
+            "date": "2015-08-29T01:36:01+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "The parent's cversion will change if the child node expires, whereas in this case the version won't change--so they won't be in sync. But that's ok. Are you seeing any case where while the leader node stayed there (didn't change) that the parent version changed? ",
+            "id": "comment-14720891"
+        },
+        {
+            "date": "2015-08-29T14:26:36+0000",
+            "author": "Mark Miller",
+            "content": "But that's ok.\n\nOkay, so I had a slightly different thought in my head. Now I understand what you meant. That works I think.\n\nI just have to figure out why the leader rebalance test is failing, but otherwise I think this works. ",
+            "id": "comment-14721122"
+        },
+        {
+            "date": "2015-08-29T15:25:28+0000",
+            "author": "Mark Miller",
+            "content": "Man, this leader rebalance stuff looks really hairy. Not much appetite to dig into it. I'm already spotting likely bugs and odd things. ",
+            "id": "comment-14721140"
+        },
+        {
+            "date": "2015-08-29T15:43:03+0000",
+            "author": "Mark Miller",
+            "content": "Blah. Perhaps it's working now.\n\nRough patch attached. ",
+            "id": "comment-14721142"
+        },
+        {
+            "date": "2015-08-29T17:18:23+0000",
+            "author": "Mark Miller",
+            "content": "Still some issue with rebalance leaders. ",
+            "id": "comment-14721160"
+        },
+        {
+            "date": "2015-08-29T23:16:11+0000",
+            "author": "Mark Miller",
+            "content": "Okay, still in rough edges shape, but this patch should address everything.\n\nWe do have to move the advertised leader node in zk so that we can have a shard specific non ephemeral version to track.\n\nPerhaps in 5x we can also just still write that data to the now parent node?\n ",
+            "id": "comment-14721287"
+        },
+        {
+            "date": "2015-08-29T23:32:59+0000",
+            "author": "Mark Miller",
+            "content": "\nSo, machine1 won the race with machine2 and declared its leadership and created the nodes. However, machine3 has just deleted them, and recreated them for itself. So machine1 and machine3 both believe they are the leader.\n\nThis is an interesting state. Mike Roberts, do you have any notes on the following behavior in this state? Other nodes should consider the leader whoever is advertised in ZK as that is what lookups will return. Even the leader that did not win the advertisement should consider the winning node the real leader, and in cases updates came in anyway, our defensive checks should prevent the losing leader from accepting anything?\n\nIn any case, the latest patch should use ZK to ensure only one node can ever think it's the leader. ",
+            "id": "comment-14721293"
+        },
+        {
+            "date": "2015-08-30T00:41:11+0000",
+            "author": "Mark Miller",
+            "content": "Here is a cleaned up patch with all tests passing. ",
+            "id": "comment-14721317"
+        },
+        {
+            "date": "2015-08-31T14:42:29+0000",
+            "author": "Mark Miller",
+            "content": "Let me know what you think Jessica Cheng Mallet. I think this is pretty close. ",
+            "id": "comment-14723484"
+        },
+        {
+            "date": "2015-08-31T16:54:58+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "This looks good to me.\n\nThe two comments I have are the following:\n1. It'd be good to add some \"explanation/documentation\" type comment in ElectionContext to describe what we're trying to accomplish with the zk multi-transaction. For example, why can we rely on the parent version, etc.\n2. Will the change to the leaderProps in ZkController (adding CORE_NODE_NAME_PROP) make this change non-backwards compatible?\n\nRelated but unrelated--how do you guys usually make line comments in a JIRA patch situation? Here I only have two comments so it's pretty tractable, but I can see it being difficult if it's a large change, etc.\n\nThanks! ",
+            "id": "comment-14723682"
+        },
+        {
+            "date": "2015-08-31T17:36:23+0000",
+            "author": "Mark Miller",
+            "content": "\n2. Will the change to the leaderProps in ZkController (adding CORE_NODE_NAME_PROP) make this change non-backwards compatible?\n\nI think it's kind of an internal API, but we could accept both for 5x.\n\nhow do you guys usually make line comments in a JIRA patch situation? \n\nI signed us up for ReviewBoard sometime back.\n\nIt has the downside of splitting the discussion between JIRA and ReviewBoard and never really got much traction.\n\nI tried to jump start it anyway because of two key features:\n\n1. Line comments\n2. Ability to easily see diffs between patches\n\nI'd be happy to put any patch on it by request. ",
+            "id": "comment-14723753"
+        },
+        {
+            "date": "2015-09-01T13:15:16+0000",
+            "author": "Shawn Heisey",
+            "content": "Being able to see diffs between patches would be pretty awesome.  I have on occasion used diff on patches in bash, but without color syntax highlighting, it's hard to read.  Something that would be really cool for that particular use case is multiple colors, not just two \u2013 one color set for the additions and removals in the underlying patch, one for the differences between the patches.  I'm thinking about another color set for parts of the text where the two overlap, but until I actually see it, I don't know if that would truly be useful.\n\nI saw things on the mailing list about ReviewBoard, but it didn't jump out as directly useful to me.  I will pay more attention the next time something shows up from it. ",
+            "id": "comment-14725371"
+        },
+        {
+            "date": "2015-09-01T16:06:40+0000",
+            "author": "Mark Miller",
+            "content": "Okay, I think we are ready to commit this.\n\nFor 5x I will accept NODE_NAME as well as CORE_NODE_NAME for the rebalance API and write the current leader info to the old registration node as well. ",
+            "id": "comment-14725626"
+        },
+        {
+            "date": "2015-09-01T16:13:39+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1700603 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1700603 ]\n\nSOLR-7844: Zookeeper session expiry during shard leader election can cause multiple leaders. ",
+            "id": "comment-14725634"
+        },
+        {
+            "date": "2015-09-02T16:48:24+0000",
+            "author": "Mark Miller",
+            "content": "Here is the 5x patch. ",
+            "id": "comment-14727611"
+        },
+        {
+            "date": "2015-09-02T17:21:38+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1700853 from Mark Miller in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1700853 ]\n\nSOLR-7844: Zookeeper session expiry during shard leader election can cause multiple leaders. ",
+            "id": "comment-14727664"
+        },
+        {
+            "date": "2015-09-02T17:22:18+0000",
+            "author": "Mark Miller",
+            "content": "Thanks guys! ",
+            "id": "comment-14727665"
+        },
+        {
+            "date": "2016-01-17T09:58:21+0000",
+            "author": "Shai Erera",
+            "content": "Mark Miller this seems to break upgrading existing 5x (e.g. 5.3) clusters to 5.4, unless I missed a \"migration\" step. If you're doing a rolling upgrade, such that you take one of the nodes down, replace the JARs to 5.4 and restart the node, you'll see such exceptions:\n\n\norg.apache.solr.common.SolrException: Error getting leader from zk for shard shard1\n    at org.apache.solr.cloud.ZkController.getLeader(ZkController.java:1034)\n    at org.apache.solr.cloud.ZkController.register(ZkController.java:940)\n    at org.apache.solr.cloud.ZkController.register(ZkController.java:883)\n    at org.apache.solr.core.ZkContainer$2.run(ZkContainer.java:184)\n    at org.apache.solr.core.ZkContainer.registerInZk(ZkContainer.java:213)\n    at org.apache.solr.core.CoreContainer.registerCore(CoreContainer.java:696)\n    at org.apache.solr.core.CoreContainer.create(CoreContainer.java:750)\n    at org.apache.solr.core.CoreContainer.create(CoreContainer.java:716)\n    at org.apache.solr.handler.admin.CoreAdminHandler.handleCreateAction(CoreAdminHandler.java:623)\n    at org.apache.solr.handler.admin.CoreAdminHandler.handleRequestInternal(CoreAdminHandler.java:204)\n    at org.apache.solr.handler.admin.CoreAdminHandler.handleRequestBody(CoreAdminHandler.java:184)\n    at org.apache.solr.handler.RequestHandlerBase.handleRequest(RequestHandlerBase.java:156)\n    at org.apache.solr.servlet.HttpSolrCall.handleAdminRequest(HttpSolrCall.java:664)\n    at org.apache.solr.servlet.HttpSolrCall.call(HttpSolrCall.java:438)\n    at org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:222)\n    at org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:181)\n        ...\nCaused by: org.apache.solr.common.SolrException: Could not get leader props\n    at org.apache.solr.cloud.ZkController.getLeaderProps(ZkController.java:1081)\n    at org.apache.solr.cloud.ZkController.getLeaderProps(ZkController.java:1045)\n    at org.apache.solr.cloud.ZkController.getLeader(ZkController.java:1001)\n    ... 35 more\nCaused by: org.apache.zookeeper.KeeperException$NoNodeException: KeeperErrorCode = NoNode for /collections/acg-test-1/leaders/shard1/leader\n    at org.apache.zookeeper.KeeperException.create(KeeperException.java:111)\n    at org.apache.zookeeper.KeeperException.create(KeeperException.java:51)\n    at org.apache.zookeeper.ZooKeeper.getData(ZooKeeper.java:1155)\n    at org.apache.solr.common.cloud.SolrZkClient$7.execute(SolrZkClient.java:345)\n    at org.apache.solr.common.cloud.SolrZkClient$7.execute(SolrZkClient.java:342)\n    at org.apache.solr.common.cloud.ZkCmdExecutor.retryOperation(ZkCmdExecutor.java:61)\n    at org.apache.solr.common.cloud.SolrZkClient.getData(SolrZkClient.java:342)\n    at org.apache.solr.cloud.ZkController.getLeaderProps(ZkController.java:1059)\n\n\n\nWhen the 5.4 nodes come up, they don't find /collections/coll/shard/leader1 path and fail. I am not quite sure how to recover this though, since the cluster has a mixture of 5.3 and 5.4 nodes. I cannot create .../shard1/leader since ../shard1 is an EPHEMERAL node and therefore can't create child nodes. I am not sure what will happen if I delete \"../shard1\" and recreate it as non EPHEMERAL, will the old 5.3 nodes work? I also need to ensure that the new 5.4 node doesn't become the leader if it wasn't already.\n\nPerhaps a fix would be for 5.4 to fallback to read the leader info from \"../shard1\"? Then when the last 5.3 node is down, the leader will be attempted by a 5.4 node which will recreate the leader path according to the 5.4 format? Should this have been a zk version change?\n\nI'd appreciate some guidance here. ",
+            "id": "comment-15103645"
+        },
+        {
+            "date": "2016-01-17T16:37:00+0000",
+            "author": "Shai Erera",
+            "content": "I think that if we also check for the leader under \"/shard1\" as a fallback, the situation will resolve itself? I.e. the new 5.4 nodes will come up finding a leader. When that leader dies, the \"shard1\" EPHEMERAL node will be deleted, and a 5.4 node will create the proper structure in ZK? What do you think? ",
+            "id": "comment-15103781"
+        },
+        {
+            "date": "2016-01-17T20:29:26+0000",
+            "author": "Mark Miller",
+            "content": "Yeah, 5x needs a little bridge back compat that checks the old location if the new one does not exist.\n\nWe don't have any tests at all for rolling updates, so it is all a bit hit or miss, but I believe that should work out fine. ",
+            "id": "comment-15103909"
+        },
+        {
+            "date": "2016-01-17T21:07:40+0000",
+            "author": "Shai Erera",
+            "content": "Where is the best place to check that in your opinion? If we do something in ZkStateReader.getLeaderPath(), then we cover both ZkController.getLeaderProps() and also ShardLeaderElectionContextBase. As I see it, the latter may also log failures to remove a leader node, while attempting to delete \"shard1/leader\".\n\nSo in ZkStateReader.getLeaderPath(), we can perhaps check if \"shard1\" is an ephemeral node (looking at its ephemeralOwner value \u2013 0 means it's not an ephemeral node), it means this is a pre-5.4 leader, and we return it as the leader path? Otherwise, we return shard1/leader?\n\nAm I over-thinking it, and this only needs to be handled in ZkController.getLeaderProps(), catching NoNodeException and attempting to read the props from the parent? I ask because I'm not sure what role ShardLeaderElectionContextBase plays here. ",
+            "id": "comment-15103923"
+        },
+        {
+            "date": "2016-01-17T21:21:32+0000",
+            "author": "Mark Miller",
+            "content": "Am I over-thinking it, and this only needs to be handled in ZkController.getLeaderProps(), catching NoNodeException and attempting to read the props from the parent?\n\nI think so.\n\nI ask because I'm not sure what role ShardLeaderElectionContextBase plays here.\n\nThis sets where it will get written out. We don't need to change that, we want to write out to the new spot, so I think the above is probably all that needs to be done with an initial glance over. ",
+            "id": "comment-15103928"
+        },
+        {
+            "date": "2016-01-18T04:10:57+0000",
+            "author": "Shai Erera",
+            "content": "Reopening to adddress \"upgrade from 5.3\" issue. ",
+            "id": "comment-15104139"
+        },
+        {
+            "date": "2016-01-18T04:11:57+0000",
+            "author": "Shai Erera",
+            "content": "Mark Miller, can you please review this patch? If it looks OK to you, I'd like to try get it out in 5.4.1. ",
+            "id": "comment-15104140"
+        },
+        {
+            "date": "2016-01-18T04:14:03+0000",
+            "author": "Mark Miller",
+            "content": "I can look in the morning. We should use the other issue and just link to this one. This issue is released and essentially frozen now.  ",
+            "id": "comment-15104142"
+        },
+        {
+            "date": "2016-01-18T04:16:37+0000",
+            "author": "Shai Erera",
+            "content": "OK I will open a separate issue. ",
+            "id": "comment-15104144"
+        },
+        {
+            "date": "2016-01-18T04:20:15+0000",
+            "author": "Shai Erera",
+            "content": "Opened SOLR-8561 ",
+            "id": "comment-15104148"
+        }
+    ]
+}

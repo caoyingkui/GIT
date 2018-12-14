@@ -1,0 +1,237 @@
+{
+    "id": "SOLR-5474",
+    "title": "Add  stateFormat=2 support to CloudSolrServer",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Sub-task",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "In this mode SolrJ would not watch any ZK node\n\nIt fetches the state  on demand and cache the most recently used n collections in memory.\n\nSolrJ would not listen to any ZK node. When a request comes for a collection \u2018xcoll\u2019\nit would first check if such a collection exists\nIf yes it first looks up the details in the local cache for that collection\nIf not found in cache , it fetches the node /collections/xcoll/state.json and caches the information\nAny query/update will be sent with extra query param specifying the collection name , version (example _stateVer=xcoll:34) . A node would throw an error (INVALID_NODE) if it does not have the right version\nIf SolrJ gets INVALID_NODE error it would invalidate the cache and fetch fresh state information for that collection (and caches it again)\n\nIf there is a connection timeout, SolrJ assumes the node is down and re-fetch the state for the collection and try again",
+    "attachments": {
+        "SOLR-5474.patch": "https://issues.apache.org/jira/secure/attachment/12620976/SOLR-5474.patch",
+        "fail.logs": "https://issues.apache.org/jira/secure/attachment/12641636/fail.logs"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13827775",
+            "date": "2013-11-20T15:51:15+0000",
+            "content": "Noble: can you share the use case - why is this valuable, what situations is this meant for, what issues does it solve?  Thanks.\nNote: this is something I generally miss and would love to see people include this sort of information when they open JIRA issues.  This would help everyone trying to follow Solr development better understand what is going on and why. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13828662",
+            "date": "2013-11-21T10:02:02+0000",
+            "content": "The parent issue is to enable Solr to deal with a large no:of collections and hence we are going to see an explosion of the no:of nodeswatching ZK. Assuming that there will be many more clients than the nodes themselves, \n\n\tThere will be too many watchers on the main clusterstate\n\tIf there are are multiple state nodes , clients would need to watch those ZK nodes as well\n\n\n\nWe want to minimize the load on ZK . Moreover, all clients don't need to be aware of all  collections and their states. It can be fetched lazily on demand\n\nThis will be another class extending SolrServer\n\n\nclass LazyCloudSolrServer extends SolrServer {\n}\n\n\n "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13831910",
+            "date": "2013-11-25T21:14:41+0000",
+            "content": "I like the strategy of using a LazyCloudSolrServer as that keeps this \"lazy\" mode de-coupled from the current implementation, giving Solr users the choice based on their environment. However, while planning an implementation strategy for this, I discovered that some of the core cloud classes in the org.apache.solr.common.cloud package, such as CloudSolrServer and ZkStateReader, are closed for extension because all of the member variables one would need access to are marked private. It seems reasonable that one would want to extend these classes, if for some other reason than this ticket alone. Curious on whether I can plan to mark the members of the core classes protected instead of private or should an implementation of this ticket leave all existing cloud code un-touched even if that leads to copy-and-paste reuse in some cases? Immediately, I can see needing to change some access modifiers for CloudSolrServer, ZkStateReader, and ClusterState. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13831921",
+            "date": "2013-11-25T21:23:13+0000",
+            "content": "If it's for our own internal use and helps us, feel free to open those classes up. I would just perhaps note in a comment that they are not intended for user extension - because we do not want to be locked into any internal back compat for those classes at this point I think. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13831923",
+            "date": "2013-11-25T21:25:09+0000",
+            "content": "I'm going to try to see how far I can get without changing the existing code, but good to know I can change access levels if I get stuck  Thanks. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13832240",
+            "date": "2013-11-26T03:06:01+0000",
+            "content": "As part of SOLR-5473 the ZKStateReader will have an option of not watching clusterstate.json. This option could be enabled with a flag. The LazyCloudSolrServer can piggyback on the new ZkStateReader\n\n\nThe _target_ param would help the client know of a node goes down . But if a new replica comes up , the client would not know about the new replica till the cache gets invalidated by a \n\n\ttimeout\n\tINAVLID_NODE from the server\n\tconnection timeout to a replica of any node in that colection\n\n\n\nAn alternative would be the send the zk version as a parameter . example _stateVer_=collx:234 . If there is a version mismatch or the node does not serve the 'collx' respond with INVALID_STATE error\n\n\nThe DocCollection Object would have a new method getZkVersion() which gives the current version of the zk Object from which the DocCollection is created\n "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13836662",
+            "date": "2013-12-02T16:32:00+0000",
+            "content": "Thanks for the info about changes to ZkStateReader for SOLR-5473. I'm trying to think about how to differentiate between downed nodes and slow queries using this approach.\n\nLet's consider the scenario where there are two nodes serving a shard (A & B) and LazyCloudSolrServer sends a query request to node A. Imagine that node A is down, but the client application doesn't know that yet because its cached state is stale. The request will timeout after some configurable duration. After the timeout, LazyCloudSolrServer refreshes the cached state and realizes node A is down so it sends the request to node B and the query succeeds.\n\nHowever, if node A is actually healthy and the cause of the timeout is a slow query, then the client should have waited longer. After refreshing the state from ZooKeeper (in response to the timeout), the client can realize that since A was healthy, the cause of the timeout was likely a slow query. So does client re-send the slow query? That seems like it could end up in a loop of timeout / resends. Does LazyCloudSolrServer keep track of how many attempts it's made for a given query ... just brainstorming here ... I know Solr supports the timeAllowed parameter for a query but that's optional.\n\nI suppose this scenario is still possible even with the current approach of having watcher on the state znode on the client side. Although, I have to think that under the current approach, the probability of sending a request to a downed node goes down since state is refreshed in real-time. The zk version doesn't help here because if node A is down, the only thing the client can do is wait for the request to timeout. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13836718",
+            "date": "2013-12-02T17:41:37+0000",
+            "content": "Before updating the cache it should check the version of \"state\" for that collection. if it finds that the version is actually not changed it should just continue talking to other nodes in the shard and not invalidate the cache "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13841922",
+            "date": "2013-12-07T00:08:05+0000",
+            "content": "As Noble mentions above, this approach needs a time-to-live (TTL) timeout for cached collection state. For this, I'm thinking of keeping an additional long property along with the cached state that holds the timestamp of when the state was last loaded from ZooKeeper. An age is computed when objects are requested from the cache and if the age is older than a configured TTL, then the object is removed from the cache and null is returned. Thinking something like the following internal private class ...\n\nclass CachedDocCollection {\n  private DocCollection cached;\n  private long cachedAt;\n\n  boolean isExpired(long ttl) \n{\n    return (System.currentTimeMillis() - cachedAt) > ttl;\n  }\n}\n\nThis approach has the benefit of not needing any new dependencies (such as Guava's cache) and doesn't require a background thread to do cache housekeeping.\n\nThis has the downside of computing an age on each \"get\", which I don't think is a big deal because state is probably not going to be requested all that frequently.  "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13859521",
+            "date": "2013-12-31T15:13:53+0000",
+            "content": "Here's the start of a solution for this ticket. This first patch contains a LazyCloudSolrServer implementation + unit tests and changes to ZkStateReader to not watch any znodes. More functional unit tests are needed as is some chaos monkey type tests to verify that the lazy approach can respond to all possible cluster state changes correctly. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13859654",
+            "date": "2013-12-31T20:10:00+0000",
+            "content": "Previous patch file was created incorrectly with git ... "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13867519",
+            "date": "2014-01-10T05:35:41+0000",
+            "content": "Here's a new patch that takes a slightly different approach to the previous. The previous did the following:\n\n1 \u2013 Client application creates a request targeted to external collection \"foo\"\n\n2 - CloudSolrServer (on the client side) doesn't know about \"foo\", so it fetches a one-time snapshot of foo's state from ZK using lazy loading. It caches that state and keeps track of the state version, e.g. 1\n\n3 - CloudSolrServer sends the request to one of the nodes servicing \u201cfoo\u201d based on the state information it retrieved from ZK. If the request is an update request, it will go to the leader, if it is a query, the request will go to one of the replicas using LBSolrServer. Every request contains the stateVer parameter, e.g. stateVer=foo:1\n\n4 - Server-side compares the stateVer it receives in the request from the client with its stateVer for foo and generates an INVALID_STATE error if they don't match. The server does have a watcher for foo\u2019s state in each replica.\n\nThere are some subtle issues with this:\n\n1) If a new replica is added (or recovers) in \"foo\", then the state of \"foo\" on the server changes and the request fails with an INVALID_STATE even though it probably shouldn't fail, but that's the only way now to tell the client its state is stale.\n\nThere is retry logic in the client and the retry may work, but it might not because there's nothing that prevents the state from changing again in between the client receiving the INVALID_STATE response, re-fetching state from ZK, and re-issuing the request. Also, failing a request when a positive state change occurs (e.g. adding a replica) just to invalidate cache seems problematic to me. In other words, the state of a collection has changed, but in a positive way that shouldn\u2019t lead to a request failing. Of course with the correct amount of retries, the request will likely work in the end but one can envision a number of network round-trips between the client and server just to respond to potentially benign state changes.\n\n2) Since the client-side is not \"watching\" any znodes, it runs the risk of trying to send a request to a node that is no longer live. Currently, the CloudSolrServer consults /live_nodes to make sure a node is \"live\" before it attempts to send a request to it. Without watchers, the client side has no way of knowing a node isn't \"live\" until an error occurs. So now it has to wait for some time for the request to timeout and then refresh /live_nodes from ZooKeeper.\n\n3) Aliases \u2013 what happens if a collection is added to an alias? Without watchers, the client won\u2019t know the alias changed. I\u2019m sure we could implement a similar stateVer solution for aliases but that seems less elegant than just watching the znode.\n\n4) Queries that span multiple collections \u2026 I think problems #1 and 2 mentioned above just get worse when dealing with queries that span multiple collections.\n\nSo based on my discussions with Noble, the new patch takes the following approach:\n\n1) No more LazyCloudSolrServer; just adding support for external collections in CloudSolrServer\n\n2) Still watch shared znodes, such as /aliases and /live_nodes\n\n3) State for external collections loaded on demand and cached\n\nAs it stands now, the CloudSolrServer does not watch external collections when running on the client side. The idea there being there may be too many external collections to setup watchers for. Thus, state is requested on demand and cached. This opens the door for the cached state to go stale, leading to an INVALID_STATE error.\n\nHowever, this presents the need for a new public method on ZkStateReader (currently named refreshAllCollectionsOnClusterStateChange), which refreshes the internal allCollections set containing the names of internal (those in /clusterstate.json and external). While this approach works, it seems like an external object telling an internal object to fix itself, which is somewhat anti-OO. One improvement would be to dynamically update allCollections when a new external collection is discovered. Please advise.\n\nExternal collections get watched on the server-side only, which gets setup by the ZkController. So client-side uses of CloudSolrServer will not have watchers setup for external collections.\n\nThe remaining issue with this patch is how to handle requests that span multiple external collections as the stateVer parameter only supports a single collection at this time. A simple comma-delimited list of collection:ver pairs could be passed and the server could check each one. However, the test case for multiple collections is not passing and is commented out currently. Next patch will address that issue. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13869924",
+            "date": "2014-01-13T20:21:14+0000",
+            "content": "Updated patch with unit test passing. The one remaining issue I can see is that CloudSolrServer is having to call refreshAllCollectionsOnClusterStateChange on the ZkStateReader, which I believe Noble mentioned as that being due to a possible bug in how allCollections are kept up-to-date for SOLR-5473. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13970581",
+            "date": "2014-04-16T08:37:29+0000",
+            "content": "Commit 1587834 from noble@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1587834 ]\n\nSOLR-5473: Make one state.json per collection ,  SOLR-5474: Have a new mode for SolrJ to support stateFormat=2 "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13973147",
+            "date": "2014-04-17T17:07:37+0000",
+            "content": "SOLR-5474: Have a new mode for SolrJ to support stateFormat=2\n\nI don't fully understand the CHANGES entry for this. Really, we should say CloudSolrServer, not SolrJ?\n\nAlso, stateFormat=2 means that clusterstate.json is split out by collection right? And support for that is in ZkStateReader, which SolrJ uses. \n\nDoes this issue give CloudSolrServer support for stateFormat=2, or does it add a new mode of operation where watchers are not used to monitor zk state? "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13973152",
+            "date": "2014-04-17T17:15:21+0000",
+            "content": "Really, we should say CloudSolrServer, not SolrJ?\n\nwe could. But originally the plan was different and things changed a lot when we started implementing it\n\nAnd support for that is in ZkStateReader....\n\nYes, But ZkStateReader would fetch the collection details from ZK if it is nnot a 'watched collectiion\" . For a client watching a collection is not really an option. SO the caching support is added outside of ZkStateReader and , right into CLoudSolrServer\n\nDoes this issue give CloudSolrServer support for stateFormat=2\n\nActually the user does not have to specify anything. CloudSolrServer would automatically handle stateFormat=2 .\n\nThe definition of the ticket is slightly misleading ,because the original design was different "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13975339",
+            "date": "2014-04-21T01:04:33+0000",
+            "content": "I guess what I meant to say is that it's pretty useless CHANGES entry for a user. I'm not talking about design, or implementation or anything. I'm trying to pull out of you what was done here, so you can realize, the CHANGES entry does a pretty bad job reflecting it.\n\nHave a new mode for SolrJ to support stateFormat=2\n\nSolrJ does not have a new mode. The CloudSolrServer SolrServer implementation that is part of SolrJ has a new mode.\n\nSO the caching support is added outside of ZkStateReader and , right into CLoudSolrServer\n\nThe CHANGES entry says nothing about \"caching\" support - it says support for stateFormat=2, which CloudSolrServer and SolrJ have without this issue! You could already say SolrJ supports stateFormat=2 as I said - it's a very general statement and so means nothing saying support for it was added here.\n\nstateFormat=2 support is meaningless to any user in any case. We should try and make CHANGES entries that have value to the user by trying to write something that they can understand. If a user reads this entry, they have no clue what we did or how they might use it or why it even matters at all. CHANGES is for the user and not the devs that implemented the issue. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13975392",
+            "date": "2014-04-21T05:00:52+0000",
+            "content": "Actually , you are right.\n\nAs I said earlier , the original concept was completely different and the ticket was created with that in mind. If the design is as it is implemented today, I would have NOT created this ticket and it would have been a part of SOLR-5473 . My recommendation would be to just remove the entry from CHANGES.txt and to add the credits for Timothy Potter be added to SOLR-5473 because he is the one who implemented this. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13975411",
+            "date": "2014-04-21T05:30:46+0000",
+            "content": "This does seem like a discrete issue that Tim worked on though. It does seem to deserve it's own CHANGES entry, it could just be a little more user friendly.\n\nCan we do something along the lines of:\n\nSOLR-5381: Add a new mode to CloudSolrServer that scales better with a large number of collections by attempting to only update cached cluster state when necessary rather than on any change.\n(Tim Potter, Noble Paul) *\n\n\n\n\tPersonally, I'd lead with Tim since he drove the code on this issue.\n\n "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13975419",
+            "date": "2014-04-21T05:40:05+0000",
+            "content": "Take 2\n\nSOLR-5474: CloudSolrServer enhancements to scale to a large no:of collections where relevant collection states are cached and updated when necessary instead of updating real-time (Tim Potter, Noble Paul)\n\n "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13979200",
+            "date": "2014-04-24T02:15:29+0000",
+            "content": "Attached is a test fail for this.\n\n\norg.apache.solr.client.solrj.SolrServerException: org.apache.solr.client.solrj.impl.HttpSolrServer$RemoteSolrException: STATE STALE: collection1:15valid : false\n\tat __randomizedtesting.SeedInfo.seed([170B85B5FF6722D6:96ED0BAD883842EA]:0)\n\tat org.apache.solr.client.solrj.impl.CloudSolrServer.requestWithRetryOnStaleState(CloudSolrServer.java:683)\n\tat org.apache.solr.client.solrj.impl.CloudSolrServer.requestWithRetryOnStaleState(CloudSolrServer.java:676)\n\tat org.apache.solr.client.solrj.impl.CloudSolrServer.request(CloudSolrServer.java:556)\n\tat org.apache.solr.client.solrj.request.QueryRequest.process(QueryRequest.java:91)\n\tat org.apache.solr.client.solrj.SolrServer.query(SolrServer.java:301)\n\tat org.apache.solr.cloud.AbstractFullDistribZkTestBase.queryServer(AbstractFullDistribZkTestBase.java:1292)\n\tat org.apache.solr.BaseDistributedSearchTestCase.query(BaseDistributedSearchTestCase.java:558)\n\tat org.apache.solr.BaseDistributedSearchTestCase.query(BaseDistributedSearchTestCase.java:540)\n\tat org.apache.solr.BaseDistributedSearchTestCase.query(BaseDistributedSearchTestCase.java:519)\n\tat org.apache.solr.cloud.BasicDistributedZk2Test.brindDownShardIndexSomeDocsAndRecover(BasicDistributedZk2Test.java:291)\n\tat org.apache.solr.cloud.BasicDistributedZk2Test.doTest(BasicDistributedZk2Test.java:109)\n\tat org.apache.solr.BaseDistributedSearchTestCase.testDistribSearch(BaseDistributedSearchTestCase.java:865)\n\tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n\n "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13979294",
+            "date": "2014-04-24T05:15:52+0000",
+            "content": "Actually , the current implementation retries only once if the state is stale, In reality it is possible that the state changed again after the client refreshed the state and it gets a error again with the same message.\n\nTimothy Potter\nInstead of trying only twice , it should try a higher no:of times ,say 5 ,   "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13984309",
+            "date": "2014-04-29T13:56:57+0000",
+            "content": "Commit 1590983 from Noble Paul in branch 'dev/branches/solr5473'\n[ https://svn.apache.org/r1590983 ]\n\nCreating a branch to sort out SOLR-5473 , SOLR-5474 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13985377",
+            "date": "2014-04-30T11:24:08+0000",
+            "content": "Commit 1591253 from Noble Paul in branch 'dev/trunk'\n[ https://svn.apache.org/r1591253 ]\n\nrevert SOLR-5473 , SOLR-5474 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14037475",
+            "date": "2014-06-19T16:25:35+0000",
+            "content": "Commit 1603938 from Noble Paul in branch 'dev/branches/solr-5473'\n[ https://svn.apache.org/r1603938 ]\n\nlatest patch applied to trunk for SOLR-5473 SOLR-5474 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14050311",
+            "date": "2014-07-02T16:50:35+0000",
+            "content": "Commit 1607418 from Noble Paul in branch 'dev/trunk'\n[ https://svn.apache.org/r1607418 ]\n\nSOLR-5473 one state.json per collection , SOLR-5474 support for one json per collection "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14051327",
+            "date": "2014-07-03T11:13:38+0000",
+            "content": "Commit 1607587 from Noble Paul in branch 'dev/trunk'\n[ https://svn.apache.org/r1607587 ]\n\nreverting SOLR-5473 , SOLR-5474 "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14091191",
+            "date": "2014-08-08T19:30:26+0000",
+            "content": "when SOLR-5473 got reverted , this too got reverted "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14131584",
+            "date": "2014-09-12T14:11:19+0000",
+            "content": "Commit 1624556 from Noble Paul in branch 'dev/trunk'\n[ https://svn.apache.org/r1624556 ]\n\nsplit clusterstate.json SOLR-5473, SOLR-5474, SOLR-5810 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14132116",
+            "date": "2014-09-12T21:12:21+0000",
+            "content": "Commit 1624650 from hossman@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1624650 ]\n\nSOLR-5473, SOLR-5474, SOLR-5810 ... NO SVN KEYWORDS! ! ! "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14142365",
+            "date": "2014-09-21T07:01:25+0000",
+            "content": "Commit 1626534 from Noble Paul in branch 'dev/trunk'\n[ https://svn.apache.org/r1626534 ]\n\nSOLR-5474 NPE in tests "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14142370",
+            "date": "2014-09-21T07:19:07+0000",
+            "content": "Commit 1626535 from Noble Paul in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1626535 ]\n\nSOLR-5474 NPE in tests "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14142486",
+            "date": "2014-09-21T16:02:01+0000",
+            "content": "Commit 1626602 from Use account \"steve_rowe\" instead in branch 'dev/trunk'\n[ https://svn.apache.org/r1626602 ]\n\nSOLR-5474 Fix NPE in tests (some more) "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14142487",
+            "date": "2014-09-21T16:03:11+0000",
+            "content": "Commit 1626603 from Use account \"steve_rowe\" instead in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1626603 ]\n\nSOLR-5474 Fix NPE in tests (some more) (merged trunk r1626602) "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14332925",
+            "date": "2015-02-23T05:02:38+0000",
+            "content": "Bulk close after 5.0 release. "
+        }
+    ]
+}

@@ -1,0 +1,92 @@
+{
+    "id": "SOLR-8777",
+    "title": "Duplicate Solr process can cripple a running process",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "affect_versions": "5.3.1",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Thanks to Jessica Cheng Mallet for catching this one.\n\nAccidentally executing the same instance of Solr twice causes the second start instance to die with an \"Address already in use\", but not before deleting the first instance's live_node entry, emitting \"Found a previous node that still exists while trying to register a new live node <node> - removing existing node to create another\".\n\nThe second start instance dies and its ephemeral node is then removed, causing /live_nodes/<node> to be empty since the first start instance's live_node was deleted by the second.",
+    "attachments": {
+        "SOLR-8777.patch": "https://issues.apache.org/jira/secure/attachment/12814167/SOLR-8777.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-03-02T19:57:54+0000",
+            "author": "Scott Blum",
+            "content": "I can take a crack at this.  My thought would be to attempt the bind the port earlier on, and exit more quickly.  BTW, looking at just the code, it looks like the live_node isn't the only possible disruption: ZkController.init() also tries to join overseer election and publish all nodes as down. ",
+            "id": "comment-15176360"
+        },
+        {
+            "date": "2016-03-03T01:07:12+0000",
+            "author": "Scott Blum",
+            "content": "Oh yuck, looks like jetty controls the ordering, and doesn't bind the port until after all the ServletFilters are initialized, which is what ultimately starts up ZkController. ",
+            "id": "comment-15176886"
+        },
+        {
+            "date": "2016-03-03T22:53:42+0000",
+            "author": "Scott Blum",
+            "content": "Not completely related, but it seems like there's a bug in jetty's SocketConnector.  It uses the ServerSocket constructor that automatically binds the port, then attempts to set setReuseAddress(), which makes no sense.  It should use the other constructor, set the reuse_address option, then call bind() manually.\n\nIn other news, I don't know that there's a way to change Jetty's startup sequence.. the best I could do is try to use reflection to pull the connectors off the Server and start them early.  But that seems ungood.\n\nI suppose we could spin for a while waiting for the previous ephemeral node to disappear, and if it doesn't, error out and refuse to start? ",
+            "id": "comment-15178770"
+        },
+        {
+            "date": "2016-03-09T20:08:15+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I suppose we could spin for a while waiting for the previous ephemeral node to disappear, and if it doesn't, error out and refuse to start?\n\nYeah, spinning for say 2 * sessionTimeout should do the trick. This effectively removes this optimisation for fast node restarts and we can look into bringing it back in some form at a later date.\n\nNot completely related, but it seems like there's a bug in jetty's SocketConnector. It uses the ServerSocket constructor that automatically binds the port, then attempts to set setReuseAddress(), which makes no sense. It should use the other constructor, set the reuse_address option, then call bind() manually.\n\nPerhaps Joakim Erdfelt or Greg Wilkins can chime in here?\n\nIn other news, I don't know that there's a way to change Jetty's startup sequence.. the best I could do is try to use reflection to pull the connectors off the Server and start them early. But that seems ungood.\n\nTheoretically, now that we control the app server \u2013 we could move to using embedded Jetty (like we do for tests with JettySolrRunner) and control the lifecycle pretty much exactly but that is way overkill for this issue. ",
+            "id": "comment-15187828"
+        },
+        {
+            "date": "2016-06-28T19:27:07+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Here's a patch which waits for upto twice the session timeout for the ephemeral node to go away before setting up overseer election and creating live node. If the node doesn't go away, we raise an exception and bail out. ",
+            "id": "comment-15353584"
+        },
+        {
+            "date": "2016-06-28T21:02:02+0000",
+            "author": "Scott Blum",
+            "content": "LGTM.  One suggestion, it's almost as easy to make checkForExistingEphemeralNode() to use a watcher instead of a loop.\n\n\nprivate void checkForExistingEphemeralNode() throws KeeperException, InterruptedException {\n  if (zkRunOnly) {\n    return;\n  }\n  String nodeName = getNodeName();\n  String nodePath = ZkStateReader.LIVE_NODES_ZKNODE + \"/\" + nodeName;\n\n  if (!zkClient.exists(nodePath, true)) {\n    return;\n  }\n\n  final CountDownLatch deletedLatch = new CountDownLatch(1);\n  Stat stat = zkClient.exists(nodePath, new Watcher() {\n    @Override\n    public void process(WatchedEvent event) {\n      if (Event.EventType.None.equals(event.getType())) {\n        return;\n      }\n      if (Event.EventType.NodeDeleted.equals(event.getType())) {\n        deletedLatch.countDown();\n      }\n    }\n  }, true);\n\n  if (stat == null) {\n    // suddenly disappeared\n    return;\n  }\n\n  boolean deleted = deletedLatch.await(zkClient.getSolrZooKeeper().getSessionTimeout() * 2, TimeUnit.MILLISECONDS);\n  if (!deleted) {\n    throw new SolrException(ErrorCode.SERVER_ERROR, \"A previous ephemeral live node still exists. \" +\n        \"Solr cannot continue. Please ensure that no other Solr process using the same port is running already.\");\n  }\n}\n\n ",
+            "id": "comment-15353715"
+        },
+        {
+            "date": "2016-06-29T05:57:00+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Scott! I like your solution better so this patch uses your code. I'll commit this shortly. ",
+            "id": "comment-15354609"
+        },
+        {
+            "date": "2016-06-29T09:20:29+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 4ea95bf8f11a9fb0b4226a0cd4b6840b845cf611 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4ea95bf ]\n\nSOLR-8777: Duplicate Solr process can cripple a running process ",
+            "id": "comment-15354863"
+        },
+        {
+            "date": "2016-06-29T11:52:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 812fd346f7a136ccfe550a6ba0d7b0e634d68769 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=812fd34 ]\n\nSOLR-8777: Duplicate Solr process can cripple a running process\n(cherry picked from commit 4ea95bf) ",
+            "id": "comment-15355082"
+        },
+        {
+            "date": "2016-06-29T11:53:04+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Jessica and Scott! ",
+            "id": "comment-15355084"
+        },
+        {
+            "date": "2016-08-26T13:58:56+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close resolved issues after 6.2.0 release. ",
+            "id": "comment-15438964"
+        }
+    ]
+}

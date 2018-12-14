@@ -1,0 +1,111 @@
+{
+    "id": "SOLR-5952",
+    "title": "Recovery race/ error",
+    "details": {
+        "affect_versions": "4.7",
+        "status": "Closed",
+        "fix_versions": [
+            "4.8",
+            "6.0"
+        ],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Invalid"
+    },
+    "description": "We're seeing some shard recovery errors in our cluster when a zookeeper \"error event\" happened. In this particular case, we had two replicas. The event from the logs look roughly like this:\n\n18:40:36 follower (host2) disconnected from zk\n18:40:38 original leader started recovery (there was no log about why it needed recovery though) and failed because cluster state still says it's the leader\n18:40:39 follower successfully connected to zk after some trouble\n19:03:35 follower register core/replica\n19:16:36 follower registration fails due to no leader (NoNode for /collections/test-1/leaders/shard2)\n\nEssentially, I think the problem is that the isLeader property on the cluster state is never cleaned up, so neither replicas are able to recover/register in order to participate in leader election again.\n\nLooks like from the code that the only place that the isLeader property is cleared from the cluster state is from ElectionContext.runLeaderProcess, which assumes that the replica with the next election seqId will notice the leader's node disappearing and run the leader process. This assumption fails in this scenario because the follower experienced the same zookeeper \"error event\" and never handled the event of the leader going away. (Mark, this is where I was saying in SOLR-3582 that maybe the watcher in LeaderElector.checkIfIamLeader does need to handle \"Expired\" by somehow realizing that the leader is gone and clearing the isLeader state at least, but it currently ignores all EventType.None events.)",
+    "attachments": {
+        "recovery-failure-host1-log.txt": "https://issues.apache.org/jira/secure/attachment/12638384/recovery-failure-host1-log.txt",
+        "recovery-failure-host2-log.txt": "https://issues.apache.org/jira/secure/attachment/12638385/recovery-failure-host2-log.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13958442",
+            "date": "2014-04-03T02:14:21+0000",
+            "content": "original leader started recovery \n\nThat's odd - the only thing that should cause this (especially if you don't see logging about the recovery being requested) is if there is a zk expiration - and that is what would cause isLeader to be reset. I'd expect that to be logged though.\n\nI'll start reading through the logs in a bit. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13958445",
+            "date": "2014-04-03T02:15:04+0000",
+            "content": "To note, I've seen a report or two that does resemble this behavior. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13958476",
+            "date": "2014-04-03T02:58:22+0000",
+            "content": "\nThat's odd - the only thing that should cause this (especially if you don't see logging about the recovery being requested) is if there is a zk expiration - and that is what would cause isLeader to be reset. I'd expect that to be logged though.\n\nAs far as I can tell, isLeader (I'm talking about the one in clusterstate, not under /collections/xxx) is only cleared in ElectionContext.runLeaderProcess (I did a find usage for ZkStateReader.LEADER_PROP). I believe a zk expiration wouldn't automatically caused this to be cleared from clusterstate. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13958477",
+            "date": "2014-04-03T02:59:07+0000",
+            "content": "I however share your confusion about the lack of zookeeper-related logging. I went back for hours searching for it. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13958484",
+            "date": "2014-04-03T03:18:46+0000",
+            "content": "I'm talking about the one in clusterstate\n\nOh - I thought you were talking about the isLeader flag that is kept on the CloudDescriptor. That clears things up a bit. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13958489",
+            "date": "2014-04-03T03:31:03+0000",
+            "content": "\nOh - I thought you were talking about the isLeader flag that is kept on the CloudDescriptor.\n\nAh, I see. Well, I guess it could've been either. I'd just assumed that clusterstate was the one that said it was the leader and CloudDescriptor was the one that said it wasn't, based on the if statement below failing:\n\n\nif (isLeader && !cloudDesc.isLeader()) {\n    throw new SolrException(ErrorCode.SERVER_ERROR, \"Cloud state still says we are leader.\");\n}\n\nwhere isLeader was determined from clusterstate. "
+        },
+        {
+            "author": "Daniel Collins",
+            "id": "comment-13958614",
+            "date": "2014-04-03T08:10:46+0000",
+            "content": "I know there have been issues if the follower disconnected from ZK, then it will fail to take updates from the leader (since it can't confirm the source of the messages is the real leader), so the follower will get asked to recover, and will have to wait until it has a valid ZK connection in order to do that.  But I believe there have been fixes around that area.\n\nIn the example logs here though (I'm assuming host 1 was the leader) host1 says that its last published state was down?  We might need to go further back in the trace history of that node, why did it publish itself as down but was still leader? "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13959364",
+            "date": "2014-04-03T22:43:03+0000",
+            "content": "Hi Daniel,\n\n\nI know there have been issues if the follower disconnected from ZK, then it will fail to take updates from the leader (since it can't confirm the source of the messages is the real leader), so the follower will get asked to recover, and will have to wait until it has a valid ZK connection in order to do that. But I believe there have been fixes around that area.\nWhat you describe doesn't seem to be related to this case. In this case, when the follower finally connected to zk again, there was no leader at all, and it fails to register itself when it hits the NoNodeException on  /collections/test-1/leaders/shard2 to find the leader. It neither got to re-join the election nor to recover.\n\n\nIn the example logs here though (I'm assuming host 1 was the leader) host1 says that its last published state was down? We might need to go further back in the trace history of that node, why did it publish itself as down but was still leader?\nYes, this is where both Mark and I were expressing confusion about. However, I went back in the logs for hours trying to find the core being marked as down and I couldn't find it. (I grepped for \"publishing core\" from ZkController.publish.) "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13959941",
+            "date": "2014-04-04T13:23:15+0000",
+            "content": "I've got ApacheCon coming up next week, so I might be a bit behind on things, but I want to try and get this addressed pretty soon. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13960240",
+            "date": "2014-04-04T18:25:09+0000",
+            "content": "I've got a collection with 3 shards, no replication and during heavy indexing I just saw the leader flash to DOWN. He stays there, though in ZooKeeper he is still the valid leader. This is 4.4 with heavy back-porting from future releases, but this may help track down this mysterious DOWN publication. I'm collecting the logs. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13960811",
+            "date": "2014-04-04T23:52:01+0000",
+            "content": "I tried to debug this a bit more today and I think my particular issue is actually with \"external\" collection (the state.json per collection mode). I'm unable to reproduce the mysterious DOWN state though, so it's great that you have. I'm going to open a separate jira to track stale state.json for \"external\" collection. Should we close this one or will you take it for the DOWN state? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13960818",
+            "date": "2014-04-04T23:59:00+0000",
+            "content": "Unfortunately, it did not end up being so mysterious for me - digging through the logs led to more answers. My perspective led me to think something like this was happening, but I was missing some info. "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13960852",
+            "date": "2014-04-05T00:30:36+0000",
+            "content": "OK, I'm going to close this one and open a new bug on stale state.json in \"external\" collection then. Thanks Mark! "
+        },
+        {
+            "author": "Jessica Cheng Mallet",
+            "id": "comment-13960853",
+            "date": "2014-04-05T00:31:28+0000",
+            "content": "The issue seems to be caused by stale state.json in \"external\" collection mode. Opening a separate issue to track that instead. "
+        }
+    ]
+}

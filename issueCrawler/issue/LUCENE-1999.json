@@ -1,0 +1,77 @@
+{
+    "id": "LUCENE-1999",
+    "title": "Match spotter for all query types",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/search"
+        ],
+        "type": "New Feature",
+        "fix_versions": [],
+        "affect_versions": "2.9",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "Related to LUCENE-1929 and the current inability to highlight NumericRangeQuery, spatial, cached term filters and other exotica.\n\nThis patch provides the ability to wrap any Query objects and record match info as flags encoded in the overall document score.\nUsing this approach it would be possible to understand (and therefore highlight) which fields matched clauses in a query.\n\nThe match encoding approach loses some precision in scores as noted here: http://tinyurl.com/ykt8nx7\n\nAvoiding these precision issues would require a change to Lucene core to record docId, score AND a matchFlag byte in ScoreDoc objects and collector APIs.\nThis may be something we should consider.",
+    "attachments": {
+        "matchflagger.patch": "https://issues.apache.org/jira/secure/attachment/12422747/matchflagger.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-10-21T10:24:46+0000",
+            "content": "Very clever!\n\nSince you are wrapping arbitrary query objs, couldn't the wrapper make a separate data structure for tracking which clause matched (instead of encoding it into the score)?\n\nAlso: doesn't highlighter run, separately, on each doc?  And so it's OK if the scores are affected?  Ie, I would run my main search with a normal query, get the 10 results for the current page, then step through each of those 10 doc IDs make a single-doc-IndexSearcher, and run this wrapper?\n\n\nAvoiding these precision issues would require a change to Lucene core to record docId, score AND a matchFlag byte in ScoreDoc objects and collector APIs.\nThis may be something we should consider.\n\n+1  I would love to see the Scorer API extended to optionally provide details on matches.  Not just which clause matched which docs/fields, but the positions within the field where the match occurred.  I think we could do this by absorbing *SpanQuery into their normal Query counterparts, making the getSpans API [somehow] optional so that if you didn't invoke it you don't pay a performance price. ",
+            "author": "Michael McCandless",
+            "id": "comment-12768163"
+        },
+        {
+            "date": "2009-10-21T10:57:02+0000",
+            "content": "couldn't the wrapper make a separate data structure for tracking which clause matched \n\nI was trying to keep the processing cost super-low with no object allocations because this is in a very tight loop. We don't really want to be generating a lot of state/processing while we're still evaluating potentially millions of candidate matches.\nThat seems to be the challenge doing this instrumentation in-line with the query execution.\n\nAlso: doesn't highlighter run, separately, on each doc? And so it's OK if the scores are affected?\n\nThe use case I'm tackling right now involves search forms with lots of optional fields (spatial, numeric, \"choice\" etc) and I only needed a yes/no match flag for each field. This approach should give me these answers back immediately without impacting query processing speeds significantly. \nHowever, I can see the value in core Lucene capturing a richer data structure than a simple boolean where you choose to do a seperate \"highlight\" pass on the top N documents. This would suggest that you might need 2 query expressions - one for execution and one for adding highlighter instrumentation. I suppose the client could add the instrumentation requests to the initial query which are passive during a Lucene \"results-selection\" mode and become active in \"highlight mode\".\n ",
+            "author": "Mark Harwood",
+            "id": "comment-12768173"
+        },
+        {
+            "date": "2009-10-21T12:14:03+0000",
+            "content": "I see, it sounds like your use case is different from the typical\nhighlighting use case in that 1) you don't need the positions of the\nmatches (just whether a given clause matched the doc or not), and 2)\nyou need it for every single doc visited by the query, not just for\nthe handful of docs that are being presented to the user on the\ncurrent \"page\".\n\nThis would suggest that you might need 2 query expressions - one for execution and one for adding highlighter instrumentation.\n\nI'm thinking it's the same query, but we fix the Scorer API for all\nqueries (= big change!!) to be able to produce match details on\ndemand, where those match details look something like what getSpans\nnow returns.  But for the normal case (only highlighting the docs\nbeing shown on current page), we'd only get the match details for that\nsmall set of docs.\n\nThen we ideally would not need a separate mirrored set of span\nqueries.  Ie, SpanTermQuery would be absorbed into TermQuery, etc.\n\nBut I could easily be being too naive here  Maybe there is some\nserious performance cost to even adding the optional API in. ",
+            "author": "Michael McCandless",
+            "id": "comment-12768191"
+        },
+        {
+            "date": "2009-10-21T14:30:15+0000",
+            "content": "and 2) you need it for every single doc visited by the query\n\nActually I don't need it for every doc, only the top ones  - it just happens to be so cheap to produce that I can afford to run this in-line with the query. (I haven't actually benchmarked it at scale buy my gut feel is it would be fast )\n\nI was thinking that this might be orthogonal to the existing \"free-text\" based highlighter. The logic for this being roughly that\n\n1) Highlighting of free-text fields is reasonably well-catered for with summarisation etc.\n2) The remaining problem areas for highlighting (NumericRangeQuery, Spatial, Cached term filters on enums eg gender:male/female) are all likely to be non-free-text fields which don't require summarisation and only contain a single value.\n\nI may be wrong in these assumptions about the existing state of play (any thoughts, Mark M?) but it might be useful to think of attacking the problem with these 2 different requirements in mind.\n\nRegardless of type e.g. int, long etc I tend to think of fields as falling into these broad usage categories:\n\na) \"Identifiers\" (e.g. primary keys)\nb) Quantifiers (e.g numerics, dates, spatial)\nc) Free-text \nd) Controlled vocabularies (e.g. enums such as gender:m/f)\n\nType a ) is catered for with a straight TermQuery and therefore can be handled with the existing highlighter\nType b) needs special indexes/queries (spatial/trie) and isn't catered for by the existing term/span-based Highlighter\nType c) is catered for with the existing highlighter and its summarising features\nType d) involves many TermDoc.next reads so is usefully cached as filters and therefore not catered for by existing Highlighter\n\nSo this patch helps cater for types b) and d) where simply knowing the field matched is all that is required to highlight. ",
+            "author": "Mark Harwood",
+            "id": "comment-12768257"
+        },
+        {
+            "date": "2010-05-15T23:44:16+0000",
+            "content": "One task in titrating(1) these requests is the specialized v.s. the general case. The general case in this instance is redoing the explain API to use a real data structure. The special case is a custom change to the inner scoring loop for certain use cases.\n\nDo you wish to highlight all 5 million results from a query, or only 10 or 20? With a better explain API, it would be very fast to require these unusual use cases to do a second search limited to the queries they actually plan to highlight.\n\n(1) There's a word for deciding who gets medical care and who doesn't. And, no, it's not death panel. ",
+            "author": "Lance Norskog",
+            "id": "comment-12867930"
+        },
+        {
+            "date": "2010-05-15T23:51:45+0000",
+            "content": "... titrating ... There's a word for deciding who gets medical care and who doesn't.\n\ntriage? ",
+            "author": "Steve Rowe",
+            "id": "comment-12867932"
+        },
+        {
+            "date": "2012-04-14T18:02:25+0000",
+            "content": "I have a potential application for this, and would be willing to work on it, assuming that committers have any interest in committing the results.\n\nLet me explain my particular case, which some of you may have seen discussed on solr-users. \n\nImagine wanted to search for documents based on some relatively expensive similarity metric. Too expensive, by far, to want to run on every single document in the index, or even all the documents that pass some filter first.\n\nFurther imagine that you come up with an approximation of the similarity metric in terms of Lucene query capabilities. The approximation is ordinary (e.g. no Solr Functions forcing a computation on each document), and approximates by having the same (or higher) recall than the real metric, but lower precision. Roughly, that the top 200 hits based on the approximation will contain the top 10 hits based on the real metric.\n\nOK, well, then, you can run this query, retrive documents, select the top hits, and then run the real metric. You get the right answer for far lower CPU time.\n\nAnd all of this works perfectly fine with Lucene (and Solr) as we know it. However, imagine a further challenge. You want to combine the approximation query with arbitrary other query terms \u2013 and then fix up the scores in the top documents to reflect the real metric.\n\nWell, you can run a second query on just the approximation query to get its score contribution, subtract it out, and add in (scaling here is a challenge) the results of the real metric.\n\nOr, it seems to me, you could use this approach here, as perhaps extended as discussed.\n\n?\n ",
+            "author": "Benson Margulies",
+            "id": "comment-13254163"
+        },
+        {
+            "date": "2012-04-14T18:15:38+0000",
+            "content": "I think this issue is before the scorer navigation api???: LUCENE-2590, LUCENE-3330.\n\nIf you want to know the inner details of subscorers and such, you can\nenumerate the Scorer \"tree\" inside your Collector.setNextReader, e.g. saving\nreferences to the subscorers you care about, and then in collect() you can\ndo whatever you want via their freq()/score()/ etc methods to find out which\nones matched...\n\nThis is in trunk today and generally works, though there are some bugs to iron out\n(see LUCENE-3505 for example) ",
+            "author": "Robert Muir",
+            "id": "comment-13254165"
+        },
+        {
+            "date": "2012-04-14T18:28:24+0000",
+            "content": "Robert, Thanks. How do you all handle JIRAs like this? Would it make sense to close it as obviated by those other things?\n\nI also have to work out how to exploit this in Solr. ",
+            "author": "Benson Margulies",
+            "id": "comment-13254168"
+        }
+    ]
+}

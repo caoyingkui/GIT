@@ -1,0 +1,63 @@
+{
+    "id": "SOLR-12635",
+    "title": "HashQParserPlugin should be run as a post filter cost is not explicitly defined",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Won't Fix",
+        "status": "Resolved"
+    },
+    "description": "I was doing some performance benchmarking for a user on slow streaming queries\n\nThe weird thing was\u00a0that same streaming expression was fast when we fired it again\n\nWe were able to isolate\u00a0the slowness\u00a0to hash query parser\n\nHere is the first and second time we fired the query - to simplify things this is for one shard and for the same worker\n\npath=/export params={q=*:*&distrib=false&indent=off&fl=fields&fq=user:1&fq={!hash workers=6 worker=3}&partitionKeys=partitionKey&sort=partitionKey asc&wt=javabin&version=2.2} hits=0 status=0 QTime=6821\n\npath=/export params={q=*:*&distrib=false&indent=off&fl=fields&fq=user:1&fq={!hash workers=6 worker=3}&partitionKeys=partitionKey&sort=partitionKey asc&wt=javabin&version=2.2} hits=0 status=0 QTime=0\n\nEven with hits=0 the first query took 6.8 seconds. The shard has 17m documents\u00a0\n\nThe\u00a0second query utilizes the queryResultCache and hence it's lightening fast the second time around.\n\nWhen we execute the same query and add\u00a0a cost i.e\u00a0&fq={!hash workers=6 worker=3 cost=101} the query get's executed as a post filter and even uncashed is super fast.\n\nI created this Jira so that we can always set cost > 100 from the parallel stream.\n\nHowever I am happy to change the default\u00a0behaviour\u00a0for\u00a0HashQParserPlugin and make it run as a post filter always unless explicitly specified.\u00a0CollapsingQParserPlugin does this currently to make sure it's run as a post filter by default\n\npublic int getCost() {\n  return Math.max(super.getCost(), 100);\n}\n\nThoughts anyone?",
+    "attachments": {
+        "SOLR-12635.patch": "https://issues.apache.org/jira/secure/attachment/12934730/SOLR-12635.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-08-07T22:30:28+0000",
+            "content": "The HashQParserPlugin is not documented so I'm guessing this was intended to be used by streaming only? In that case I'm inclined to make this a post filter by default\u00a0 ",
+            "author": "Varun Thacker",
+            "id": "comment-16572438"
+        },
+        {
+            "date": "2018-08-07T22:56:37+0000",
+            "content": "Simple patch which defaults cost=100 if not specified.\n\nGiven HashQuery implements PostFilter\u00a0I felt this would be the right approach.\n\nNot sure if we can test this other than manually.\u00a0\n\nAny thoughts\u00a0Joel Bernstein ?\u00a0 ",
+            "author": "Varun Thacker",
+            "id": "comment-16572458"
+        },
+        {
+            "date": "2018-08-08T02:42:27+0000",
+            "content": "Here are some thoughts about using the HashQParser after speaking to Joel offline\n\nWe almost always want to use\u00a0HashQParser to fetch a lot of data in parallel.\n\nNow that sentence can be interpreted in two ways\n\nThought 1 - If we want to parallelize fetching data each 1/N stream won't be big. So a post filter approach makes sense.\n\nThought 2 - We are using parallel because the data is big and 1/N will also be big.\u00a0The\u00a0HashQParser is very cache friendly i.e once executed the following query will always be able to leverage the filterCache/queryResultCache and serve the query very fast.\u00a0Pay the cost for the first time the query get's executed and then the query will be super fast. We could even avoid paying the cost for the\u00a0first query by adding these 6 queries in the\u00a0newSearcher event in your solrconfig.xml file\u00a0\n\n<listener event=\"newSearcher\" class=\"solr.QuerySenderListener\">\n  <arr name=\"queries\">\n\n    <lst><str name=\"q\">*:*</str><str name=\"fq\">{!hash workers=6 worker=0}</str><str name=\"partitionKeys\">myPartitionKey</str></lst>\n    <lst><str name=\"q\">*:*</str><str name=\"fq\">{!hash workers=6 worker=1}</str><str name=\"partitionKeys\">myPartitionKey</str></lst>\n    <lst><str name=\"q\">*:*</str><str name=\"fq\">{!hash workers=6 worker=2}</str><str name=\"partitionKeys\">myPartitionKey</str></lst>\n    <lst><str name=\"q\">*:*</str><str name=\"fq\">{!hash workers=6 worker=3}</str><str name=\"partitionKeys\">myPartitionKey</str></lst>\n    <lst><str name=\"q\">*:*</str><str name=\"fq\">{!hash workers=6 worker=4}</str><str name=\"partitionKeys\">myPartitionKey</str></lst>\n    <lst><str name=\"q\">*:*</str><str name=\"fq\">{!hash workers=6 worker=5}</str><str name=\"partitionKeys\">myPartitionKey</str></lst>\n  </arr>\n</listener>\n\n\u00a0\n\nI'm going to ponder on this a little more but I'm tempted to go with the second school of thought . This would involve no changes to the code just adding this to the solrconfig.xml file .\u00a0 ",
+            "author": "Varun Thacker",
+            "id": "comment-16572588"
+        },
+        {
+            "date": "2018-08-08T10:58:06+0000",
+            "content": "The postFilter will have to be applied to every document that matches the main query and filter queries, and the postFilter is never cached. For large exports the postFilter will perform poorly every time.\n\nFor small result sets, the best approach is simply to not use the parallel function so the hash partitioning is not needed.\n\nWhen not using the postFilter the hashQparser plugin will automatically be cached in the filter cache and can be auto-warmed so queries don't take a performance hit when a new searcher is opened. The firstSearcher listener can be used to perform the initial warming as\u00a0Varun Thacker mentions above.\n\nAfter the hashQparser plugin has been cached, hash partitioning is extremely fast at query time.\n\n\u00a0 ",
+            "author": "Joel Bernstein",
+            "id": "comment-16573018"
+        },
+        {
+            "date": "2018-08-20T21:16:44+0000",
+            "content": "There was a concern that if you do rollups on 10 fields\u00a0in any combination the\u00a0partitionKeys combination would be too high and we won't be able to pre-cache it.\n\nHere's an example Joel discussed offline which shows why partitionKeys should not have all the fields as your underlying sort and rollup fields. Infact\u00a0if you provide more than 4 partitionKeys today we skip the remaining keys for partitioning silently.\u00a0\u00a0\n\nThe hash partitioner just needs to send documents to the same worker node. You could do that with just one partitioning key\n\nFor example if you sort on year, month and day. You could partition on year only and still be fine as long as there was enough different years to spread the records around the worker nodes.\n\nI'll write up some best practices around using parallel stream on the ref-guide which talks about warming and how many partitionKeys to use. Closing out this Jira as Wont-Fix though ",
+            "author": "Varun Thacker",
+            "id": "comment-16586536"
+        },
+        {
+            "date": "2018-08-20T21:30:00+0000",
+            "content": "Infact\u00a0if you provide more than 4 partitionKeys today we skip the remaining keys for partitioning silently.\u00a0\u00a0\nCreated\u00a0SOLR-12683 for it ",
+            "author": "Varun Thacker",
+            "id": "comment-16586546"
+        },
+        {
+            "date": "2018-08-20T21:42:54+0000",
+            "content": "I'll write up some best practices around using parallel stream on the ref-guide which talks about warming and how many partitionKeys to use.\n\u00a0\nCreated\u00a0SOLR-12684 for it ",
+            "author": "Varun Thacker",
+            "id": "comment-16586557"
+        }
+    ]
+}

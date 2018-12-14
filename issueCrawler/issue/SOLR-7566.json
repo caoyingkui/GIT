@@ -1,0 +1,130 @@
+{
+    "id": "SOLR-7566",
+    "title": "Search requests should return the shard name that is down",
+    "details": {
+        "components": [
+            "search",
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.3",
+            "6.0"
+        ],
+        "affect_versions": "5.1",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Trivial"
+    },
+    "description": "If no replicas of a shard are up and running, a search request gives the following response:\n\n\n{\n  \"responseHeader\": {\n    \"status\": 503,\n    \"QTime\": 2,\n    \"params\": {\n      \"q\": \"*:*\",\n      \"indent\": \"true\",\n      \"wt\": \"json\",\n      \"_\": \"1432048084930\"\n    }\n  },\n  \"error\": {\n    \"msg\": \"no servers hosting shard: \",\n    \"code\": 503\n  }\n}\n\n\n\nThe message should mention the shard which is down/unreachable.",
+    "attachments": {
+        "SOLR-7566-test-code-cosmetics.patch": "https://issues.apache.org/jira/secure/attachment/12739343/SOLR-7566-test-code-cosmetics.patch",
+        "SOLR-7566.patch": "https://issues.apache.org/jira/secure/attachment/12735183/SOLR-7566.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-05-25T08:16:34+0000",
+            "author": "Marius Grama",
+            "content": "Shalin Shekhar Mangar could you please give me some tips on how to reproduce this issue? ",
+            "id": "comment-14558037"
+        },
+        {
+            "date": "2015-05-25T10:48:29+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tCreate a two node solrcloud cluster\n\tcreate a collection with numShards=2&replication factor=1&maxShardsPerNode=1\n\tshutdown one node\n\trun a search query using the collection name on the running node\n\n\n\nThe request will fail with the error in the description. ",
+            "id": "comment-14558105"
+        },
+        {
+            "date": "2015-05-25T15:49:30+0000",
+            "author": "Marius Grama",
+            "content": "Shalin Shekhar Mangar thank you. I could reproduce the issue and I have also found the cause of it.\nWhen doing a distributed search, the available shards are taken from the cluster state and are joined together (HttpShardHandler#checkDistributed(ResponseBuilder) method)\nHttpShardHandler#checkDistributed\n// ...\n            StringBuilder sliceShardsStr = new StringBuilder();\n            for (Replica replica : sliceShards.values()) {\n              if (!clusterState.liveNodesContain(replica.getNodeName())\n                  || replica.getState() != Replica.State.ACTIVE) {\n                continue;\n              }\n              if (first) {\n                first = false;\n              } else {\n                sliceShardsStr.append('|');\n              }\n              String url = ZkCoreNodeProps.getCoreUrl(replica);\n              sliceShardsStr.append(url);\n            }\n\n            rb.shards[i] = sliceShardsStr.toString();\n\n\n\nIn the case when the replicas for a shard are not available, the string corresponding to the shard addresses will remain empty.\n\nIn the SearchHandler#handleRequestBody method, the empty shard will be simply forwarded to the HttpShardHandler to be evaluated asynchronously : \nSearchHandler.java line 352\n\nshardHandler1.submit(sreq, shard, params);\n\n\nand in the HttpShardHandler#submit() method will be thrown the exception with an inconsistent message because the shard is empty.\nHttpShardHandler#submit\n          // if there are no shards available for a slice, urls.size()==0\n          if (urls.size()==0) {\n            // TODO: what's the right error code here? We should use the same thing when\n            // all of the servers for a shard are down.\n            throw new SolrException(SolrException.ErrorCode.SERVICE_UNAVAILABLE, \"no servers hosting shard: \" + shard);\n          }\n\n\n\n\nOne solution would be to throw the SolrException within the code of HttpShardHandler#checkDistributed method when the sliceShardsStr StringBuilder is empty. This seems to me the easy way to handle this situation.\n\nCan somebody give me feedback whether I am on the right track here? Thanks in advance. ",
+            "id": "comment-14558347"
+        },
+        {
+            "date": "2015-05-25T16:16:28+0000",
+            "author": "Marius Grama",
+            "content": "Attached a small patch that could possibly be used as solution for this issue.\n\nI think throwing of the exception from HttpShardHandler#submit() method (mentioned in the above comment) should not be kept anymore in its current form. When there are no replica urls available there's no more need to submit the callable function.\n\nHttpShardHandler#submit\nfinal List<String> urls = getURLs(sreq, shard);\nif (urls.size()==0) {\n    throw new IllegalArgumentException(\"The shard argument doesn't contain any valid URLs. got \" + shard);\n}\n\n ",
+            "id": "comment-14558361"
+        },
+        {
+            "date": "2015-06-11T14:20:17+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Marius. Considering that urls can be non null if at least one slice has active replicas, we should detect this situation and throw an exception inside the HttpShardHandler.checkDistributed() method itself. ",
+            "id": "comment-14581965"
+        },
+        {
+            "date": "2015-06-12T13:24:13+0000",
+            "author": "Marius Grama",
+            "content": "Shalin Shekhar Mangar I don't understand what you imply in your last statement. The patch attached to this issue checks already within HttpShardHandler.checkDistributed method whether a shard doesn't have any active replicas.  ",
+            "id": "comment-14583377"
+        },
+        {
+            "date": "2015-06-12T13:45:46+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "The patch attached to this issue checks already within HttpShardHandler.checkDistributed method whether a shard doesn't have any active replicas.\n\nI am sorry, I misread your earlier patch. I thought that you were checking the complete URL string instead of one slice's URL string. You should also handle the shards.tolerant parameter (see ShardParams.SHARDS_TOLERANT). If this param is true then we cannot throw an exception in HttpShardHandler.checkDistributed and we should continue with the empty string. ",
+            "id": "comment-14583399"
+        },
+        {
+            "date": "2015-06-12T14:43:44+0000",
+            "author": "Marius Grama",
+            "content": "I've added the modifications that you've requested on this new patch.\nI didn't know about the shards.tolerant parameter handling before.\n\nDo you see a way to unit test the changes from this patch? ",
+            "id": "comment-14583514"
+        },
+        {
+            "date": "2015-06-12T19:52:24+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "There was no test which tested shards.tolerant with a cloud setup so I wrote one. This is ready. I'll commit shortly. ",
+            "id": "comment-14583972"
+        },
+        {
+            "date": "2015-06-12T20:03:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1685153 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1685153 ]\n\nSOLR-7566: Search requests should return the shard name that is down ",
+            "id": "comment-14583986"
+        },
+        {
+            "date": "2015-06-12T20:07:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1685154 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1685154 ]\n\nSOLR-7566: Search requests should return the shard name that is down ",
+            "id": "comment-14583991"
+        },
+        {
+            "date": "2015-06-12T20:08:48+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Marius! ",
+            "id": "comment-14583992"
+        },
+        {
+            "date": "2015-06-12T21:47:14+0000",
+            "author": "Marius Grama",
+            "content": "Shalin Shekhar Mangar thank you for setting up the test case. It looks very good and is straightforward to read. I've taken the liberty of doing some code cosmetics on it.It's up to you whether you include them in SVN. ",
+            "id": "comment-14584144"
+        },
+        {
+            "date": "2015-06-12T22:03:50+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1685179 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1685179 ]\n\nSOLR-7566: Code cosmetics ",
+            "id": "comment-14584166"
+        },
+        {
+            "date": "2015-06-12T22:04:39+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1685180 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1685180 ]\n\nSOLR-7566: Code cosmetics ",
+            "id": "comment-14584167"
+        },
+        {
+            "date": "2015-06-12T22:05:15+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Committed, thanks Marius Grama! ",
+            "id": "comment-14584169"
+        },
+        {
+            "date": "2015-08-26T13:06:05+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Bulk close for 5.3.0 release ",
+            "id": "comment-14713210"
+        }
+    ]
+}

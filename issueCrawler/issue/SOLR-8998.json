@@ -1,0 +1,245 @@
+{
+    "id": "SOLR-8998",
+    "title": "JSON Facet API child roll-ups",
+    "details": {
+        "components": [
+            "Facet Module"
+        ],
+        "type": "New Feature",
+        "labels": "",
+        "fix_versions": [
+            "7.4",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The JSON Facet API currently has the ability to map between parents and children ( see http://yonik.com/solr-nested-objects/ )\nThis issue is about adding a true rollup ability where parents would take on derived values from their children.  The most important part (and the most difficult part) will be the external API.\n\nMikhail Khludnev says\n\nThe bottom line is to introduce uniqueBlock(_root_) aggregation, which is supposed to be faster than unique(_root_) and purposed for blocked index only. For now it it supports singlevalue string fields, docValues usually make sense.",
+    "attachments": {
+        "SOLR-8998-api-doc.patch": "https://issues.apache.org/jira/secure/attachment/12921580/SOLR-8998-api-doc.patch",
+        "SOLR_8998.patch": "https://issues.apache.org/jira/secure/attachment/12839724/SOLR_8998.patch",
+        "SOLR-8998.patch": "https://issues.apache.org/jira/secure/attachment/12920177/SOLR-8998.patch",
+        "SOLR-8998-doc.patch": "https://issues.apache.org/jira/secure/attachment/12921543/SOLR-8998-doc.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-04-15T15:50:01+0000",
+            "author": "Yonik Seeley",
+            "content": "Although we don't need to implement everything all at once, we should be thinking ahead about everything we want to do.\n\nExisting block parent faceting example.\nIncoming domain consists of children (reviews) who are then mapped to parents (books) before faceting is done:\n\nq=type:review AND review_author:yonik\njson.facet={\n  genres : {\n    type : field,\n    field : genre,\n    domain: { blockParent : \"type:book\" }\n  }\n}\n\n\n\nDesirable features:\n\n\tability to \"pretend\" that parent documents have all values of their child documents ( a union() set rollup?)\n\tnumeric rollups (min, max, avg, etc) and the ability to use range faceting over these values\n\tan API that's sharable (to the degree that makes sense) with other places that need rollups (i.e. normal join)\n\tmaximum \"persistence\" of rolled-up values... meaning they should be ideally usable in any context that other field values would be usable in.\n\t\n\t\texample: multiple levels of sub-facets operating on values that were rolled up at a higher level\n\t\tuse in function queries\n\t\tuse in a sort, or retrievable from topdocs (SOLR-7830)\n\t\n\t\n\n\n\nIdeas:\n\n\twe already have a syntax for rolling up values over a bucket (avg(field1), min(field2) etc), re-use that as much as possible\n\twe're going to need some sort of context based registry for information about rolled-up child documents (and/or about which fields were rolled up)\n\n\n\nUse case 1:\n\nWe have products, which have multiple SKUs, and we want to facet by color on the products.\n\nParent1: { type:product, name:\"Solr T-Shirt\" }\nChild1: { type:SKU, size:L, color:Red, inStock:true}\nChild2: { type:SKU, size:L, color:Blue, inStock:false}\nChild3: { type:SKU, size:M, color:Red, inStock:true}\nChild4: { type:SKU, size:S, color:Blue, inStock:true}\n\n\nNow, we want to facet by \"color\" and get back numbers of products (not number of SKUs).  Hence if our query is inStock:true, we want Blue:1 and Red:1.\nPut another way, we want a virtual \"color\" field on Parent1 containing all the colors of matching child documents.\n\nUse case 1a: input domain is children\nMain query finds children, and hence the root faceting domain consists of children.  The block join is done in a facet via \n\n domain:{blockParent=\"type:product\"} \n\n\nUsecase 1b, input domain is parents from previous block join\nMain query selected products by including a blockJoin filter (mapping from children to parents).\n\nUse case 1c: input domain is parents, no previous block join\nNo previous block join (or an irrelevant one), but we still want to roll up children (all children, or a specific subset).\n\nApproach 1: specify rollups at the point of the join\nSpecify rollups where the child->parent join/mapping is being done.\n\nOur basic child->parent mapping is currently specified by:\n\n    domain: { blockParent : \"type:book\" }\n\n\nWe could add rollup specifications to that in a number of different ways.\nReuse \"blockParent\" tag, but make it more structured, adding a \"parentFilter\" and then other rollups.\n\n    domain: { \n      blockParent : {\n        parentFilter : \"type:book\",\n        average_rating : \"avg(rating)\" \n      }\n    }\n\n\nDownside: name collisions... say you wanted to name a rollup the same name as something like \"parentFilter\"\nAdvantages: flatter structure is simpler, and since we chose rollup names, the namespace issue is likely just academic.\n\nOr, we could have a specific \"rollups\" tag if a unique namespace is desired:\n\n    domain: { \n      blockParent : {\n        parentFilter : \"type:book\",\n        rollups: {\n          average_rating : \"avg(rating)\"\n        } \n      }\n    }\n\n\n\nUse of specified rollups:\n\nq=type:review AND review_year:2016\njson.facet={\n  genres : {\n    type : field,\n    field : genre,\n    domain: { \n      blockParent : {\n        parentFilter : \"type:book\",\n        book_rating : \"avg(review_rating)\"\n      }\n    },\n    facet : {\n       // things in here are calculated per-bucket of the parent facet\n       avg_rating : \"avg(book_rating)\",\n       min_rating : \"min(book_rating)\"\n    },\n    sort : \"avg_rating desc\"\n  }\n}\n\n\n\nApproach 2: refer to children from the POV of the parent later\nThis approach does not explicitly specify any rollups at the point of the join, but lets one specify them later by referring to child fields using something like child.<child_field_name>.\nOr perhaps even <child_type>.<field_field_name>... (related to SOLR-7672)\nOr as a function: child(child_field_name)\n\n\nq=type:review AND review_year:2016\njson.facet={\n  genres : {\n    type : field,\n    field : genre,\n    domain: { blockParent :  \"type:book\" }\n    facet : {\n       // things in here are calculated per-bucket of the parent facet\n       avg_rating : \"avg(avg(child.review_rating))\",\n       min_rating : \"min(avg(child.review_rating))\"\n    },\n    sort : \"avg_rating desc\"\n  }\n}\n\n\nAdvantages:\n\n\tfewer syntactic elements... simpler?\n\n\n\nDisadvantages:\n\n\t\"child\" name doesn't make sense for non-block (normal) join\n\tmore difficult to implement\n\t\n\t\tparsing... any place that would normally take a simple name needs to take a rollup function\n\t\tat the point of doing the join, we need to know what information is required to be kept?  we can figure this out, but it requires inspecting all sub-facets?\n\t\n\t\n\n ",
+            "id": "comment-15243133"
+        },
+        {
+            "date": "2016-04-20T11:51:40+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Yonik Seeley in these cases q= aims children explicitly. But one of the desirable features for typical e-commerce is\n\nto search for parents which has children which are foo, get parent results, get also child field facets rolled up to parents, in single query. \n\nSo far it seems like it requires to issue two request, which might be unacceptable complex. \nIt.s not easy to achieve, do you accept it as challenge at all?  ",
+            "id": "comment-15249700"
+        },
+        {
+            "date": "2016-04-20T14:56:47+0000",
+            "author": "Yonik Seeley",
+            "content": "There's prob more than one way to do that in a single request.  One way would do it all in facets:\n\n\tquery facet that does the block join child->parent\n\ttopdocs() to get the top parents\n\tfield facet (a sub-facet) on the parents (including any rollups)\n\n\n\nThere may be other reasons one wants the actual main document list to be the parents... but I don't see why we wouldn't be able to support that as well. ",
+            "id": "comment-15250039"
+        },
+        {
+            "date": "2016-07-03T13:57:03+0000",
+            "author": "Mikhail Khludnev",
+            "content": "following this way: \nfield facet (a sub-facet) on the parents (including any rollups)\nfrom the comment, that's how it may work \n\ncurl http://localhost:8983/solr/collection1/query -d 'q={!parent which=type_s:parent}type_s:child&rows=0&\njson.facet={\nfilter_by_children: {\ntype:query,\nq:\"type_s:child\",\ndomain: { blockChildren : \"type_s:parent\" },\nfacet:{\ncolors:{\ntype : terms,\nfield : COLOR_s,\nfacet: {\nproductsCount: \"unique(_root_)\"\n}\n},\nsizes:{\ntype : terms,\nfield : SIZE_s,\nfacet: {\nproductsCount: \"unique(_root_)\"\n}}}}}\n\n\nYonik Seeley,\nHere's my obvious proposal for improvement, let's introduce rollup(type_s:parent) as a specialized alternative to unique(_root_)? My expectation, that checking next bit in parents' bitset is faster than getting _root_ values. \nDoes it deserve a separate issue or it can be counted step toward this one?    ",
+            "id": "comment-15360550"
+        },
+        {
+            "date": "2016-09-12T06:57:30+0000",
+            "author": "Mikhail Khludnev",
+            "content": "query facet that does the block join child->parent\nbut it returns only parent count, there will be no fields, nor relevancy ranking\ntopdocs() to get the top parents\nhowever SOLR-7830  is still in progress\nfield facet (a sub-facet) on the parents (including any rollups)\nI might not understand correctly but it may return all ids, without any other fields beside, and there is no ranking again. \n\nWhat's is the most probable direction?   \n ",
+            "id": "comment-15483290"
+        },
+        {
+            "date": "2016-09-12T11:05:21+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Regarding this example above. It's hard to support filter exclusion if we search for parents with bjq query. Searching for children gives exclusions for free, but still lacks topdocs.  ",
+            "id": "comment-15483808"
+        },
+        {
+            "date": "2016-09-13T12:36:04+0000",
+            "author": "Mikhail Khludnev",
+            "content": "ok. one more try with parent level query. Here is how we can calculate child level facet with roll up to parents (see in_books below), and get exclusions for them too. .The idea is that when we calculate child level facets we can apply a necessary subset of child filters via {type:query, q:\"foo\", domain:{blockChildren:\"..\"}}. ie. it's done via manual inclusion instead of exclusion.\nBeware of + to %2B escaping. Child level filters can be cached with filter(..), then they can be referred with {!v=$childq} instead of repeating.  \n\n\nq={!parent which=type_s:book}comment_t:* %2Bauthor_s:yonik %2Bstars_i:(5 3)&wt=json&indent=on&rrrows=0&json.facet={\ncomments_for_author:{\n  type:query,\n  q:\"comment_t:* %2Bstars_i:(5 3)\",\n  \"//note\":\"author filter is excluded\",\n  domain:{\n     blockChildren:\"type_s:book\"\n   }, facet:{\n   authors:{\n      type:terms,\n      field:author_s,\n      facet: {\n          in_books: \"unique(_root_)\"\n        }\n    }\n   }\n} ,\ncomments_for_stars:{\n  type:query,\n  q:\"comment_t:* %2Bauthor_s:yonik\",\n  \"//note\":\"stars_i filter is excluded\",\n  domain:{\n     blockChildren:\"type_s:book\"\n   }, facet:{\n   stars:{\n      type:terms,\n      field:stars_i,\n      facet: {\n          in_books: \"unique(_root_)\"\n        }\n    }\n  }\n}\n}\n\n ",
+            "id": "comment-15487095"
+        },
+        {
+            "date": "2016-10-31T13:54:14+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Yonik Seeley, is it possible to implement rollup(type_s:parent) which does what unique(root) in a way how o.a.s.s.join.BlockJoinFieldFacetAccumulator enumerating docset once, without running through per value docsets one by one as it happens with unique() now? ",
+            "id": "comment-15622209"
+        },
+        {
+            "date": "2016-11-07T08:03:14+0000",
+            "author": "Nikita Pchelintsev",
+            "content": "Mikhail, is the above solution the only one that works in the current version of Solr (6.2.1) that implements exclusions for child filters? Are there any performance drawbacks with this approach (for example compared with the upcoming https://issues.apache.org/jira/browse/SOLR-9510)?  ",
+            "id": "comment-15643444"
+        },
+        {
+            "date": "2016-11-07T11:08:49+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Nikita Pchelintsev,\n\n\tI think this is the only one.\n\tI don't know how it will end up in SOLR-9510, but so far it expose a room for performance improvement, imho.\n\n ",
+            "id": "comment-15643879"
+        },
+        {
+            "date": "2016-11-09T21:26:12+0000",
+            "author": "Nikita Pchelintsev",
+            "content": "Very promising solution, I've tried it on my own setup and one problem I see with it is that the exclusions work differently to the way \"normal\" (non-BlockJoin) exclusions do. Normal exclusions allow to go beyond the root domain and widen it before calculating facets. As I understand, JSON Facet API doesn't allow that and the above exclusions only exclude children documents from the otherwise fixed parent document set. Or am I missing something? ",
+            "id": "comment-15652081"
+        },
+        {
+            "date": "2016-11-10T06:54:39+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Yes. You don't miss anything. Follow up SOLR-9683 ",
+            "id": "comment-15653236"
+        },
+        {
+            "date": "2016-11-20T14:48:42+0000",
+            "author": "Dr Oleg Savrasov",
+            "content": "Unfortunately definition like\n\nfacet: {\n    productsCount: \"unique(root)\"\n}\n\nassumes iterating one by one through all the facet values and creating appropriate docset for each of them.\nIn order to leverage algorithm implemented in BlockJoinFieldFacetAccumulator, I propose to introduce a new keyword for JSON facet:\n\nrollup : <Parent documents query>.\n\nThe example of request should look like:\n\ncurl http://localhost:8983/solr/collection1/query -d 'q=\n{!parent which=type_s:parent}\ntype_s:child&rows=0&\njson.facet={\nfilter_by_children: {\ntype:query,\nq:\"type_s:child\",\ndomain: \n{ blockChildren : \"type_s:parent\" }\n,\nfacet:{\ncolors:{\ntype : terms,\nfield : COLOR_s,\nrollup : \"type_s:parent\"\n},\nsizes:\n{\ntype : terms,\nfield : SIZE_s,\nrollup : \"type_s:parent\"\n}}\n}}\n\nThe patch for proposed solution is attached. For the above request it returns\n\nfacets=={ count:1,\n filter_by_children:{count:2,\n colors:{buckets:[ \n{val:Blue, count:1, rollup:1}\n,\n                   \n{val:Red,  count:1, rollup:1}\n ]},\n sizes:{buckets:[  \n{val:XL,   count:2, rollup:1}\n ]}}}}\n\nSee TestFacetRollup. ",
+            "id": "comment-15681263"
+        },
+        {
+            "date": "2017-01-03T13:07:44+0000",
+            "author": "Dr Oleg Savrasov",
+            "content": "Previous patch is covered with random unit-test, which is quite similar to BlockJoinFacetRandomTest. The test proves that the patch is functionally correct, i.e. JSON Facet API behavior with proposed syntax change is equivalent to BlockJoinFacetComponent. The test helped to find a small defect in initial implementation, that has been fixed. ",
+            "id": "comment-15795029"
+        },
+        {
+            "date": "2018-02-27T16:38:02+0000",
+            "author": "Dr Oleg Savrasov",
+            "content": "Latest patch is adjusted to use MultiAcc.SOLR_8998.patch ",
+            "id": "comment-16378898"
+        },
+        {
+            "date": "2018-04-01T14:06:05+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Thank you,  Dr Oleg Savrasov. The feasible syntax is a challenge. I suppose that those who need rollup (parent's count) doesn't need count (children's one). I propose to introduce the special facet type:termsUnique or type:termsDedupe or what's the better name here? Also, I want to start from passing a field or func values, rather than filter query, to mimic existing solution unique(_root_). ie \n\n\n\"sku_colors_in_prods\":{\n    \"type\" : \"termsUnique\",\n    \"field\" : \"COLOR_s\",\n    \"uniqueVal\": \"_root_\",\n    \"domain\" : {\n        \"blockChildren\":\"type:product\"\n    }\n}\n\n\n\nYonik Seeley, what do you think of this syntax?  ",
+            "id": "comment-16421667"
+        },
+        {
+            "date": "2018-04-15T16:16:11+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Yonik Seeley, do you think we need this algorithm in json.facet at all?\u00a0 ",
+            "id": "comment-16438759"
+        },
+        {
+            "date": "2018-04-21T21:20:31+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Dr Oleg Savrasov, I'd like to challenge the the following statement\nUnfortunately definition like facet: { productsCount: \"unique(_root_)\"} assumes iterating one by one through all the facet values and creating appropriate docset for each of them.\nif we just add limit:-1 here unique() is added as FacetFieldProcessor.collectAcc see comment above (otherwise it goes to FacetFieldProcessor. deferredAggs), then it's notified on every doc.\nWhat about introducing  uniqueBlock(_root_) as an extension of UniqueSlotAcc having acc as array of tuples of counter and last seen deduplicating value? ",
+            "id": "comment-16447002"
+        },
+        {
+            "date": "2018-04-21T22:18:48+0000",
+            "author": "Mikhail Khludnev",
+            "content": "attaching SOLR-8998.patch as proof for the proposal above. ",
+            "id": "comment-16447027"
+        },
+        {
+            "date": "2018-04-23T11:41:01+0000",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  -1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 1 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   1m 37s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   1m 33s \n  the patch passed  \n\n\n +1 \n  javac  \n   1m 33s \n  the patch passed  \n\n\n +1 \n  Release audit (RAT)  \n   1m 33s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   1m 33s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   1m 33s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n -1 \n  unit  \n  55m 25s \n  core in the patch failed.  \n\n\n  \n   \n  61m 10s \n   \n\n\n\n\n\n\n\n\n\n Reason \n Tests \n\n\n Failed junit tests \n solr.search.QueryEqualityTest \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n SOLR-8998 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12920177/SOLR-8998.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene1-us-west 3.13.0-88-generic #135-Ubuntu SMP Wed Jun 8 21:10:42 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-SOLR-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / e8c36f4 \n\n\n ant \n version: Apache Ant(TM) version 1.9.3 compiled on April 8 2014 \n\n\n Default Java \n 1.8.0_152 \n\n\n unit \n https://builds.apache.org/job/PreCommit-SOLR-Build/65/artifact/out/patch-unit-solr_core.txt \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-SOLR-Build/65/testReport/ \n\n\n modules \n C: solr/core U: solr/core \n\n\n Console output \n https://builds.apache.org/job/PreCommit-SOLR-Build/65/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "id": "comment-16448006"
+        },
+        {
+            "date": "2018-04-26T02:49:43+0000",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  +1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 3 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   1m 13s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   1m 20s \n  the patch passed  \n\n\n +1 \n  javac  \n   1m 20s \n  the patch passed  \n\n\n +1 \n  Release audit (RAT)  \n   1m 20s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   1m 20s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   1m 20s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n  47m 32s \n  core in the patch passed.  \n\n\n  \n   \n  52m 45s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n SOLR-8998 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12920527/SOLR-8998.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene1-us-west 3.13.0-88-generic #135-Ubuntu SMP Wed Jun 8 21:10:42 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-SOLR-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / bea6f42 \n\n\n ant \n version: Apache Ant(TM) version 1.9.3 compiled on April 8 2014 \n\n\n Default Java \n 1.8.0_152 \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-SOLR-Build/67/testReport/ \n\n\n modules \n C: solr/core U: solr/core \n\n\n Console output \n https://builds.apache.org/job/PreCommit-SOLR-Build/67/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "id": "comment-16453399"
+        },
+        {
+            "date": "2018-05-01T11:42:34+0000",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  +1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 3 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   4m 57s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   4m 43s \n  the patch passed  \n\n\n +1 \n  javac  \n   4m 43s \n  the patch passed  \n\n\n +1 \n  Release audit (RAT)  \n   4m 43s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   4m 43s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   4m 43s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n 120m 55s \n  core in the patch passed.  \n\n\n  \n   \n 136m 55s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n SOLR-8998 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12921176/SOLR-8998.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene2-us-west.apache.org 4.4.0-112-generic #135-Ubuntu SMP Fri Jan 19 11:48:36 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-SOLR-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / d92b891 \n\n\n ant \n version: Apache Ant(TM) version 1.9.6 compiled on July 8 2015 \n\n\n Default Java \n 1.8.0_172 \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-SOLR-Build/70/testReport/ \n\n\n modules \n C: solr solr/core U: solr \n\n\n Console output \n https://builds.apache.org/job/PreCommit-SOLR-Build/70/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "id": "comment-16459634"
+        },
+        {
+            "date": "2018-05-01T14:29:41+0000",
+            "author": "Dr Oleg Savrasov",
+            "content": "I like the idea. Usage of proposed uniqueBlock(root) aggregation looks very similar to unique(root) workaround. But the implementation avoids accumulating FixedBitSet for each slot. The only thing I worry about is found hack with limit:-1. I believe uniqueBlock should perform much better with it, but I don't see any way to use it by default without modifying main facet machinery. Shall we somehow document that it's recommended to use uniqueBlock aggregation with limit:-1 facet parameter? ",
+            "id": "comment-16459719"
+        },
+        {
+            "date": "2018-05-01T17:18:35+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ee7b52f4c6fe55f0d07ce8228c246b61d1f2b5fb in lucene-solr's branch refs/heads/master from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ee7b52f ]\n\nSOLR-8998: uniqueBlock() aggreagation for singlevalue string fields in json.facet ",
+            "id": "comment-16459877"
+        },
+        {
+            "date": "2018-05-01T17:21:24+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit b347f031dbec8fe76ee15f85cdcc62efbf63a80d in lucene-solr's branch refs/heads/branch_7x from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b347f03 ]\n\nSOLR-8998: uniqueBlock() aggreagation for singlevalue string fields in json.facet ",
+            "id": "comment-16459884"
+        },
+        {
+            "date": "2018-05-02T07:11:42+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Attaching SOLR-8998-doc.patch. Cassandra Targett, I appreciate you have a look. Thanks.  ",
+            "id": "comment-16460612"
+        },
+        {
+            "date": "2018-05-02T10:19:16+0000",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  +1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  Release audit (RAT)  \n   0m  4s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   0m  4s \n  the patch passed  \n\n\n +1 \n  Validate ref guide  \n   0m  4s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n  \n   \n   2m 16s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n SOLR-8998 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12921543/SOLR-8998-doc.patch \n\n\n Optional Tests \n  ratsources  validatesourcepatterns  validaterefguide  \n\n\n uname \n Linux lucene1-us-west 3.13.0-88-generic #135-Ubuntu SMP Wed Jun 8 21:10:42 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-SOLR-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / ee2198d \n\n\n ant \n version: Apache Ant(TM) version 1.9.3 compiled on April 8 2014 \n\n\n modules \n C: solr/solr-ref-guide U: solr/solr-ref-guide \n\n\n Console output \n https://builds.apache.org/job/PreCommit-SOLR-Build/71/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "id": "comment-16460826"
+        },
+        {
+            "date": "2018-05-02T13:32:52+0000",
+            "author": "Dr Oleg Savrasov",
+            "content": "I've tried to document JSON Facet API changes, please review SOLR-8998-api-doc.patch  ",
+            "id": "comment-16461033"
+        },
+        {
+            "date": "2018-05-02T15:22:28+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit df713fc70009733afed84484298326b15f963d15 in lucene-solr's branch refs/heads/master from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=df713fc ]\n\nSOLR-8998: ref guide update. ",
+            "id": "comment-16461171"
+        },
+        {
+            "date": "2018-05-02T15:23:44+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 8083dea9c8cfab393c1ed2a1e87d28bc25849043 in lucene-solr's branch refs/heads/branch_7x from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8083dea ]\n\nSOLR-8998: ref guide update. ",
+            "id": "comment-16461173"
+        },
+        {
+            "date": "2018-05-02T15:24:29+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Thanks. Dr Oleg Savrasov.  ",
+            "id": "comment-16461174"
+        },
+        {
+            "date": "2018-05-04T15:05:58+0000",
+            "author": "Cassandra Targett",
+            "content": "Mikhail Khludnev, sorry for the delay taking a look at this. Just to make sure I understand what you asked me to look at...Some documentation was done with the code changes last week, but then there are some additional doc changes that are proposed in the SOLR-8998-doc.patch, is that correct?\n\nI haven't reviewed in much depth yet, but one thing that jumped out at me right away is if you look at the BlockJoin Faceting page as it's built (https://builds.apache.org/view/L/view/Lucene/job/Solr-reference-guide-master/javadoc/blockjoin-faceting.html) there are two warnings near the top of the page. The one that was added with this issue says the functionality is deprecated, but the next one that's been there for a while says it's experimental. Those statements on the status conflict, I think - \"experimental\" would indicate to me that future development is likely, but \"deprecated\" says no more development should be expected. I think we could merge those statements with something like:\n\n\nThis functionality is considered deprecated. Users are encouraged to use uniqueBlock(_root_) aggregation under terms facet in JSON Facet API.\n\nIf this component is used, it must be explicitly enabled for a request handler in solrconfig.xml, in the same way as any other search component.\n\n\n\nDoes that seem reasonable and an accurate reflection of the status of BlockJoinFacetComponent? ",
+            "id": "comment-16463988"
+        },
+        {
+            "date": "2018-05-04T20:03:23+0000",
+            "author": "Mikhail Khludnev",
+            "content": "make sense Cassandra Targett I'll fix it next week.  ",
+            "id": "comment-16464332"
+        },
+        {
+            "date": "2018-05-06T13:45:56+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit beaf3a47ebe6ad79572bccaeafc2551dc86f19c6 in lucene-solr's branch refs/heads/master from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=beaf3a4 ]\n\nSOLR-8998: documentation fix. ",
+            "id": "comment-16465131"
+        },
+        {
+            "date": "2018-05-06T13:47:04+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 709782ac9d50e20da5745aa6fa2351b6b6757b20 in lucene-solr's branch refs/heads/branch_7x from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=709782a ]\n\nSOLR-8998: documentation fix. ",
+            "id": "comment-16465132"
+        },
+        {
+            "date": "2018-05-07T07:08:15+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Further improvement might be:\n\n\thandling numeric fields in uniqueBlock(id) SOLR-12324\n\tusing filters for aggregating hits for better performance eg uniqueBlockQuery(parent:true) SOLR-12325\nI'm not able to work on it soon.  \n\n ",
+            "id": "comment-16465528"
+        }
+    ]
+}

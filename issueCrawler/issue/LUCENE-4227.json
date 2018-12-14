@@ -1,0 +1,84 @@
+{
+    "id": "LUCENE-4227",
+    "title": "DirectPostingsFormat, storing postings as simple int[] in memory, if you have tons of RAM",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-BETA",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "This postings format just wraps Lucene40 (on disk) but then at search\ntime it loads (up front) all terms postings into RAM.\n\nYou'd use this if you have insane amounts of RAM and want the fastest\npossible search performance.  The postings are not compressed: docIds,\npositions are stored as straight int[]s.\n\nThe terms are stored as a skip list (array of byte[]), but I packed\nall terms together into a single long byte[]: I had started as actual\nseparate byte[] per term but the added pointer deref and loss of\nlocality was a lot (~2X) slower for terms-dict intensive queries like\nFuzzyQuery.\n\nLow frequency postings (docFreq <= 32 by default) store all docs, pos\nand offsets into a single int[].  High frequency postings store docs\nas int[], freqs as int[], and positions as int[][] parallel arrays.\nFor skipping I just do a growing binary search.\n\nI also made specialized DirectTermScorer and DirectExactPhraseScorer\nfor the high freq case that just pull the int[] and iterate\nthemselves.\n\nAll tests pass.",
+    "attachments": {
+        "LUCENE-4227.patch": "https://issues.apache.org/jira/secure/attachment/12536708/LUCENE-4227.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-07-16T20:32:14+0000",
+            "content": "Patch. ",
+            "author": "Michael McCandless",
+            "id": "comment-13415609"
+        },
+        {
+            "date": "2012-07-16T20:35:27+0000",
+            "content": "I ran perf tests on a 2M Wikipedia index (requires 8 GB heap: need\nmore RAM to go higher!).\n\nResults without the specialized scorers (baseline is trunk w/ MMapDir):\n\n\n                Task    QPS base StdDev base  QPS directStdDev direct      Pct diff\n            PKLookup      259.28       11.94      227.96        5.85  -18% -   -5%\n              Fuzzy1      160.21        5.11      183.91        1.48   10% -   19%\n         TermGroup1M       18.33        0.21       21.60        0.11   15% -   19%\n            SpanNear        5.79        0.16        6.86        0.31   10% -   27%\n        TermBGroup1M       18.46        0.24       22.16        0.11   17% -   22%\n      TermBGroup1M1P       22.47        0.65       28.04        0.67   18% -   31%\n        SloppyPhrase        3.51        0.13        4.60        0.05   24% -   37%\n              IntNRQ       53.75        4.68       71.22        4.21   14% -   53%\n          OrHighHigh       18.85        0.42       26.89        2.16   28% -   57%\n           OrHighMed       37.93        0.91       54.57        5.71   25% -   62%\n             Respell      167.73        5.37      242.93        1.78   39% -   50%\n            Wildcard       46.64        1.74       69.98        3.43   37% -   63%\n             Prefix3      109.51        3.45      165.77        6.42   41% -   62%\n              Fuzzy2       56.48        2.37       88.25        0.91   48% -   64%\n         AndHighHigh       24.59        0.74       41.82        0.72   62% -   78%\n              Phrase       12.57        0.20       21.89        0.71   65% -   82%\n                Term       39.05        1.74       69.00        3.68   60% -   94%\n          AndHighMed      126.87        2.48      261.73        4.19   99% -  113%\n\n\n\nNice speedups!\n\nSame run, but using trunk w/ RAMDirectory as the baseline:\n\n\n                Task    QPS base StdDev base  QPS directStdDev direct      Pct diff\n            PKLookup      248.50        4.73      222.03        4.43  -14% -   -7%\n              Fuzzy1      159.41        3.65      185.32        3.15   11% -   21%\n            SpanNear        5.74        0.08        6.75        0.17   13% -   22%\n         TermGroup1M       17.78        0.42       21.03        0.68   11% -   25%\n        TermBGroup1M       19.32        0.58       23.08        1.02   10% -   28%\n              IntNRQ       46.82        0.49       56.12        1.28   15% -   23%\n      TermBGroup1M1P       23.27        0.46       30.14        0.91   23% -   36%\n             Respell      163.36        3.42      221.10        2.48   31% -   39%\n           OrHighMed       30.62        1.94       42.94        5.70   14% -   69%\n          OrHighHigh       17.98        0.99       25.69        3.35   17% -   70%\n             Prefix3      114.41        0.67      164.19        2.22   40% -   46%\n            Wildcard       47.58        0.36       70.47        1.20   44% -   51%\n              Fuzzy2       53.92        1.37       83.54        2.66   46% -   64%\n        SloppyPhrase        5.07        0.23        8.12        0.74   39% -   82%\n         AndHighHigh       24.73        0.75       40.51        0.42   57% -   70%\n              Phrase       14.02        0.07       23.42        0.30   64% -   69%\n                Term       39.96        2.13       67.39        4.09   50% -   88%\n          AndHighMed      132.66        3.24      274.07        1.64  100% -  113%\n\n\n\nStill good speedups over the \"obvious hold index in RAM\" option.\n\nThen, just testing the specialized scorers (baseline = DirectPF without\nspecialized scorers):\n\n\n                Task    QPS base StdDev base  QPS directStdDev direct      Pct diff\n              IntNRQ       74.86        3.42       71.72        0.27   -8% -    0%\n            Wildcard       62.88        2.34       60.52        0.49   -7% -    0%\n             Prefix3      102.46        3.98       98.92        0.85   -7% -    1%\n         AndHighHigh       51.41        1.96       50.26        1.10   -7% -    3%\n          AndHighMed      238.18        5.17      234.14        2.83   -4% -    1%\n              Fuzzy1      179.64        1.73      177.96        3.27   -3% -    1%\n        SloppyPhrase        8.97        0.37        8.93        0.48   -9% -    9%\n             Respell      223.76        1.16      222.79        2.68   -2% -    1%\n              Fuzzy2       79.62        1.38       79.31        0.90   -3% -    2%\n            SpanNear        6.83        0.25        6.89        0.31   -7% -    9%\n            PKLookup      220.25        1.46      225.17        2.56    0% -    4%\n           OrHighMed       50.70        4.27       53.20        3.95  -10% -   23%\n         TermGroup1M       22.17        0.33       23.42        0.37    2% -    8%\n        TermBGroup1M       24.45        0.44       25.86        0.21    3% -    8%\n      TermBGroup1M1P       30.61        0.82       32.76        0.12    3% -   10%\n                Term       68.69        3.99       74.88        0.28    2% -   16%\n          OrHighHigh       26.61        1.95       29.07        2.24   -6% -   26%\n              Phrase       13.81        0.17       15.96        0.13   13% -   17%\n\n\n\nReasonable but not immense speedups by specializing query\nscorers. ",
+            "author": "Michael McCandless",
+            "id": "comment-13415613"
+        },
+        {
+            "date": "2012-07-20T11:43:26+0000",
+            "content": "New patch, fixing previous nocommits / downgrading to TODOs.  I also removed the specialized scorers since they seem not to help much.\n\nAll tests pass, but I still need to fix all tests that now avoid MemoryPF to also avoid DirectPF.  Otherwise I think it's ready... ",
+            "author": "Michael McCandless",
+            "id": "comment-13419067"
+        },
+        {
+            "date": "2012-07-20T11:53:57+0000",
+            "content": "Would it really be that much slower if it was slightly more reasonable, e.g. storing freqs\nin packed ints (with huper-duper fast options) instead of wasting so much on them? ",
+            "author": "Robert Muir",
+            "id": "comment-13419071"
+        },
+        {
+            "date": "2012-07-20T13:25:27+0000",
+            "content": "\nWould it really be that much slower if it was slightly more reasonable, e.g. storing freqs\n in packed ints (with huper-duper fast options) instead of wasting so much on them?\n\nProbably not that much slower?  I think that's a good idea!\n\nBut I think we can explore this after committing?  There are other things we can try too (eg collapse skip list into shared int[]: I think this one may give a perf gain, collapse positions, etc.). ",
+            "author": "Michael McCandless",
+            "id": "comment-13419119"
+        },
+        {
+            "date": "2012-07-20T13:29:15+0000",
+            "content": "Yeah, i don't think we need to solve it before committing.\n\nI do think maybe this class needs some more warnings, to me it seems it will use crazy amounts of RAM.\nI also am not sure I like the name \"Direct\"... is it crazy to suggest \"Instantiated\"? ",
+            "author": "Robert Muir",
+            "id": "comment-13419126"
+        },
+        {
+            "date": "2012-07-20T13:36:20+0000",
+            "content": "I do think maybe this class needs some more warnings, to me it seems it will use crazy amounts of RAM.\n\nI'll add some scary warnings \n\nI also am not sure I like the name \"Direct\"... is it crazy to suggest \"Instantiated\"?\n\nIt is very much like the old instantiated (though I think its terms dict is faster than instantiated's)... but I didn't really like the name \"Instanstiated\"... I had picked Direct because it \"directly\" represents the postings ... but maybe we can find a better name.\n\nI will update MIGRATE.txt to explain how \"Direct\" (or whatever we name it) is the closest match if you were previously using Instantiated...\n ",
+            "author": "Michael McCandless",
+            "id": "comment-13419129"
+        },
+        {
+            "date": "2012-07-20T13:38:47+0000",
+            "content": "\nIt is very much like the old instantiated (though I think its terms dict is faster than instantiated's)... but I didn't really like the name \"Instanstiated\"... I had picked Direct because it \"directly\" represents the postings ... but maybe we can find a better name.\n\nOK, I think what would be better is a better synonym for \"Uncompressed\". I realized Direct is consistent with packedints\nor whatever... but I don't think it should using this name either, its not intuitive. ",
+            "author": "Robert Muir",
+            "id": "comment-13419131"
+        },
+        {
+            "date": "2012-07-20T14:21:30+0000",
+            "content": "New patch, adding scary warning & MIGRATE.txt entry, fixing javadoc errors, and adding lucene.experimental ... still haven't thought of another name yet ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13419172"
+        },
+        {
+            "date": "2012-07-20T14:23:15+0000",
+            "content": "I dont have better name either. Lets just commit it with this one and think about it for later! ",
+            "author": "Robert Muir",
+            "id": "comment-13419173"
+        }
+    ]
+}

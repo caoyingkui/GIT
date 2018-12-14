@@ -1,0 +1,309 @@
+{
+    "id": "SOLR-11003",
+    "title": "Enabling bi-directional CDCR on cluster for better failover",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "CDCR"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "7.2"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "The latest version of Solr CDCR across collections / clusters is in active-passive format, where we can index into source collection and the updates gets forwarded to the passive one and vice-versa is not supported.\n\nhttps://lucene.apache.org/solr/guide/6_6/cross-data-center-replication-cdcr.html\nhttps://issues.apache.org/jira/browse/SOLR-6273\n\nWe are try to get a  design ready to index in both collections and the updates gets reflected across the collections in real-time (given the backlog of replicating updates to other data center). ClusterACollectionA => ClusterBCollectionB | ClusterBCollectionB => ClusterACollectionA.\n\nThe STRONG RECOMMENDED way to keep indexing in ClusterACollectionA which forwards the updates to ClusterBCollectionB. If ClusterACollectionA gets down, we point the indexer and searcher application to ClusterBCollectionB. Once ClusterACollectionA is up, depending on updates count, they will be bootstrapped or forwarded to ClusterACollectionA from ClusterBCollectionB and keep indexing on the ClusterBCollectionB.",
+    "attachments": {
+        "sample-configs.zip": "https://issues.apache.org/jira/secure/attachment/12876130/sample-configs.zip",
+        "SOLR-11003-tlogutils.patch": "https://issues.apache.org/jira/secure/attachment/12876260/SOLR-11003-tlogutils.patch",
+        "SOLR-11003.patch": "https://issues.apache.org/jira/secure/attachment/12876245/SOLR-11003.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-07-04T12:23:17+0000",
+            "content": "Proposed design =>\n\nConfiguration:\n\nConfigure both collections as source and point to their targets. Sample configurations listed below:\n\nCluster2:\n\n<requestHandler name=\"/cdcr\" class=\"solr.CdcrRequestHandler\">\n    <lst name=\"replica\">\n      <str name=\"zkHost\">${cdcr.cluster1.zkHost}</str>\n      <str name=\"source\">cdcr-cluster2</str>\n      <str name=\"target\">cdcr-cluster1</str>\n    </lst>\n    <lst name=\"replicator\">\n      <str name=\"threadPoolSize\">1</str>\n      <str name=\"schedule\">1000</str>\n      <str name=\"batchSize\">1000</str>\n    </lst>\n    <lst name=\"updateLogSynchronizer\">\n      <str name=\"schedule\">1000</str>\n    </lst>\n  </requestHandler>\n\n\n\nCluster1:\n\n  <requestHandler name=\"/cdcr\" class=\"solr.CdcrRequestHandler\">\n    <lst name=\"replica\">\n      <str name=\"zkHost\">${cdcr.cluster2.zkHost}</str>\n      <str name=\"source\">cdcr-cluster1</str>\n      <str name=\"target\">cdcr-cluster2</str>\n    </lst>\n    <lst name=\"replicator\">\n      <str name=\"threadPoolSize\">1</str>\n      <str name=\"schedule\">1000</str>\n      <str name=\"batchSize\">1000</str>\n    </lst>\n    <lst name=\"updateLogSynchronizer\">\n      <str name=\"schedule\">1000</str>\n    </lst>\n  </requestHandler>\n\n\n\nReplication Improvement:\n\nCdcrReplicator replays the tlogs, creates new UpdateRequests and forwards them to target collection. The plan is to persist information in the tlogs' each update entries telling the collection this update is received as a CDCR forward and it should be not be forwarded further.\n\nEach CDCR update forward contains the param key \"cdcr.update\" and value empty. Once the target collection received that particular update, before writing it down to transaction log, we check whether the UpdateCommand -> SolrRequest -> contains params key \"cdcr.update\", if there is, apart from the entries listed for each update, we add a flag, say isCdcr. \"true\" and write it to tlog. When CdcrReplicator reads updates from the tlog, and if the flag is present / set, skip that update for forwarding and read next.\n\nWe had to be very careful of where to put the flag so that we don't break the backward compatibility and hence we added at the last index for DELETE and DELETEBYQUERY while second last index for ADD. Reason listed below. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16073572"
+        },
+        {
+            "date": "2017-07-04T12:26:57+0000",
+            "content": "Backward-compat::\n\ntlogs entries index are definite for each operation: identifier(0) and version(1) common to all.\n\nDELETE:\nidentifier: delete\nupdate version\npayload\n\nif you see UpdateLog: doReplay: 1801\n\ncase UpdateLog.DELETE: {\n                recoveryInfo.deletes++;\n                byte[] idBytes = (byte[]) entry.get(2);\n                DeleteUpdateCommand cmd = new DeleteUpdateCommand(req);\n                cmd.setIndexedId(new BytesRef(idBytes));\n                cmd.setVersion(version);\n                cmd.setFlags(UpdateCommand.REPLAY | UpdateCommand.IGNORE_AUTOCOMMIT);\n                if (debug) log.debug(\"delete \" + cmd);\n                proc.processDelete(cmd);\n                break;\n              }\n\n\nhardcoded, the position of payload(2) is hardcoded. See CdcrReplicator, same. So we can put anything on next index(3).\n\nDELETE_BY_QUERY:\nDitto same!!\n\nADD:\nindentifier: add or inplace\nversion\npayload\nIN_PLACE_ADD:\nindentifier: add or inplace\nversion\nprevious pointer\nprevious version\npayload\n\nUpdateLog:: 1916, since our current code handles both adds in one manner, it assumes the last index of the entries is our payload:\n\npublic static AddUpdateCommand convertTlogEntryToAddUpdateCommand(SolrQueryRequest req, List entry,\n                                                                    int operation, long version) {\n    assert operation == UpdateLog.ADD || operation == UpdateLog.UPDATE_INPLACE;\n    SolrInputDocument sdoc = (SolrInputDocument) entry.get(entry.size()-1);\n    AddUpdateCommand cmd = new AddUpdateCommand(req);\n    cmd.solrDoc = sdoc;\n    cmd.setVersion(version);\n    if (operation == UPDATE_INPLACE) {\n      long prevVersion = (Long) entry.get(UpdateLog.PREV_VERSION_IDX);\n      cmd.prevVersion = prevVersion;\n    }\n    return cmd;\n  }\n\n\nSo our window of adding something is the index just before the last. entry.size - 2. Please see CdcrReplicator for the same. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16073575"
+        },
+        {
+            "date": "2017-07-04T12:34:53+0000",
+            "content": "Patch uploaded:\n\n\n\tmodified:   solr/core/src/java/org/apache/solr/handler/CdcrReplicator.java\n\tmodified:   solr/core/src/java/org/apache/solr/update/CdcrTransactionLog.java\n\tmodified:   solr/core/src/java/org/apache/solr/update/TransactionLog.java\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster1/conf/schema.xml\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster1/conf/solrconfig.xml\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster2/conf/schema.xml\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster2/conf/solrconfig.xml\n\tnew file:   solr/core/src/test/org/apache/solr/cloud/CdcrBidirectionalTest.java\n\n\n\nAdded testclass CdcrBidirectionalTest where two active clusters are talking to each other runtime.\n\nThe write operations in TransactionLog are repeated in CdcrTransactionLog to accommodate the extra entry for each update. Repeated code! henceforth planning to have TLogCommonUtils / UpdateLogCommonUtils to put the common code for both classes' methods.\n\nEagerly looking forward to feedback, suggestions and improvements. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16073586"
+        },
+        {
+            "date": "2017-07-08T00:20:20+0000",
+            "content": "Hi Amrit,\n\nPatch is looking good!\n\nLet's add some code comments in CDCRTransactionLog and CDCRReplicator.\n\nFor example, this change in CDCRTransactionLog is confusing till you look at CDCRReplicator#isTargetCluster \n\n        if (cmd.getReq().getParamString().contains(CdcrUpdateProcessor.CDCR_UPDATE)) {\n          codec.writeTag(JavaBinCodec.ARR, 6);\n        } else {\n          codec.writeTag(JavaBinCodec.ARR, 5);\n        }\n\n\n\n\nThe test has adds, deleteByid and deleteByQuery.  Can we also test for in place updates ( I didn't see a anything triggering that code path ) \nAlso it wouldn't hurt to add atomic updates to the test. ",
+            "author": "Varun Thacker",
+            "id": "comment-16078861"
+        },
+        {
+            "date": "2017-07-08T00:23:01+0000",
+            "content": "Shalin Shekhar Mangar / Renaud Delbru curious to hear your feedback to the approach we are taking here.  ",
+            "author": "Varun Thacker",
+            "id": "comment-16078862"
+        },
+        {
+            "date": "2017-07-08T15:24:03+0000",
+            "content": "Varun Thacker, thank you for the review and feedback,\n\n\n Can we also test for in place updates ( I didn't see a anything triggering that code path ) \nI think IN_PLACE updates are not forwarded to target clusters / supported in CDCR, as those updates are not recognised in CDCRReplicator::processUpdate and are never forwarded. I still put the boolean flag in place for IN_PLACE updates for near future. I don't know the reason why it is excluded. See this:\n\n  private UpdateRequest processUpdate(Object o, UpdateRequest req) {\n    // should currently be a List<Oper,Ver,Doc/Id>\n    List entry = (List) o;\n\n    int operationAndFlags = (Integer) entry.get(0);\n    int oper = operationAndFlags & UpdateLog.OPERATION_MASK;\n    long version = (Long) entry.get(1);\n\n    // record the operation in the benchmark timer\n    state.getBenchmarkTimer().incrementCounter(oper);\n\n    switch (oper) {\n      case UpdateLog.ADD: {\n        // the version is already attached to the document\n        SolrInputDocument sdoc = (SolrInputDocument) entry.get(entry.size() - 1);\n        req.add(sdoc);\n        return req;\n      }\n      case UpdateLog.DELETE: {\n        byte[] idBytes = (byte[]) entry.get(2);\n        req.deleteById(new String(idBytes, Charset.forName(\"UTF-8\")));\n        req.setParam(VERSION_FIELD, Long.toString(version));\n        return req;\n      }\n      case UpdateLog.DELETE_BY_QUERY: {\n        String query = (String) entry.get(2);\n        req.deleteByQuery(query);\n        req.setParam(VERSION_FIELD, Long.toString(version));\n        return req;\n      }\n      case UpdateLog.COMMIT: {\n        return null;\n      }\n      default:\n        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, \"Unknown Operation! \" + oper);\n    }\n  }\n\n\n\nAlso it wouldn't hurt to add atomic updates to the test. Suitable comments.\nPatch updated. SOLR-11003.patch with the above recommendations.\n\nAlso I have uploaded SOLR-11003-tlogutils.patch (NOT TESTED 100%), where we are eliminating duplicate code and putting  the common in TLogCommonUtils. This solution is much cleaner and effective. I will update once I get ant test and ant test -Dtests.nightly=true run successfully for solr sub-project. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16079183"
+        },
+        {
+            "date": "2017-07-08T15:37:17+0000",
+            "content": "heads up :: CdcrBootstrapTest is failing due to missing index on both the patches, looking into it.\n\nseems it is failing in the master branch anyway  ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16079185"
+        },
+        {
+            "date": "2017-07-08T18:06:36+0000",
+            "content": "Fixed bits in SOLR-11003-tlogutils.patch. Looking forward to the resolution of CdcrBootstrapTest test failures and we can take forward SOLR-11003-tlogutils.patch as the standard patch for this use-case. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16079257"
+        },
+        {
+            "date": "2017-07-14T14:26:16+0000",
+            "content": "Latest patch uploaded:\n\n\tmodified:   core/src/java/org/apache/solr/handler/CdcrReplicator.java\n\tmodified:   core/src/java/org/apache/solr/update/CdcrTransactionLog.java\n\tnew file:   core/src/java/org/apache/solr/update/TLogCommonUtils.java\n\tmodified:   core/src/java/org/apache/solr/update/TransactionLog.java\n\tnew file:   core/src/test-files/solr/configsets/cdcr-cluster1/conf/schema.xml\n\tnew file:   core/src/test-files/solr/configsets/cdcr-cluster1/conf/solrconfig.xml\n\tnew file:   core/src/test-files/solr/configsets/cdcr-cluster2/conf/schema.xml\n\tnew file:   core/src/test-files/solr/configsets/cdcr-cluster2/conf/solrconfig.xml\n\tnew file:   core/src/test/org/apache/solr/cloud/CdcrBidirectionalTest.java\n\n\nTLogCommonUtils.java included contains common code of TLog and CdcrTLog and wrapped it under one class. Neat. Looking forward to more feedback and suggestions. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16087384"
+        },
+        {
+            "date": "2017-07-21T20:09:23+0000",
+            "content": "I want to be sure I understand the scope here. IIUC, this patch does not allow simultaneous indexing to both SOURCE and TARGET, correct? I don't consider this a show-stopper, just making sure I'm looking at it correctly.\n\nIf the above is correct, then what happens in this case:\n-indexing to collectionA which is using CDCR to forward updates to collectionB\n-collectionA goes down for some reason and there are some updates not yet forwarded to CollectionB\n-indexing is switched to collectionB\n-collectionA comes back on line as TARGET.\n\nWhat happens with the updates in collectionA that weren't forwarded? Is collectionB out of sync in this case? If so how do the collections get back in sync? If there's an attempt to forward collection A's buffered updates how are they coordinated with collectionB's updates which may be for the same docs?\n\nI admit I haven't really looked at the code carefully, I'd like an idea of what the intention is before diving in.\n\nAnd if my opening question is incorrect and one can index to both collections simultaneously, how does it work when the same document is sent go both collectionA and collectionB independently? ",
+            "author": "Erick Erickson",
+            "id": "comment-16096778"
+        },
+        {
+            "date": "2017-07-21T20:52:42+0000",
+            "content": "Erick Erickson,\n\nAnd if my opening question is incorrect and one can index to both collections simultaneously, how does it work when the same document is sent go both collectionA and collectionB independently?\n\nWe can index in both the collection, collectionA and collectionB at run-time. Now when same doc gets indexed simultaneously, \n\nsay, docX indexed into collectionA assigned versionA\nand docX (same) indexed into collectionB assigned versionB\n\ndocX pushed from collectionA to collectionB and will get indexed into collectionB only and only if versionA > versionB\ndocX pushed from collectionB to collectionA and will get indexed into collectionA only and only if versionB > versionA\n\nIn either case, one will prevail and one will fail and we will have one winner. The above mentioned is strong recommendation if you are going to set bi-directional cdcr on collections; index at one cluster at a time due the same simultaneous indexing scenario.\n\nIf in any case, a very less probability, versionA = versionB, then optimistic concurrency comes into play and versions of the document docX in both collections will be different, a new version will assigned at the respective target collections then. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16096841"
+        },
+        {
+            "date": "2017-08-28T10:48:52+0000",
+            "content": "The patch is failing on branch_6_6 :\n\n\n   [junit4]   2> Caused by: org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException: Error from server at http://127.0.0.1:55117/solr/cdcr-cluster1: Error while requesting shard's checkpoints\n\n\n\n   [junit4]   2> Caused by: org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException: Error from server at http://127.0.0.1:55117/solr/cdcr-cluster1_shard1_replica1: Invalid shift value (64) in prefixCoded bytes (is encoded value really an INT?)\n\n\n\nI will check on other branches to see the matter. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16143630"
+        },
+        {
+            "date": "2017-08-28T11:24:53+0000",
+            "content": "The patch is failing on master and previous versions:  branch_6_5\n\n\n[junit4]   2> Caused by: java.util.concurrent.ExecutionException: org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException: Error from server at https://127.0.0.1:55565/solr/cdcr-cluster1_shard1_replica1: Invalid shift value (64) in prefixCoded bytes (is encoded value really an INT?)\n   [junit4]   2> \tat java.util.concurrent.FutureTask.report(FutureTask.java:122)\n   [junit4]   2> \tat java.util.concurrent.FutureTask.get(FutureTask.java:192)\n   [junit4]   2> \tat org.apache.solr.handler.CdcrRequestHandler.handleCollectionCheckpointAction(CdcrRequestHandler.java:414)\n   [junit4]   2> \t... 34 more \n\n\n\nInvalid shift value (64) in prefixCoded bytes (is encoded value really an INT?)\n\nNeed to fix this for CollectionCheckpoint. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16143670"
+        },
+        {
+            "date": "2017-08-28T12:21:44+0000",
+            "content": "Patch uploaded with everything fixed, working in master and others. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16143725"
+        },
+        {
+            "date": "2017-08-28T13:46:33+0000",
+            "content": "Fixed closure of CloudSolrClients to make the patch pass beasts rounds of 100.\n\nVarun Thacker, this is ready to ship. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16143790"
+        },
+        {
+            "date": "2017-08-28T15:48:28+0000",
+            "content": "Amrit Sarkar There has been a regularly-failing CDCR test for a while, do you have any insight what's going on there (since you're in the code...).\n\nI'll try beasting that test without and with this patch just to see if it has any effect just for yucks.\n\nOr is this yet another variant of SOLR-11034 and/or SOLR-11035? ",
+            "author": "Erick Erickson",
+            "id": "comment-16143924"
+        },
+        {
+            "date": "2017-08-28T15:56:14+0000",
+            "content": "Erick Erickson Are you talking about this? SOLR-11278: CdcrBootstrapTest failing in branch_6_6. I am trying to understand what's wrong with it, and have narrowed down to: \n\nAll the tests in this class fails where we stop CDCR, index docs in source and then turns on CDCR again and expect BOOTSTRAP to happen. If I debug on IDE, all tests passes successfully (as the steps slows down), suggesting the time to wait for target to sync is low. But increasing it to 5 minutes even, instead of default 2 minutes, doesn't work. I increased explicit commit issued while waiting from 1 to 3 second, doesn't work either.\n\nLet me know if there are other tests which are failing too related to CDCR. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16143932"
+        },
+        {
+            "date": "2017-08-28T15:59:34+0000",
+            "content": "Though the tests which are constantly failing I mentioned above, do Solr Core reload every second when it waits for target to sync. It can very well be variant of SOLR-11034 and/or SOLR-11035, as we can see occasional NPE at IndexFetcher.java:753. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16143935"
+        },
+        {
+            "date": "2017-08-28T18:35:17+0000",
+            "content": "Well, it was a nice theory, too bad it's not true. I added a loop in the test (on master, but I don't think that matters) where if the document counts don't match, I add one more doc to the source and go back around the WaitForTargetToSync loop again. \n\nAt the initial failure I see counts of\ntarget: 1901\nsource: 2000\n\nAfter my new loop I see counts of\ntarget: 1902\nsource: 2001\n\nClearly my new doc is being indexed to the source and sent to the target so it's not just a matter of the docs getting to the target but somehow not being available to the currently-open searcher.\n\nSo this is very unlikely related to SOLR-11034 and SOLR-11035, never mind. ",
+            "author": "Erick Erickson",
+            "id": "comment-16144175"
+        },
+        {
+            "date": "2017-09-02T06:20:54+0000",
+            "content": "SOLR-11278: the reason behind CdcrBootstrapTest failing intermittently, is causing CdcrBidiretionalTest to fail too. I ran beast iters of 100 few days back, in July, it didn't fail once. We definitely need to address SOLR-11278 asap.\n\n\n  [beaster]   2> 60134 ERROR (updateExecutor-43-thread-1-processing-n:127.0.0.1:52448_solr x:cdcr-cluster2_shard1_replica_n1 s:shard1 c:cdcr-cluster2 r:core_node2) [n:127.0.0.1:52448_solr c:cdcr-cluster2 s:shard1 r:core_node2 x:cdcr-cluster2_shard1_replica_n1] o.a.s.h.CdcrRequestHandler Bootstrap operation failed\n  [beaster]   2> java.util.concurrent.ExecutionException: java.lang.AssertionError\n  [beaster]   2> \tat java.util.concurrent.FutureTask.report(FutureTask.java:122)\n  [beaster]   2> \tat java.util.concurrent.FutureTask.get(FutureTask.java:192)\n  [beaster]   2> \tat org.apache.solr.handler.CdcrRequestHandler.lambda$handleBootstrapAction$0(CdcrRequestHandler.java:646)\n  [beaster]   2> \tat com.codahale.metrics.InstrumentedExecutorService$InstrumentedRunnable.run(InstrumentedExecutorService.java:176)\n  [beaster]   2> \tat java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)\n  [beaster]   2> \tat java.util.concurrent.FutureTask.run(FutureTask.java:266)\n  [beaster]   2> \tat org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor.lambda$execute$0(ExecutorUtil.java:188)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)\n  [beaster]   2> \tat java.lang.Thread.run(Thread.java:745)\n  [beaster]   2> Caused by: java.lang.AssertionError\n  [beaster]   2> \tat org.apache.solr.handler.CdcrRequestHandler$BootstrapCallable.call(CdcrRequestHandler.java:789)\n  [beaster]   2> \tat org.apache.solr.handler.CdcrRequestHandler$BootstrapCallable.call(CdcrRequestHandler.java:716)\n  [beaster]   2> \tat com.codahale.metrics.InstrumentedExecutorService$InstrumentedCallable.call(InstrumentedExecutorService.java:197)\n  [beaster]   2> \t... 5 more\n\n ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16151422"
+        },
+        {
+            "date": "2017-09-21T00:31:23+0000",
+            "content": "Ok!\n\nCdcrBidirectionalTest is failing miserably every now and then while we do beast tests. I see:\n\no.a.s.h.CdcrReplicator Forwarded 496 updates to target cdcr-cluster1\n  [beaster]   2> 19147 ERROR (cdcr-replicator-31-thread-1-processing-n:127.0.0.1:46505_solr x:cdcr-cluster1_shard1_replica_n1 s:shard1 c:cdcr-cluster1 r:core_node2) [n:127.0.0.1:46505_solr c:cdcr-cluster1 s:shard1 r:core_node2 x:cdcr-cluster1_shard1_replica_n1] o.a.s.c.u.ExecutorUtil Uncaught exception java.lang.AssertionError thrown by thread: cdcr-replicator-31-thread-1-processing-n:127.0.0.1:46505_solr x:cdcr-cluster1_shard1_replica_n1 s:shard1 c:cdcr-cluster1 r:core_node2\n  [beaster]   2> java.lang.Exception: Submitter stack trace\n  [beaster]   2> \tat org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor.execute(ExecutorUtil.java:163)\n  [beaster]   2> \tat org.apache.solr.handler.CdcrReplicatorScheduler.lambda$start$1(CdcrReplicatorScheduler.java:76)\n  [beaster]   2> \tat java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)\n  [beaster]   2> \tat java.util.concurrent.FutureTask.runAndReset(FutureTask.java:308)\n  [beaster]   2> \tat java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$301(ScheduledThreadPoolExecutor.java:180)\n  [beaster]   2> \tat java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:294)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)\n  [beaster]   2> \tat java.lang.Thread.run(Thread.java:748)\n  [beaster]   2> 19155 INFO  (qtp620825517-65) [n:127.0.0.1:46505_solr c:cdcr-cluster1 s:shard1 r:core_node2 x:cdcr-cluster1_shard1_replica_n1] o.a.s.c.S.Request [cdcr-cluster1_shard1_replica_n1]  webapp=/solr path=/update params={_stateVer_=cdcr-cluster1:5&cdcr.update=&wt=javabin&version=2} status=0 QTime=23\n  [beaster]   2> 19156 INFO  (cdcr-replicator-35-thread-1-processing-n:127.0.0.1:46044_solr x:cdcr-cluster2_shard1_replica_n1 s:shard1 c:cdcr-cluster2 r:core_node2) [n:127.0.0.1:46044_solr c:cdcr-cluster2 s:shard1 r:core_node2 x:cdcr-cluster2_shard1_replica_n1] o.a.s.h.CdcrReplicator Forwarded 495 updates to target cdcr-cluster1\n  [beaster]   2> Sht 21, 2017 6:02:10 PD com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n  [beaster]   2> WARNING: Uncaught exception in thread: Thread[cdcr-replicator-31-thread-1,5,TGRP-CdcrBidirectionalTest]\n  [beaster]   2> java.lang.AssertionError\n  [beaster]   2> \tat __randomizedtesting.SeedInfo.seed([AE4E9FB83368594B]:0)\n  [beaster]   2> \tat org.apache.solr.update.TransactionLog$LogReader.next(TransactionLog.java:588)\n  [beaster]   2> \tat org.apache.solr.update.CdcrTransactionLog$CdcrLogReader.next(CdcrTransactionLog.java:143)\n  [beaster]   2> \tat org.apache.solr.update.CdcrUpdateLog$CdcrLogReader.next(CdcrUpdateLog.java:633)\n  [beaster]   2> \tat org.apache.solr.handler.CdcrReplicator.run(CdcrReplicator.java:77)\n  [beaster]   2> \tat org.apache.solr.handler.CdcrReplicatorScheduler.lambda$null$0(CdcrReplicatorScheduler.java:81)\n  [beaster]   2> \tat org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor.lambda$execute$0(ExecutorUtil.java:188)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)\n  [beaster]   2> \tat java.lang.Thread.run(Thread.java:748)\n  [beaster]   2> \n\n\nSome issue with concurrency in tlogs. some issue with tlog positions.\n\nThis results in:\n\n [beaster]   2> NOTE: reproduce with: ant test  -Dtestcase=CdcrBidirectionalTest -Dtests.method=testBiDir -Dtests.seed=AE4E9FB83368594B -Dtests.slow=true -Dtests.locale=sq-AL -Dtests.timezone=Asia/Thimphu -Dtests.asserts=true -Dtests.file.encoding=ANSI_X3.4-1968\n  [beaster] [00:01:51.287] ERROR   24.8s | CdcrBidirectionalTest.testBiDir <<<\n  [beaster]    > Throwable #1: java.lang.AssertionError: cluster 2 docs mismatch expected:<0> but was:<2>\n  [beaster]    > \tat org.junit.Assert.fail(Assert.java:93)\n  [beaster]    > \tat org.junit.Assert.failNotEquals(Assert.java:647)\n  [beaster]    > \tat org.junit.Assert.assertEquals(Assert.java:128)\n  [beaster]    > \tat org.junit.Assert.assertEquals(Assert.java:472)\n  [beaster]    > \tat org.apache.solr.cloud.CdcrBidirectionalTest.testBiDir(CdcrBidirectionalTest.java:199)\n  [beaster]    > \tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n  [beaster]    > \tat sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)\n  [beaster]    > \tat sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n  [beaster]    > \tat java.lang.reflect.Method.invoke(Method.java:498)\n  [beaster]    > \tat com.carrotsearch.randomizedtesting.RandomizedRunner.invoke(RandomizedRunner.java:1737)\n  [beaster]    > \tat com.carrotsearch.randomizedtesting.RandomizedRunner$8.evaluate(RandomizedRunner.java:934)\n  [beaster]    > \tat com.carrotsearch.randomizedtesting.RandomizedRunner$9.evaluate(RandomizedRunner.java:970)\n  [beaster]    > \tat com.carrotsearch.randomizedtesting.RandomizedRunner$10.evaluate(RandomizedRunner.java:984)\n  [beaster]    > \tat \n\n\nand maybe something else too in other conditions.\n\nLooking into what's the deal with this, it is happening when indexing and forwarding is happening simultaneously. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16174051"
+        },
+        {
+            "date": "2017-09-21T00:43:39+0000",
+            "content": "The test failures are irreproducible with the attached seeds; putting extensive logging and trying to understand what can be done next. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16174066"
+        },
+        {
+            "date": "2017-09-22T20:10:08+0000",
+            "content": "The problem was with the refracting of the code where the common portions of TLog and CdcrTLog takien into Utils class.\n\nI reverted back to old code now, w/o utils, will figure out how to refractor. Yes, there is repetitive code but I think that's necessary considering we are about to put an extra entry for cdcr updates.\n\n\n\tmodified:   solr/core/src/java/org/apache/solr/handler/CdcrReplicator.java\n\tmodified:   solr/core/src/java/org/apache/solr/update/CdcrTransactionLog.java\n\tmodified:   solr/core/src/java/org/apache/solr/update/TransactionLog.java\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster1/conf/schema.xml\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster1/conf/solrconfig.xml\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster2/conf/schema.xml\n\tnew file:   solr/core/src/test-files/solr/configsets/cdcr-cluster2/conf/solrconfig.xml\n\tnew file:   solr/core/src/test/org/apache/solr/cloud/CdcrBidirectionalTest.java\n\n\n\nBeasts of 100 rounds are passed successfuly. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16177040"
+        },
+        {
+            "date": "2017-09-28T02:03:39+0000",
+            "content": "Working on documentation changes now. Will open a new JIRA as changes needs to be discussed in detail.  ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16183564"
+        },
+        {
+            "date": "2017-09-28T14:51:41+0000",
+            "content": "Documentation changes for CDCR jira: SOLR-11412 ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16184283"
+        },
+        {
+            "date": "2017-10-27T06:13:55+0000",
+            "content": "Hi Amrit,\n\nPatch looks great!\n\nisTargetCluster uses the entry list size to see if we have the extra information in the tlog. This works and handles back-compat correctly.\nHowever I'm more inclined to do this:\nEncode a CDCR TLOG version if each entry . We can use this for the back-compat check. This potentially opens the door for new features down the road to be handled differently, when to stop caring about old back-compat checks ( next major version ) etc . Lucene does it from 7.0 ( LUCENE-7703  )\n\nWe could however argue that this improvement could be implemented for the regular transaction log as well. So let's put this for another Jira\n\n\n\tIn CDCRBiDirectionalTest can we have one try block instead of two currently. In the finally we could do a null check before shutting down\n\tMethods like cdcrStart are the same in CdcrBootstrapTest. Can we put them in a util class and reuse?We also have BaseCdcrDistributedZkTest#invokeCdcrAction . Let's refactor the usage\n\twaitForClusterToSync is the same as CdcrBootsrapTest#waitForTargetToSync\n\tEven CdcrBootstrapTest#indexDocs can be factored into the util class and reused here?\n\tCan we use the logger instead of System.out.println\n\tAfter we add docs to cluster 1, can we do a assert that the numFound is not 0 . Just a sanity check to make sure we indexed docs atleast.\n\tAre we printing the queue responses just for debugging? can we change that to an assert?\n\tFor /get?getVersions=X we need to do distrib=false . But since this is a one shard collection we don't need to I guess. You can add fingerprint=true and use the maxVersionEncountered key instead of calculating the max in code?\n\tAfter a DBQ/delete-by-id/atomic updates we do a 2s thread wait. Can we not rely on this and use waitForClusterToSync? In general we should not be doing any thread sleeps in the test\n\n ",
+            "author": "Varun Thacker",
+            "id": "comment-16221766"
+        },
+        {
+            "date": "2017-10-27T12:24:10+0000",
+            "content": "Varun,\n\nthank you for the constructive feedback.\n\n> We could however argue that this improvement could be implemented for the regular transaction log as well. So let's put this for another Jira\nI understand what you are saying, we can certainly do this to make the back-compat safe. This can be part of next iteration of CDCR optimisation.\n\n> In CDCRBiDirectionalTest can we have one try block instead of two currently. In the finally we could do a null check before shutting down\nI was following CdcrBootstrapTest format Shalin wrote, but yeah maybe two try catch not required, changed as suggested.\n\n> Methods like cdcrStart are the same in CdcrBootstrapTest. Can we put them in a util class and reuse?We also have BaseCdcrDistributedZkTest#invokeCdcrAction . Let's refactor the usage\n> waitForClusterToSync is the same as CdcrBootsrapTest#waitForTargetToSync\nPositively, moved to CdcrTestsUtil, we can surely make some code effective refactoring when we write this.\n\n> Even CdcrBootstrapTest#indexDocs can be factored into the util class and reused here?\nWe can, but then we have to specify the prefix for id for each collection, we can leave the refactoring there I guess.\n\n> Can we use the logger instead of System.out.println\nDone.\n\n> After we add docs to cluster 1, can we do a assert that the numFound is not 0 . Just a sanity check to make sure we indexed docs atleast.\nWe have already added this check at every stage, doing : at source.\n\n> Are we printing the queue responses just for debugging? can we change that to an assert?\nWe cannot assert on that, as queue responses will be different for different clusters, we are just printing it for our reference.\n\n> For /get?getVersions=X we need to do distrib=false . But since this is a one shard collection we don't need to I guess. You can add fingerprint=true and use the maxVersionEncountered key instead of calculating the max in code?\nI have to see this, how to do this part. I copied blindly from CdcrBootstrapTest, and as fingerprint was not introduced when bootstrap came in, its not there.\n\n> After a DBQ/delete-by-id/atomic updates we do a 2s thread wait. Can we not rely on this and use waitForClusterToSync? In general we should not be doing any thread sleeps in the test\nYeah that was poor test writing, fixed this. Thanks for pointing it out.\n\nPending: introducing fingerprint to get the maxVersion.  ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16222265"
+        },
+        {
+            "date": "2017-10-27T13:14:57+0000",
+            "content": "Refactored packages, put the fingerprint in place. Beasts successfully executed. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16222341"
+        },
+        {
+            "date": "2017-10-28T18:21:39+0000",
+            "content": "Hi Amrit,\n\nPatch looks very close! \n\nUploaded new patch. Removed some sleep waits, changed System.out.println to use a  logger, \n removed unused imports added CHANGES etc.\n\nI think we still need to work on the tests a little more . Here are my two concerns \n\n1. What are we trying to test with this part?\n\n\n      response = CdcrTestsUtil.getCdcrQueue(cluster1SolrClient);\n      log.info(\"Cdcr cluster1 queue response: \" + response.getResponse());\n      response = CdcrTestsUtil.getCdcrQueue(cluster2SolrClient);\n      log.info(\"Cdcr cluster2 queue response: \" + response.getResponse());\n\n\n\n2. We should change the collections to be 2 shards instead of 1. It's probably have better test coverage for DBQs etc.\n\nYou would need to check the individual shards for the fingerprint and checkpoint matches so it might require some additional work. ",
+            "author": "Varun Thacker",
+            "id": "comment-16223692"
+        },
+        {
+            "date": "2017-10-28T20:42:45+0000",
+            "content": "1. What are we trying to test with this part?\nPrint the current status of the cdcr -queue, tlog size, total tlogs. No usage when all goes well, when it doesn't; it will provide us exact number of what's up in the cdcr queues of the respective clusters, which cluster was behind etc.\n\n2. We should change the collections to be 2 shards instead of 1. It's probably have better test coverage for DBQs etc.\nMakes sense. Though it is proven there is no multiple back and forth DBQ, as we add the same doc in next iteration which we delete via DBQ.\n\nAlso, your latest patch, I cannot apply on the master branch. First, the patch is cut from solr module. Second, I think something's wrong with the refactoring I did moving all cdcr tests under one directory. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16223729"
+        },
+        {
+            "date": "2017-10-30T14:52:18+0000",
+            "content": "Does this patch apply cleanly for you ? ",
+            "author": "Varun Thacker",
+            "id": "comment-16225060"
+        },
+        {
+            "date": "2017-10-30T15:00:40+0000",
+            "content": "Varun Thacker\n\nYes it applies smoothly. Do you need any changes in the current patch? \n\nThe above two you mentioned, \n\n\t2 shards instead of 1? The only problem / caveat is the test will become heavier with two separate clusters running already, I hope it don't introduce unnecessary zk-timeouts or such.\n\tAlso removing CdcrQueue status (it causes no harm though).\n\n\n\nLet me know. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16225077"
+        },
+        {
+            "date": "2017-10-30T15:15:57+0000",
+            "content": "2 shards instead of 1? The only problem / caveat is the test will become heavier with two separate clusters running already, I hope it don't introduce unnecessary zk-timeouts or such.\n\nWe'll find out. But I'd be more comfortable testing with 2 shards instead of 1. \n\nAlso removing CdcrQueue status (it causes no harm though).\n\nSure then let's keep it then. We can add a code comment clarifying that this is only to observe the queue length when the test runs ",
+            "author": "Varun Thacker",
+            "id": "comment-16225107"
+        },
+        {
+            "date": "2017-10-31T07:08:04+0000",
+            "content": "Varun,\n\nPatch is all set and ready. \n\nOne issue we discussed offline is the sleep we put after we start CDCR on each clusters. CDCR status changes to \"started\" before setting up LogReader pointer on target cluster collection. We can introduce CDCR status \"running\" in near future to accommodate this. Beasts of 100 are passed successfully. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16226365"
+        },
+        {
+            "date": "2017-10-31T18:43:28+0000",
+            "content": "Commit bc46de3b2a07b77d40e85e1609d0ee04eacbcf76 in lucene-solr's branch refs/heads/master from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bc46de3 ]\n\nSOLR-11003 ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16227304"
+        },
+        {
+            "date": "2017-10-31T18:50:49+0000",
+            "content": "Commit 12d9d67dab3ae0619b92953edde8d4fec96786ff in lucene-solr's branch refs/heads/master from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=12d9d67 ]\n\nRevert \"SOLR-11003\"\n\nThis reverts commit bc46de3b2a07b77d40e85e1609d0ee04eacbcf76. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16227315"
+        },
+        {
+            "date": "2017-10-31T18:51:34+0000",
+            "content": "Sorry for the noise here. This was a local stale commit which got pushed with another commit and it wasn't intended.\n\nI plan on applying the latest patch that Amrit provided, testing that and then commit it.  ",
+            "author": "Varun Thacker",
+            "id": "comment-16227317"
+        },
+        {
+            "date": "2017-10-31T20:47:58+0000",
+            "content": "I still don't see the test using two shards in this patch ",
+            "author": "Varun Thacker",
+            "id": "comment-16227520"
+        },
+        {
+            "date": "2017-10-31T20:53:13+0000",
+            "content": "PF the latest, it is the same as the last. These two lines changed:\n\n\n          CollectionAdminRequest.createCollection(\"cdcr-cluster1\", \"cdcr-cluster1\", 2, 1)\n          .withProperty(\"solr.directoryFactory\", \"solr.StandardDirectoryFactory\")\n          .setMaxShardsPerNode(2)\n          .process(cluster1.getSolrClient());\n\n\n\n          CollectionAdminRequest.createCollection(\"cdcr-cluster2\", \"cdcr-cluster2\", 2, 1)\n          .withProperty(\"solr.directoryFactory\", \"solr.StandardDirectoryFactory\")\n          .setMaxShardsPerNode(2)\n          .process(cluster2.getSolrClient());\n\n\n\n     long maxVersion_c1 = Math.min((long)CdcrTestsUtil.getFingerPrintMaxVersion(cluster1SolrClient, \"shard1\", numDocs),\n          (long)CdcrTestsUtil.getFingerPrintMaxVersion(cluster1SolrClient, \"shard2\", numDocs));\n      long maxVersion_c2 = Math.min((long)CdcrTestsUtil.getFingerPrintMaxVersion(cluster2SolrClient, \"shard1\", numDocs),\n          (long)CdcrTestsUtil.getFingerPrintMaxVersion(cluster2SolrClient, \"shard2\", numDocs));\n\n ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16227529"
+        },
+        {
+            "date": "2017-11-03T23:00:59+0000",
+            "content": "Made some changes to CdcrBidirectionalTest  ",
+            "author": "Varun Thacker",
+            "id": "comment-16238544"
+        },
+        {
+            "date": "2017-11-03T23:27:10+0000",
+            "content": "Commit db18de7e6b9783df3bec80ca02de415e306c4e87 in lucene-solr's branch refs/heads/master from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=db18de7 ]\n\nSOLR-11003: Support bi-directional syncing of cdcr clusters. We still only support actively into one cluster cluster,\n but have the ability to switch indexing clusters and cdcr will replicate correctly ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16238579"
+        },
+        {
+            "date": "2017-11-06T16:13:27+0000",
+            "content": "Commit a30c92a79cd75d3c4fe21829e70292f8314afd4f in lucene-solr's branch refs/heads/branch_7x from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a30c92a ]\n\nSOLR-11003: Support bi-directional syncing of cdcr clusters. We still only support actively into one cluster cluster,\n but have the ability to switch indexing clusters and cdcr will replicate correctly ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16240493"
+        },
+        {
+            "date": "2017-11-06T16:15:40+0000",
+            "content": "Commit a0163232edfaa3068c6240a352781e0637f53b1c in lucene-solr's branch refs/heads/branch_7x from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a016323 ]\n\nSOLR-11003: Improve description of the feature in the CHANGES file ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16240498"
+        },
+        {
+            "date": "2017-11-06T16:16:13+0000",
+            "content": "Commit fdff8deabdffe6a840fc1cbb5eb249aaed3fed63 in lucene-solr's branch refs/heads/master from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fdff8de ]\n\nSOLR-11003: Improve description of the feature in the CHANGES file ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16240499"
+        },
+        {
+            "date": "2017-11-06T16:16:38+0000",
+            "content": "Thanks Amrit ! ",
+            "author": "Varun Thacker",
+            "id": "comment-16240500"
+        },
+        {
+            "date": "2017-11-08T15:40:26+0000",
+            "content": "Commit dcbcabbd54c0a21c69a891d0fe5955d190d4bfc0 in lucene-solr's branch refs/heads/branch_7x from Steve Rowe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=dcbcabb ]\n\nSOLR-11003: Do not import ImmutableMap from shaded junit4-ant jar ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16244176"
+        },
+        {
+            "date": "2017-11-08T15:40:28+0000",
+            "content": "Commit b28ed8f0ef84100dea2410b2ef394ad93aded27d in lucene-solr's branch refs/heads/master from Steve Rowe\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b28ed8f ]\n\nSOLR-11003: Do not import ImmutableMap from shaded junit4-ant jar ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16244177"
+        }
+    ]
+}

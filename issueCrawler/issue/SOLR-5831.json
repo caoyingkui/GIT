@@ -1,0 +1,159 @@
+{
+    "id": "SOLR-5831",
+    "title": "Scale score PostFilter",
+    "details": {
+        "affect_versions": "4.7",
+        "status": "Open",
+        "fix_versions": [
+            "4.9"
+        ],
+        "components": [
+            "search"
+        ],
+        "type": "Improvement",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "The ScaleScoreQParserPlugin is a PostFilter that performs score scaling.\nThis is an alternative to using a function query wrapping a scale() wrapping a query(). For example:\n\nselect?qq=\n{!edismax v='news' qf='title^2 body'}\n&scaledQ=scale(product(query($qq),1),0,1)&q=\n{!func}\nsum(product(0.75,$scaledQ),product(0.25,field(myfield)))&fq=\n{!query v=$qq}\n\n\nThe problem with this query is that it has to scale every hit. Usually, only the returned hits need to be scaled,\nbut there may be use cases where the number of hits to be scaled is greater than the returned hit count,\nbut less than or equal to the total hit count.\n\nSample syntax:\n\nfq=\n{!scalescore+l=0.0 u=1.0 maxscalehits=10000 func=sum(product(sscore(),0.75),product(field(myfield),0.25))}\nl=0.0 u=1.0 \t\t//Scale scores to values between 0-1, inclusive \nmaxscalehits=10000 \t//The maximum number of result scores to scale (-1 = all hits, 0 = results 'page' size)\nfunc=... \t\t\t//Apply the composite function to each hit. The scaled score value is accessed by the 'score()' value source\n\nAll parameters are optional. The defaults are:\n\nl=0.0 u=1.0\nmaxscalehits=0 (result window size)\nfunc=(null)\n\nNote: this patch is not complete, as it contains no test cases and may not conform \nto all the guidelines in http://wiki.apache.org/solr/HowToContribute. \n\nI would appreciate any feedback on the usability and implementation.",
+    "attachments": {
+        "TestScaleScoreQParserPlugin.patch": "https://issues.apache.org/jira/secure/attachment/12637488/TestScaleScoreQParserPlugin.patch",
+        "SOLR-5831.patch": "https://issues.apache.org/jira/secure/attachment/12633423/SOLR-5831.patch",
+        "scalescoreplugin.zip": "https://issues.apache.org/jira/secure/attachment/12659212/scalescoreplugin.zip"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13924693",
+            "date": "2014-03-08T03:21:48+0000",
+            "content": "Peter,\n\nLot's of good stuff here. It's going to take me some time to fully review it. I'm on vacation next week but when I get back I'll take a close look.  \n\nJoel "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13925227",
+            "date": "2014-03-09T16:04:06+0000",
+            "content": "Peter,\n\nI was able to do a first review of the code before heading out on vacation.\n\nVery cool piece of code. How is this performing compared to using the scale() function?\n\nThe following issues were in early versions of the CollaspingQParserPlugin so you can look at the most recent version to see how they were resolved:\n\n1) The ScoreScaleFilter class needs to only have instance variables that are needed for the hashCode() and equals() method otherwise they'll be all kinds of bugs with the Solr caches. So any work you're doing in the constructor of this class and hanging onto needs to be moved to the getFilterCollector() method.\n\n2) The DummyScore also needs to implement the docID() method. Pretty simple to do, check the latest CollapsingQParserPlugin to see how this is handled.\n\n3) I think getting this working with the QueryResultCache will be important. Early versions of the CollapsingQParserPlugin didn't do this, but standard grouping didn't either, so it wasn't a downgrade in functionality for FieldCollapsing. But people who use this feature will be surprised if the QueryResultCache stops working. So hashCode() and equals() will need to be implemented.\n\n4) The value source needs a proper context (rcontext in the code). Latest version of the CollapsingQParserPlugin demonstrates this as well.\n\nAlso having good tests will be important and probably somewhat tricky to write.  Using some form of randomized testing would be good to ensure that random scores get normalized properly.\n\nI'll checkin on this when I get back from vacation.\n\nJoel\n\n\n\n "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13930313",
+            "date": "2014-03-11T13:08:55+0000",
+            "content": "> How is this performing compared to using the scale() function?\nNo comparison. I'm running Solr on a 4-vCPU EC2 instance and tested with SolrMeter.\nOn a production index (1.6 million docs) and production queries at a leisurely rate of 10 QPS:\n\n1. scale() with function query:\nMedian response time: 3000 ms\nAve response time: 8000 ms\nLoad average: double digits \n\n2. PostFilter with maxscalehits=0 (rows=50):\nMedian response time: 18 ms\nAve response time: 108 ms\nLoad average:  <1\n\n3. PostFilter with maxscalehits=10000:\nMedian response time: 21 ms\nAve response time: 120 ms\nLoad average: <1 \n\n4. PostFiilter with maxscalehits=-1 (scale all hits)\nWorse than #1. Most queries timed-out. \nThis is not surprising since the PriorityQueue size is often huge from high hit counts, and all hits are delegated.\n\nRegarding the QueryResultCache, are there any suggestions on how to determine its size in the context of the PostFilter?\n\nThanks,\nPeter "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13933339",
+            "date": "2014-03-13T14:56:18+0000",
+            "content": "Here is a comparison of ScaleScorePostFilter and a Configurable Collector that does the same score scaling with the function 'hard wired' in the collector. I had to hand merge some of the patch from SOLR-4465 into the 4.6.1 branch. My tests show that the Collector is faster:\n\n1. SolrMeter test @ 20 QPS:\n\nCustom Collector with maxscalehits=10000:\nMedian response time: 25 ms\nAve response time: 135 ms\nLoad average: 2.3\n\nPostFilter with maxscalehits=10000:\nMedian response time: 30 ms\nAve response time: 190 ms\nLoad average: 3.3\t\n\n2. Typical response times as a function of hit count:\n\n\n\thits\t\tCollector\t PostFilter\n\t\n\t\t\n\t\t\n\t\t\t\n\t\t\t\n\t\t\t\t\n\t\t\t\t\n\t\t\t\t\t\n\t\t\t\t\t\n\t\t\t\t\t\t---------\t----------\n80K\t\t        12\t\t35\n230K\t\t20\t\t80\n330K\t\t25\t\t123\n720K\t\t35\t\t275\n1.1M\t\t        32\t\t390\n\t\t\t\t\t\n\t\t\t\t\t\n\t\t\t\t\n\t\t\t\t\n\t\t\t\n\t\t\t\n\t\t\n\t\t\n\t\n\t\n\n\n\nThese difference in the response times is likely due to the hits being collected twice by the PostFilter \n(once by the PostFilter and once by the delegate collector), but the Custom Collector only collects the \nhits once.  "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13938515",
+            "date": "2014-03-17T22:50:37+0000",
+            "content": "Hi Joel,\n\nThanks for the reviewing the code. I have a few questions about the issues you found:\n\n1. I've fixed the hashCode() and equals() methods you referred to in your #1. Is this the same issue as your #3?\n\n2. Do you have any suggestions on how to determine the proper result window size for the QueryResultCache?\n\n3. Are there any unit tests that use randomized testing that I could study for use in this patch?\n\nThanks,\nPeter "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13947115",
+            "date": "2014-03-25T20:42:05+0000",
+            "content": "Hi Peter,\n\nIt looks like you haven't updated the patch? I'll take a look and see if I can find some random test examples. I'll also have some time in the next couple of days to help out with the tests.\n\nJoel "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13947250",
+            "date": "2014-03-25T22:18:35+0000",
+            "content": "Hi Joel,\n\nI've updated the patch which includes fixes for hashCode() and isEqual(), and and I added unit tests to QueryEqualityTest.java. \n\nI'm still stuck on how to determine the proper result window size for the QueryResultCache\n\nI will work on unit tests, too, with your help, when you have the time.\n\nThanks,\nPeter "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13951285",
+            "date": "2014-03-28T19:39:22+0000",
+            "content": "Here's a first pass at some unit tests. The (unscaled) Lucene scores are generated via a 'boost' query that uses a field containing a random value. 3 of the 4 PostFilter parameters are tested. I'll do the 4th next week. I just wanted to have something to post before the week ended. "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13956630",
+            "date": "2014-04-01T15:20:58+0000",
+            "content": "Hi Peter,\n\nI haven't forgotten about this ticket. I've got one ticket ahead of this to finish for Solr 4.8 and then I'll work with you to try to get this ticket ready for Solr 4.9.\n\nJoel "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13956664",
+            "date": "2014-04-01T15:47:23+0000",
+            "content": "Thanks Joel. I found a bug in the Collector's 'finish()' method that wasn't obvious until I added a secondary Sort to a query. Patch updated. "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13987005",
+            "date": "2014-05-01T21:17:56+0000",
+            "content": "I went through the latest patch and it looks really good. \n\nThe main pitfalls with the CollapsingQParserPlugin dealt with how the DummyScorer behaved with the different types of ranking collectors. You mentioned a secondary sort issue, that was fixed in the latest patch. I'm not sure if this was related to the use of the DummyScorer.\n\nTo account for this lets add some tests that confirm proper result ordering under the different sorting conditions. I should have some time to install the patch and work with it next week. "
+        },
+        {
+            "author": "Chris Russell",
+            "id": "comment-13987037",
+            "date": "2014-05-01T21:48:53+0000",
+            "content": "Hi.  I have uploaded a patch that is designed to improve the performance of the scale function by allowing it to only score documents that match the filters.\nI am curious how my patch compares with your posted benchmarks from March 11th.\nWould you be willing to apply it and run them?\nLUCENE-5637 "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13987916",
+            "date": "2014-05-02T17:05:13+0000",
+            "content": "Hi Joel,\n\nThe bug I discovered with secondary sort only occurs when the index has multiple segments. The dummy scorer docId should have been relative to the doc base. Also, the collector 'finish' method wasn't calling the delegate's finish method. Both of these bugs were fixed in the previous patch.\n\nI don't have a unit test for multiple segments, but I did add a new unit test for the 'maxscalehits' parameter.\n\nI'm still not sure that I'm determining the result window size for the QueryResultCache, correctly. See this part:\n      // Determine the results window size.\n      // TODO: this should be sized larger for the query result cache\n      int winSize = request.getSearcher().getCore().getSolrConfig().queryResultWindowSize;\n\nCould you verify if this is ok?\n\nThanks,\nPeter "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13989486",
+            "date": "2014-05-05T13:05:55+0000",
+            "content": "Peter,\n\nWe can add a test with multiple segments by committing between updates in the test case. The QueryResultCache issue I'lll have to review closer to see how your using it.\n\nBefore I do that though...\n\nI'm getting close to committing SOLR-5973. How would you feel about contributing your score scaling Collector, instead of the PostFilter version. There are some compelling reasons for this:\n\n1) Response times as a function of hit count is much better with the Collector.\n2) It would make a great first example of how to use the new pluggable collector framework. Right now I don't have another example.\n\nLet me know your thoughts.\n\nJoel\n\n\n\n\n "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13989491",
+            "date": "2014-05-05T13:12:54+0000",
+            "content": "Chris,\n\nI haven't had a chance to review the patch you're working on closely. I did see that it makes some changes in the lucene core library. One of the nice things about the approach in this ticket is that it accomplishes score scaling without making any changes to Solr or lucene's core libraries. In my last post I mention using the a pluggable Collector rather then a PostFilter in conjuction with SOLR-5973. Using the collector seems to be very fast and scale very well.\n\nJoel  "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13989704",
+            "date": "2014-05-05T17:02:41+0000",
+            "content": "Hi Joel,\n\nI'll work on adding some multi-segment unit tests soon.\n\nI haven't looked closely at SOLR-5973 yet, so I don't know how much effort it will be to change the score scaling collector  from the old framework to the new. In the old framework, the plugin extends TopDocsCollector and overrides 'topDocs' to change the ordering, and is not particularly generic. I'll take a look, though.\n\nPeter "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-13991850",
+            "date": "2014-05-07T14:26:12+0000",
+            "content": "I added a test for scoring and sorting with a multi-segment index in this patch. "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-14011402",
+            "date": "2014-05-28T18:12:43+0000",
+            "content": "Hi Joel,\n\nI'm not sure why I didn't see this problem until now, but this PostFilter doesn't work after being cached. When the ScoreScaleFilter is retrieved from the cache, the docSet is null and a new PostFilter collector is created, but the Collector's 'setScorer' method isn't called. As a result, the 'collect' method throws NPE (scorer.score()). What do I need to do to keep the query from rerunning?  Can the scorer be saved with the ScoreScaleFilter instead of the ScoreCollector?\n\nThanks,\nPeter "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-14011568",
+            "date": "2014-05-28T20:58:55+0000",
+            "content": "If your Query class implements PostFilter and ScoreFilter then the SolrIndexSearcher will make sure the scorer is present during docset retrieval. ScoreFilter is just a flag, no methods.\n\nIt's little things like this that make me believe this would be better as a pluggable collector. SOLR-5973 is now committed. You can also see a pluggable collector example with SOLR-6088. "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-14011635",
+            "date": "2014-05-28T21:36:39+0000",
+            "content": "Thanks, that was a simple fix. But if the results are coming from the cache, why does the PostFilter collection have to be rerun?\n\nI totally agree that there are a lot of little details that make it tricky to implement a PostFilter. For the short term, we'll likely go to production with it, though, since we're running on 4.6.1.  Can the pluggable collector framework be patched into 4.6.1? (when I looked at it a while ago, it didn't seem so)\n\nPeter "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-14011723",
+            "date": "2014-05-28T22:33:36+0000",
+            "content": "The main DocSet isn't cached. So, if you pull a DocList from the QueryResultCache, Solr needs to regenerate the DocSet for faceting etc... "
+        },
+        {
+            "author": "Peter Keegan",
+            "id": "comment-14082628",
+            "date": "2014-08-01T18:00:15+0000",
+            "content": "I reimplemented this PostFilter as a RankQuery in 4.9. Although it still has some of the complexity of the PostFilter, it no longer has to manage its own PQ and since it's a plugin, there are no changes to Solr core. I haven't figured out how to implement the 'explain' method yet, since most of the state is in the collector. Also, where does one contribute external plugins?\n\nPeter "
+        }
+    ]
+}

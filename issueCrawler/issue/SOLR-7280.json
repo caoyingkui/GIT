@@ -1,0 +1,394 @@
+{
+    "id": "SOLR-7280",
+    "title": "Load cores in sorted order and tweak coreLoadThread counts to improve cluster stability on restarts",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.5.3",
+            "6.2"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "In SOLR-7191, Damien mentioned that by loading solr cores in a sorted order and tweaking some of the coreLoadThread counts, he was able to improve the stability of a cluster with thousands of collections. We should explore some of these changes and fold them into Solr.",
+    "attachments": {
+        "SOLR-7280-test.patch": "https://issues.apache.org/jira/secure/attachment/12819483/SOLR-7280-test.patch",
+        "SOLR-7280-5x.patch": "https://issues.apache.org/jira/secure/attachment/12818623/SOLR-7280-5x.patch",
+        "SOLR-7280.patch": "https://issues.apache.org/jira/secure/attachment/12815476/SOLR-7280.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-06-30T14:31:10+0000",
+            "author": "Noble Paul",
+            "content": "moved patch over from SOLR-7191 ",
+            "id": "comment-15357166"
+        },
+        {
+            "date": "2016-07-06T12:06:33+0000",
+            "author": "Noble Paul",
+            "content": "Erick Erickson planning to commit this soon ",
+            "id": "comment-15364212"
+        },
+        {
+            "date": "2016-07-06T15:01:46+0000",
+            "author": "Erick Erickson",
+            "content": "Great! ",
+            "id": "comment-15364423"
+        },
+        {
+            "date": "2016-07-07T14:13:37+0000",
+            "author": "Mark Miller",
+            "content": "// This assumes replicaCount is less than coreLoadThreadCount?\n\nWhy is that a question?\n\nIf you don't have enough threads to load all the cores in a shard, you have to wait for the leader vote timeout which is long.\n\nThat doesn't seem look good default behavior. How does this address that? I'm only mildly caught up on the related issue. ",
+            "id": "comment-15366168"
+        },
+        {
+            "date": "2016-07-07T17:10:17+0000",
+            "author": "Noble Paul",
+            "content": "Thanks Mark Miller for looking into this. The coreLoadThreads is something that's ignored in cloud mode today.  Should the user not have a way to limit the no:of threads used to load cores in cloud mode. If there are thousands of cores, the cluster ends up unstable because of this. Normally, users will have a few cores per node and it is no big deal to keep the thread pool to be unbounded. The power users must have a way to tune this.  ",
+            "id": "comment-15366417"
+        },
+        {
+            "date": "2016-07-07T18:33:23+0000",
+            "author": "Erick Erickson",
+            "content": "The symptom is that  OOM errors \"unable to create native thread\" happens, resulting in replicas that never come up, sometimes never ending recovery cycles etc. etc. etc. Decreasing Xss or increasing Xmx  doesn't help (maybe some other settings?). In my testing  with 400 replicas in a JVM, something on the order of 1K temporary threads were spun up when I tried to start the JVM. More correctly that many threads were running, the rest (number unknown) never started at all.\n\nWhat the default should be is certainly debatable. The curious thing was that at no time did the JVM memory appear to be stressed (using jconsole to spot-check, not rigorous at all)....\n\nI've assumed that by ordering the replicas to come up based on what collection they belong to, they won't get stuck waiting for a leader election just because the ordering on instance1 happened to try to bring up collection1 then collection2 whereas instance2 tried to bring them up in reverse order. More like skip-lists in terms of waiting...\n\nSure, with weird enough topology instance1 could have a long queue to get through before getting to collectionX whereas instance N could start with collectionX and have to go through leader vote wait timeouts, but that's way better than having a cluster that won't start at all.\n\nAnd when I tested starting 3 of my 4 JVMs, it was indeed painfully slow waiting for leader vote wait timeouts. But the cluster came up.\n\nUsing 3 coreLoadThreads and starting all my JVMs at once took just a few minutes.\n\nAnd the painfully trappy behavior without this patch is that I can create all my collections just fine, but then I can't restart the cluster successfully.\n ",
+            "id": "comment-15366563"
+        },
+        {
+            "date": "2016-07-07T19:06:14+0000",
+            "author": "Mark Miller",
+            "content": "Sure, with weird enough topology\n\nI don't think it takes a weird topology - just more replicas than thread to load them in a shard.\n\nThe current behavior is trappy if you want to try and load tons and tons of cores. The change in behavior is trappy in general.\n\nI think we always anticipated a better strategy to deal with this, but I don't think this does it very well. ",
+            "id": "comment-15366614"
+        },
+        {
+            "date": "2016-07-07T19:09:50+0000",
+            "author": "Mark Miller",
+            "content": "One strategy might be to only require a certain number of replicas participate in an election to elect a leader and then tie that to the number of threads used to load replicas and then start replicas in some intelligent, per shard manner. ",
+            "id": "comment-15366618"
+        },
+        {
+            "date": "2016-07-07T20:02:04+0000",
+            "author": "Erick Erickson",
+            "content": "bq: I don't think it takes a weird topology - just more replicas than thread to load them in a shard.\n\nOK, I think I see what you're saying. You're talking about a \"deep\" topology, i.e. one with many replicas on a particular shard on a particular instance and I was looking at a \"wide\" topology, many collections per instance but each shard had only a few replicas. I've seen both in the field as I'm sure you have....\n\nHow much of both situations would be handled by creating an ordered list of all replicas that were leaders and loading those first then loading an ordered list of all replicas that weren't labeled as leader? There's still the case of a zillion leaders on a single instance, so some heuristic like you suggest seems to be in order.\n\nI'll emphasize though that the current code (without this patch) can prevent a cluster from coming up at all. With this patch the cluster at least comes up, albeit slowly if the leaderVoteWait comes into play. Bumping the number of threads to > the max replicas for a shard can handle the case you mentioned while keeping it \"reasonable\" can deal with the one I'm seeing.\n\nThat said, I think the default should be quite high in the cloud case so we don't change the current behavior and let situations like I'm seeing deal with configuring this. I think it defaults to 8 currently, perhaps 100 (or unlimited) instead in cloud mode?\n\nHow much of all of the above makes this patch \"good enough for now\" with perhaps follow-ons on more sophisticated approaches? ",
+            "id": "comment-15366690"
+        },
+        {
+            "date": "2016-07-07T20:15:38+0000",
+            "author": "Mark Miller",
+            "content": "I'll emphasize though that the current code (without this patch) can prevent a cluster from coming up at all.\n\nThe current code is a fix to a bug that existed when we did something like this before  I don't want to reintroduce the bug. We didn't, and as far as I know still don't, support tons of cores very well. As we move to do that, we don't want to reintroduce bugs though. ",
+            "id": "comment-15366703"
+        },
+        {
+            "date": "2016-07-07T20:17:03+0000",
+            "author": "Mark Miller",
+            "content": "That said, I think the default should be quite high in the cloud case so we don't change the current behavior and let situations like I'm seeing deal with configuring this. I think it defaults to 8 currently, perhaps 100 (or unlimited) instead in cloud mode?\n\nI think it's trappy, whatever the default is. Unless we don't let users create shards with that many replicas or something. ",
+            "id": "comment-15366705"
+        },
+        {
+            "date": "2016-07-07T20:19:29+0000",
+            "author": "Mark Miller",
+            "content": "Unless we don't let users create shards with that many replicas or something.\n\nAlthough even that is probably not enough unless we only load one shard at a time. ",
+            "id": "comment-15366706"
+        },
+        {
+            "date": "2016-07-08T08:52:13+0000",
+            "author": "Noble Paul",
+            "content": "Had a chat with Shalin Shekhar Mangar and came up with the following design.\n\nObjectives\n\n\n\tMove away from the current design of infinite number of threads for core loads which leads to OOM or other issues\n\tAvoid the leaderVoitWait problem which leads to shards with no leader for a long time or even (down shards)\n\n\n\nBlindly sorting cores based on replica names is not foolproof. It can lead to deadlocks depending on how the replicas are distributed. The sorting logic could be as follows.\n\nCore Sorting logic\nWhen a node comes up, it reads the list of live nodes and the states  of each collection it hosts. Construct a List of shards collectionName+shardName it hosts sorted by the (no:of replicas for that shard in other started nodes + no:of replicas present in the current node for that replica) . Break the tie by sorting the name in alphabetic collectionName+shardName  order. This ensures that no other node is waiting for some replica in this node to be up.\n\nThread count\nThe default no:of coreLoadThreads should be much higher for SolrCloud (Maybe 50 ?). The user should be able to override the value by explicitly configuring it. \n ",
+            "id": "comment-15367410"
+        },
+        {
+            "date": "2016-07-13T02:22:36+0000",
+            "author": "damien kamerman",
+            "content": "Or, ensure that the coreLoadThreads is >= max(collection's replicas on a single node) ? ",
+            "id": "comment-15374195"
+        },
+        {
+            "date": "2016-07-13T10:48:05+0000",
+            "author": "Noble Paul",
+            "content": "A patch with tests implementing the new  design (with some change). Shalin Shekhar Mangar please take a look\n ",
+            "id": "comment-15374825"
+        },
+        {
+            "date": "2016-07-13T12:25:37+0000",
+            "author": "Noble Paul",
+            "content": "The sorting of shards to be loaded in the following order\n\n\n\tThe shards with least no:of replicas in down nodes and there is at least one live node waiting for replicas of this shard. If these nodes are in down nodes, it is no use bringing up a replica because, until those down nodes come up, that shard cannot be up\n\tThe shards with max no:of replica in live nodes. Because more replicas in other nodes are waiting for this replica to be up\n\tleast no:of replicas in my node. This helps us finish a shard by starting the least no:of cores\n\tfinally, use the replica name to break the tie .this  helps in having a predictable order across nodes\n\n\n\nThe thread count is set to 24 as the default in cloud. However, users can override that \n ",
+            "id": "comment-15374914"
+        },
+        {
+            "date": "2016-07-13T12:33:07+0000",
+            "author": "Noble Paul",
+            "content": "there was a bug in the previous patch  ",
+            "id": "comment-15374924"
+        },
+        {
+            "date": "2016-07-15T20:34:06+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "What was the motivation behind changing the sorting logic? Can you please explain what use-cases does the new logic cover better?\n\nThe shards with least no:of replicas in down nodes and there is at least one live node waiting for replicas of this shard. If these nodes are in down nodes, it is no use bringing up a replica because, until those down nodes come up, that shard cannot be up\n\nThis is flawed because with these rules, a shard which has exactly 1 replica in total and that too on the current node will always be chosen last. ",
+            "id": "comment-15380062"
+        },
+        {
+            "date": "2016-07-15T20:59:49+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Hmm, actually the logic we had discussed earlier also fails on this corner case. Let me think more on this. ",
+            "id": "comment-15380105"
+        },
+        {
+            "date": "2016-07-16T04:15:01+0000",
+            "author": "Noble Paul",
+            "content": "Shalin, that is the expected behavior. If there is only one replica for a shard and  that replica is in this node, then nobody else is waiting for that replica to come up.that means nobody else will wait time out because of that replica. ",
+            "id": "comment-15380477"
+        },
+        {
+            "date": "2016-07-16T04:54:19+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Ah, right, I missed that. I'm reviewing the rest of the patch. ",
+            "id": "comment-15380491"
+        },
+        {
+            "date": "2016-07-16T13:43:12+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6c1b75b06bf2fe53be776923097e54b8c560826d in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6c1b75b ]\n\nSOLR-7280: In cloud-mode sort the cores smartly before loading & limit threads to improve cluster stability ",
+            "id": "comment-15380759"
+        },
+        {
+            "date": "2016-07-16T14:25:11+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 74633594d891d3f6eff61ad39310f6410dbfc313 in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7463359 ]\n\nSOLR-7280: precommit errors ",
+            "id": "comment-15380791"
+        },
+        {
+            "date": "2016-07-16T17:12:48+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6902eddd8df66b6120730eccf179797b6a585848 in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6902edd ]\n\nSOLR-7280: In cloud-mode sort the cores smartly before loading & limit threads to improve cluster stability ",
+            "id": "comment-15380855"
+        },
+        {
+            "date": "2016-07-16T17:20:52+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 5932f52588a2773b2fb87feee8a3501eb8c5cb5c in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5932f52 ]\n\nSOLR-7280: In cloud-mode sort the cores smartly before loading & limit threads to improve cluster stability ",
+            "id": "comment-15380860"
+        },
+        {
+            "date": "2016-07-18T15:41:05+0000",
+            "author": "Mike Drob",
+            "content": "minor nit: when compiling I see [javac] /home/mdrob/workspace/lucene-solr/solr/core/src/java/org/apache/solr/core/CoreSorter.java:24: warning: documentation comment not expected here. The javadoc should be after the package declaration. ",
+            "id": "comment-15382476"
+        },
+        {
+            "date": "2016-07-18T19:17:42+0000",
+            "author": "Erick Erickson",
+            "content": "Work in progress patch for back-porting to 5x, just re-doing the lambdas.\n\nWIP because I just noticed that the new test class also has lambdas that have not been changed in this patch. Even so, I could still compile the server and run my test suite on it.\n\nResults:\n\nThis is vastly better than the old 5x code, I don't get OOM errors and the like. Occasionally I'll get 1 or two replicas (out of 1,600) that stay in the \"down\" state, but do come back up when I restart the Solr instance hosting them.\n\nAt Ishan's suggestion I applied my 5x patch to a clean 6x code base and don't see any replicas staying down there (so far) so it looks like some other changes between 5x and 6x are making the startup process more robust as well. ",
+            "id": "comment-15382879"
+        },
+        {
+            "date": "2016-07-18T19:34:19+0000",
+            "author": "Mike Drob",
+            "content": "regarding the lambdas in the test, is there a functional difference between what is there and something like:\n\n    expect(mockCC.isZooKeeperAware()).andReturn(Boolean.TRUE).anyTimes();\n    expect(mockCC.getZkController()).andReturn(mockZKC).anyTimes();\n    expect(mockClusterState.getLiveNodes()).andReturn(liveNodes).anyTimes();\n    expect(mockZKC.getClusterState()).andReturn(mockClusterState).anyTimes();\n\n\nLooks like a lot of complexity added from the lambdas, but I'm not sure if there is a more subtle nuance. ",
+            "id": "comment-15382916"
+        },
+        {
+            "date": "2016-07-18T21:46:07+0000",
+            "author": "Mike Drob",
+            "content": "\n-  public int getCoreLoadThreadCount() {\n-    return coreLoadThreads;\n+  public int getCoreLoadThreadCount(int def) {\n+    return coreLoadThreads == null ? def : coreLoadThreads;\n   }\n\n\n\nIt might make sense for this to look like this instead:\n\n  public int getCoreLoadThreadCount(boolean zkAware) {\n    return coreLoadThreads == null ? (zkAware ? DEFAULT_CORE_LOAD_THREADS_IN_CLOUD : DEFAULT_CORE_LOAD_THREADS) : coreLoadThreads;\n   }\n\n\nThat was the standalone v cloud logic doesn't have to leak out as much.  ",
+            "id": "comment-15383138"
+        },
+        {
+            "date": "2016-07-19T10:23:57+0000",
+            "author": "Noble Paul",
+            "content": "\ud83d\udc4d ",
+            "id": "comment-15383907"
+        },
+        {
+            "date": "2016-07-19T12:51:48+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2d1496c83d83bb6582af39af6cf272828d83c9e3 in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2d1496c ]\n\nSOLR-7280: refactored to incorporate Mike's suggestions. Default thread count for cloud is limited to 8 now. In our internal teting 8 has given us the best stability during restarts ",
+            "id": "comment-15384095"
+        },
+        {
+            "date": "2016-07-19T13:13:19+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit fcd2cc57d595440de032cd3a58aabd72e69c3299 in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fcd2cc5 ]\n\nSOLR-7280: refactored to incorporate Mike's suggestions. Default thread count for cloud is limited to 8 now. In our internal teting 8 has given us the best stability during restarts ",
+            "id": "comment-15384125"
+        },
+        {
+            "date": "2016-07-19T14:46:54+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 89a1fe661e7b73082d019543a83a7f511e74c9ca in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=89a1fe6 ]\n\nSOLR-7280: refactored to incorporate Mike's suggestions. Default thread count for cloud is limited to 8 now. In our internal teting 8 has given us the best stability during restarts ",
+            "id": "comment-15384263"
+        },
+        {
+            "date": "2016-07-19T17:14:31+0000",
+            "author": "Erick Erickson",
+            "content": "Success! The problem I was having before was that I was still getting OOM errors in my setup with the default 24 coreLoadTheads. Reducing it to 8 cured the problem, I ran my test setup all last night and there were zero problems.\nI've attached the patch for 5x. I had to re-implement the lambda expressions in the original, I think I did the right thing in the new CoreSorterTest, but any checks welcome. This patch also sets the default coreLoadThreads to 8 as Noble discussed.\n\nMike Drob thanks for the pointer on the junit stuff BTW. I didn't incorporate your other suggestion, but having it in 6x and 7x suffices I think.\n\nThis passes precommit and test as well as my stress test.\n\nSo, the question becomes should this be merged into the 5x code line so it'll be picked up by any (hypothetical) 5x releases or just left here and we'll deal with whether it should be included in any new 5x release when the time comes? Any firm opinions? This topic has come up on more than one occasion, but even checking it into 5x still means people would have to build it themselves. ",
+            "id": "comment-15384526"
+        },
+        {
+            "date": "2016-07-19T17:42:24+0000",
+            "author": "Mike Drob",
+            "content": "+    List<CountsForEachShard> l = new ArrayList<>();\nCould init this list to copy.size()\n\n+    List<CloudDescriptor> ret = new ArrayList<>();\nSame idea here, cc.getCores().size()\n\nOther than that, your unwrapped lambdas look fine to me. ",
+            "id": "comment-15384572"
+        },
+        {
+            "date": "2016-07-19T18:09:38+0000",
+            "author": "Noble Paul",
+            "content": "backported the changes I committed to 6x today ",
+            "id": "comment-15384614"
+        },
+        {
+            "date": "2016-07-20T16:56:33+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 9fbb2fe752b5baa224c33e0fd441cfb9082dd102 in lucene-solr's branch refs/heads/branch_5_5 from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9fbb2fe ]\n\nSOLR-7280: Load cores in sorted order & limit threads to improve cluster stability ",
+            "id": "comment-15386201"
+        },
+        {
+            "date": "2016-07-20T22:23:04+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit bcaf4999d83a5a4cbc7f02ecc8d1f00e4a4a7212 in lucene-solr's branch refs/heads/branch_5x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bcaf499 ]\n\nSOLR-7280: Load cores in sorted order & limit threads to improve cluster stability\n(cherry picked from commit 9fbb2fe) ",
+            "id": "comment-15386729"
+        },
+        {
+            "date": "2016-07-21T19:49:36+0000",
+            "author": "Mark Miller",
+            "content": "Did this just reintroduce the old bug if you do > 8 replicas or it tried to address it somehow? ",
+            "id": "comment-15388304"
+        },
+        {
+            "date": "2016-07-21T19:54:33+0000",
+            "author": "Mark Miller",
+            "content": "Yeah, looks like I have the same issue as I mentioned.\n\nI've got to veto this commit unless that issue is addressed nicely or (the ugly fix) you just make it fail if someone tries to create a shard with more replica than load threads. ",
+            "id": "comment-15388312"
+        },
+        {
+            "date": "2016-07-21T19:55:43+0000",
+            "author": "Erick Erickson",
+            "content": "Not in my testing, but I'll give it another whirl tonight just to be sure.\n\nI'm thinking of, say, 3 collections spread over 4 JVMS each with \n3 shards each with 150 replicas and 3 coreLoadThreads....\n\nPlus I'll vary the order of bring the JVMs up and loop all night\nthat way.\n\nI've already go the infrastructure in place....\n ",
+            "id": "comment-15388314"
+        },
+        {
+            "date": "2016-07-21T20:00:55+0000",
+            "author": "Mark Miller",
+            "content": "I have no problem if it works.\n\nPerhaps some other unrelated changes have influenced how the load threads interact with leader election.\n\nI just don't see the problem explained or addressed and there is a previous JIRA issue with this exact problem. The only way I can see it would still not be a problem is if waiting for a leader doesn't hold up core loading. I don't remember seeing that change though.\n\nYou may not be able to test this simply with tests either - many tests lower the leaderVoteWait to very low to speed up tests. In production it should be like 3 minutes by default. ",
+            "id": "comment-15388323"
+        },
+        {
+            "date": "2016-07-21T20:13:38+0000",
+            "author": "Mark Miller",
+            "content": "If it indeed remains an issue, another thing we might try is loading cores with a limited number of threads, but registering with ZK with many more, instead of doing both in the same thread as we are now. ",
+            "id": "comment-15388349"
+        },
+        {
+            "date": "2016-07-21T20:33:05+0000",
+            "author": "Mark Miller",
+            "content": "Plus I'll vary the order of bring the JVMs up and loop all night\nthat way.\n\nIf you simply do that and walk away and come back in the morning, it will work. The bug is that starting your shard will go from as fast as possible to 3 minutes plus just because you created too many replicas. And not only will it take 3 minutes, but all the replicas will not participate in the election as is currently designed. That's a bug, and one we have already fixed and one I'm not willing to allow back  ",
+            "id": "comment-15388376"
+        },
+        {
+            "date": "2016-07-21T21:16:17+0000",
+            "author": "Mark Miller",
+            "content": "Mike Drob made a nice little test for this and the initial results make it look something was fishy before this or after it. Need to dig into it a little more. ",
+            "id": "comment-15388442"
+        },
+        {
+            "date": "2016-07-21T21:23:44+0000",
+            "author": "Mark Miller",
+            "content": "Okay, I think I got it.\n\nAt some point after the bug I'm referring to was resolved, registering in ZK got spun off into it's own thread and no longer holds up the core load thread. You can see this in ZkContainer. That effectively creates the situation I suggest above:\n\nIf it indeed remains an issue, another thing we might try is loading cores with a limited number of threads, but registering with ZK with many more, instead of doing both in the same thread as we are now.\n\nSo we are okay on this issue. Mike Drob, it would be great to get some form of that test committed. ",
+            "id": "comment-15388456"
+        },
+        {
+            "date": "2016-07-21T22:23:24+0000",
+            "author": "Mike Drob",
+            "content": "This is the test that Mark was talking about. (attached) ",
+            "id": "comment-15388529"
+        },
+        {
+            "date": "2016-07-21T22:28:27+0000",
+            "author": "Mike Drob",
+            "content": "If anybody wants to apply that, they should also add a call to resetFactory() in the @AfterClass that I missed. ",
+            "id": "comment-15388538"
+        },
+        {
+            "date": "2016-07-21T22:29:49+0000",
+            "author": "Erick Erickson",
+            "content": "Well, I'll still test it for fun, if _you're_worried I should be more se. But it sounds like you're getting more comfortable with the approach.\n\nAnyway, a couple of things:\n\nbq: If you simply do that and walk away and come back in the morning, it will work....\n\nThese aren't Junit tests, but scripts because of similar concerns I had. They:\n1> bring up and down real solr JVMs via shell scripts, so the default 3 minute timeout is in place That said, making it longer (say 20 minutes?) would emphasize the issue....and...\n2> I have a monitor process that records how long it took for all the replicas to come up so I can see any anomalies.\n3> brings JVMs up and down in different orders to avoid happening to have all the leaders on the first node that comes up.\n\nI've been nervous that the way I'm testing certainly isn't foolproof.\n\nbq: registering in ZK got spun off into it's own thread\n\nHmm, interesting since the symptom I'm seeing is being unable to spawn native threads and a large spike in threads during startup (steady-state 1,200 threads, startup started crapping out around 2,600)..... upping the Xmx or Xss (or both) doesn't matter and bumping the ulimit didn't either....\n ",
+            "id": "comment-15388541"
+        },
+        {
+            "date": "2016-07-22T06:25:22+0000",
+            "author": "Noble Paul",
+            "content": "It should work even if there is only one thread and many replicas. The idea is to sort your cores first in such a way that you prioritize replicas others are waiting for and deprioritize cores which depend on other 'down' nodes. So, this node will should not timeout. ",
+            "id": "comment-15388992"
+        },
+        {
+            "date": "2016-07-22T15:20:35+0000",
+            "author": "Erick Erickson",
+            "content": "Tests ran find last night FWIW... ",
+            "id": "comment-15389669"
+        },
+        {
+            "date": "2016-07-23T18:48:46+0000",
+            "author": "Noble Paul",
+            "content": "Mike Drob why do you want to test with createCollection(collection, \"conf1\", 1, NodeConfigBuilder.DEFAULT_CORE_LOAD_THREADS_IN_CLOUD * 3). Why not keep it at the default 8\n\n{{ // we only need 1 node because we're going to be shoving all of the replicas on there to promote deadlock}}\n\nHow do you plan to get a deadlock if you are only going to have one node? The deadlock happens because a node waits for other nodes to come up and those nodes wait for this node (directly or through a circular dependency) ",
+            "id": "comment-15390812"
+        },
+        {
+            "date": "2016-07-23T19:23:26+0000",
+            "author": "Mark Miller",
+            "content": "You only need one node because this issue is about loading cores on one node. You also of course need more replicas than load threads to stimulate the old issue. \n\nThe one issue with the test is I don't think it would fail nicely if the problem was reintroduced as it was when I saw it? As I saw it, if the problem was reintroduced the test would just take longer.\n\nWe should probably just make sure it doesn't take 180 seconds + (or whatever we set the leaderVoteWait to in the test) to startup and elect a leader, and if it does, fail with a nice message. ",
+            "id": "comment-15390819"
+        },
+        {
+            "date": "2016-07-23T19:25:44+0000",
+            "author": "Mark Miller",
+            "content": "But it sounds like you're getting more comfortable with the approach.\n\nIt has nothing to do with being comfortable with the approach. There was an existing bug that was fixed that no one working on this issue seems to yet comprehend. Which had me worried the problem still existed. I found that another change from another JIRA has decoupled core loading and leader election. All as I mention above. Details matter. ",
+            "id": "comment-15390820"
+        },
+        {
+            "date": "2016-07-25T09:16:08+0000",
+            "author": "Noble Paul",
+            "content": "the zk register threads are still unbounded and that is done asynchronously. We are just limiting the core load threads. \n\nSo, after this fix, we will not have this reoccurring if there is only one node. It is more important to  test it in a multi-node setup ",
+            "id": "comment-15391586"
+        },
+        {
+            "date": "2016-07-25T15:44:01+0000",
+            "author": "Erick Erickson",
+            "content": "Do note that all of my (non jUnit) tests were with 4 nodes. Of course having those built into junit tests is A Good Thing, just FYI. ",
+            "id": "comment-15392129"
+        },
+        {
+            "date": "2016-08-25T04:41:09+0000",
+            "author": "Erick Erickson",
+            "content": "Didn't close this when the code was committed. ",
+            "id": "comment-15436272"
+        },
+        {
+            "date": "2016-08-26T14:00:05+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close resolved issues after 6.2.0 release. ",
+            "id": "comment-15439019"
+        },
+        {
+            "date": "2016-11-29T05:57:19+0000",
+            "author": "Damien Kamerman",
+            "content": "I've just been testing this and found a couple of issues:\n\nAll the core registrations are done in background threads. This can flood the overseer queue. See CoreContainer.load() calls zkSys.registerInZk(core, true, false);\n\nI've increased leaderConflictResolveWait to 30min but every 15s I can see:\norg.apache.solr.handler.admin.PrepRecoveryOp; After 15 seconds, core ip_1224_shard1_replica1 (shard1 of ip_1224) still does not have state: recovering; forcing ClusterState update from ZooKeeper\nAgain, I think this can flood the overseer queue. ",
+            "id": "comment-15704322"
+        },
+        {
+            "date": "2016-11-29T14:42:44+0000",
+            "author": "Mark Miller",
+            "content": "Hey Damien Kamerman, could you file a new JIRA issue with this info and link it to this one?\n\nSounds like you are probably correct, but this issue has already been released so any further changes or improvements needs a fresh issue on top of notifying the original issue. ",
+            "id": "comment-15705464"
+        },
+        {
+            "date": "2016-11-29T14:53:57+0000",
+            "author": "Mark Miller",
+            "content": "It would seem the next step is probably to make the ZkController#preRegister phase more efficient. We would want to try and avoid all the individual down publish calls. This is what initially populates those entries in ZK though, which is why this was not simply switched to a more efficient 'down' node Overseer action like some other places. We may need another bulk Overseer command or perhaps we can expand the 'down' node one. ",
+            "id": "comment-15705501"
+        }
+    ]
+}

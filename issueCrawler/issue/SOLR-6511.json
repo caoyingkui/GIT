@@ -1,0 +1,180 @@
+{
+    "id": "SOLR-6511",
+    "title": "Fencepost error in LeaderInitiatedRecoveryThread",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.10.2",
+            "5.0"
+        ],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "At line 106:\n\n    while (continueTrying && ++tries < maxTries) {\n\n\n\nshould be\n\n    while (continueTrying && ++tries <= maxTries) {\n\n\n\nThis is only a problem when called from DistributedUpdateProcessor, as it can have maxTries set to 1, which means the loop is never actually run.",
+    "attachments": {
+        "SOLR-6511.patch": "https://issues.apache.org/jira/secure/attachment/12668426/SOLR-6511.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Alan Woodward",
+            "id": "comment-14131777",
+            "date": "2014-09-12T17:25:23+0000",
+            "content": "So here's how this manifested:\n\n\treplica1 is busy sending updates to replica2 when it gets a network blip and it's ZK connection times out\n\treplica2 is then elected leader\n\treplica1 also still thinks it's leader (because it hasn't noticed the ZK timeout yet) and then gets errors back from replica2 saying \"I'm the leader, stop sending me these updates!\"\n\treplica1 interprets these as errors, and attempts to put replica2 into leader-initiated recovery\n\twhat ought to happen here is that replica2 sends a message back saying \"no need, I'm the leader, I'll take it from here, thanks\".  But because of the fencepost error, the message to replica2 is never actually sent, and replica1 then writes replica2's state as DOWN into the LIRT zk node\n\tthe two replicas send each other some request-recover messages, trying to work out who is actually leader\n\treplica2 then tries to recover, but it can't publish itself as active, because you can't do that if your LIRT state is DOWN, so it eventually goes into RECOVERY_FAILED\n\n\n\nThere is a bunch of fairly confusing logging around all this as well.  I particularly liked the messages that said \"WaitingForState recovering, but I see state: recovering\"  "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14131805",
+            "date": "2014-09-12T17:40:12+0000",
+            "content": "yeah, that WaitForState stuff is not actually related to this code and is very confusing, but that's another issue ... for this issue, I'll post a patch shortly but I think it should also include a check for whether the node trying to start LIR thread is still the leader\n\nnot hitting this loop at least once is pretty bad actually, so we try to get this into 4.10.1 IMHO "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14131923",
+            "date": "2014-09-12T18:50:43+0000",
+            "content": "Here's a patch to address this problem, specifically it does:\n\n1) tries the recovery command at least once (Alan's fix)\n\n2) doesn't put a replica into LIR if the node is not currently the leader anymore (added safeguard) ... the LIR thread also checks to make sure it is still running in the leader before continuing to nag the replica "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14131972",
+            "date": "2014-09-12T19:19:42+0000",
+            "content": "what ought to happen here is that replica2 sends a message back saying \"no need, I'm the leader, I'll take it from here, thanks\". But because of the fencepost error, the message to replica2 is never actually sent, and replica1 then writes replica2's state as DOWN into the LIRT zk node\n\nThe more I think about this, I don't see how the fencepost error gets hit here? maxTries will be 120 if replica1 is setting replica2 to down\n\nSo I think the real fix is to do what Alan suggests - have the new leader respond with: no need, I'm the leader, I'll take it from here, thanks\n\nThe patch I posted earlier has some good improvements in it, but I think we need a unit test that proves the code works correctly for the scenario described above. "
+        },
+        {
+            "author": "Alan Woodward",
+            "id": "comment-14132960",
+            "date": "2014-09-13T21:16:47+0000",
+            "content": "I think you might have some extra stuff on the end of the patch?\n\nDigging a bit further into the logs, maxTries is set to 1 because ensureReplicaInLeaderInitiatedRecovery throws a SessionExpiredException (presumably because ZK has noticed the network blip and removed the relevant ephemeral node).  Maybe maxTries should always be set to 120?\n\nOne thing that might be nice here would be to add a utility method to ZkController called something like ensureLeadership(CloudDescriptor cd), which checks if the core described by the CloudDescriptor really is the current leader according to ZK, and throws an exception if it isn't. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14140974",
+            "date": "2014-09-19T17:52:50+0000",
+            "content": "I now have a test case that duplicates Alan's scenario exactly, which is good. In devising a fix, the following problem has come up \u2013 the request has been accepted locally on the used to be leader and is failing on one of the replicas because of the leader change (\"Request says it is coming from leader, but we are the leader\").\n\nSo does the old leader (the one receiving the error back from the new leader) try to be clever and forward the request to the leader as any replica would do under normal circumstances? Keep in mind that this request has already been accepted locally and possibly on other replicas. Or does this old leader just propagate the failure back to the client and let it decide what to do? Guess it comes down to whether we think its safe to just re-process a request? Seems like it would be but wanted feedback before assuming that. "
+        },
+        {
+            "author": "Alan Woodward",
+            "id": "comment-14141269",
+            "date": "2014-09-19T20:49:23+0000",
+            "content": "I think the safest response is to return the error to the client.  Updates are idempotent, right?  An ADD will just overwrite the previous ADD, DELETE doesn't necessarily have to delete anything to be successful, etc.  So if the client gets a 503 back again it can just resend.\n\nThe only tricky bit might be what happens if a replica finds itself ahead of its leader, as would be the case here.  Does it automatically try and send updates on, or does it roll back? "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14141411",
+            "date": "2014-09-19T22:14:50+0000",
+            "content": "Here's an updated patch. It'll need to be updated again after SOLR-6530 is committed. Key things in this patch are:\n\n1) HttpPartitionTest.testLeaderZkSessionLoss: reproduces the scenario described in this ticket\n\n2) DistributedUpdateProcessor now checks to see if the reason for a failure is because of a leader change and if so, the request fails and an error is sent to the client\n\nI had to add a way to pass-thru some additional context information about an error from server to client, which I'll do that work in another ticket but this patch shows the approach I'm taking.\n\nLastly, HttpPartitionTest continues to be a problem - I beast'd it for 10 times and it failed after 6 runs locally (sometimes fewer), so will need to get that problem resolved before committing this patch too. It consistently fails in the testRf3WithLeaderFailover but for different reasons. My thinking is that I'll break the problem test case (testRf3WithLeaderFailover) out to its own test class as the other tests in this class work well and cover a lot of important functionality. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14143678",
+            "date": "2014-09-22T19:40:11+0000",
+            "content": "I'm ready to commit this solution, but before I do, I'd like some feedback on SOLR-6550, which is how I'm implementing Alan's \"no need, I'm the leader, I'll take it from here, thanks\" recommendation. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14146420",
+            "date": "2014-09-24T15:21:48+0000",
+            "content": "Commit 1627347 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1627347 ]\n\nSOLR-6511: Fencepost error in LeaderInitiatedRecoveryThread; refactor HttpPartitionTest to resolve jenkins failures. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14151781",
+            "date": "2014-09-29T15:19:14+0000",
+            "content": "Commit 1628203 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1628203 ]\n\nSOLR-6511: adjust test logic to account for timing issues in zk session expiration scenario. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14156445",
+            "date": "2014-10-02T11:45:22+0000",
+            "content": "Tim, I've committed SOLR-6530 on trunk. I'll merge it to branch_5x after you merge these changes. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14156641",
+            "date": "2014-10-02T14:58:27+0000",
+            "content": "Commit 1628989 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1628989 ]\n\nSOLR-6511: Fencepost error in LeaderInitiatedRecoveryThread; refactor HttpPartitionTest to resolve jenkins failures. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14157843",
+            "date": "2014-10-03T09:52:53+0000",
+            "content": "Digging a bit further into the logs, maxTries is set to 1 because ensureReplicaInLeaderInitiatedRecovery throws a SessionExpiredException (presumably because ZK has noticed the network blip and removed the relevant ephemeral node).\n\nIt's not just SessionExpiredException. Sometime it might throw a ConnectionLossException which also should be handled in the same way. I got the following stack trace in my testing when a node was partitioned from ZooKeeper for a long time:\n\n7984566 [qtp1600876769-17] ERROR org.apache.solr.update.processor.DistributedUpdateProcessor  \u2013 Leader failed to set replica http://n4:8983/solr/collection_5x3_shard4_replica3/ state to DOWN due to: org.apache.solr.common.SolrException: Failed to update data to down for znode: /collections/collection_5x3/leader_initiated_recovery/shard4/core_node10\norg.apache.solr.common.SolrException: Failed to update data to down for znode: /collections/collection_5x3/leader_initiated_recovery/shard4/core_node10\n        at org.apache.solr.cloud.ZkController.updateLeaderInitiatedRecoveryState(ZkController.java:1959)\n        at org.apache.solr.cloud.ZkController.ensureReplicaInLeaderInitiatedRecovery(ZkController.java:1841)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.doFinish(DistributedUpdateProcessor.java:837)\n        at org.apache.solr.update.processor.DistributedUpdateProcessor.finish(DistributedUpdateProcessor.java:1679)\n        at org.apache.solr.update.processor.LogUpdateProcessor.finish(LogUpdateProcessorFactory.java:179)\n        at org.apache.solr.update.processor.UpdateRequestProcessor.finish(UpdateRequestProcessor.java:76)\n        at org.apache.solr.handler.ContentStreamHandlerBase.handleRequestBody(ContentStreamHandlerBase.java:83)\n        at org.apache.solr.handler.RequestHandlerBase.handleRequest(RequestHandlerBase.java:135)\n        at org.apache.solr.core.SolrCore.execute(SolrCore.java:1967)\n        at org.apache.solr.servlet.SolrDispatchFilter.execute(SolrDispatchFilter.java:777)\n        at org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:418)\n        at org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:207)\n        at org.eclipse.jetty.servlet.ServletHandler$CachedChain.doFilter(ServletHandler.java:1419)\n        at org.eclipse.jetty.servlet.ServletHandler.doHandle(ServletHandler.java:455)\n        at org.eclipse.jetty.server.handler.ScopedHandler.handle(ScopedHandler.java:137)\n        at org.eclipse.jetty.security.SecurityHandler.handle(SecurityHandler.java:557)\n        at org.eclipse.jetty.server.session.SessionHandler.doHandle(SessionHandler.java:231)\n        at org.eclipse.jetty.server.handler.ContextHandler.doHandle(ContextHandler.java:1075)\n        at org.eclipse.jetty.servlet.ServletHandler.doScope(ServletHandler.java:384)\n        at org.eclipse.jetty.server.session.SessionHandler.doScope(SessionHandler.java:193)\n        at org.eclipse.jetty.server.handler.ContextHandler.doScope(ContextHandler.java:1009)\n        at org.eclipse.jetty.server.handler.ScopedHandler.handle(ScopedHandler.java:135)\n        at org.eclipse.jetty.server.handler.ContextHandlerCollection.handle(ContextHandlerCollection.java:255)\n        at org.eclipse.jetty.server.handler.HandlerCollection.handle(HandlerCollection.java:154)\n        at org.eclipse.jetty.server.handler.HandlerWrapper.handle(HandlerWrapper.java:116)\n        at org.eclipse.jetty.server.Server.handle(Server.java:368)\n        at org.eclipse.jetty.server.AbstractHttpConnection.handleRequest(AbstractHttpConnection.java:489)\n        at org.eclipse.jetty.server.BlockingHttpConnection.handleRequest(BlockingHttpConnection.java:53)\n        at org.eclipse.jetty.server.AbstractHttpConnection.content(AbstractHttpConnection.java:953)\n        at org.eclipse.jetty.server.AbstractHttpConnection$RequestHandler.content(AbstractHttpConnection.java:1014)\n        at org.eclipse.jetty.http.HttpParser.parseNext(HttpParser.java:953)\n        at org.eclipse.jetty.http.HttpParser.parseAvailable(HttpParser.java:240)\n        at org.eclipse.jetty.server.BlockingHttpConnection.handle(BlockingHttpConnection.java:72)\n        at org.eclipse.jetty.server.bio.SocketConnector$ConnectorEndPoint.run(SocketConnector.java:264)\n        at org.eclipse.jetty.util.thread.QueuedThreadPool.runJob(QueuedThreadPool.java:608)\n        at org.eclipse.jetty.util.thread.QueuedThreadPool$3.run(QueuedThreadPool.java:543)\n        at java.lang.Thread.run(Thread.java:745)\nCaused by: org.apache.zookeeper.KeeperException$ConnectionLossException: KeeperErrorCode = ConnectionLoss for /collections/collection_5x3/leader_initiated_recovery/shard4/core_node10\n        at org.apache.zookeeper.KeeperException.create(KeeperException.java:99)\n        at org.apache.zookeeper.KeeperException.create(KeeperException.java:51)\n        at org.apache.zookeeper.ZooKeeper.exists(ZooKeeper.java:1045)\n        at org.apache.solr.common.cloud.SolrZkClient$5.execute(SolrZkClient.java:256)\n        at org.apache.solr.common.cloud.SolrZkClient$5.execute(SolrZkClient.java:253)\n        at org.apache.solr.common.cloud.ZkCmdExecutor.retryOperation(ZkCmdExecutor.java:74)\n        at org.apache.solr.common.cloud.SolrZkClient.exists(SolrZkClient.java:253)\n        at org.apache.solr.cloud.ZkController.updateLeaderInitiatedRecoveryState(ZkController.java:1949)\n        ... 36 more\n\n "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14158073",
+            "date": "2014-10-03T15:15:18+0000",
+            "content": "Re-opening this to address the problem Shalin noticed. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14160573",
+            "date": "2014-10-06T17:50:50+0000",
+            "content": "Commit 1629720 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1629720 ]\n\nSOLR-6511: Better handling of ZooKeeper related exceptions when deciding to start the leader-initiated recovery nag thread "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14162377",
+            "date": "2014-10-07T19:35:13+0000",
+            "content": "Commit 1629966 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1629966 ]\n\nSOLR-6511: keep track of the node that created the leader-initiated recovery znode, helpful for debugging "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14163608",
+            "date": "2014-10-08T15:20:24+0000",
+            "content": "Commit 1630137 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1630137 ]\n\nSOLR-6511: backport latest changes to branch_5x "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14163701",
+            "date": "2014-10-08T16:25:21+0000",
+            "content": "Commit 1630164 from Timothy Potter in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1630164 ]\n\nSOLR-6550: backport to 4_10 branch so we can backport SOLR-6511 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14163950",
+            "date": "2014-10-08T18:41:39+0000",
+            "content": "Commit 1630196 from Timothy Potter in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1630196 ]\n\nSOLR-6511: backport to 4.10 branch "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14169037",
+            "date": "2014-10-13T07:38:53+0000",
+            "content": "Tim, the change to the LIR state to be kept as map is not back-compatible. For example, I saw the following error upon upgrading a cluster (to trunk) (which had some LIR state written down in ZK already). But looking at the code, the same exception can happen on upgrading to latest lucene_solr_4_10 branch too.\n\n\n41228 [RecoveryThread] ERROR org.apache.solr.cloud.RecoveryStrategy   Error while trying to recover. core=coll_5x3_shard5_replica3:java.lang.ClassCastException: java.lang.String cannot be cast to java.util.Map\n        at org.apache.solr.cloud.ZkController.getLeaderInitiatedRecoveryStateObject(ZkController.java:1993)\n        at org.apache.solr.cloud.ZkController.getLeaderInitiatedRecoveryState(ZkController.java:1958)\n        at org.apache.solr.cloud.ZkController.publish(ZkController.java:1105)\n        at org.apache.solr.cloud.ZkController.publish(ZkController.java:1075)\n        at org.apache.solr.cloud.ZkController.publish(ZkController.java:1071)\n        at org.apache.solr.cloud.RecoveryStrategy.doRecovery(RecoveryStrategy.java:355)\n        at org.apache.solr.cloud.RecoveryStrategy.run(RecoveryStrategy.java:235)\n\n\n "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14169402",
+            "date": "2014-10-13T15:35:37+0000",
+            "content": "Commit 1631439 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1631439 ]\n\nSOLR-6511: fix back compat issue when reading existing data from ZK "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14169428",
+            "date": "2014-10-13T15:52:14+0000",
+            "content": "Commit 1631444 from Timothy Potter in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1631444 ]\n\nSOLR-6511: fix back compat issue when reading existing data from ZK "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14169432",
+            "date": "2014-10-13T15:55:45+0000",
+            "content": "Commit 1631447 from Timothy Potter in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1631447 ]\n\nSOLR-6511: fix back compat issue when reading existing data from ZK "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14169433",
+            "date": "2014-10-13T15:57:00+0000",
+            "content": "Good catch Shalin thanks. That's my bad for changing functionality as part of this ticket. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14175862",
+            "date": "2014-10-18T05:31:18+0000",
+            "content": "Hi Tim, sorry for the late review but it'd more awesome if we put the replica core in addition to the node name inside createdByNode key (or maybe just coreNodeName). Otherwise if there are more than one replica for the same shard on the node then we don't know which one created the LIR. "
+        }
+    ]
+}

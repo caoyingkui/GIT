@@ -1,0 +1,321 @@
+{
+    "id": "SOLR-8453",
+    "title": "Jetty update from 9.2 to 9.3 causes the server to reset formerly legitimate client connections.",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The basic problem is that when we are streaming in updates via a client, an update can fail in a way that further updates in the request will not be processed, but not in a way that causes the client to stop and finish up the request before the server does something else with that connection.\n\nThis seems to mean that even after the server stops processing the request, the concurrent update client is still in the process of sending the request. It seems previously, Jetty would not go after the connection very quickly after the server processing thread was stopped via exception, and the client (usually?) had time to clean up properly. But after the Jetty upgrade from 9.2 to 9.3, Jetty closes the connection on the server sooner than previous versions , and the client does not end up getting notified of the original exception at all and instead hits a connection reset exception. The result was random fails due to connection reset throughout our tests and one particular test failing consistently. Even before this update, it does not seem like we are acting in a safe or 'behaved' manner, but our version of Jetty was relaxed enough (or a bug was fixed?) for our tests to work out.",
+    "attachments": {
+        "jetty9.2.pcapng": "https://issues.apache.org/jira/secure/attachment/12780998/jetty9.2.pcapng",
+        "SOLR-8453_test.patch": "https://issues.apache.org/jira/secure/attachment/12780581/SOLR-8453_test.patch",
+        "SOLR-8453.patch": "https://issues.apache.org/jira/secure/attachment/12778901/SOLR-8453.patch",
+        "jetty9.3.pcapng": "https://issues.apache.org/jira/secure/attachment/12780999/jetty9.3.pcapng"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-12-21T20:24:25+0000",
+            "author": "Mark Miller",
+            "content": "Here is one idea. ",
+            "id": "comment-15067034"
+        },
+        {
+            "date": "2015-12-21T20:38:31+0000",
+            "author": "Mark Miller",
+            "content": "This 'bad' behavior is kind of baked into some our test error handling expectations. When a single request multi update has a fail in it, we expect that the rest of the updates are not processed.\n\nCan we easily tell between a streaming request and a single multi-update request in DistributedUpdateProcessor? ",
+            "id": "comment-15067040"
+        },
+        {
+            "date": "2015-12-21T21:40:12+0000",
+            "author": "Mark Miller",
+            "content": "Rather than in DistributedUpdateProcessor, probably the right place to deal with this without changing behavior is in the code that manages the UpdateProcessor objects. That is a bit of a drag though, because a bunch of places can work with those. ",
+            "id": "comment-15067106"
+        },
+        {
+            "date": "2015-12-21T22:47:52+0000",
+            "author": "Mark Miller",
+            "content": "I did a little more work on the above patch. You can try and simulate the old behavior by letting the client finishing sending and just do nothing with those updates after a fail. Better if we could tell the client to give up more cleanly, but anyway.\n\nThe main issue I've found with that so far is that DocBasedVersionConstraintsProcessor actually counts on getting a physical exception for 409 conflicts. I think one other spot may too. ",
+            "id": "comment-15067199"
+        },
+        {
+            "date": "2015-12-22T02:45:45+0000",
+            "author": "Mark Miller",
+            "content": "Here is a fairly simple and clean approach.\n\nWe inject a new ErrorHandlingProcessor as the first processor in all chains (have not thought very long about the name yet).\n\nThis can provide with us with the almost identical behavior to what we had previously while getting us to what we need now (to cleanly manage our client / server connection lifecycles).\n\nPatch still needs some work. ",
+            "id": "comment-15067469"
+        },
+        {
+            "date": "2015-12-22T03:37:05+0000",
+            "author": "Mark Miller",
+            "content": "Here is a more complete patch with test fixes.\n\nThis also has a couple unrelated other changes I've tried while looking into SOLR-7339. ",
+            "id": "comment-15067496"
+        },
+        {
+            "date": "2015-12-22T14:51:59+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This is great, thanks for debugging this.\n\nIf you move the following to the life cycle started method then you should also increase the timeout in the start() method because currently it gives up waiting for solr in 500ms.\n\nsynchronized (JettySolrRunner.this) {\n          waitOnSolr = true;\n          JettySolrRunner.this.notify();\n        }\n\n\n\nDid you see any test failures after this change? When I tried moving waitOnSolr to life cycle started, it failed many tests. However, I tried only once so it may have been the locale problems we've seen in other places. I'll run the tests in a loop with this patch to see if I can reproduce the failures. ",
+            "id": "comment-15068201"
+        },
+        {
+            "date": "2015-12-22T15:44:15+0000",
+            "author": "Mark Miller",
+            "content": "I have not seen any failures due to that change and have been running it for a lot of days. I don't know that it's very important for this issue though - I'll probably pare a couple of those things out or into their own issues. I think most tests now are actually using that wait till cores are loaded option anyway? Logically, this does make more sense to me though.\n\nI'm still fighting with some DIH tests a little. Their test classes really want the 'old processor throws out an exception' behavior - and while I can easily simulate that, it seems that also leaves those tests with the random connection reset issue. Old behavior, old problem I guess. Will probably have to try and tweak those tests a bit more. ",
+            "id": "comment-15068279"
+        },
+        {
+            "date": "2015-12-23T01:45:41+0000",
+            "author": "Mark Miller",
+            "content": "I'll run the tests in a loop with this patch to see if I can reproduce the failures.\n\nI'm still looping more recent versions. If you get a chance, update to the most recent patch. It has some changes to how our clients handle cleanup under failures. I think we overdo method.abort and I think it messes up connection reuse. On a clean server->client exception, we should simply make sure the response entity content is fully consumed and closed like a normal request. ",
+            "id": "comment-15069016"
+        },
+        {
+            "date": "2015-12-29T03:03:50+0000",
+            "author": "Mark Miller",
+            "content": "Yonik Seeley, you have a some time to look at this? We are holding off on the Jetty upgrade for a bit, but I think that has just made it easier to see issues that exist even on the older version. I think it may just be a matter of timing.\n\nBasically, we are not managing the connection like we are supposed to - errors, especially ones we expect to see in normal operations, should not bubble out and cut off the request. We want to use our Response.exception handling to properly notify the client, and let the request fully execute.\n ",
+            "id": "comment-15073402"
+        },
+        {
+            "date": "2016-01-04T16:59:05+0000",
+            "author": "Yonik Seeley",
+            "content": "Catching up from the holidays... yeah, I can take a look.\n\nIIRC, in the past, didn't a failed update in a batch cause all the updates after that to fail as well?  That was never that desirable, but I don't remember if it was ever fixed.\n\nthe client does not end up getting notified of the original exception at all and instead hits a connection reset exception.\n\nI thought we caught all exceptions in the SolrDispatchFilter and never let any bubble up to Jetty.\nedit: this code is in HttpSolrCall now:\n\n    } catch (Throwable ex) {\n      sendError(ex);\n\n ",
+            "id": "comment-15081360"
+        },
+        {
+            "date": "2016-01-04T17:34:03+0000",
+            "author": "Mark Miller",
+            "content": "I thought we caught all exceptions in the SolrDispatchFilter and never let any bubble up to Jetty.\n\nThe problem is not about whether the exception comes out of the SolrDispatchFilter - it's a matter of managing the connection.\n\nWe want the client to handle the connection, so everything can be done cleanly. So the client needs to be able to fully send the request and then fully receive the response - that is the goal for all but really exceptional cases. If we let an exception bubble out and stop the server thread (whether the dispatch filter swallows it or not), the request thread can still be wrapping up - but if it tries to do any communication, it will get a connection reset as the server has closed the connection. We are not properly letting the client finish its request in these cases - so there is a race. We need to make sure the server does not close the connection until the request is fully done. ",
+            "id": "comment-15081423"
+        },
+        {
+            "date": "2016-01-04T17:52:58+0000",
+            "author": "Yonik Seeley",
+            "content": "That's unfortunate if one can't provide an error response before the request has finished.\n(I'm thinking of something like uploading a multi-gigabyte CSV file, but one of the fields is missing... it would be nice to have the option of saying \"abort on any errors\", and still get the specific error message back).\n\nTrying to figure out if this is a Jetty regression (regardless of how we want to act - which would seem to depend on context).\n\nAn HTTP/1.1 (or later) client sending a message-body SHOULD monitor the network connection for an error status while it is transmitting the request. If the client sees an error status, it SHOULD immediately cease transmitting the body.\n\n ",
+            "id": "comment-15081468"
+        },
+        {
+            "date": "2016-01-04T18:59:07+0000",
+            "author": "Yonik Seeley",
+            "content": "That's unfortunate if one can't provide an error response before the request has finished.\n\nHmmm, OK... it doesn't look like that's happening:\n\n\n~$ nc 127.0.0.1 8983\nPOST /solr/techproducts/update HTTP/1.1\nHost: localhost:8983\nUser-Agent: curl/7.43.0\nAccept: */*\nContent-type:application/json\nContent-Length: 1000000000\n\n\n[\n {\"id_not_exist\" : \"TestDoc1\", \"title\" : \"test1\"},\n\n\n\nHTTP/1.1 400 Bad Request\nContent-Type: text/plain;charset=utf-8\nTransfer-Encoding: chunked\n\n7E\n{\"responseHeader\":{\"status\":400,\"QTime\":6312},\"error\":{\"msg\":\"Document is missing mandatory uniqueKey field: id\",\"code\":400}}\n\n0\n\n\n\nI guess this suggests that we should be able to handle things better on the client side? ",
+            "id": "comment-15081576"
+        },
+        {
+            "date": "2016-01-05T14:33:55+0000",
+            "author": "Mark Miller",
+            "content": "I think it's more related to using HttpClient than http. We see random connection resets in many tests that go away with this, but looking at the consistent test we have that fails (SolrExampleStreamingTest#testUpdateField), we seem to hit the problem when HttpClient is cleaning up and closing the outputstream, which flushes a buffer.\n\n\njava.net.SocketException: Connection reset\n\tat java.net.SocketOutputStream.socketWrite(SocketOutputStream.java:113)\n\tat java.net.SocketOutputStream.write(SocketOutputStream.java:153)\n\tat org.apache.http.impl.io.AbstractSessionOutputBuffer.flushBuffer(AbstractSessionOutputBuffer.java:159)\n\tat org.apache.http.impl.io.AbstractSessionOutputBuffer.flush(AbstractSessionOutputBuffer.java:166)\n\tat org.apache.http.impl.io.ChunkedOutputStream.close(ChunkedOutputStream.java:205)\n\tat org.apache.http.impl.entity.EntitySerializer.serialize(EntitySerializer.java:118)\n\tat org.apache.http.impl.AbstractHttpClientConnection.sendRequestEntity(AbstractHttpClientConnection.java:265)\n\tat org.apache.http.impl.conn.ManagedClientConnectionImpl.sendRequestEntity(ManagedClientConnectionImpl.java:203)\n\tat org.apache.http.protocol.HttpRequestExecutor.doSendRequest(HttpRequestExecutor.java:237)\n\tat org.apache.http.protocol.HttpRequestExecutor.execute(HttpRequestExecutor.java:122)\n\tat org.apache.http.impl.client.DefaultRequestDirector.tryExecute(DefaultRequestDirector.java:685)\n\tat org.apache.http.impl.client.DefaultRequestDirector.execute(DefaultRequestDirector.java:487)\n\tat org.apache.http.impl.client.AbstractHttpClient.doExecute(AbstractHttpClient.java:882)\n\tat org.apache.http.impl.client.CloseableHttpClient.execute(CloseableHttpClient.java:82)\n\tat org.apache.http.impl.client.CloseableHttpClient.execute(CloseableHttpClient.java:107)\n\tat org.apache.http.impl.client.CloseableHttpClient.execute(CloseableHttpClient.java:55)\n\tat org.apache.solr.client.solrj.impl.ConcurrentUpdateSolrClient$Runner.sendUpdateStream(ConcurrentUpdateSolrClient.java:280)\n\tat org.apache.solr.client.solrj.impl.ConcurrentUpdateSolrClient$Runner.run(ConcurrentUpdateSolrClient.java:161)\n\n\n\nIt may also be that it only happens with this chunked encoding. On close, it tries to write a 'closing chunk' and then flush: https://github.com/apache/httpcore/blob/4.0.x/httpcore/src/main/java/org/apache/http/impl/io/ChunkedOutputStream.java\n\nIf there is a problem here we get the connection reset.\n\nIt does actually seem like a bit of a race to me and I'm not sure how to address that yet (other than this patch). If you remove the 250ms poll that happens in ConcurrentUpdateSolrClient->sendUpdateStream->EntityTemplate->writeTo, it seems to go away. But that would indicate our connection management is a bit fragile, with the client kind of racing the server.\n\nStill playing around to try and find other potential fixes. ",
+            "id": "comment-15083141"
+        },
+        {
+            "date": "2016-01-05T14:48:39+0000",
+            "author": "Mark Miller",
+            "content": "If you remove the 250ms poll that happens ... with the client kind of racing the server.\n\nOn trunk right now, you have to drop that poll to 12ms or less on my machine to get the test to pass. ",
+            "id": "comment-15083159"
+        },
+        {
+            "date": "2016-01-05T15:54:00+0000",
+            "author": "Mark Miller",
+            "content": "On trunk right now, you have to drop that poll to 12ms or less on my machine to get the test to pass.\n\nAnd on 5x, Jetty is not sensitive to the length of the poll it seems (at least up to 30 seconds). ",
+            "id": "comment-15083272"
+        },
+        {
+            "date": "2016-01-05T17:25:47+0000",
+            "author": "Yonik Seeley",
+            "content": "Here's a test with normal solrj clients that reproduces HTTP level exceptions.  It uses multiple threads and large request sizes.\n\nExample exception summary (from 10 clients):\n\n3567 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->SocketException(Connection reset)\n3569 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3569 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3570 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3571 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3571 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3571 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3572 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3572 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3572 ERROR (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.c.s.TestSolrJErrorHandling CHAIN: ->SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n3573 INFO  (TEST-TestSolrJErrorHandling.testWithBinary-seed#[5C3578C3D02417A3]) [    ] o.a.s.SolrTestCaseJ4 ###Ending testWithBinary\n\n ",
+            "id": "comment-15083405"
+        },
+        {
+            "date": "2016-01-05T17:58:41+0000",
+            "author": "Yonik Seeley",
+            "content": "Here's an updated test that dedups the exception summary and cranks up the number of client threads, just to see what type of errors we can get.\n\n\n10714 ERROR (TEST-TestSolrJErrorHandling.testWithXml-seed#[CDCE136AF9E0FF01]) [    ] o.a.s.c.s.TestSolrJErrorHandling EXCEPTION LIST:\n\t98) SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Broken pipe)\n\t2) SolrServerException->ClientProtocolException->NonRepeatableRequestException->SocketException(Protocol wrong type for socket)\n\n ",
+            "id": "comment-15083471"
+        },
+        {
+            "date": "2016-01-05T18:37:07+0000",
+            "author": "Yonik Seeley",
+            "content": "This test currently passes on Solr 5x. ",
+            "id": "comment-15083534"
+        },
+        {
+            "date": "2016-01-06T06:44:26+0000",
+            "author": "Mark Miller",
+            "content": "Okay, I'm starting to think it's a change in consumeAll in - https://github.com/eclipse/jetty.project/blame/jetty-9.3.x/jetty-server/src/main/java/org/eclipse/jetty/server/HttpInput.java#L443\n\nI think perhaps that is now returning false in https://github.com/eclipse/jetty.project/blob/jetty-9.3.x/jetty-server/src/main/java/org/eclipse/jetty/server/HttpConnection.java#L403\n\nIt's looking to me like the server resets the connection because of unconsumed content, and previously it must have been properly consuming the extra. ",
+            "id": "comment-15085065"
+        },
+        {
+            "date": "2016-01-06T17:18:51+0000",
+            "author": "Mark Miller",
+            "content": "Here is consumeAll from 9.2:\n\nhttps://github.com/eclipse/jetty.project/blame/jetty-9.2.x/jetty-server/src/main/java/org/eclipse/jetty/server/HttpInput.java#L281\n\nThere are a couple possible changes that may be doing this to us:\n\n9.3\n\n    public boolean consumeAll()\n    {\n        synchronized (_inputQ)\n        {\n            try\n            {\n                while (!isFinished())\n                {\n                    Content item = nextContent();\n                    if (item == null)\n                        break; // Let's not bother blocking\n\n                    skip(item, remaining(item));\n                }\n                return isFinished() && !isError();\n            }\n            catch (IOException e)\n            {\n                LOG.debug(e);\n                return false;\n            }\n        }\n    }\n\n\n\n9.2\n\n    public boolean consumeAll()\n    {\n        synchronized (lock())\n        {\n            // Don't bother reading if we already know there was an error.\n            if (_onError != null)\n                return false;\n\n            try\n            {\n                while (!isFinished())\n                {\n                    T item = getNextContent();\n                    if (item == null)\n                        _contentState.waitForContent(this);\n                    else\n                        consume(item, remaining(item));\n                }\n                return true;\n            }\n            catch (IOException e)\n            {\n                LOG.debug(e);\n                return false;\n            }\n        }\n    }\n\n\n\nI would first guess it's the change of not waiting for a new entity on item==null with  _contentState.waitForContent(this) anymore. The other change looks to be instead of just checking the error status at the start, we check it at the end. ",
+            "id": "comment-15085861"
+        },
+        {
+            "date": "2016-01-06T17:32:27+0000",
+            "author": "Mark Miller",
+            "content": "If that change is the issue (and it was added in 9.3), it's this commit: https://github.com/eclipse/jetty.project/commit/ebaf84b97ec50c6836c230f9068b46ad8030f974 Refactored HttpInput to use poison pills\n\nI don't see any tracking issue for it. ",
+            "id": "comment-15085884"
+        },
+        {
+            "date": "2016-01-06T18:57:27+0000",
+            "author": "Mark Miller",
+            "content": "Yup, seems to go away with this hack:\n\n\n    public boolean consumeAll()\n    {\n        synchronized (_inputQ)\n        {\n            try\n            {\n                while (!isFinished())\n                {\n                    Content item = nextContent();\n                    if (item == null) {\n                      blockForContent();\n                      item = nextContent();\n                     }\n\n                    if (item != null) skip(item, remaining(item));\n                }\n            return true;\n            }\n            catch (IOException e)\n            {\n                LOG.debug(e);\n                return false;\n            }\n        }\n    }\n\n ",
+            "id": "comment-15086065"
+        },
+        {
+            "date": "2016-01-07T15:31:59+0000",
+            "author": "Yonik Seeley",
+            "content": "Nice find!\n\nI've been messing around on the client side with HttpURLConnection and raw sockets.\n\nEven with HttpURLConnection (the stuff built into the JVM) I can't even get the status code...\nThe server has probably written the error response, but the client side wants to push the complete request before looking at it I guess:\n\n\nCaused by: java.io.IOException: Error writing to server\n\tat sun.net.www.protocol.http.HttpURLConnection.writeRequests(HttpURLConnection.java:665)\n\tat sun.net.www.protocol.http.HttpURLConnection.writeRequests(HttpURLConnection.java:677)\n\tat sun.net.www.protocol.http.HttpURLConnection.getInputStream0(HttpURLConnection.java:1533)\n\tat sun.net.www.protocol.http.HttpURLConnection.getInputStream(HttpURLConnection.java:1440)\n\tat java.net.HttpURLConnection.getResponseCode(HttpURLConnection.java:480)\n\tat org.apache.solr.client.solrj.TestSolrJErrorHandling.testHttpURLConnection(TestSolrJErrorHandling.java:242)\n\n\nCatching the exception and trying to get the errorStream also doesn't work.\n\nAnyway, I had a thought that even if we could fix this in the SolrJ clients, there are a lot of other clients out there that will get bitten by this.\nRegardless of what improvements we make to SolrJ, it seems like we should roll back the Jetty upgrade. ",
+            "id": "comment-15087580"
+        },
+        {
+            "date": "2016-01-07T15:56:46+0000",
+            "author": "Joakim Erdfelt",
+            "content": "You should probably have reached out to us (at Jetty) as soon as you discovered this.\nBefore you even dug into the Jetty source.  \n\nDo you have a wireshark capture of this behavior?\nLets see what is happening on the network first. ",
+            "id": "comment-15087612"
+        },
+        {
+            "date": "2016-01-07T16:32:29+0000",
+            "author": "Mark Miller",
+            "content": "I think someone reached out to the Jetty project in SOLR-7339.\n\nI'll attach a wireshark log I have.\n\nWireshark and debug logs all confirm this change in behavior. ",
+            "id": "comment-15087662"
+        },
+        {
+            "date": "2016-01-07T16:39:35+0000",
+            "author": "Mark Miller",
+            "content": "Anyway, I had a thought that even if we could fix this in the SolrJ clients, there are a lot of other clients out there that will get bitten by this.\n\nI would think so. It seems to just be a matter of if the client pauses sending the request long enough to get cut off. We are able to trigger it so easily because ConcurrentUpdateSolrClient will generally pause 250 ms after adding a single doc. A GC event or load or something of the like could cause the same thing. ",
+            "id": "comment-15087671"
+        },
+        {
+            "date": "2016-01-07T19:22:24+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1723613 from Yonik Seeley in branch 'dev/trunk'\n[ https://svn.apache.org/r1723613 ]\n\nSOLR-8453: test HTTP client error responses ",
+            "id": "comment-15087912"
+        },
+        {
+            "date": "2016-01-07T22:57:57+0000",
+            "author": "Greg Wilkins",
+            "content": "Copying this comment over from the jetty-users discussion (and expanding somewhat)\n\nThis is indeed a change in behaviour in jetty 9.3, but not one that should affect any application.\n\nThe problem with consumeAll previously is that it was an unlimited commitment - a client could send chunks forever and consume a thread forever. The only reason we need to consume all is to maintain a persistent connection.   But a server is under no obligation to maintain a persistent connection (even if the application consumes all the request data).  So if jetty doesn't consumeAll, we can close that connection and the client needs to start a new one.\n\nSo the approach that 9.3 takes is that if the application has not read all it's content (which is normally an error condition of the application), then jetty will make a best effort attempt to read the content, but only if it can do so without blocking.  If it has to block - it gives up and the connection is closed.   The decision is that it is better to throw away the connection rather than commit to blocking for an unknown period of time.   This is more important now as apps are using the async APIs and are configured with minimal threadpools - thus we need to avoid places where the container can block and consume the thread pool (and thus be vulnerable to DOS attacks).\n\nSo your client needs to be more robust in this circumstance and/or your application should make a better attempt to consume all the data.\n\nEven if we reinstated the behaviour in jetty - it would really just be happenstance that your client works and intermediaries/proxies could change the behaviour. ",
+            "id": "comment-15088327"
+        },
+        {
+            "date": "2016-01-07T23:40:37+0000",
+            "author": "Greg Wilkins",
+            "content": "Note I just added a comment on 7339 - that this can be worked around by adding a filter that consumes all the content.   But the client should still be fixed IMHO. ",
+            "id": "comment-15088394"
+        },
+        {
+            "date": "2016-01-08T00:45:04+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1723646 from Tom\u00e1s Fern\u00e1ndez L\u00f6bbe in branch 'dev/trunk'\n[ https://svn.apache.org/r1723646 ]\n\nSOLR-8453: Fix precommit ",
+            "id": "comment-15088495"
+        },
+        {
+            "date": "2016-01-08T00:50:35+0000",
+            "author": "Mark Miller",
+            "content": "But the client should still be fixed IMHO.\n\nOn the Jetty mailing list you mentioned that Apache HttpClient seemed to be acting reasonably. I'm not sure how that relates to this comment about the client being fixed? ",
+            "id": "comment-15088501"
+        },
+        {
+            "date": "2016-01-08T00:55:35+0000",
+            "author": "Mark Miller",
+            "content": "To expand:\n\nIf HttpClient is behaving reasonably by throwing an exception about connection reset, Solr cannot get the actual server exception, which is essential to our proper operation. I don't see what we can do as a client without changes to HttpClient. ",
+            "id": "comment-15088506"
+        },
+        {
+            "date": "2016-01-08T03:40:51+0000",
+            "author": "Greg Wilkins",
+            "content": "\nAh - well I've evolved my view a bit, although the client (as in the part that uses the HttpClient) may need to be fixed.\n\nTo repeat what I stated on the jetty-user list, I think both client and server are acting reasonably.   Jetty sees an application return without having consumed all of a request - it assumes this is an error condition, makes a best effort attempt to consume, but when that requires blocking decides to close the connection before all the content is sent.\n\nThe HttpClient is sending a chunked body and the connection is closed before it sends the terminal chunk, so apache is correct to return an exceptional condition to the client application, as the request did not end correctly.   I guess the HttpClient could potentially do better by making the status received in the response available, but then it is in a race because the close may occur prior to the response being read/parsed/processed.\n\nSo if the client applications cannot be made more robust - ie it can't reasonably handle such connection failures without knowing the status code, then the best solution is to avoid the server creating the ambiguity in the first place.   If it is important for the client that all the content is consumed, then the server application should consume all the content, even if there is an error.    A filter can achieve that or perhaps a sendError wrapper.\n\nWe really don't want Jetty to have to do this consumeAll, because we then cannot protect asynchronous apps with small thread pools from DOS attacks.   \n\ncheers\n\n\n\n ",
+            "id": "comment-15088651"
+        },
+        {
+            "date": "2016-01-08T04:14:24+0000",
+            "author": "Mark Miller",
+            "content": "Okay here is a patch that has the filter read out the inputstream on errors. ",
+            "id": "comment-15088670"
+        },
+        {
+            "date": "2016-01-08T04:34:04+0000",
+            "author": "Mark Miller",
+            "content": "So if the client applications cannot be made more robust - ie it can't reasonably handle such connection failures without knowing the status code\n\nI don't think we can. As a user of HttpClient, we don't care about the connection reset. We do care about the error on the server though. We would want to be able to get the error, and ignore that we won't be reusing that connection. Solr wants connection reuse, but we don't want to be interrupted when it doesn't happen (especially if that also means we don't get the server error). I don't think we can get that option in the short term though, so best bet seems to be as you suggest in a filter. ",
+            "id": "comment-15088691"
+        },
+        {
+            "date": "2016-01-08T08:07:45+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1723660 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1723660 ]\n\nSOLR-8453: Fix raw socket test to correctly use HTTP spec: headers in HTTP are US-ASCII, body's Content-Length is number of bytes (not chars!), PrintWriter swallows Exceptions and was not needed (Forbidden apis found the bug, but fix was incorrect) ",
+            "id": "comment-15088866"
+        },
+        {
+            "date": "2016-01-08T16:56:21+0000",
+            "author": "Yonik Seeley",
+            "content": "I guess the HttpClient could potentially do better by making the status received in the response available, but then it is in a race because the close may occur prior to the response being read/parsed/processed.\n\nNot sure I understand this part.  At the OS/socket level, the server can send the response and immediately close the socket, and the client (if written properly) can always read the response. ",
+            "id": "comment-15089498"
+        },
+        {
+            "date": "2016-01-12T14:05:30+0000",
+            "author": "Mark Miller",
+            "content": "I think this patch is okay. I change consomeInput to not throw out an Exception , instead we just log it, and I added a bit of doc that links to this JIRA. ",
+            "id": "comment-15093917"
+        },
+        {
+            "date": "2016-01-12T16:33:40+0000",
+            "author": "Yonik Seeley",
+            "content": "+1, looks fine. ",
+            "id": "comment-15094203"
+        },
+        {
+            "date": "2016-01-13T05:07:16+0000",
+            "author": "Greg Wilkins",
+            "content": "It depends on how the socket is closed.   If the socket is RST rather than FIN'd then it is possible for the RST to overtake sent data - ie to cause some kind of exception with unconsumed data in a buffer.  I have no idea if that is really the case or not.\n\nJetty will to a proper close only if it has completed a HTTP message.  Otherwise the close may be more brutal and may result in a RST (not directly under the control of java). ",
+            "id": "comment-15095619"
+        },
+        {
+            "date": "2016-01-13T16:24:08+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1724450 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1724450 ]\n\nSOLR-8453: Solr should attempt to consume the request inputstream on errors as we cannot count on the container to do it. ",
+            "id": "comment-15096467"
+        },
+        {
+            "date": "2016-01-13T16:30:53+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1724457 from Mark Miller in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1724457 ]\n\nSOLR-8453: Solr should attempt to consume the request inputstream on errors as we cannot count on the container to do it. ",
+            "id": "comment-15096486"
+        },
+        {
+            "date": "2016-01-13T23:58:07+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1724529 from Mark Miller in branch 'dev/trunk'\n[ https://svn.apache.org/r1724529 ]\n\nSOLR-8453: Only consume input here if exp != null, otherwise it is done in writeResponse. ",
+            "id": "comment-15097316"
+        },
+        {
+            "date": "2016-01-13T23:59:04+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1724530 from Mark Miller in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1724530 ]\n\nSOLR-8453: Only consume input here if exp != null, otherwise it is done in writeResponse. ",
+            "id": "comment-15097318"
+        },
+        {
+            "date": "2016-02-16T18:57:05+0000",
+            "author": "Mark Miller",
+            "content": "Seems only doing this on errors is not enough. I'm looking at upgrading Jetty again and still see a bunch of connection resets now unless I make sure to always fully consume the stream. ",
+            "id": "comment-15149094"
+        },
+        {
+            "date": "2016-02-17T09:26:32+0000",
+            "author": "Greg Wilkins",
+            "content": "If solr is in the habit of not consuming the content AND is particular about how such connections are closed/reused, then I believe a filter should be applied to all requests.\nI will have a look again to see if jetty can provide consumeAll behaviour as an option, but I really think that is just making solr dependent on a container features... as it was when it assumed the container would consume all of the input on it's behalf - which is behaviour not covered by any spec I know of.\n\nOther than that, you could make a feature request on the client to be able to handle request sending errors separately to response processing.  Ie in this case may receive a valid response and the request body send still failed.\n ",
+            "id": "comment-15150173"
+        },
+        {
+            "date": "2016-02-17T15:20:07+0000",
+            "author": "Mark Miller",
+            "content": "Yeah, we are doing it in a filter, but we were just doing it on failures. I suspect some other code changes have exposed that we really should be doing it every request, but I've made that change. Currently, we don't really want the client or server to give up early in any case if we can help it. Since this issue is released, I filed a new JIRA for it, SOLR-8683 Always consume the full request on the server, not just in the case of an error. ",
+            "id": "comment-15150629"
+        }
+    ]
+}

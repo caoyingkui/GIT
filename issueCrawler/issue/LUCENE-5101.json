@@ -1,0 +1,181 @@
+{
+    "id": "LUCENE-5101",
+    "title": "make it easier to plugin different bitset implementations to CachingWrapperFilter",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Currently this is possible, but its not so friendly:\n\n  protected DocIdSet docIdSetToCache(DocIdSet docIdSet, AtomicReader reader) throws IOException {\n    if (docIdSet == null) {\n      // this is better than returning null, as the nonnull result can be cached\n      return EMPTY_DOCIDSET;\n    } else if (docIdSet.isCacheable()) {\n      return docIdSet;\n    } else {\n      final DocIdSetIterator it = docIdSet.iterator();\n      // null is allowed to be returned by iterator(),\n      // in this case we wrap with the sentinel set,\n      // which is cacheable.\n      if (it == null) {\n        return EMPTY_DOCIDSET;\n      } else {\n/* INTERESTING PART */\n        final FixedBitSet bits = new FixedBitSet(reader.maxDoc());\n        bits.or(it);\n        return bits;\n/* END INTERESTING PART */\n      }\n    }\n  }\n\n\n\nIs there any value to having all this other logic in the protected API? It seems like something thats not useful for a subclass... Maybe this stuff can become final, and \"INTERESTING PART\" calls a simpler method, something like:\n\n\nprotected DocIdSet cacheImpl(DocIdSetIterator iterator, AtomicReader reader) {\n  final FixedBitSet bits = new FixedBitSet(reader.maxDoc());\n  bits.or(iterator);\n  return bits;\n}",
+    "attachments": {
+        "LUCENE-5101.patch": "https://issues.apache.org/jira/secure/attachment/12592174/LUCENE-5101.patch",
+        "DocIdSetBenchmark.java": "https://issues.apache.org/jira/secure/attachment/12592573/DocIdSetBenchmark.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-07-11T02:22:29+0000",
+            "content": "I suppose taking DocIDSet is more flexible, in case you can build it in a faster way.\nBut it would be good to make this simpler (less boilerplate) without losing the flexibility.\n\nMaybe a bigger change is needed: we have quite a few impls now and CWF is messy:\nfor example I think EMPTY_DOCIDSET should not exist here in CWF, but instead be DocIDSet.EMPTY...\n\nAnyway this is just to hopefully encourage discussion about how we can make it easier to use the new impls  ",
+            "author": "Robert Muir",
+            "id": "comment-13705404"
+        },
+        {
+            "date": "2013-07-11T09:32:58+0000",
+            "content": "+1 The two new impls at least can be constructed from a DocIdSetIterator.\n\nMaybe we should have another protected method for what to do in case the doc ID set returned by the filter is already cacheable (by default it would return the set directly). Some filters return doc id sets which are already cacheable (TermsFilter for example) and it could be useful to make sure a CWF always returns the same impl (for instance block joins want a FixedBitSet). ",
+            "author": "Adrien Grand",
+            "id": "comment-13705638"
+        },
+        {
+            "date": "2013-07-12T19:10:59+0000",
+            "content": "A quick note about alternative DocIdSet we now have. I wrote a benchmark (attached) to see how they compared to FixedBitSet, you can look at the results here: http://people.apache.org/~jpountz/doc_id_sets.html Please note that EliasFanoDocIdSet is disadvantaged for advance() since it doesn't have an index yet, it will be interesting to run this benchmark again when it gets one.\n\nMaybe we could use these numbers to have better defaults in CWF? (and only use FixedBitSet for dense sets for example) ",
+            "author": "Adrien Grand",
+            "id": "comment-13707268"
+        },
+        {
+            "date": "2013-07-14T00:11:33+0000",
+            "content": "\nMaybe we could use these numbers to have better defaults in CWF? (and only use FixedBitSet for dense sets for example)\n\n+1: we should have better defaults. Ideally we would use DISI.cost() to estimate the sparsity.\n\nOne problem is a lot of the costly filters that people want to cache have a crap cost() implementation.\ne.g. MultiTermQueryWrapperFilter could instead getAndSet() and return a DISI with an actual accurate cost().\n\nOr instead for now, we could also check firstDocID too... ",
+            "author": "Robert Muir",
+            "id": "comment-13707889"
+        },
+        {
+            "date": "2013-07-14T00:30:16+0000",
+            "content": "I was thinking about a heuristic like this... ",
+            "author": "Robert Muir",
+            "id": "comment-13707890"
+        },
+        {
+            "date": "2013-07-14T15:01:21+0000",
+            "content": "I wrote a benchmark (attached) to see how they compared to FixedBitSet, you can look at the results here: http://people.apache.org/~jpountz/doc_id_sets.html \n\nThank you very much, plenty of dilemma's ahead. Do WAH8 and PFOR already have an index?\nWith an index, each of these, including Elias-Fano, should have about constant access time when advancing far enough. What that constant time will be is still open.\n\nBlock decoding might still be added to EliasFano, which should improve its nextDoc() performance, but I have no idea by how much. See also at LUCENE-2750 for Kamikaze PFOR.\nThe Elias-Fano code is not tuned yet, so I'm surprised that the Elias-Fano time for nextDoc() is less than a factor two worse than PFOR.\n\nAnother surpise is that Elias-Fano is best at advance() among the compressed sets for some cases. That means that Long.bitCount() is doing well on the upper bits then.\n\nFor bit densities > 1/2 there is clear need for WAH8 and Elias-Fano to be able to encode the inverse set. Could that be done by a common wrapper? ",
+            "author": "Paul Elschot",
+            "id": "comment-13708046"
+        },
+        {
+            "date": "2013-07-14T20:11:02+0000",
+            "content": "Do WAH8 and PFOR already have an index?\n\nThey do, but the index is naive: it is a plain binary search over a subset of the (docID,position) pairs contained in the set. With the first versions of these DocIdSets, I just wanted to guarantee O(log(cardinality)) advance performance.\n\nBlock decoding might still be added to EliasFano, which should improve its nextDoc() performance\n\nThe main use-case I see for these sets is to be used as filters. So I think advance() performance is more important?\n\nThe Elias-Fano code is not tuned yet, so I'm surprised that the Elias-Fano time for nextDoc() is less than a factor two worse than PFOR.\n\nWell, the PFOR doc ID set is not tuned either.  But I agree this is a good surprise for the Elias-Fano set. I mean even the WAH8 doc id set should be pretty fast and is still slower than the Elias-Fano set.\n\nAnother surprise is that Elias-Fano is best at advance() among the compressed sets for some cases. That means that Long.bitCount() is doing well on the upper bits then.\n\nI'm looking forward for the index. \n\nFor bit densities > 1/2 there is clear need for WAH8 and Elias-Fano to be able to encode the inverse set. Could that be done by a common wrapper?\n\nI guess so. ",
+            "author": "Adrien Grand",
+            "id": "comment-13708113"
+        },
+        {
+            "date": "2013-07-15T19:02:55+0000",
+            "content": "I had another look at the recent benchmark results and something does not seem in order there.\n\nAt density -2 (1%), Elias-Fano is faster at advance(docID() +1) (2.45 times fixed) than at nextDoc() (1.81 times fixed), and I would expect that FixedBitSet would have an almost equal run times for advance(docId()+1) and nextDoc().\n\nThe code for advance (advanceToValue in EliasFanoDecoder) is really more complex than the code for nextDoc (nextValue in EliasFanoDecoder) and the code at EliasFanoDocIdSet is so simple that it should not really influence things here.\nSo for EliasFanoDocIdSet advance(docId() + 1) should normally be slower than nextDoc(), but the benchmark contradicts this.\n\nCould there be a mistake in the benchmark for these cases? Or is this within expected (JIT) tolerances? ",
+            "author": "Paul Elschot",
+            "id": "comment-13708830"
+        },
+        {
+            "date": "2013-07-16T17:41:32+0000",
+            "content": "Well spotted. Maybe I did a mistake when moving the data from the benchmark output to the charts. I modified the program so that it outputs directly the input of the charts. See the updated charts at http://people.apache.org/~jpountz/doc_id_sets.html. I also modified it so that memory uses a log scale too. ",
+            "author": "Adrien Grand",
+            "id": "comment-13709973"
+        },
+        {
+            "date": "2013-07-22T11:26:10+0000",
+            "content": "I simplified the benchmark somewhat and ran it on my 32 bit home machine.\n\nThe relative results for EliasFanoDocIdSet are very similar to the ones above, so this benchmark is a good measuring tool for me. I'll use it to verify performance of an index once it is working, LUCENE-5109. ",
+            "author": "Paul Elschot",
+            "id": "comment-13715124"
+        },
+        {
+            "date": "2013-08-09T18:29:35+0000",
+            "content": "I just updated http://people.apache.org/~jpountz/doc_id_sets.html based on the latest updated on WAH8DocIdSet and PFORDeltaDocIdSet and added the building time to the charts. PFORDeltaDocIdSet now better compresses doc id sets of medium load factors (~ 0.7) by switching to unary coding when it saves space compared to PFor. This way, it never grows much larger than a FixedBitSet. Similarly, WAH8DocIdSet now better compresses dense sets (LUCENE-5150).\n\nI wish I had more time to work on the EliasFanoDocIdSet to add an index to it and see how it behaves. It has interesting characteristics!\n\nRegarding this issue, I think we could update the patch to always use WAH8DocIdSet? I think the most interesting benchmark is advance(31) since it maps to a Scorer that performs leap frog between a query and a filter that both contain lots of documents (hence the query execution is slow) and WAH8DocIdSet is the one which has the best worst case here? ",
+            "author": "Adrien Grand",
+            "id": "comment-13735113"
+        },
+        {
+            "date": "2013-08-10T00:32:35+0000",
+            "content": "I think that would be a reasonable default. \n\nI still think it would be good to improve the API in a way that makes it easier for someone to add their own heuristics/logic/subclasses and use different implementations. Its just unfortunate there is some boilerplate and cornercases they have to worry about (null DocIDSet, null Iterator, etc etc).\n\nThe way the patch does it is just one possibility (we could also just move forward with a better default and not change the API, too). ",
+            "author": "Robert Muir",
+            "id": "comment-13735589"
+        },
+        {
+            "date": "2013-08-10T01:27:28+0000",
+            "content": "Updated patch that just defaults to compressing but with the same protected method. I also added some tests to TestCWF (for the corner cases of the boilerplate stuff). ",
+            "author": "Robert Muir",
+            "id": "comment-13735669"
+        },
+        {
+            "date": "2013-08-10T17:10:46+0000",
+            "content": "Patch looks good to me. Since join users are going to need fixed bit sets, maybe we should have a FixedBitSetCachingWrapperFilter so that they don't need to instantiate an anynous class to override cacheImpl every time? ",
+            "author": "Adrien Grand",
+            "id": "comment-13735972"
+        },
+        {
+            "date": "2013-08-11T11:53:51+0000",
+            "content": "Patch looks good to me, too.\n\nHopefully we'll get some early feedback about performance. ",
+            "author": "Paul Elschot",
+            "id": "comment-13736266"
+        },
+        {
+            "date": "2013-09-05T18:26:04+0000",
+            "content": "I iterated on Robert's patch to fix failures in the join module which were due to the fact that CWF doesn't always produce FixedBitSets anymore.\n\nI added a new FixedBitSetCachingWrapperFilter in oal.search.join which extends CWF to always produce FixedBitSets, as required by To(Parent|Child)BlockJoinQuery.\n\nAll tests passed. ",
+            "author": "Adrien Grand",
+            "id": "comment-13759289"
+        },
+        {
+            "date": "2013-09-05T18:29:50+0000",
+            "content": "did you forget to 'svn add'? ",
+            "author": "Robert Muir",
+            "id": "comment-13759290"
+        },
+        {
+            "date": "2013-09-05T18:53:58+0000",
+            "content": "Indeed! Here is a complete patch. ",
+            "author": "Adrien Grand",
+            "id": "comment-13759312"
+        },
+        {
+            "date": "2013-09-05T20:08:35+0000",
+            "content": "Can the FixedBitSetCachingWrapperFilter.java just override cacheImpl instead of all the boilerplate?  ",
+            "author": "Robert Muir",
+            "id": "comment-13759386"
+        },
+        {
+            "date": "2013-09-05T20:22:15+0000",
+            "content": "This CWF is a bit different in that if it gets a cacheable filter which is not a FixedBitSet, it will convert it to a FixedBitSet instead of keeping it as-is. I think this is required for instance if users have custom filter implementations that return cacheable filters which are not a FixedBitSet (some filters return cacheable doc id sets, for instance TermsFilter  could be backed by something else than a FixedBitSet in the future). ",
+            "author": "Adrien Grand",
+            "id": "comment-13759404"
+        },
+        {
+            "date": "2013-09-05T20:31:49+0000",
+            "content": "ok, makes sense: thanks. maybe we could add this to the docs or in a code comment?\n\npatch looks good to me. ",
+            "author": "Robert Muir",
+            "id": "comment-13759416"
+        },
+        {
+            "date": "2013-09-05T20:40:57+0000",
+            "content": "Good point, here is an updated patch with an additional comment explaining the difference with CWF. ",
+            "author": "Adrien Grand",
+            "id": "comment-13759431"
+        },
+        {
+            "date": "2013-09-06T10:07:14+0000",
+            "content": "Commit 1520525 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1520525 ]\n\nLUCENE-5101: Make it easier to plugin different bitset implementations to CachingWrapperFilter. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13760102"
+        },
+        {
+            "date": "2013-09-06T10:16:29+0000",
+            "content": "Commit 1520527 from Adrien Grand in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1520527 ]\n\nLUCENE-5101: Make it easier to plugin different bitset implementations to CachingWrapperFilter. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13760104"
+        },
+        {
+            "date": "2013-09-06T10:19:08+0000",
+            "content": "Committed, thanks Robert! ",
+            "author": "Adrien Grand",
+            "id": "comment-13760106"
+        },
+        {
+            "date": "2013-10-05T10:19:17+0000",
+            "content": "4.5 release -> bulk close ",
+            "author": "Adrien Grand",
+            "id": "comment-13787113"
+        }
+    ]
+}

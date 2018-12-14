@@ -1,0 +1,239 @@
+{
+    "id": "SOLR-6816",
+    "title": "Review SolrCloud Indexing Performance.",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Task",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Critical"
+    },
+    "description": "We have never really focused on indexing performance, just correctness and low hanging fruit. We need to vet the performance and try to address any holes.\n\nNote: A common report is that adding any replication is very slow.",
+    "attachments": {
+        "SolrBench.pdf": "https://issues.apache.org/jira/secure/attachment/12684987/SolrBench.pdf"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-12-03T23:10:59+0000",
+            "author": "Mark Miller",
+            "content": "I'm starting to feel around the edges with 2 of my local machines and simple benchmarking.\n\nI've found two fairly concerning things so far:\n\n\n\tI can't seem to saturate any key resource.\n\tThe VersionInfo bucket size appears to be a large bottleneck with replication (we lock on this bucket in DistributedUpdateProcessor for the entire document add).\n\n\n\nI've attached a PDF record of my runs that I'm keeping. ",
+            "id": "comment-14233651"
+        },
+        {
+            "date": "2014-12-03T23:54:40+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thank you for looking into this.\n\nThe VersionInfo bucket size appears to be a large bottleneck with replication (we lock on this bucket in DistributedUpdateProcessor for the entire document add).\n\nI met a few folks during recent Solr meetups who were comparing SolrCloud indexing with non-cloud master node indexing and this was one of their biggest bottlenecks according to them.  ",
+            "id": "comment-14233691"
+        },
+        {
+            "date": "2014-12-04T00:19:39+0000",
+            "author": "Timothy Potter",
+            "content": "Cool - been looking into this as well, nothing definitive yet but here's one thing I've noticed:\n\nCPU load is considerable higher on replicas than on leaders when doing high-volume indexing with batched documents coming from the client. Basically the batch gets broken up on the leader and then sent in mini-batches to replicas. Thus, replicas are having to process many more update requests than leaders to index the same documents. Check out these two graphs from one of my tests:\n\nreplica - http://www.dropmocks.com/mHoPUx\nleader - http://www.dropmocks.com/mHoWpX\n\nPretty clear that there is considerably higher load on the replica than on the leader. This was done with a 1x2 collection each replica on a separate node. Without replication, I indexed a 10M doc collection (my synthetic ones ~1K each) at 7,225 docs per second. With replication, I got 4,626 per second ~ 36% slower.\n\nBehind the scenes, CUSS does some minimal buffering of the docs, so there are many, many more requests sent from the leader to the replica. The updateHandler stats tell a good story (basically the replica received 5x the number of update requests than the leader for just 10M docs).\n\nLeader:\nrequests:40,022\navgRequestsPerSecond:9.830068574096831\n5minRateReqsPerSecond:0.09800683344335624\n15minRateReqsPerSecond:2.9134044254494302\navgTimePerRequest:628.6526956285293\nmedianRequestTime:379.48604750000004\n75thPcRequestTime:568.784846\n95thPcRequestTime:1365.1776681499978\n99thPcRequestTime:6501.922041030025\n\nReplica:\nrequests:206,367\navgRequestsPerSecond:51.13560879471209\n5minRateReqsPerSecond:0.514584592882959\n15minRateReqsPerSecond:14.541814273402418\navgTimePerRequest:104.61283714253733\nmedianRequestTime:35.7488105\n75thPcRequestTime:96.46166525\n95thPcRequestTime:272.08549294999995\n99thPcRequestTime:718.7258438000003\n\nI've been experimenting with tweaking things like the pollQueueTime, queueSize, runner count setup by StreamingSolrServers but haven't come up with a definitive recipe for improving things ... still digging  ",
+            "id": "comment-14233700"
+        },
+        {
+            "date": "2014-12-04T00:46:16+0000",
+            "author": "Mark Miller",
+            "content": "then sent in mini-batches to replicas\n\nI think we may have discussed this before. I think it's because we don't poll on the queue for any amount of time - due to it's cost on single update per request stuff. It would be ideal if we could tell if we were in a batch or not, and if it is a batch, perhaps we still poll 50 or 100ms. ",
+            "id": "comment-14233720"
+        },
+        {
+            "date": "2014-12-04T00:47:59+0000",
+            "author": "Mark Miller",
+            "content": "but haven't come up with a definitive recipe for improving things\n\nDid you see any improvements with any of those changes though? ",
+            "id": "comment-14233721"
+        },
+        {
+            "date": "2014-12-04T00:57:48+0000",
+            "author": "Timothy Potter",
+            "content": "Did you see any improvements with any of those changes though?\n\nI did see some improvements, but now I'm fighting with the opposite problem, namely, with pollQueueTime > 0, the docs get buffered (in the runner) a little too long now because the queue always has another request on it, so now I'm experimenting with a maxPending concept, which attempts to flush the buffer out to the replica if docs have been piling up for too long in the runner. ",
+            "id": "comment-14233732"
+        },
+        {
+            "date": "2014-12-04T11:39:20+0000",
+            "author": "Per Steffensen",
+            "content": "Just want to add my 5 cents on this one. It is only regarding indexing when you do version-check/optimistic-locking (SOLR-3178). We have a very different implementation of SOLR-3178, but the performance problems will be the same for \"your\" implementation.\n\nDoing optimistic-locking you typically do a lot of this\n\n\t1) real-time-get document D from Solr\n\t2) update D to D' locally on client\n\t3) try to replace D with D' in Solr. In case of version-conflict-error go to 1)\n\n\n\nIn step 1) you get-by-id document D, and I step 3) you UpdateLog.lookupVersion on the same id.\nIn our system it is most likely that two processes, both wanting to update document D, run at the same time or fairly shortly after each other. It is rare that the same document gets updated a long time apart.\nIn order to speed up on those aspects, we have introduced a \"recently looked-up or updated\" cache, where we store documents that has recently been fetch by real-time-get or updated. It has improved our indexing speed significantly. We have a mature solution that is running in production.\n\nIn the scenarios above you most often discover that the document you try to real-time-get or lookup-version for does NOT exist, but it is relatively time-consuming to realize that (looking in index). We have a PoC of introducing a bloom-filter that can help say one of \"document definitely does not exist\" (you do not have to search the index) or \"document may exist\" (you will have to search the index to see if it exists). Our PoC shows that this will speed up our indexing-speed tremendously (like 60-80% reduction), but we havnt prioritized to mature and put it into production yet. The PoC was using a modified version of Guava bloom-filter - modified to be able work in a memory-mapped file, so that we do not lose bloom-filter information when shutting down Solr (it will take some time building it from scratch every time you start Solr). Guava bloom-filter currently is memory only - you can save it to file and load it again, but it will not go on continuously, and it is not efficient to store it completely to disk at every update  Hence the \"work in memory-mapped file\" modification.\n\nOf course, let me know if any of this sounds interesting to you. ",
+            "id": "comment-14234145"
+        },
+        {
+            "date": "2014-12-04T15:41:38+0000",
+            "author": "Mark Miller",
+            "content": "Another note: I also am beginning to have reason to believe we have lost a decent percentage of indexing performance since at least 4.4 or 4.5. ",
+            "id": "comment-14234281"
+        },
+        {
+            "date": "2014-12-08T21:56:54+0000",
+            "author": "Timothy Potter",
+            "content": "Pardon the naive question, but I'm curious as to why a replica has to do the version checking for added documents (which is mostly the case for high-volume bulk indexing)? In other words, would it be possible to have specialized logic in versionAdd for bulk adds of new documents? ",
+            "id": "comment-14238519"
+        },
+        {
+            "date": "2014-12-08T22:16:35+0000",
+            "author": "Yonik Seeley",
+            "content": "In other words, would it be possible to have specialized logic in versionAdd for bulk adds of new documents?\n\nYep.  Just like on a single node, if \"overwrite=false\", we could skip version checking.  But that's the special case.  If the general case has an issue, we should figure that out too. ",
+            "id": "comment-14238563"
+        },
+        {
+            "date": "2014-12-08T23:32:25+0000",
+            "author": "Timothy Potter",
+            "content": "Ok, cool - just wanted to verify I wasn't missing something obvious. If an indexing client can give a hint that tells Solr \"hey, I'm going to be sending in new docs in bulk\", optimize for that, I think that's a valid case to support. Agreed on addressing performance for the general case too. ",
+            "id": "comment-14238672"
+        },
+        {
+            "date": "2014-12-09T23:44:56+0000",
+            "author": "Timothy Potter",
+            "content": "I think messing with the queue poll time in CUSS is a red herring for improving indexing performance. It does help reduce CPU load on replicas (less requests / garbage) so might still be a config property we want to add, but I wasn't able to get it to always be faster than using 0, which I suppose is a good thing since that's what we're doing now in released code.\n\nThe biggest performance gain I've been able to make (in addition to increasing the number of version buckets), is to avoid the lookup to the ulog (in the replica) when doing bulk adds. Of course, I realize that is special case, but doing high-volume bulk adds is when you especially need better indexing performance. ",
+            "id": "comment-14240312"
+        },
+        {
+            "date": "2014-12-10T14:54:37+0000",
+            "author": "Per Steffensen",
+            "content": "Make sure to document when it is safe to turn off the version-check for replica (overwrite=false). Believe the version-check is also used to detect and prevent old versions that get to the replica last does not overwrite new versions that get to the replica first. E.g leader might get an update-request of document D updating it from state S1 to S2, and send a request U1 to a replica with overwrite=false saying \"just write S2 without checking\". Immediately after the update of D from S1 to S2, the leader gets another request updating it from S2 to S3. Leader again reacts by sending a \"just write S3 without checking\"-request U2 to the replica. The replica might receive U2 before U1 (if replica-request is not sent and waited for response while the leader has the bucket-lock for the document) and then you are in trouble.\n\nSure that is an odd case, just do not forget that versions are also used for that on replica (AFAIK) ",
+            "id": "comment-14241199"
+        },
+        {
+            "date": "2014-12-10T15:20:50+0000",
+            "author": "Timothy Potter",
+            "content": "Per Steffensen definitely - my first pass is focused only on high-volume adds of new documents ... haven't quite nailed down a solution but to be clear, I'm not intending to make this a risky change that affects updates for the reasons you raise. ",
+            "id": "comment-14241217"
+        },
+        {
+            "date": "2014-12-10T15:47:58+0000",
+            "author": "Per Steffensen",
+            "content": "Thats fine. Just wanted to mention it so that you do not forget when you \"nail down a solution\" ",
+            "id": "comment-14241267"
+        },
+        {
+            "date": "2014-12-11T20:56:46+0000",
+            "author": "Mark Miller",
+            "content": "There is a fairly ugly periodic lock up in indexing when using update vs add - I've filed SOLR-6838 to look at improving this.  ",
+            "id": "comment-14243122"
+        },
+        {
+            "date": "2014-12-16T16:27:30+0000",
+            "author": "Timothy Potter",
+            "content": "Yep. Just like on a single node, if \"overwrite=false\", we could skip version checking. \nYonik Seeley I'm curious if we shouldn't have a different flag here, something like \"bulkAdd=true\" to disable the version lookup to the ulog on the replicas for bulk adds vs. trying to overload the overwrite=false behavior as it seems like setting overwrite=false would by-pass a lot of checking around the unique doc ID. This is how I think it should work:\n\n\n\tclient sends batch of new docs with bulkAdd=true to leader\n\tleader does versionAdd\n\tleader sends docs with version set to replica(s) and bulkAdd=true param\n\treplica checks bulkAdd and by-passes the lookup to the ulog for that doc\n\n\n\nI guess what I need to hear is that we think it's safe and a valid approach to allow an indexing client to tell Solr this request contains a bunch of new docs, so optimize for that. Thanks in advance for feedback  ",
+            "id": "comment-14248447"
+        },
+        {
+            "date": "2014-12-17T09:09:57+0000",
+            "author": "Per Steffensen",
+            "content": "I believe today overwrite=false will not prevent neither document-version-check on leader (it will in the Solr we use in my company, but not in Apache Solr) nor bucket-version-check on non-leaders. As far as I can see DistributedUpdateProcessor.versionAdd will do document-version-check if versionsStored=true, leaderLogic=true and versionOnUpdate != 0. It will do bucket-version-check if versionsStored=true and leaderLogic=false. This has nothing to do with overwrite param. This version-check is not only for add-commands but also for delete-commands.\n\nThe overwrite param controls only (in DirectUpdateHandler2) if you make sure to delete an existing document with the same id, before you add the new document. You do that by default, but if overwrite=false you just add the new document, allowing duplicates (defined to be documents that have the same id-value).\n\nSo as far as I read the code, document-version-check will only be performed on leaders. Non-leaders will only do bucket-version-check, and I do not think that is expensive?\nAs I said our version of Solr does not do document-version-check if overwrite=false. I think you should introduce that as well. But besides that, whats left to do in this area?\n\nWhat did I not understand? ",
+            "id": "comment-14249639"
+        },
+        {
+            "date": "2014-12-17T10:05:23+0000",
+            "author": "Per Steffensen",
+            "content": "Those of you that have been following my comments on misc issues will know that I like \"separation of concerns\". So in our version of Solr all this decision-making on when to do document-version-check, when to delete existing documents with same id-value etc is isolated in enum UpdateSemanticsMode - see https://issues.apache.org/jira/secure/attachment/12553312/SOLR-3173_3178_3382_3428_plus.patch. We support different modes that makes slightly different decisions on the above topics, which is the reason for using an enum. You do not need that, because you only have \"one mode\", but that should not prevent you from separating the decision-making concern.\n\nThe patch is not entirely up to date with what we do today, but at least it illustrates the \"separation of concerns\". DistributedUpdateHandler deals with a million concerns, so maybe you want to adopt that idea and move the code making the decisions out of DistributedUpdateHandler.\n\nOnly mention this because I sense that at least Shalin Shekhar Mangar agrees that some cleanup (a.o. of DistributedUpdateHandler) is required: https://twitter.com/shalinmangar/status/543874893549277184 ",
+            "id": "comment-14249673"
+        },
+        {
+            "date": "2015-03-26T15:52:14+0000",
+            "author": "Timothy Potter",
+            "content": "Coming back to this discussion ...\n\nI still think there is need for a new optional parameter on an UpdateRequest that specifies this request is a bulk add and the client application knows all the docs in the request are either exact duplicates or new docs. You would use this parameter for high-volume indexing jobs such as from Hadoop, Spark, or log indexing applications. When this parameter is set to true (default is false of course), we can skip the version lookup on replicas in the versionAdd method of the DistributedUpdateProcessor, i.e.:\n\n\n              boolean bulkAdds = cmd.getReq().getParams().getBool(UpdateRequest.BULK_ADD, false);\n              if (!bulkAdds) {\n                Long lastVersion = vinfo.lookupVersion(cmd.getIndexedId());\n                if (lastVersion != null && Math.abs(lastVersion) >= versionOnUpdate) {\n                  // This update is a repeat, or was reordered.  We need to drop this update.\n                  return true;\n                }\n              }\n\n\n\nI didn't think the lookupVersion would be that much of an overhead, but my testing shows that it is, even when using docValues for the version field.\n\nUsing this bulk add parameter, I'm seeing very good improvements when using replication. Specifically, here are the results I'm getting by making this simple change:\n\nIndexing 9,992,262 docs (~1k in size) in a 3-shard collection with RF=2 (I'm using 6 r3.xlarge instances in EC2 so there is no contention between nodes, i.e. all replicas are on different servers):\n\n\n\tbaseline branch5x: 758 seconds, ~13,182 docs per second\n\tbranch5x with fix for SOLR-6820 (65536 version buckets): 710 seconds, ~14,074 docs per second\n\tbranch5x with fix for SOLR-6820 and this bulkAdds parameter: 485 seconds, ~20,603 docs per second\n\n\n\nThat's a 56% increase in throughput performance over the baseline in branch5x! What's more is the 20,603 is nearing the performance I was getting in the baseline without replication (23,401).\n\nI don't think using overwrite=false will work here though because most apps still want basic duplicate checking on the leader to catch duplicate documents that get resent to Solr. For instance, imagine a Map/Reduce job that indexes into Solr ... if a task fails, then Hadoop usually re-tries that task a couple of times, meaning all docs in the block that failed will be sent again. If we use overwrite=false, then you'll end up with dupes in your index. This is why I think having an additional parameter that lets client apps tell Solr they are doing bulk adds of new docs is required.\n\nLastly, I'm still working on a way to send less requests from leader to replica when using batches. Just increasing the poll queue time for CUSS in StreamingSolrClients imposes an unnecessary wait after the last doc in the batched request is processed. So I'm trying to devise a way for the entire batch of docs to be streamed to the replica without having this unnecessary wait after the last doc. ",
+            "id": "comment-14382086"
+        },
+        {
+            "date": "2015-03-26T16:08:13+0000",
+            "author": "Yonik Seeley",
+            "content": "I didn't think the lookupVersion would be that much of an overhead, but my testing shows that it is, even when using docValues for the version field.\n\nCan you tell what part is taking so much time?  Looking up the ID to find the internal lucene docid? Obtaining the docvalues reference? or using it to look up the version?  My guess would be that it's the external-id to internal-id translation that is the slowest.\n\nThere's another way to safely & transparently speed up indexing for everyone: maintain-highest version-per-bucket.  It's been the plan since the beginning... see VersionBucket:\n\npublic class VersionBucket {\n  public long highest;\n\n  public void updateHighest(long val) {\n    if (highest != 0) {\n      highest = Math.max(highest, Math.abs(val));\n    }\n  }\n}\n\n\n\nRight now, we start off with highest=0 (which essentially means \"unknown\"), so we never update it.\nIf we could initialize the highest versions correctly (would need to get from the index) then we would only need to check versions when a reorder happened on the same bucket. ",
+            "id": "comment-14382123"
+        },
+        {
+            "date": "2015-03-26T17:45:44+0000",
+            "author": "Timothy Potter",
+            "content": "Can you tell what part is taking so much time?\n\nIf you already knew the answer, why did you ask?  your assumption was correct \u2013 it spends most of the time is spent doing long lookup = searcher.lookupId(idBytes); ... this is explains why docValues for version didn't help because the doc doesn't exist so we never get to the ValueSource code where the docValues would help \n\nIf we could initialize the highest versions correctly (would need to get from the index) ...\n\nCan you expand on this a bit? I'm not clear how we would get the latest version of the bucket from the index? ",
+            "id": "comment-14382306"
+        },
+        {
+            "date": "2015-03-26T22:15:32+0000",
+            "author": "Yonik Seeley",
+            "content": "most of the time is spent doing long lookup = searcher.lookupId(idBytes);\n\nAs an aside... I wonder what the state of Bloom filters are.  No one has made progress getting themSolr. Last effort was SOLR-3950 ? ",
+            "id": "comment-14382802"
+        },
+        {
+            "date": "2015-03-26T22:32:08+0000",
+            "author": "Yonik Seeley",
+            "content": "> If we could initialize the highest versions correctly (would need to get from the index) ...\nCan you expand on this a bit? I'm not clear how we would get the latest version of the bucket from the index?\n\nLet me back up for a minute and more fully describe things for others that may be following along.\n\nVersionInfo has a list of 256 version buckets.  We hash the ID field and synchronize on the bucket to ensure that only one udpate with a given ID is being processed concurrently.  This is the way we know which update \"won\" and can replicate that ordering on the replicas, etc.\n\nOn replicas, things can be sent over multiple threads/connections, and updates can get reordered.  We detect this by checking the version in the index (and tlog) and make sure there is nothing newer.  We do the same synchronization on the version bucket here as well.\n\nIf we maintain the highest version we've ever seen on the bucket (it's already there, VersionBucket.highest), then when an update comes in, we just compare the update version to the bucket.highest... if the update version is higher (which it almost always will be) then we know that this update wasn't reordered and we don't have to do any checking of the actual index. Maintaining VersionBucket.highest is simple too... we just update it each time we see a larger version.\n\nThe only problem comes with initialization of \"highest\".  If we start with a new index, we're all good.  But if we start up with an existing index... we don't know what the highest version number in that index is, and hence we don't know what is safe to initialize VersionBucket.highest  to.\n\nIf it's a single node or if clocks are well synchronized, then we can just pick the current time as \"highest\".  But if this index is replicated from another node,  and the clock skew is more than the time it took to replicate the index, then it's possible that there is something in the index newer.  It's actually pretty unlikely I think, but when we were starting off with all this cloud stuff I didn't want to introduce any more factors.\n\nAnyway, one way to solve the initialization problem is to simply look in the index and find the highest value for version.  Then use that for all the buckets initial value (no need to hash the IDs and get it exact). ",
+            "id": "comment-14382834"
+        },
+        {
+            "date": "2015-03-26T23:20:19+0000",
+            "author": "Timothy Potter",
+            "content": "Thanks for clarifying Yonik Seeley ... I was over-thinking that we'd have to figure out the highest for each bucket  I'll work on adding that solution tomorrow AM as I'm sure we all prefer not having to turn on some sneaky bulk add parameter to get better performance.\n\nAlso, not sure about bloom filters, but definitely worth digging into when I have more time ... Per recommended that too, but I think there's some lower-hanging fruit around this stuff that as my numbers show, can make a significant improvement in performance. ",
+            "id": "comment-14382917"
+        },
+        {
+            "date": "2015-03-27T09:08:59+0000",
+            "author": "Per Steffensen",
+            "content": "Just to clarify. We did our own implementation of bloom-filter, and did not build on the existing feature, because we did not find it satisfactory. I do not remember exactly why, but maybe it was because the current solution builds a bloom-filter on each segment, and bloom-filters are not really mergeable unless they have the same size and used the same hashing-algorithm (and number of hashes performed). To be efficient you want your bloom-filter to be bigger (and potentially do another number of hashes) the bigger your segment is. We decided to do a one-bloom-filter-per-index/core/replica (or whatever you like to call it) solution, so that you do not need to merge bloom-filters. Besides that you can tell Solr about the maximum expected amount of documents in the index and the FPP you want at that number of documents, and it will calculate the size of the bloom-filter to use. Because such a one-bloom-filter-per-index does not go very well hand-in-hand with Lucenes segmenting strategy, we implemented it as a Solr-feature, that is, it is Solr that maintains the bloom-filter and the feature is not available for people who just uses Lucene.\nIt is not a simple task to do it right, so if the lower-hanging fruits are satisfactory, you should pick them first.\nTo recap, we have recently-updated-or-lookedup cache to be able to efficiently find the version of a document that does actually exist (and was \"touched\" recently), and bloom-filter to be able to efficiently find out if a document does not exist. ",
+            "id": "comment-14383556"
+        },
+        {
+            "date": "2015-03-27T09:17:11+0000",
+            "author": "Per Steffensen",
+            "content": "if a task fails, then Hadoop usually re-tries that task a couple of times, meaning all docs in the block that failed will be sent again\n\nWe do not send all documents again if just a few in a batch (bulk) fails. Lets say you send a batch of 1000 docs for indexing and only 2 fails due to e.g. version-control, we only do another round on those 2 documents - SOLR-3382 ",
+            "id": "comment-14383567"
+        },
+        {
+            "date": "2015-03-27T19:29:52+0000",
+            "author": "Timothy Potter",
+            "content": "I think you mis-understood my point. I wasn't talking about retrying documents in the same UpdateRequest. If a Map/Reduce task fails, the HDFS block is retried entirely, meaning a Hadoop-based indexing job may send the same docs that have already been added so using overwite=false is dangerous when doing this type of bulk indexing. The solution proposed in SOLR-3382 would be great to have as well though.\n\nI'm working on implementing the version bucket initialization approach that Yonik suggested but I'm wondering if we can do better with the hand-off from leader to replica? For instance, the leader knows if a doc didn't exist (because it's doing a similar ID lookup), so why can't the leader simply share that information with the replica, thus allowing the replica to avoid looking up a doc that doesn't exist. I'll get the version bucket initialization done and then see if this is still a concern, but just bugs me that we're wasting all this CPU on looking for docs the leader already knows don't exist. ",
+            "id": "comment-14384462"
+        },
+        {
+            "date": "2015-03-27T19:40:25+0000",
+            "author": "Yonik Seeley",
+            "content": "For instance, the leader knows if a doc didn't exist (because it's doing a similar ID lookup) [...]\n\nI think the leader doesn't need to do this lookup since it is the one establishing the order?  Although there is other stuff like peer sync and recovery that complicate the picture.\nAnyway, the primary reordering issue is between the leader and replica, so even if the leader says \"hey, previous doc exists for id:1234\", it could be reordered and hence be false by the time it gets to the replica.\n\nLonger term, I'd like to see reordering eliminated.  The primary mechanism would be via a single communication channel between the leader and it's replicas that would enforce ordering. ",
+            "id": "comment-14384479"
+        },
+        {
+            "date": "2015-03-27T20:09:04+0000",
+            "author": "Timothy Potter",
+            "content": "Seems like the leader is doing a lookup for the existing doc in DistributedUpdateProcessor#versionAdd:\n\n\n            boolean updated = getUpdatedDocument(cmd, versionOnUpdate);\n\n\n\nAnyway, it seemed like I was treading on dangerous ground going down that path. Part of this re-ordering / mixing deletes / updates, etc. is why I liked the bulkAdd parameter ... I want all this version checking safety when I need it, but if I'm pushing in 100's of thousands of docs per second (e.g. logs), I don't want any of that slowing me down unnecessarily. But I'll hold off on that until I've measured the improvement of initializing the version buckets correctly. Thanks for your continued support on this! ",
+            "id": "comment-14384519"
+        },
+        {
+            "date": "2015-03-27T20:45:13+0000",
+            "author": "Yonik Seeley",
+            "content": "boolean updated = getUpdatedDocument(cmd, versionOnUpdate);\n\nThat's for atomic udpates... and the version passed is the version that was on the update itself, not the version of the last doc in the index.\n\nIt will be interesting to see if the code works w/o any tweaks... it's been sitting there since the beginning of solrcloud, for years unused and untested \n\n            // if we aren't the leader, then we need to check that updates were not re-ordered\n            if (bucketVersion != 0 && bucketVersion < versionOnUpdate) {\n              // we're OK... this update has a version higher than anything we've seen\n              // in this bucket so far, so we know that no reordering has yet occurred.\n              bucket.updateHighest(versionOnUpdate);\n\n ",
+            "id": "comment-14384600"
+        },
+        {
+            "date": "2015-03-30T09:18:00+0000",
+            "author": "Per Steffensen",
+            "content": "I think you mis-understood my point. I wasn't talking about retrying documents in the same UpdateRequest. If a Map/Reduce task fails, the HDFS block is retried entirely, meaning a Hadoop-based indexing job may send the same docs that have already been added so using overwite=false is dangerous when doing this type of bulk indexing. The solution proposed in SOLR-3382 would be great to have as well though.\n\nWell, we might be mis-understanding each other. Im am not talking about retrying documents in the same UpdateRequest either. What we have:\nOur indexing client (something not in Solr - think of it as the Map/Reduce job) decides to do 1000 update-doc-commands U1, U2, ... , U1000 (add-doc and delete-doc commands), by sending one bulk-job containing all of those to Solr-node S1. S1 handles some of the Us itself and forwards other Us to the other Solr-nodes - depending or routing. For simplicity lets say that we have three Solr-nodes S1, S2 and S3 and that S1 handles U1-U333 itself, forwards U334-U666 to S2 and U667-U1000 to S3. Now lets say that U100, U200, U400, U500, U700 and U800 fails (two on each Solr-node), and the rest succeeds. S1 gets that information back from S2 and S3 (including reasons for each U that failed), and is able to send a response to our indexing client saying that all was a success, except that U100, U200, U400, U500, U700 and U800 failed, and why they failed. Some might fail due to DocumentAlreadyExists (if U was about creating a new document, assuming that it does not already exist), others might fail due to VersionConflict (if U was about updating an existing document and includes its last known (to the client) version, but the document at server has a higher version-number), others again might fail due to DocumentDoesNotExist (if U was about updating an existing document, but that document does not exist (anylonger) at server). Our indexing client takes note of that combined response from S1, performs the appropriate actions (e.g. version-lookups) and sends a new request to the Solr-cluster now only including U100', U200', U400', U500', U700' and U800'.\nWe have done it like that for a long time, using our solution to EDR-3382 (and our solution to SOLR-3178). I would expect a Map/Reduce-job could do the same, playing the role as the indexing client. Essentially only resending (maybe by issuing a new Map/Reduce-job from the \"reduce\"-phase of the first Map/Reduce-job) the (modified versions of) update-commands that failed the first time. ",
+            "id": "comment-14386432"
+        },
+        {
+            "date": "2015-03-31T23:26:42+0000",
+            "author": "Timothy Potter",
+            "content": "Yonik Seeley I opened SOLR-7332 for the version bucket idea you proposed. Patch posted - please review at your earliest convenience - results look very good indeed! ",
+            "id": "comment-14389659"
+        },
+        {
+            "date": "2015-04-09T19:31:46+0000",
+            "author": "Timothy Potter",
+            "content": "Hi Mark Miller, I know you're probably slammed with 10 other things, but I think my patches for SOLR-7332 and SOLR-7333 are getting close and I'd appreciate another data point to see what type of perf. improvement you get with your testing framework described in this ticket with those fixes applied. The patch for SOLR-7332 also includes your suggested fix for SOLR-6820 so you can increase the number of buckets for the ulog in solrconfig.xml. ",
+            "id": "comment-14488078"
+        },
+        {
+            "date": "2015-04-10T13:35:22+0000",
+            "author": "Mark Miller",
+            "content": "I'll see if I can get some testing done over the weekend. ",
+            "id": "comment-14489627"
+        },
+        {
+            "date": "2015-04-12T18:23:20+0000",
+            "author": "Mark Miller",
+            "content": "Postponing this a couple days. Dealing with a dying 2TB drive today. ",
+            "id": "comment-14491627"
+        }
+    ]
+}

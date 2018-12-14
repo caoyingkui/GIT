@@ -1,0 +1,109 @@
+{
+    "id": "SOLR-7247",
+    "title": "sliceHash for compositeIdRouter is not coherent with routing",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "4.10.3",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "in CompositeIdRouter the function sliceHash check routeField configured for collection.\nThis make me to guess that intended behaviour is manage alternative field to  id field to hash documents.\n\nBut the signature of this method is very general ( can take id, doc or params) and it is used in different ways from different functionality.\n\nIn my opinion it should have overloads instead of a weak internal logic. One overload with \"doc\" and \"collection\" and another one with \"id\" , \"params\" and \"collections\".\n\nIn any case , if \"_route_\" is not available by \"params\" , \"collection\" should be mandatory and in case of RouteField, also \"doc\" should be mandatory.\n\nThis will break SplitIndex but it will save coherence of data.\n\nIf i configure routeField i noticed that is broken the DeleteCommand (this pass to sliceHash only \"id\" and \"params\" ) and SolrIndexSplitter ( this pass only \"id\" )\n\nIt should be forbidden to specify RouteField to compositeIdRouter or implements related functionality to make possible to hash documents based on RouteField.\n\nin case of DeleteCommand command the workaround is to specify \"route\" param in request but in case of Index Splitting is not possible any workaround.\n\nIn this case it should be passed entire document during splitting (\"doc\" parameter\") or build params with proper \"_route_\" parameter.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-03-15T16:31:53+0000",
+            "author": "Yonik Seeley",
+            "content": "You are correct.  I argued against adding routeField to compositeIdRouter, but some people like the flexibility (even if it's incomplete, broken, and doesn't make anyone's life easier).\n\nI'll continue to recommend users against routing on anything other than the \"id\" field for compositeId routing.\n\nIt's simple: if you have some existing external doc id you want to use (existing_id), and you have another field you want to partition documents on (my_route_field), then simply make the Solr \"id\" value equal to <my_route_field>!<existing_id> ",
+            "id": "comment-14362437"
+        },
+        {
+            "date": "2015-03-15T18:56:12+0000",
+            "author": "Noble Paul",
+            "content": "Yonik Seeley Do you mean to say that , it is impossible or very difficult to make routing on an alternate field?\n\nIf it is broken , we need to fix it. Other data stores let you route on secondary fields . ",
+            "id": "comment-14362501"
+        },
+        {
+            "date": "2015-03-15T19:03:40+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Shard splitting does work with a custom route field. See SOLR-5246 ",
+            "id": "comment-14362505"
+        },
+        {
+            "date": "2015-03-16T10:48:38+0000",
+            "author": "Paolo Cappuccini",
+            "content": "Shalin, perhaps i'm missing something but in file org.apache.solr.update.SolrIndexSplitter.java i see at line 194 (ver. 4.10.3) :\n\nhash = hashRouter.sliceHash(idString, null, null, null);\n\nInternally , in this way, routeField is ignored becuause collection and doc is missing and no params are specified.\n\nInfact in my case split is done, but in wrong way!\n\nWheni said \"is broken\" i meant that it works in wrong way (i didn't mean that it throws expeption ).\n\nBut after the splitting docs are in wrong shard and future searches can fail in logic because search use other parameters. ",
+            "id": "comment-14363057"
+        },
+        {
+            "date": "2015-03-16T13:00:27+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "See CoreAdminHandler.handleSplitAction where it does:\n\nObject routerObj = collection.get(DOC_ROUTER); // for back-compat with Solr 4.4\n        if (routerObj != null && routerObj instanceof Map) {\n          Map routerProps = (Map) routerObj;\n          routeFieldName = (String) routerProps.get(\"field\");\n        }\n\n\nwhich is then passed to SplitIndexCommand:\n\nSplitIndexCommand cmd = new SplitIndexCommand(req, paths, newCores, ranges, router, routeFieldName, splitKey);\n      core.getUpdateHandler().split(cmd);\n\n\n\nThen SolrIndexSplitter has the following in the constructor:\n\nrouteFieldName = cmd.routeFieldName;\n    if (routeFieldName == null) {\n      field = searcher.getSchema().getUniqueKeyField();\n    } else  {\n      field = searcher.getSchema().getField(routeFieldName);\n    }\n\n\n\nSo the \"field\" used by SolrIndexSplitter is the right field whether it is the uniqueKey or the router.field. The \"idString\" is just a bad name because the splitter code was written first and the support for router.field was added later. There's also a test ShardSplitTest.splitByRouteFieldTest to assert that doc counts match as expected. If you have found otherwise, can you please detail how you tested, what results were expected and what were actually found. ",
+            "id": "comment-14363165"
+        },
+        {
+            "date": "2015-03-16T19:32:22+0000",
+            "author": "Paolo Cappuccini",
+            "content": "Thanks Shalin! \nI finally understood better splitting behaviour.\nI did further investigation and i found the real reason of my problems.\n\nAfter splitting i have obvsiouly new distribution of docs in shards.\nThe reason because i didn't find documents is in RealTimeGetComponent.java (line 366) :\n\nSlice slice = coll.getRouter().getTargetSlice(id, null, params, coll);\n\nIn this case \"nobody\" consider routeField and it should be impossible to consider : at that time is not possible to get the value of route field.\n\nAlso the sliceHash function in CompositeIdRouter doesn't consider route field in params. So the document is lost and passing explicit \"_route_\" field is not useful.\n\nAround same behaviour is in DistributedUpdateProcessor in case of \"processDelete\".\n\nThe behaviour is so strange that perhaps i am completely wrong!!!!!!\n\nI think that CompositeIdRouter.sliceHash sliceHash could have explicit overloads to hash by \"doc\"/\"collection\" or hash by \"value\" (like in IndexSplitter\")\n\ngetTargetSlice itself should have same overloads (actually it has same ambigous signature then sliceHash ).\n\nRealtimeGetComponent can only \"think\" by id (and not by routeField) so it should consider all active slices if routeField is specified for collection; a good optimization for these case could be to consider \"_route_\" param to route specific shard.\n\nAbout \"processDelete\" any solution look very complicate but in general, if i'm not wrong, routeField break something. ",
+            "id": "comment-14363757"
+        },
+        {
+            "date": "2015-03-17T22:36:30+0000",
+            "author": "Noble Paul",
+            "content": "We should fix the RealtimeGetComponent ",
+            "id": "comment-14366218"
+        },
+        {
+            "date": "2015-03-18T00:29:01+0000",
+            "author": "Yonik Seeley",
+            "content": "Do you mean to say that , it is impossible or very difficult to make routing on an alternate field?\n\nIt's possible to make it work, but it makes a lot of things more complex (and slower from the user perspective if you have to broadcast realtime-get, deletes, atomic updates, etc).  And what's the gain really?  It appears to come down to aesthetics or something?\n\n\n ",
+            "id": "comment-14366391"
+        },
+        {
+            "date": "2015-03-18T00:35:34+0000",
+            "author": "Noble Paul",
+            "content": "And what's the gain really? It appears to come down to aesthetics or something?\n\nDo we want to look like a system where we don't care about user convenience? Adding routing information to the id does not look like the most intuitive thing if we really wish to partition our index based on another field. We can add support for realtime-get to work with routing information.  ",
+            "id": "comment-14366396"
+        },
+        {
+            "date": "2015-03-18T00:53:45+0000",
+            "author": "Yonik Seeley",
+            "content": "Do we want to look like a system where we don't care about user convenience?\n\nIMO this is anti-user convenience if they are unknowingly led down a path that will result in worse performance.  I would never recommend them doing so if they had a choice.  Would you? ",
+            "id": "comment-14366421"
+        },
+        {
+            "date": "2015-03-18T12:47:43+0000",
+            "author": "Paolo Cappuccini",
+            "content": "I can share my personal workaround.\nI use deleteByquery to delete the document (because it's automatically routed to proper shards)\nI specify \"shards\" parameter for realtimeget , so the realtimeget don't use hashing logic to route but instead use \"shards\" specified.\n\nFrom user perspective both are very ugly ways to route documents but I think that both behaviors could be the easier solution to be implemented internally just in case of routeField and make things transparent to user.\n\nI think that the loss of performance is the price to pay if one want use custom routeField.\n\nAnyway  the documentation should underline this loss of performance but the user can still specify \"route\" parameter if his application have some business rule chaining \"id\" and \"routeField\" so RealTimeGet can still use \"route\" to calculate properly the shard (if the realtimeget component would care of this parameter insteand of \"shards\")\n\nActually realtimeget just use \"getTargetSlice\" . In case of \"route\" it should use getSearchSlices\n ",
+            "id": "comment-14367070"
+        },
+        {
+            "date": "2015-03-18T14:46:15+0000",
+            "author": "Noble Paul",
+            "content": "IMO this is anti-user convenience if they are unknowingly led down a path that will result in worse performance. I would never recommend them doing so if they had a choice. Would you?\n\nI would say you are being paranoid.\n\nLet's take the case of anyone who would like to partition their data. realtime get is not the most common request that is sent to Solr. They are search queries. So, whether you use composite id or router.field , you MUST use the _route_ param to be efficient. So , they are already aware of the fact that they would need to pass extra information to route their request properly. When it comes to realtime get , we don't have the support in place and we should add them.\n ",
+            "id": "comment-14367212"
+        },
+        {
+            "date": "2015-03-18T14:49:38+0000",
+            "author": "Noble Paul",
+            "content": "Paolo Cappuccini\n\nThe delete by query functionality now suports the _route_ param in trunk and 5x. We will add support for the same in realtime get as well.\n\nYes , we need to underline the performance loss of not using the _route_ param ",
+            "id": "comment-14367218"
+        },
+        {
+            "date": "2015-03-18T15:03:43+0000",
+            "author": "Yonik Seeley",
+            "content": "I would say you are being paranoid.\n\nHaving a different separate route field makes so many things harder.  People should not be steered in that way unless they don't have another choice, and it should be made clear to them that this isn't just a cosmetic change.  For many collections, one doesn't necessarily know what future clients will want to do (or how many future clients there will be).   Getting a doc, updating a doc, deleting a doc, can be common operations.  But now you've made it harder for them by requiring an extra piece of data (the route field value).  Think about generic tools as well that may simply work with ids.\n\nAnd what does one gain if they use a separate route field... isn't it just cosmetic? ",
+            "id": "comment-14367261"
+        },
+        {
+            "date": "2015-03-18T17:52:16+0000",
+            "author": "Paolo Cappuccini",
+            "content": "I think that the most import thing is coherence of datas.\nSo if the user doesn't specify route field, Solr should automatically route on all shards if the shard is unknown OR throw exception.\n\nThe same, Solr should route deletion (e.g. using internally deleteByQuery) is route is not specified.\n\nYOu both agree? \n ",
+            "id": "comment-14367554"
+        }
+    ]
+}

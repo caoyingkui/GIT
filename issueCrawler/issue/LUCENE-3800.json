@@ -1,0 +1,85 @@
+{
+    "id": "LUCENE-3800",
+    "title": "Readers wrapping other readers don't prevent usage if any of their subreaders was closed",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "4.0-ALPHA",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "On recent trunk test we got this problem:\norg.apache.lucene.index.TestReaderClosed.test\nfails because the inner reader is closed but the wrapped outer ones are still open.\n\nI fixed the issue partially for SlowCompositeReaderWrapper and ParallelAtomicReader but it failed again. The cool thing with this test is the following:\n\nThe test opens an DirectoryReader and then creates a searcher, closes the reader and executes a search. This is not an issue, if the reader is closed that the search is running on. This test uses LTC.newSearcher(wrap=true), which randomly wraps the passed Reader with SlowComposite or ParallelReader - or with both!!! If you then close the original inner reader, the close is not detected when excuting search. This can cause SIGSEGV when MMAP is used.\n\nThe problem in (in Slow* and Parallel*) is, that both have their own Fields instances thats are kept alive until the reader itsself is closed. If the child reader is closed, the wrapping reader does not know and still uses its own Fields instance that delegates to the inner readers. On this step no more ensureOpen checks are done, causing the failures.\n\nThe first fix done in Slow and Parallel was to call ensureOpen() on the subReader, too when requesting fields(). This works fine until you wrap two times: ParallelAtomicReader(SlowCompositeReaderWrapper(StandardDirectoryReader(segments_1:3:nrt _0(4.0):C42)))\n\nOne solution would be to make ensureOpen also check all subreaders, but that would do the volatile checks way too often (with n is the total number of subreaders and m is the number of hierarchical levels this is n^m) - we cannot do this. Currently we only have n*m which is fine.\n\nThe proposal how to solve this (closing subreaders under the hood of parent readers is to use the readerClosedListeners. Whenever a composite or slow reader wraps another readers, it registers itself as interested in readerClosed events. When a subreader is then forcefully closed (e.g by a programming error or this crazy test), we automatically close the parents, too.\n\nWe should also fix this in 3.x, if we have similar problems there (needs investigation).",
+    "attachments": {
+        "LUCENE-3800.patch": "https://issues.apache.org/jira/secure/attachment/12515259/LUCENE-3800.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-02-19T17:59:08+0000",
+            "content": "\nThe proposal how to solve this (closing subreaders under the hood of parent readers is to use the readerClosedListeners. Whenever a composite or slow reader wraps another readers, it registers itself as interested in readerClosed events. When a subreader is then forcefully closed (e.g by a programming error or this crazy test), we automatically close the parents, too.\n\n+1. free safety. ",
+            "author": "Robert Muir",
+            "id": "comment-13211447"
+        },
+        {
+            "date": "2012-02-19T22:09:24+0000",
+            "content": "I am still playing around with different solutions, its not so easy. I have a patch, but I have to think more about it.\n\nFor now (to prevent test failures), I will commit a temporary fix to TestReaderClosed.test, so it does not wrap on newSearcher(). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13211568"
+        },
+        {
+            "date": "2012-02-19T22:14:34+0000",
+            "content": "Until this is fixed, I added a workaround for the test that's failing in revision: 1291071 ",
+            "author": "Uwe Schindler",
+            "id": "comment-13211572"
+        },
+        {
+            "date": "2012-02-20T16:51:09+0000",
+            "content": "Patch for trunk that enforces a \"soft-close\" (make it unuseable) once a child-reader (subreader, delegate, parallel reader) is closed.\n\nThe implementation works like that:\n\n\tA parent reader that delegates to one or more child readers (its currently BaseCompositeReader, SlowCompositeReaderWrapper, FilterAtomicReader, ParallelAtomicReader), register itsself on every child/delegate reader. The registration is done using a weak reference, so there is no circular ref problems. To be able to use WeakHashMap, this patch explicitely enforces identity equals/hashcode on IndexReader (which we always assumedin the past for FieldCache and so on, now its enforced like in MMapIndexInput)\n\tWhen a reader closes, it simply iterates over all registered parents and \"marks\" them as \"unuseable\" (they are not really closed).\n\tWhen somebody calls any method of a reader of which any child was closed, ensureOpen() will throw an AlreadyClosedEx with corresponding message.\n\tYou are still able to decRef/close readers which are marked as invalid (otherwise tests would fail). The child reader closed -> disable parent reader is simply done for safety.\n\tTo make the ensureOpen() checks not more expensive than before, the extra boolean was not made volatile, instead happens before and volatile behaviour as explained in Michael Busch's talks was used to guard the \"closedByChild\" boolean.\n\tThe patch does not use readerClosedListener for 2 reasons: (1) RCL has no weak refs, so we don't produce circular references between parents and childs, (2) We have to recursively go up the parent chain, which may confuse conventional readerClosedListeners. Also the parent readers are not closed, so its not applicable to call the listeners.\n\n ",
+            "author": "Uwe Schindler",
+            "id": "comment-13211970"
+        },
+        {
+            "date": "2012-02-20T22:54:32+0000",
+            "content": "Improved patch with some minor things fixed:\n\n\tBetter test for the close child case\n\tFix Solr TestDocSet now hopefully the last time by implementing the fake reader correctly as AtomicReader subclass without passing null to FilterAtomicReader\n\n\n\nAll tests pass. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13212190"
+        },
+        {
+            "date": "2012-02-21T13:30:41+0000",
+            "content": "New patch, as parts of it were already committed (LTC changes). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13212580"
+        },
+        {
+            "date": "2012-02-22T13:58:13+0000",
+            "content": "Committed trunk revision: 1292293 ",
+            "author": "Uwe Schindler",
+            "id": "comment-13213624"
+        },
+        {
+            "date": "2012-02-22T13:59:02+0000",
+            "content": "If this would be good for 3.x, too -> reopen. 3.x is more safe as if a child reader is closed also parent readers have mostly no chance to do anything. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13213626"
+        },
+        {
+            "date": "2012-02-22T14:14:16+0000",
+            "content": "Ouch - more weak references.  I was hoping we could reduce the number of those (I've seen them cause worse GC problems for a number of people).\nBut if I understand the description correctly, then without this patch things could core dump when using mmap directory? ",
+            "author": "Yonik Seeley",
+            "id": "comment-13213638"
+        },
+        {
+            "date": "2012-02-22T14:16:49+0000",
+            "content": "Yes! By the way, the same trick is used for MMapDirectory to keep track of its clones IndexInputs. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13213642"
+        }
+    ]
+}

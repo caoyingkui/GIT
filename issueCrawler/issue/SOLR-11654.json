@@ -1,0 +1,103 @@
+{
+    "id": "SOLR-11654",
+    "title": "TimePartitionedUpdateProcessor.lookupShardLeaderOfCollection should route to the ideal shard",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Sub-task",
+        "fix_versions": [
+            "7.5"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "TimePartitionedUpdateProcessor.lookupShardLeaderOfCollection looks up the Shard/Slice to talk to for the given collection.  It currently picks the first active Shard/Slice but it has a TODO to route to the ideal one based on the router configuration of the target collection.  There is similar code in CloudSolrClient & DistributedUpdateProcessor that should probably be refactored/standardized so that we don't have to repeat this logic.",
+    "attachments": {
+        "SOLR-11654.patch": "https://issues.apache.org/jira/secure/attachment/12925854/SOLR-11654.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-05-31T05:20:48+0000",
+            "content": "This has been dangling a bit too long, so attaching what I have so far. I feel pretty good that I've got code in place that selects an appropriate shard, and things seem to not break, but trying to write a test for this code has been a mess... I've been lost in the weeds chasing the notion that TrackingShardHandlerFactory could be used to track which shards requests were sent to, but based on everything I can find updates never touch shardHandlers so that's a dead end. The in-code documentation on ShardRequest and ShardHandler, and ShardHandlerFactory and pretty much everything having anything to do with shard requests is virtually non existent. HttpShardHandler has the seemingly odd property that many of the request making methods are on the factory, not the object produced by the factory... In any case I think something analogous to TrackingShardHandlerFactory for tracking updates is required to properly test this, probably a custom URP, though it needs to be configured after DistributedUpdateProcessor to ensure it isn't skipped on the sub-requests. ",
+            "author": "Gus Heck",
+            "id": "comment-16496119"
+        },
+        {
+            "date": "2018-06-05T21:32:24+0000",
+            "content": "Looking at your patch. \u00a0getLeaderNode I noticed doesn't pass along \"slice\" to the constructor of RetryNode (last param). \u00a0It probably should do so for routeDocToSlice, but lookupShardLeadersOfCollections I guess null (what's happening today). \u00a0I'm not completely clear on the implications yet.\n\nHey Shalin Shekhar Mangar or anyone who knows SolrCloud well, do you know if there are tests for ensuring the doc routing goes right to the correct shard leader instead of being arbitrary?  I suppose it's fundamental to DURP but in CloudSolrClient AFAIK this is an optimization so perhaps there's a test for that?  We're not sure how to test this since it's an internal routing thing.  See Gus's most recent comment above.  I directed Gus at TrackingShardHandlerFactory but didn't realize it's a search-only tracker not for updates (ouch). ",
+            "author": "David Smiley",
+            "id": "comment-16502530"
+        },
+        {
+            "date": "2018-06-05T21:38:24+0000",
+            "content": "RE your change to TimeRoutedAliasUpdateProcessorTest ... I'd rather the test not bother doing a cleanup of the conifgsets added.  Since the current test asserts the number of configSets, it can be modified to be less stringent or not care; it's not important. ",
+            "author": "David Smiley",
+            "id": "comment-16502540"
+        },
+        {
+            "date": "2018-06-13T23:16:00+0000",
+            "content": "New patch with TrackingUpdateProcessorFactory class\u00a0(for test use only) and unit test utilizing it to test that docs are now routed to the shard leader. Just realized I didn't yet investigate the null for RetryNode... I'll look at that and add another patch if it seems to worry me ",
+            "author": "Gus Heck",
+            "id": "comment-16511776"
+        },
+        {
+            "date": "2018-06-13T23:22:17+0000",
+            "content": "It looks like the lack of a slice name might cause some problems if a retry actually happens (seems to be needed to look up the leader). Looking around DistributedUpdateProcessor is the only class building one of these in production code besides us and it simply passes in the name of the slice (DURP line 1509) so I added that in this latest patch ",
+            "author": "Gus Heck",
+            "id": "comment-16511785"
+        },
+        {
+            "date": "2018-06-18T15:30:52+0000",
+            "content": "Thanks Gus! \u00a0This is looking great; I really like your TrackingUpdateProcessorFactory in particular. \u00a0Very useful. \u00a0I have some local super minor tweaks but I want to mention a few things:\n\n\tremoved SolrTestCaseJ4.adocs which you added but wasn't used.\u00a0 Besides, I don't like these methods on SolrTestCaseJ4 that return XML strings.\n\tremoved SolrClient.add(collection,SolrInputDocument...) because I don't think an API should have both array/varargs form and Collection form (and besides, Arrays.asList() is not that verbose).\n\tI did leave just one method you added on SolrClient...\n\n\n\n\n  /**\n   * Adds a collection of documents, specifying max time before they become committed and additional\n   * parameters for the update.\n   *\n   * @param collection the Solr collection to add documents to\n   * @param docs  the collection of documents\n   * @param commitWithinMs  max time (in ms) before a commit will happen\n   * @param params any parameters to be sent with this update request.\n   *\n   * @return an {@link org.apache.solr.client.solrj.response.UpdateResponse} from the server\n   *\n   * @throws IOException         if there is a communication error with the server\n   * @throws SolrServerException if there is an error on the server\n   *\n   * @since Solr 5.1\n   */\n  public UpdateResponse add(String collection, Collection<SolrInputDocument> docs, int commitWithinMs, ModifiableSolrParams params) throws SolrServerException, IOException {\n    UpdateRequest req = new UpdateRequest();\n    if (params != null) {\n      req.setParams(params);\n    }\n    req.add(docs);\n    req.setCommitWithin(commitWithinMs);\n    return req.process(this, collection);\n  }\n\n\n\nSince I think peer review is especially important on the public API of SolrClient, I'd like input from Jason Gerlowski or Varun Thacker that the above new method is okay.  What the above method saves is manual creation of an UpdateRequest as used above.  I know it's not often to use params on an update.  There is one thing I think that should be changed from Gus's proposal \u2013 I think setParams should copy the input to a new ModifiableSolrParams, and I think the declared param type of the method here should simply be SolrParams.  I think it's trappy that UpdateRequest takes a mutable SolrParams and then modifies it. ",
+            "author": "David Smiley",
+            "id": "comment-16515888"
+        },
+        {
+            "date": "2018-06-19T12:37:41+0000",
+            "content": "Wow! I was surprised when I saw 10 add methods already in SolrClient . How do our users even use our APIs :/\n\nMaybe food for another Jira : If we need 10+ add methods and the fact that the UpdateRequest is public meaning they could do this by\u00a0stiching\u00a0it together themselves anyways doesn't sound right at all. Happy to discuss and contribute in the right Jira if others feel the same way.\n\n\u00a0\n\nBut for the scope of this Jira maybe it's not the worst thing adding a couple of more methods as well? I guess if we just use UpdateRequest we wouldn't need this but that depends on Gus and you on how much ease does this add to docs vs directly using UpdateRequest ?\u00a0\n\n\u00a0 ",
+            "author": "Varun Thacker",
+            "id": "comment-16517023"
+        },
+        {
+            "date": "2018-06-19T13:22:51+0000",
+            "content": "It's not a great ease to add this to SolrClient admittedly (IMO)... and it's easy enough to add a utility method on this test which does this equivalent logic. \u00a0I was about to point out that UpdateRequest's setter methods return \"this\" which can make usage even more compact but this isn't done uniformly here (which is sloppy) \u2013 setParams doesn't. \u00a0\n\nAny way I guess we'll leave SolrClient alone. \u00a0Thanks for your input Varun. \u00a0Yes it's a shame there are so many darned overloaded methods... I think it's a large part due to the optional \"collection\" parameter which like doubles the methods! \u00a0I've been bitten several times writing SolrJ code that doesn't use the right overloaded version (forgot to specify collection). \u00a0I think\u00a0for 8.0, either\u00a0all SolrClient methods without \"collection\" can be removed in favor of insisting you use the overloaded variant accepting a collection, or\u00a0SolrClient itself could be locked down to one collection at the time you create it or have a CollectionSolrClient interface retrieved from a SolrClient.withCollection(collection) in which all the operations that require a SolrClient are on that interface and not SolrClient proper. \u00a0Several ideas to consider.\n\nGus I'll move the logic out of SolrClient and commit later. \u00a0I ran the tests the other day via beasting + precommit and it passed. ",
+            "author": "David Smiley",
+            "id": "comment-16517065"
+        },
+        {
+            "date": "2018-06-19T18:30:16+0000",
+            "content": "The other additions were syntactic sugar, so whatever folks think there is fine. It just seemed to me that varargs was likely just something nobody bothered to add yet, though certainly it's great to discuss all of this. For the method that you pasted above I agree.\u00a0It would be a good\u00a0idea to make a copy of the params and note that in the javadoc for clarity.\u00a0 ",
+            "author": "Gus Heck",
+            "id": "comment-16517404"
+        },
+        {
+            "date": "2018-06-20T14:55:22+0000",
+            "content": "This new test takes a long time and I don't want it to take so long on average. \u00a0Randomization can help here so I chose shards & replicas randomly with the high end being the numbers you chose. \u00a0The patch shows this (and other changes). \u00a0However this test failed on me\u00a0on waitFor the collections after the doc is added. \u00a0Try seed\u00a0-Dtests.seed=613B69692267C615 \u00a0 Can you investigate Gus Heck? \u00a0The # shards & replicas should have no bearing on the test up to this point. ",
+            "author": "David Smiley",
+            "id": "comment-16518222"
+        },
+        {
+            "date": "2018-06-20T16:58:09+0000",
+            "content": "I'll look tonight ",
+            "author": "Gus Heck",
+            "id": "comment-16518348"
+        },
+        {
+            "date": "2018-06-21T05:28:59+0000",
+            "content": "Took the symptoms were quite odd... waiting for ever... and failing, sometimes not finding shards. Turned out our waitCol() method needed the number of shards passed in and then an assert needed it too. ",
+            "author": "Gus Heck",
+            "id": "comment-16518924"
+        },
+        {
+            "date": "2018-06-21T15:52:36+0000",
+            "content": "Thanks; I'm glad that was simple. \u00a0I added some @Slow and @Nightly annotations here.\n\nBeasted, ran all tests, and finally committed: https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;a=commit;h=bc9ac994a4d738faec00f42b1cd3585bd2570c65\u00a0 \u00a0\u00a0\n\nI put you as the \"Author\" in git \u2013 something we don't really have a policy/practice for/against but I figure it makes sense to do this for contributors. ",
+            "author": "David Smiley",
+            "id": "comment-16519535"
+        }
+    ]
+}

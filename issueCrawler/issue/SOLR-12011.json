@@ -1,0 +1,134 @@
+{
+    "id": "SOLR-12011",
+    "title": "Consistence problem when in-sync replicas are DOWN",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.3",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Currently, we will meet consistency problem when in-sync replicas are DOWN. For example:\n 1. A collection with 1 shard with 1 leader and 2 replicas\n 2. Nodes contain 2 replicas go down\n 3. The leader receives an update A, success\n 4. The node contains the leader goes down\n 5. 2 replicas come back\n 6. One of them become leader --> But they shouldn't become leader since they missed the update A\n\nA solution to this issue :\n\n\tThe idea here is using term value of each replica (SOLR-11702) will be enough to tell that a replica received the latest updates or not. Therefore only replicas with the\u00a0highest term can become the leader.\n\tThere are a couple of things need to be done on this issue\n\t\n\t\tWhen leader receives the first updates, its term should be changed from 0 -> 1, so further replicas added to the same shard\u00a0won't be able to become leader (their term = 0) until they finish recovery\n\t\tFor DOWN replicas, the\u00a0leader should also need to check (in DUP.finish()) that those replicas have term less than leader before return results to users\n\t\tJust by looking at term value of replica, it is not enough to tell us that replica is in-sync with leader or not. Because\u00a0that replica\u00a0might not finish the recovery process. We need to introduce another flag (stored on shard term node on ZK) to tell us that replica finished recovery or not. It will look like this.\n\t\t\n\t\t\t{\"code_node1\" : 1, \"core_node2\" : 0}\n \u2014 (when core_node2 start recovery) --->\n\t\t\t{\"core_node1\" : 1, \"core_node2\" : 1, \"core_node2_recovering\" : 1}\n \u2014 (when core_node2 finish recovery) --->\n\t\t\t{\"core_node1\" : 1, \"core_node2\" : 1}",
+    "attachments": {
+        "SOLR-12011.patch": "https://issues.apache.org/jira/secure/attachment/12911476/SOLR-12011.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-02-28T08:15:52+0000",
+            "content": "Thanks Dat. A few comments:\n\n\tThe line log.info(\"skip url:{} cause its term is less than leader\", replica.getCoreUrl()); will be logged on each update request during the time the other replicas don't have the same term as leader. Perhaps this should be debug level.\n\tElectionContext has if (weAreReplacement && isClosed). Did you mean !isClosed?\n\tElectionContext has getReplicas(EnumSet.of(Replica.Type.TLOG, Replica.Type.TLOG). Perhaps you meant TLOG and NRT?\n\tElectionContext has replaced shouldIBeLeader() which has a check for last published state being active. I'm curious if there can be a condition where the term is not registered and last published state is not active and therefore the replica becomes a leader.\n\tPrepRecoveryOp refreshes terms if shardTerms.skipSendingUpdatesTo(coreNodeName) return true. But should it not wait for skip status to go away in a loop? The reason behind PrepRecovery is that we ensure that when the call to prep recovery returns, the leader has already seen the waitForState state and therefore is already forwarding the updates to the recoverying replica. Now that the behavior is changed to forward updates only after the term is equal and not depend on seeing 'recoverying' state, we should change PrepRecovery as well.\n\tAdd a comment before calling getShardTerms(collection, shardId).startRecovering(coreNodeName); and getShardTerms(collection, shardId).doneRecovering(coreNodeName); in ZkController.publish() describing why it is necessary and why only PULL replicas are excluded. I understand the reason but it can be confusing to others reading this code\n\n ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16379927"
+        },
+        {
+            "date": "2018-02-28T08:16:37+0000",
+            "content": "Also, it'd be nice to describe in this issue the solution you have implemented for the sake of completeness. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16379928"
+        },
+        {
+            "date": "2018-02-28T08:56:49+0000",
+            "content": "Thank\u00a0Shalin Shekhar Mangar\n\n1, 3, 6 are correct\n\n2, yeah it seems that {{ if(isClosed) }} we can simply return\n\n4, Can't be, in ZkController.register() we register term of replica first, then do join election\u00a0after that. Besides that last published state is initialized to ACTIVE so when a core is first loaded on startup of a node, the flag is useless\n\n5.\u00a0Should we? Replica only sends PrepRecoveryOp to the leader after success updates its term. So I think a live-fetch on the leader's side will be enough.\u00a0 And I'm afraid that looping at that call can\u00a0cause an endless loop. ( I'm not sure about this point )\n\n\u00a0\n\n\u00a0 ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16379977"
+        },
+        {
+            "date": "2018-02-28T10:49:35+0000",
+            "content": "New patch based on Shalin Shekhar Mangar's review. I will commit soon. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16380116"
+        },
+        {
+            "date": "2018-03-01T04:45:18+0000",
+            "content": "Found a bug in the previous patch. DUP should also skip replica with state == DOWN as well\u00a0 ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16381510"
+        },
+        {
+            "date": "2018-03-01T08:49:19+0000",
+            "content": "Latest patch added changes for\u00a0\u00a0RestoreCoreOp\u00a0and SplitOp where an empty\u00a0core is added new data. We should change term of that replica from 0 -> 1 ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16381688"
+        },
+        {
+            "date": "2018-03-02T06:20:00+0000",
+            "content": "Should we? Replica only sends PrepRecoveryOp to the leader after success updates its term. So I think a live-fetch on the leader's side will be enough.  And I'm afraid that looping at that call can cause an endless loop. ( I'm not sure about this point )\n\nSo I traced the code and a live fetch on the leader works fine today but as a side-effect. We set the term equal to max for a recoverying replica (using ZkShardTerms.startRecovering() method) in ZkController.publish before we publish the replica state to the overseer queue. So if the leader (during prep recovery) sees replica state as recoverying then Zookeeper also guarantees that it will see the max term published before the recoverying state was published. I think we should make this behavior clear via a code comment.\n\nThe changes in SolrCmdDistributor fix a different bug, no? Describe the problem here in this issue and how it is solved. Otherwise extract it to its own ticket.\n\nLatest patch added changes for  RestoreCoreOp and SplitOp where an empty core is added new data\n\nI don't understand this change. It seems to disallow restore or split if the slice has more than 1 replicas? ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16383232"
+        },
+        {
+            "date": "2018-03-02T06:48:50+0000",
+            "content": "So I traced the code and a live fetch on the leader works fine today but as a side-effect. We set the term equal to max for a recoverying replica (using ZkShardTerms.startRecovering() method) in ZkController.publish\u00a0before\u00a0we publish the replica state to the overseer queue. So if the leader (during prep recovery) sees replica state as recoverying then Zookeeper also guarantees that it will see the max term published before the recoverying state was published. I think we should make this behavior clear via a code comment.\nYeah, I will add a comment for clarification\u00a0\n\u00a0The changes in SolrCmdDistributor fix a different bug, no? Describe the problem here in this issue and how it is solved. Otherwise extract it to its own ticket.\nHmm, you're right,\u00a0maybe the changes in SolrCmdDistributor should go into SOLR-11702\nLatest patch added changes for RestoreCoreOp and SplitOp where an empty core is added new data\nThe destination for RestoreCoreOp and SplitOp should be for slice with no more than 1 replicas, and that how some collections API use these admins API. If not, how can other replicas in the same shard acknowledge the changes and put themselves to recovery?\u00a0 ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16383261"
+        },
+        {
+            "date": "2018-03-02T09:32:02+0000",
+            "content": "Thanks for explaining. +1 to commit. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16383394"
+        },
+        {
+            "date": "2018-03-02T09:51:03+0000",
+            "content": "Thanks a lot for your hard works, Shalin Shekhar Mangar\n\nThe latest patch for this ticket will commit soon. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16383405"
+        },
+        {
+            "date": "2018-03-02T17:05:35+0000",
+            "content": "As I understand it, you're describing a situation where only the leader is up for an update, then that one replica (the leader) goes down, followed by the other replicas coming back up.\n\nWhat are you suggesting happens in this situation?  Does the shard just wait, with no leader at all, until the replica that got the update comes back?  What if it never comes back, or when it comes back all its data is gone? ",
+            "author": "Shawn Heisey",
+            "id": "comment-16383820"
+        },
+        {
+            "date": "2018-03-02T23:32:30+0000",
+            "content": "Shawn Heisey Yeah, the shard just wait, with no leader at all, until the replica that got update comes back OR users use FORCE_LEADER API (if it never comes back). My idea for this problem (in a different ticket) is increasing the leaderVoteWait to 1hour as default and after that timeout, replicas just go ahead and become leader. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16384312"
+        },
+        {
+            "date": "2018-03-04T05:57:18+0000",
+            "content": "Commit 9de4225e9a54ba987c2c7c9d4510bea3e4f9de97 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9de4225 ]\n\nSOLR-12011: Consistence problem when in-sync replicas are DOWN ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16384981"
+        },
+        {
+            "date": "2018-03-04T05:58:06+0000",
+            "content": "Commit 59f67468b7f9f90f2377033d358521d451508f9a in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=59f67468 ]\n\nSOLR-12011: Consistence problem when in-sync replicas are DOWN ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16384982"
+        },
+        {
+            "date": "2018-03-05T09:33:58+0000",
+            "content": "Commit 27eb6ba0620abc096aeabf5817e54c9e27976074 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=27eb6ba ]\n\nSOLR-12011: Remove FORCEPREPAREFORLEADERSHIP ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16385852"
+        },
+        {
+            "date": "2018-03-05T09:35:00+0000",
+            "content": "Commit d7824a3793f8ec697a6f9a4f12eeb052a68b4782 in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d7824a3 ]\n\nSOLR-12011: Remove FORCEPREPAREFORLEADERSHIP ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16385854"
+        },
+        {
+            "date": "2018-03-10T00:53:40+0000",
+            "content": "Commit e47bf8b63aa732c884091f48ffe5b467c94e590c in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e47bf8b ]\n\nSOLR-12011: Remove unused imports ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16393893"
+        },
+        {
+            "date": "2018-03-10T01:17:22+0000",
+            "content": "Commit 40660ade9d296bacae4b7a2e23364da8aeae7b35 in lucene-solr's branch refs/heads/branch_7x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=40660ad ]\n\nSOLR-12011: Remove unused imports\n\n(cherry picked from commit e47bf8b) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16393925"
+        }
+    ]
+}

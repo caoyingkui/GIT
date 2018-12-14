@@ -1,0 +1,72 @@
+{
+    "id": "LUCENE-4259",
+    "title": "Allow reloading of codec/postings format list when classpath changes",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-BETA",
+            "6.0"
+        ],
+        "affect_versions": "4.0-ALPHA",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "While implementing the SPI for analysis factories, Robert and me found out that Solr does not see codecs/postingsformats or analysis factories outside it's webapp/lib folder. The reason is simple: SPI uses by default the context classloader of the thread calling the codec API for the first time (which is Jetty's webapp classpath).\n\nWe solved the problem for analysis factories, because those are loaded with the help of SolrResourceLoader, which exports the ClassLoader it uses, so it can return all analysis compoenst visible to the ResourceLoader. This is cool, because you can drop the analysis/smartchinese or analysis/icu module JAR into your plugin folder and Solr will automatically use it.\n\nFor Codecs and PostingsFormats this is a little bit more complicated: The list of codecs is loaded on clinit of Codecs.class or PostingsFormat.class, which can be very early in Solr's startup. When Solr changes his classpath in ResourceLoader, the new Codecs are never seen, so you cannot drop new codecs into the plugin folder. Similar problems may happen with other webapps, because Tomcat & Jetty have crazy classloader delegations (there were although reports that Lucene did not find their codecs at all - Simon Willnauer told me!)\n\nThis patch will change NamedSPILoader to provide similar support like java.util.ServiceLoader does in JDK: You can tell NamedSPILoader to reload (means again list the classpath's JAR files and look for new META-INF/services files). This API is statically exported to Codec.reloadCodecs() and PostingsFormat.reploadPostingsFormats(), which takes a ClassLoader. This Classloader will then be checked only for new codecs, old ones or those already visible are not removed/replaced. SolrResourceLoader can then call this static method on each change of its classloader on startup.\n\nThe implementation presented here is threadsafe, the SPI map is updated in a copy-on-write way and assigned to a volatile field.",
+    "attachments": {
+        "LUCENE-4259.patch": "https://issues.apache.org/jira/secure/attachment/12537991/LUCENE-4259.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-07-26T15:13:18+0000",
+            "content": "I think this is a good clean solution to fixing the fact you cannot plugin additional \ncodecs/postingsformats to solr by dropping them in the lib/ directory.\n\nA few questions:\n1. I think solr should reload postingsformats first, then codecs? Some codecs might call \nPostingsFormat.forName in their ctor (Lucene40Codec does this, we should remove it, its stupid).\n2. Should the analysis loader be changed to work just like this? It would simplify things in my opinion. ",
+            "author": "Robert Muir",
+            "id": "comment-13423136"
+        },
+        {
+            "date": "2012-07-26T15:25:23+0000",
+            "content": "Thanks for comment:\n\nI think solr should reload postingsformats first, then codecs? Some codecs might call \nPostingsFormat.forName in their ctor (Lucene40Codec does this, we should remove it, its stupid).\n\nYes, I change that. In ym opinion we might add a utility method somewhere in Lucene Core to do it in correct order. I know the problems of the order of init: Codec.class itsself inits defaultCodec with forName(), which is fine as same class, but cross-calling forName on init is not good. At the end it can to chicken-egg bugls like in ICU4J\n\nShould the analysis loader be changed to work just like this? It would simplify things in my opinion.\n\nI was thinking about that. I will change the AnalysisSPILoader to support reloading and the abtsract Factories to support this, too - so its useable by 3rd party projects.\n\nFor Solr, the current solution is much better and safe, especially with class unloading. The problem with codecs is not solveable in a different way, because we need the static Codec.forName() for the internals of Lucene to work, so we have to modify the static instance (singleton) to reload itsself. For analysis, we dont need this (as inside Solr, only Solr's code who owns the AnalysisSPILoader will instantiate tokenizers) and the ResourceLoader approach we currently use is much cleaner and allows the ClassLoader to be released if you shutdown Solr. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13423144"
+        },
+        {
+            "date": "2012-07-26T15:45:51+0000",
+            "content": "Attached new patch with the changes in order of reload + AnalysisSPI handler supplied with the same mechanism.\n\nI will think a little bit about Solr. Maybe it is indeed a good idea to do it in the same way like for codecs. The current approach has also the problem when a TokenFilter uses TokenFilterFactory.newInstance() to create another filter it implicitely wraps, this will not work with solr, as this would use the context class path again.\n\nI think as we already linked codecs hard ref'd to lucene-core.jar there is no problem to break class unloading also for analysis.\n\nWe can also hide the SPI loader & the crazy methods in the factories again  ",
+            "author": "Uwe Schindler",
+            "id": "comment-13423163"
+        },
+        {
+            "date": "2012-07-26T16:31:20+0000",
+            "content": "Patch that cleans up SolrResourceLoader to use the reloading of SPIs. I also fixed the slowdown by calling the reload too often. Now its only called 2 times on Solr boot: After ResourceLoader is created and a second time after SolrConfig loaded. The crazy pkg-private addToClassLoader methods are only called from SolrConfig. This is not good at all, modifiable classes are jgdjwqgdkjq! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13423198"
+        },
+        {
+            "date": "2012-07-26T16:50:14+0000",
+            "content": "Seems to work fine!\n\nI created CrazyPostingsFormat (inside lucene-demo.jar, just returns SimpleText impls), \nconfigured SchemaCodecFactory in solrconfig.xml, configured text_general with postingsFormat=Crazy and tokenizer of solr.ICUTokenizerFactory and indexed the example docs, all works.\n\n\n-rw-rw-r-- 1 rmuir rmuir 56433 Jul 26 12:47 _0_Crazy_0.pst\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13423220"
+        },
+        {
+            "date": "2012-07-26T17:59:31+0000",
+            "content": "Updated patch with javadocs corrected, will commit now. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13423293"
+        },
+        {
+            "date": "2012-07-26T18:02:29+0000",
+            "content": "Committed trunk revision: 1366115\nCommitted 4.x revision: 1366116 ",
+            "author": "Uwe Schindler",
+            "id": "comment-13423298"
+        },
+        {
+            "date": "2012-07-26T18:02:52+0000",
+            "content": "Thanks Robert for testing with AlcoholicPostingsFormat! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13423300"
+        }
+    ]
+}

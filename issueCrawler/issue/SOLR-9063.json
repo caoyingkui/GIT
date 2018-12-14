@@ -1,0 +1,42 @@
+{
+    "id": "SOLR-9063",
+    "title": "CloudSolrClient with _route_ shouldn't require collection param to disambig cores",
+    "details": {
+        "components": [
+            "SolrCloud",
+            "SolrJ"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "4.10.4",
+        "status": "Closed",
+        "resolution": "Not A Problem",
+        "priority": "Major"
+    },
+    "description": "CloudSolrClient uses _route_ to know where to send a request  It sorta works \u2013 it'll go to an appropriate node.  But it will only go to the correct core on that node if the collection parameter is explicitly added.  In another words, it ignores the default collection configured on CloudSolrClient.  It also seems to ignore \"collection\" parameter to the protected method sendRequest for this purpose too.  As I write this, see line 1139 on master.",
+    "attachments": {
+        "SOLR_9063.patch": "https://issues.apache.org/jira/secure/attachment/12802524/SOLR_9063.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-05-04T15:59:48+0000",
+            "author": "David Smiley",
+            "content": "This problem occurs when multiple shards are on the same server/node.  Investigating further, trying to put together a patch either adding a new test or more likely strengthening some existing tests to sometimes co-host the shards. ",
+            "id": "comment-15270887"
+        },
+        {
+            "date": "2016-05-05T05:37:01+0000",
+            "author": "David Smiley",
+            "content": "Okay I chased this one down sufficiently to know what's going on.  Strictly speaking, there is no bug, or perhaps a small one.  In SOLR-5380 Mark Miller fixed a bug in CloudSolrClient involving aliases pointing to multiple collections, and when \"collection\" was not specified as a parameter thus relying on the default collection (an alias).  I think it's because when the server gets the request to a specific core, doesn't know what the original/unresolved alias was.  So the solution implemented as seen in the code now is to send the request to a collection (the alias) level URL instead of to a specific core, but to do this only when \"collection\" isn't a parameter.  If \"collection\" is a parameter, then the server end will know how to deal with it.\n\nBut I think the logic to know when to do this should be improved to go to the collection level URL (thus not to the core) in more constrained circumstances.  In particular, if collectionNames.size() == 1 then it can go directly to the core URL, as we just resolved the alias (if there even was one).  I think the condition to differentiate should be exactly that instead of combining in the current condition looking to see if \"collection\" was specified, if at least for the reason of simpler understanding.  Would this be an optimization or simplification?  I'm not completely sure.\n\nHere's the snippet I propose it become:\n\n            String url;\n            if (collectionNames.size() > 1) {\n              // If there was an alias pointing to multiple collections, we can't send directly to a core.  If it were\n              // convenient to modify the params to add collection=(list) we would but it isn't.  So we send the request\n              // to the collection at the node and let the server end handle dispatching (incl. alias resolution).\n              url = ZkCoreNodeProps.getCoreUrl(nodeProps.getStr(ZkStateReader.BASE_URL_PROP), collection);\n            } else {\n              url = coreNodeProps.getCoreUrl();\n            }\n            ((!sendToLeaders || coreNodeProps.isLeader()) ? urlList2 : replicas).add(url);\n\n\n\nHow did I run into this?  I'm working with a codebase that wanted to make a request to a custom request handler that did not extend SearchHandler.  It's expected that a request be routed to the proper shard via an explicit _route_, which we do and CloudSolrClient processes that param.  However, because we didn't set \"collection\" as a param (we relied on the default collection prop), CloudSolrClient ignored it's work in figuring out which shard to send it to and instead sent the request to the collection level.  At the server end, HttpSolrCall doesn't process _route_ so it arbitrarily passed the request to a shard that was the wrong one on the node.  If the request handler were a SearchHandler (it isn't), then it'd become a distributed search to the _route_ handling logic in HttpShardHandler.  The solution was quite simple \u2013 add \"collection\" and don't use the default collection setting.  That seemed awfully weird so I spent today finding out why it didn't work.  I argue this should work and hence I propose the simple change above.\n\nTesting in progress... ",
+            "id": "comment-15271908"
+        },
+        {
+            "date": "2016-05-05T20:49:05+0000",
+            "author": "David Smiley",
+            "content": "Testing revealed at least one issue: It's insufficient for the condition to be simply collectionNames.size() > 1 because the collection String might actually be a comma delimited list.  So that brings me to: if (collectionNames.size() > 1 && reqParams.get(UpdateParams.COLLECTION) == null).  ...\n\nThen StressHdfsTest failed reproducibly with seed A8BBAE62E21BB966.  There was some other failure but it didn't reproduce/happen again.  The failure is Jetty returning an HTML page of 404 status trying to reach a specific core URL.  Here's the trace:\n\n\nat org.apache.solr.client.solrj.impl.HttpSolrClient.executeMethod(HttpSolrClient.java:574)\n\tat org.apache.solr.client.solrj.impl.HttpSolrClient.request(HttpSolrClient.java:259)\n\tat org.apache.solr.client.solrj.impl.HttpSolrClient.request(HttpSolrClient.java:248)\n\tat org.apache.solr.client.solrj.impl.LBHttpSolrClient.doRequest(LBHttpSolrClient.java:413)\n\tat org.apache.solr.client.solrj.impl.LBHttpSolrClient.request(LBHttpSolrClient.java:366)\n\tat org.apache.solr.client.solrj.impl.CloudSolrClient.sendRequest(CloudSolrClient.java:1204)\n\tat org.apache.solr.client.solrj.impl.CloudSolrClient.requestWithRetryOnStaleState(CloudSolrClient.java:965)\n\tat org.apache.solr.client.solrj.impl.CloudSolrClient.request(CloudSolrClient.java:901)\n\tat org.apache.solr.client.solrj.SolrRequest.process(SolrRequest.java:149)\n\tat org.apache.solr.client.solrj.SolrClient.commit(SolrClient.java:484)\n\tat org.apache.solr.client.solrj.SolrClient.commit(SolrClient.java:463)\n\tat org.apache.solr.cloud.hdfs.StressHdfsTest.createAndDeleteCollection(StressHdfsTest.java:208)\n\tat org.apache.solr.cloud.hdfs.StressHdfsTest.test(StressHdfsTest.java:104)\n\tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n\tat sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)\n\tat sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n\tat java.lang.reflect.Method.invoke(Method.java:498)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner.invoke(RandomizedRunner.java:1764)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$8.evaluate(RandomizedRunner.java:871)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$9.evaluate(RandomizedRunner.java:907)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$10.evaluate(RandomizedRunner.java:921)\n\n\nI have suspicions it's an issue with the test but I'm not sure.  I don't have time to debug this one further, and as this isn't pressing I think I'll move on from this issue for now.\n\nStepping back a bit, might it make more sense to always go to the collection level URL at an appropriate node?  Kinda the opposite of what I've been trying to do.  That would be consistent, which is nice.  But then ideally, to retain some of the direct routing going on here, HttpSolrCall would have to gain the ability to dispatch based on _route_.  That sounds like a better path, actually, although the thought of it sheds more light on duplicated routing logic for different contexts: CloudSolrClient, HttpSolrCall, HttpShardHandler.  Maybe elsewhere too.  :-/ ",
+            "id": "comment-15273044"
+        }
+    ]
+}

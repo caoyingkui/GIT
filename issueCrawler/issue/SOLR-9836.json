@@ -1,0 +1,206 @@
+{
+    "id": "SOLR-9836",
+    "title": "Add more graceful recovery steps when failing to create SolrCore",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.7",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Reopened",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "I have seen several cases where there is a zero-length segments_n file. We haven't identified the root cause of these issues (possibly a poorly timed crash during replication?) but if there is another node available then Solr should be able to recover from this situation. Currently, we log and give up on loading that core, leaving the user to manually intervene.",
+    "attachments": {
+        "SOLR-9836.patch": "https://issues.apache.org/jira/secure/attachment/12842195/SOLR-9836.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-12-07T19:22:48+0000",
+            "author": "Mike Drob",
+            "content": "Attaching a first attempt at improving this behaviour.\n\nSome open discussion points -\n\n\tDo we want to expand this for other types of failures? I think yes, but in a future iteration/JIRA.\n\tWould it be safe to add directoryFactory.doneWithDirectory() to modifyIndexProps\n\tShould modifyIndexProps stay in IndexFetcher or move somewhere more generic?\n\n ",
+            "id": "comment-15729667"
+        },
+        {
+            "date": "2016-12-07T20:01:09+0000",
+            "author": "Mark Miller",
+            "content": "We probably want to be able to turn it off. Some users may want to ability to use check index and try to salvage what they can in corruption cases.\n\nI'm not sure that is the right exception to catch - very brittle. We should probably be mostly looking for CorruptedIndexException and if that doesn't cover a case at the Lucene level, look at improving that there. Even if the case of a 0 byte segments file with nothing to roll back on throws an EOFException today, it may not tomorrow. I think that is the goal of the CorruptIndexException - you can actually have a little more than momentary confidence that your code is not treating exceptions one way while things change underneath you over time.\n\nWould it be safe to add directoryFactory.doneWithDirectory() to modifyIndexProps\ndirectoryFactory.doneWithDirectory is for the case where you are done with the directory and it can now be deleted if need be - you won't access it again.\n\nShould modifyIndexProps stay in IndexFetcher or move somewhere more generic?\n\nI have not looked yet, but may make more sense in SolrCore or something. ",
+            "id": "comment-15729763"
+        },
+        {
+            "date": "2016-12-07T20:08:38+0000",
+            "author": "Mark Miller",
+            "content": "I think initially it would be good to offer three options.\n\n\n\tNo action\n\tRecovery from leader on a CorruptedIndexException\n\tOnly recover from leader if the segments file is not readable and there is none to fall back to\n\n ",
+            "id": "comment-15729780"
+        },
+        {
+            "date": "2016-12-07T20:12:48+0000",
+            "author": "Mark Miller",
+            "content": "directoryFactory.doneWithDirectory is for the case where you are done with the directory and it can now be deleted if need be\n\nShould not have said deleted, it was just on my mind due to the ephemeral directory factories, but you can expect data to survive if you have not specified options otherwise. It's for one off directories though, or directories you are moving on from - once their reference counts hit 0, they can be let out of the cache. ",
+            "id": "comment-15729792"
+        },
+        {
+            "date": "2016-12-07T23:17:32+0000",
+            "author": "Mike Drob",
+            "content": "I'm not sure that is the right exception to catch - very brittle. We should probably be mostly looking for CorruptedIndexException and if that doesn't cover a case at the Lucene level, look at improving that there. Even if the case of a 0 byte segments file with nothing to roll back on throws an EOFException today, it may not tomorrow. I think that is the goal of the CorruptIndexException - you can actually have a little more than momentary confidence that your code is not treating exceptions one way while things change underneath you over time.\nI could add a check somewhere along the chain that would turn an EOF into a CorruptIndex. However, I'm not confident enough in the lucene internals to know if this leads to eventual false positives somewhere...  It probably looks like:\nSegmentInfos.java:276\n     long generation = generationFromSegmentsFileName(segmentFileName);\n     //System.out.println(Thread.currentThread() + \": SegmentInfos.readCommit \" + segmentFileName);\n+    ChecksumIndexInput saved = null;\n     try (ChecksumIndexInput input = directory.openChecksumInput(segmentFileName, IOContext.READ)) {\n+      saved = input;\n       return readCommit(directory, input, generation);\n+    } catch (EOFException e) {\n+      throw new CorruptIndexException(\"Unexpected end of file while reading index.\", saved, e);\n     }\n   }\n\n\n\nBut the method javadoc worries me: * Read a particular segmentFileName.  Note that this may throw an IOException if a commit is in process.\nUnder what circumstances would this throw an IOException? Randomly returning CorruptIndex during normal operation is bad news. ",
+            "id": "comment-15730254"
+        },
+        {
+            "date": "2016-12-12T23:31:05+0000",
+            "author": "Mike Drob",
+            "content": "Filed LUCENE-7592 to deal with the exception throwing issue. ",
+            "id": "comment-15743514"
+        },
+        {
+            "date": "2016-12-15T22:17:21+0000",
+            "author": "Mike Drob",
+            "content": "Current WIP patch.\n\n\n\tMoved modifyIndexProps to SolrCore\n\tAdded system property toggle for controlling desired behaviour here.\n\t\n\t\tProperty name and values are shots in the dark and by no means final\n\t\tUsed an enum because it made sense logically at the time, not sure if this actually matters.\n\t\n\t\n\tSwitched to looking for CorruptIndexException\n\n\n\n\n\tFall back to earlier segments file implementation is missing, pending some questions below. (there's a unit test though)\n\t\n\t\tIt's very hard to tell if it was actually the segments file that is corrupt, or if it was something else.\n\t\tIs it sufficient to delete segments_n and let lucene try to read from the new \"latest\" commit? Will this screw up replication? Do we need to update the generation anywhere else? And I'm still nervous about indiscriminately deleting files where recovery might be possible. I guess that's the point of the config options.\n\t\tAnother option is to hack a FilterDirectory on the index that would hide the latest segments_n file instead of deleting it. That might work to open it, but we will likely end up with write conflicts next time we commit.\n\t\n\t\n\n\n\nThe more I toss this idea around, the more it feels like something that would be more cleanly handled at the Lucene level. Possibly best to have two options (recover from leader, do nothing) instead of the initial three proposed by Mark Miller and expand on them later. ",
+            "id": "comment-15752667"
+        },
+        {
+            "date": "2016-12-16T03:40:08+0000",
+            "author": "Mark Miller",
+            "content": "Fall back to earlier segments file implementation is missing\n\nThis should already be Lucene's behavior. I assume if it's not falling back it's because there is no previous segments file to fall back to.  ",
+            "id": "comment-15753324"
+        },
+        {
+            "date": "2016-12-16T03:42:06+0000",
+            "author": "Mark Miller",
+            "content": "Possibly best to have two options \n\nThe third option is not very difficult. Lucene already loads the last segments file it can. So if we get a corrupt index, we can just sanity check that the segments file can be loaded. If it can't, we can't fix things anyway, so recover. If the segments file looks fine, don't recover because the index could be corrected. ",
+            "id": "comment-15753330"
+        },
+        {
+            "date": "2016-12-16T17:21:29+0000",
+            "author": "Mike Drob",
+            "content": "This should already be Lucene's behavior. I assume if it's not falling back it's because there is no previous segments file to fall back to. \nI didn't see Lucene doing this. Or at least, I didn't see Solr leverage Lucene to do this. Both through manual inspection of the code and through testing via MissingSegmentRecoveryTest::testRollback in my patch. ",
+            "id": "comment-15755004"
+        },
+        {
+            "date": "2016-12-27T14:29:55+0000",
+            "author": "Mark Miller",
+            "content": "I believe it's in SegmentInfos->FindSegmentsFile. We can leave the third option for another JIRA though. ",
+            "id": "comment-15780504"
+        },
+        {
+            "date": "2016-12-27T15:15:15+0000",
+            "author": "Mike Drob",
+            "content": "I believe it's in SegmentInfos->FindSegmentsFile\nThat only goes forward in case of concurrent commits, I don't see it ever falling back to an older segments.\n\nChanges in latest patch:\n\n\tCompletely drop attempts to open older segments. Leaving it for future work.\n\tAdded javadocs.\n\tPreserve original exception in case there is still a problem the second time we create SolrCore\n\n\n\nMissingSegmentRecoveryTest takes ~45 seconds to run on my machine. Is this long enough that it deserves a @Slow annotation? ",
+            "id": "comment-15780583"
+        },
+        {
+            "date": "2016-12-27T15:25:52+0000",
+            "author": "Mark Miller",
+            "content": "That only goes forward in case of concurrent commits, I don't see it ever falling back to an older segments.\n\nThat would be very surprising to me. A lot of code has changed in this area since I've looked at it closer, but if Lucene crashes while writing the segments file and then can't load the index rather than falling back to the last successful commit, I'd be really surprised. I'm not current on the strategy for that situation though. ",
+            "id": "comment-15780603"
+        },
+        {
+            "date": "2016-12-27T15:37:44+0000",
+            "author": "Mark Miller",
+            "content": "Hmm, okay, it looks like these days we count on a file rename to publish the segments file, so that case is avoided all together. We can just still probably see it because we have replication and external things like that. ",
+            "id": "comment-15780635"
+        },
+        {
+            "date": "2016-12-27T17:06:42+0000",
+            "author": "Mark Miller",
+            "content": "Is this long enough that it deserves a @Slow annotation?\n\nYes.\n\nHave you run the full test suite as well yet? ",
+            "id": "comment-15780798"
+        },
+        {
+            "date": "2016-12-28T20:16:58+0000",
+            "author": "Mike Drob",
+            "content": "Have you run the full test suite as well yet?\nI'm getting some errors related to backup/restore operations that go away if I modify those tests to useFactory(\"solr.StandardDirectoryFactory\") instead of RAM/Mock. Will look into this further and then post a new patch when I figure it out. ",
+            "id": "comment-15783628"
+        },
+        {
+            "date": "2016-12-29T16:17:11+0000",
+            "author": "Mike Drob",
+            "content": "version 4:\n\n\tRebased patch onto master, incorporating changes from SOLR-9859.\n\tAddressed failing tests.\n\n ",
+            "id": "comment-15785615"
+        },
+        {
+            "date": "2017-01-04T18:42:19+0000",
+            "author": "Mike Drob",
+            "content": "Patch #5 - rebase based on changes from solr metrics. ",
+            "id": "comment-15799012"
+        },
+        {
+            "date": "2017-01-04T20:46:40+0000",
+            "author": "Mark Miller",
+            "content": "writeNewIndexProps no longer has the correct impl - needs to be properly merged up. ",
+            "id": "comment-15799285"
+        },
+        {
+            "date": "2017-01-04T21:29:47+0000",
+            "author": "Mike Drob",
+            "content": "Yep, you're right, the delete snuck in. Thanks for looking. ",
+            "id": "comment-15799401"
+        },
+        {
+            "date": "2017-01-04T22:16:41+0000",
+            "author": "Mike Drob",
+            "content": "I'm running some tests, but getting failures from I think SOLR-9928. And also some failures in CoreAdminRequestStatusTest, but get those without my patch applied also. Will try to track all of these down. ",
+            "id": "comment-15799515"
+        },
+        {
+            "date": "2017-01-05T00:44:48+0000",
+            "author": "Mike Drob",
+            "content": "Never mind, the CoreAdminRequestStatusTest failures I saw were due to an environment issue on my end. I think everything is passing for me now. ",
+            "id": "comment-15799852"
+        },
+        {
+            "date": "2017-01-13T18:11:45+0000",
+            "author": "Mike Drob",
+            "content": "Attaching the patch rebased onto latest master, since the current one wouldn't apply cleanly anymore. ",
+            "id": "comment-15822086"
+        },
+        {
+            "date": "2017-01-17T17:53:45+0000",
+            "author": "Mark Miller",
+            "content": "Thanks Mike, I'm getting this in today. ",
+            "id": "comment-15826486"
+        },
+        {
+            "date": "2017-01-18T01:32:14+0000",
+            "author": "Mark Miller",
+            "content": "Okay, I'm pretty happy with this patch. I'll commit tomorrow to give anyone else with an interest a chance to weigh in. ",
+            "id": "comment-15827210"
+        },
+        {
+            "date": "2017-01-19T00:45:56+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit a89560bb72de57d291db45c52c04b9edf6c91d92 in lucene-solr's branch refs/heads/master from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a89560b ]\n\nSOLR-9836: Add ability to recover from leader when index corruption is detected on SolrCore creation. ",
+            "id": "comment-15829071"
+        },
+        {
+            "date": "2017-01-19T02:18:55+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 59d7bc5ede7cf4d50b5efb79b31bc0343d6f10dc in lucene-solr's branch refs/heads/branch_6x from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=59d7bc5 ]\n\nSOLR-9836: Add ability to recover from leader when index corruption is detected on SolrCore creation.\n\n\n\tConflicts:\n\tsolr/CHANGES.txt\n\tsolr/core/src/java/org/apache/solr/core/CoreContainer.java\n\n ",
+            "id": "comment-15829176"
+        },
+        {
+            "date": "2017-01-19T23:30:32+0000",
+            "author": "Hoss Man",
+            "content": "FWIW: erick found a diff situation where corruption prevented solr from being able to do a full fetch index to recover that is evidently not solved by this existing fix: SOLR-10006 ",
+            "id": "comment-15830819"
+        },
+        {
+            "date": "2017-03-03T21:16:56+0000",
+            "author": "Steve Rowe",
+            "content": "MissingSegmentRecoveryTest.testLeaderRecovery() has been failing pretty regularly on Jenkins.  Something happened on or about February 10th, when the probability of failure went up considerably (and has since remained at this elevated level).\n\nI got 3 failures beasting 100 iterations of the test suite using Miller's beasting script on my box.  However, for the past three weeks I've gotten several failures a day on my Jenkins, and roughly once a day on either ASF or Policeman Jenkins.\n\nHere's a recent failure https://builds.apache.org/job/Lucene-Solr-Tests-master/1699/:\n\n\n  [junit4]   2> 599977 ERROR (coreLoadExecutor-3254-thread-1-processing-n:127.0.0.1:41308_solr) [n:127.0.0.1:41308_solr c:MissingSegmentRecoveryTest s:shard1 r:core_node1 x:MissingSegmentRecoveryTest_shard1_replica2] o.a.s.u.SolrIndexWriter Error closing IndexWriter\n  [junit4]   2> java.nio.file.NoSuchFileException: /x1/jenkins/jenkins-slave/workspace/Lucene-Solr-Tests-master/solr/build/solr-core/test/J2/temp/solr.cloud.MissingSegmentRecoveryTest_B800C15EC6F11C02-001/tempDir-001/node2/MissingSegmentRecoveryTest_shard1_replica2/data/index.20170228030909468/write.lock\n  [junit4]   2> \tat sun.nio.fs.UnixException.translateToIOException(UnixException.java:86)\n  [junit4]   2> \tat sun.nio.fs.UnixException.rethrowAsIOException(UnixException.java:102)\n  [junit4]   2> \tat sun.nio.fs.UnixException.rethrowAsIOException(UnixException.java:107)\n  [junit4]   2> \tat sun.nio.fs.UnixFileAttributeViews$Basic.readAttributes(UnixFileAttributeViews.java:55)\n  [junit4]   2> \tat sun.nio.fs.UnixFileSystemProvider.readAttributes(UnixFileSystemProvider.java:144)\n  [junit4]   2> \tat sun.nio.fs.LinuxFileSystemProvider.readAttributes(LinuxFileSystemProvider.java:99)\n  [junit4]   2> \tat java.nio.file.Files.readAttributes(Files.java:1737)\n  [junit4]   2> \tat org.apache.lucene.store.NativeFSLockFactory$NativeFSLock.ensureValid(NativeFSLockFactory.java:177)\n  [junit4]   2> \tat org.apache.lucene.store.LockValidatingDirectoryWrapper.sync(LockValidatingDirectoryWrapper.java:67)\n  [junit4]   2> \tat org.apache.lucene.index.IndexWriter.startCommit(IndexWriter.java:4698)\n  [junit4]   2> \tat org.apache.lucene.index.IndexWriter.prepareCommitInternal(IndexWriter.java:3093)\n  [junit4]   2> \tat org.apache.lucene.index.IndexWriter.commitInternal(IndexWriter.java:3227)\n  [junit4]   2> \tat org.apache.lucene.index.IndexWriter.shutdown(IndexWriter.java:1136)\n  [junit4]   2> \tat org.apache.lucene.index.IndexWriter.close(IndexWriter.java:1179)\n  [junit4]   2> \tat org.apache.solr.update.SolrIndexWriter.close(SolrIndexWriter.java:291)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.initIndex(SolrCore.java:728)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:911)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:828)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.processCoreCreateException(CoreContainer.java:1011)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.create(CoreContainer.java:939)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.lambda$load$3(CoreContainer.java:572)\n  [junit4]   2> \tat com.codahale.metrics.InstrumentedExecutorService$InstrumentedCallable.call(InstrumentedExecutorService.java:197)\n  [junit4]   2> \tat java.util.concurrent.FutureTask.run(FutureTask.java:266)\n  [junit4]   2> \tat org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor.lambda$execute$0(ExecutorUtil.java:229)\n  [junit4]   2> \tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)\n  [junit4]   2> \tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)\n[...]\n  [junit4]   2> 600005 ERROR (coreContainerWorkExecutor-3250-thread-1-processing-n:127.0.0.1:41308_solr) [n:127.0.0.1:41308_solr    ] o.a.s.c.CoreContainer Error waiting for SolrCore to be created\n  [junit4]   2> java.util.concurrent.ExecutionException: org.apache.solr.common.SolrException: Unable to create core [MissingSegmentRecoveryTest_shard1_replica2]\n  [junit4]   2> \tat java.util.concurrent.FutureTask.report(FutureTask.java:122)\n  [junit4]   2> \tat java.util.concurrent.FutureTask.get(FutureTask.java:192)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.lambda$load$4(CoreContainer.java:600)\n  [junit4]   2> \tat com.codahale.metrics.InstrumentedExecutorService$InstrumentedRunnable.run(InstrumentedExecutorService.java:176)\n  [junit4]   2> \tat java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)\n  [junit4]   2> \tat java.util.concurrent.FutureTask.run(FutureTask.java:266)\n  [junit4]   2> \tat org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor.lambda$execute$0(ExecutorUtil.java:229)\n  [junit4]   2> \tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)\n  [junit4]   2> \tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)\n  [junit4]   2> \tat java.lang.Thread.run(Thread.java:745)\n  [junit4]   2> Caused by: org.apache.solr.common.SolrException: Unable to create core [MissingSegmentRecoveryTest_shard1_replica2]\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.create(CoreContainer.java:952)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.lambda$load$3(CoreContainer.java:572)\n  [junit4]   2> \tat com.codahale.metrics.InstrumentedExecutorService$InstrumentedCallable.call(InstrumentedExecutorService.java:197)\n  [junit4]   2> \t... 5 more\n  [junit4]   2> Caused by: org.apache.solr.common.SolrException: Error opening new searcher\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:964)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:828)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.processCoreCreateException(CoreContainer.java:1011)\n  [junit4]   2> \tat org.apache.solr.core.CoreContainer.create(CoreContainer.java:939)\n  [junit4]   2> \t... 7 more\n  [junit4]   2> \tSuppressed: org.apache.solr.common.SolrException: Error opening new searcher\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:964)\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:828)\n  [junit4]   2> \t\tat org.apache.solr.core.CoreContainer.create(CoreContainer.java:937)\n  [junit4]   2> \t\t... 7 more\n  [junit4]   2> \tCaused by: org.apache.solr.common.SolrException: Error opening new searcher\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:2005)\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:2125)\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.initSearcher(SolrCore.java:1053)\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:937)\n  [junit4]   2> \t\t... 9 more\n  [junit4]   2> \tCaused by: org.apache.lucene.index.CorruptIndexException: Unexpected file read error while reading index. (resource=BufferedChecksumIndexInput(MMapIndexInput(path=\"/x1/jenkins/jenkins-slave/workspace/Lucene-Solr-Tests-master/solr/build/solr-core/test/J2/temp/solr.cloud.MissingSegmentRecoveryTest_B800C15EC6F11C02-001/tempDir-001/node2/MissingSegmentRecoveryTest_shard1_replica2/data/index/segments_2\")))\n  [junit4]   2> \t\tat org.apache.lucene.index.SegmentInfos.readCommit(SegmentInfos.java:286)\n  [junit4]   2> \t\tat org.apache.lucene.index.IndexWriter.<init>(IndexWriter.java:938)\n  [junit4]   2> \t\tat org.apache.solr.update.SolrIndexWriter.<init>(SolrIndexWriter.java:125)\n  [junit4]   2> \t\tat org.apache.solr.update.SolrIndexWriter.create(SolrIndexWriter.java:100)\n  [junit4]   2> \t\tat org.apache.solr.update.DefaultSolrCoreState.createMainIndexWriter(DefaultSolrCoreState.java:240)\n  [junit4]   2> \t\tat org.apache.solr.update.DefaultSolrCoreState.getIndexWriter(DefaultSolrCoreState.java:114)\n  [junit4]   2> \t\tat org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:1966)\n  [junit4]   2> \t\t... 12 more\n  [junit4]   2> \tCaused by: java.io.EOFException: read past EOF: MMapIndexInput(path=\"/x1/jenkins/jenkins-slave/workspace/Lucene-Solr-Tests-master/solr/build/solr-core/test/J2/temp/solr.cloud.MissingSegmentRecoveryTest_B800C15EC6F11C02-001/tempDir-001/node2/MissingSegmentRecoveryTest_shard1_replica2/data/index/segments_2\")\n  [junit4]   2> \t\tat org.apache.lucene.store.ByteBufferIndexInput.readByte(ByteBufferIndexInput.java:75)\n  [junit4]   2> \t\tat org.apache.lucene.store.BufferedChecksumIndexInput.readByte(BufferedChecksumIndexInput.java:41)\n  [junit4]   2> \t\tat org.apache.lucene.store.DataInput.readInt(DataInput.java:101)\n  [junit4]   2> \t\tat org.apache.lucene.index.SegmentInfos.readCommit(SegmentInfos.java:296)\n  [junit4]   2> \t\tat org.apache.lucene.index.SegmentInfos.readCommit(SegmentInfos.java:284)\n  [junit4]   2> \t\t... 18 more\n  [junit4]   2> Caused by: org.apache.solr.common.SolrException: Error opening new searcher\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:2005)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:2125)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.initSearcher(SolrCore.java:1053)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.<init>(SolrCore.java:937)\n  [junit4]   2> \t... 10 more\n  [junit4]   2> Caused by: org.apache.lucene.index.IndexNotFoundException: no segments* file found in LockValidatingDirectoryWrapper(MMapDirectory@/x1/jenkins/jenkins-slave/workspace/Lucene-Solr-Tests-master/solr/build/solr-core/test/J2/temp/solr.cloud.MissingSegmentRecoveryTest_B800C15EC6F11C02-001/tempDir-001/node2/MissingSegmentRecoveryTest_shard1_replica2/data/index.20170228030909468 lockFactory=org.apache.lucene.store.NativeFSLockFactory@74782755): files: [write.lock]\n  [junit4]   2> \tat org.apache.lucene.index.IndexWriter.<init>(IndexWriter.java:933)\n  [junit4]   2> \tat org.apache.solr.update.SolrIndexWriter.<init>(SolrIndexWriter.java:125)\n  [junit4]   2> \tat org.apache.solr.update.SolrIndexWriter.create(SolrIndexWriter.java:100)\n  [junit4]   2> \tat org.apache.solr.update.DefaultSolrCoreState.createMainIndexWriter(DefaultSolrCoreState.java:240)\n  [junit4]   2> \tat org.apache.solr.update.DefaultSolrCoreState.getIndexWriter(DefaultSolrCoreState.java:114)\n  [junit4]   2> \tat org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:1966)\n[...]\n  [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=MissingSegmentRecoveryTest -Dtests.method=testLeaderRecovery -Dtests.seed=B800C15EC6F11C02 -Dtests.multiplier=2 -Dtests.slow=true -Dtests.locale=fi-FI -Dtests.timezone=Asia/Famagusta -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n  [junit4] FAILURE 94.6s J2 | MissingSegmentRecoveryTest.testLeaderRecovery <<<\n  [junit4]    > Throwable #1: java.lang.AssertionError: Expected a collection with one shard and two replicas\n  [junit4]    > null\n  [junit4]    > Last available state: DocCollection(MissingSegmentRecoveryTest//collections/MissingSegmentRecoveryTest/state.json/6)={\n  [junit4]    >   \"replicationFactor\":\"2\",\n  [junit4]    >   \"shards\":{\"shard1\":{\n  [junit4]    >       \"range\":\"80000000-7fffffff\",\n  [junit4]    >       \"state\":\"active\",\n  [junit4]    >       \"replicas\":{\n  [junit4]    >         \"core_node1\":{\n  [junit4]    >           \"core\":\"MissingSegmentRecoveryTest_shard1_replica2\",\n  [junit4]    >           \"base_url\":\"https://127.0.0.1:41308/solr\",\n  [junit4]    >           \"node_name\":\"127.0.0.1:41308_solr\",\n  [junit4]    >           \"state\":\"down\"},\n  [junit4]    >         \"core_node2\":{\n  [junit4]    >           \"core\":\"MissingSegmentRecoveryTest_shard1_replica1\",\n  [junit4]    >           \"base_url\":\"https://127.0.0.1:60247/solr\",\n  [junit4]    >           \"node_name\":\"127.0.0.1:60247_solr\",\n  [junit4]    >           \"state\":\"active\",\n  [junit4]    >           \"leader\":\"true\"}}}},\n  [junit4]    >   \"router\":{\"name\":\"compositeId\"},\n  [junit4]    >   \"maxShardsPerNode\":\"1\",\n  [junit4]    >   \"autoAddReplicas\":\"false\"}\n  [junit4]    > \tat __randomizedtesting.SeedInfo.seed([B800C15EC6F11C02:E855595D9FD0AA1F]:0)\n  [junit4]    > \tat org.apache.solr.cloud.SolrCloudTestCase.waitForState(SolrCloudTestCase.java:265)\n  [junit4]    > \tat org.apache.solr.cloud.MissingSegmentRecoveryTest.testLeaderRecovery(MissingSegmentRecoveryTest.java:105)\n[...]\n  [junit4]   2> NOTE: test params are: codec=Asserting(Lucene70): {_version_=TestBloomFilteredLucenePostings(BloomFilteringPostingsFormat(Lucene50(blocksize=128))), id=FST50}, docValues:{}, maxPointsInLeafNode=1106, maxMBSortInHeap=6.191537660994534, sim=RandomSimilarity(queryNorm=true): {}, locale=fi-FI, timezone=Asia/Famagusta\n  [junit4]   2> NOTE: Linux 3.13.0-85-generic amd64/Oracle Corporation 1.8.0_121 (64-bit)/cpus=4,threads=1,free=138683768,total=527433728\n\n ",
+            "id": "comment-15895044"
+        },
+        {
+            "date": "2017-07-24T19:54:37+0000",
+            "author": "Steve Rowe",
+            "content": "Non-reproducing master failure from my Jenkins yesterday: \n\n\nChecking out Revision 97ca529e49505cef0c1dd6138ed70be4a7b85610 (refs/remotes/origin/master)\n[...]\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=MissingSegmentRecoveryTest -Dtests.method=testLeaderRecovery -Dtests.seed=E0C710C4147CEA7B -Dtests.multiplier=2 -Dtests.nightly=true -Dtests.slow=true -Dtests.linedocsfile=/home/jenkins/lucene-data/enwiki.random.lines.txt -Dtests.locale=ar-BH -Dtests.timezone=Asia/Urumqi -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] FAILURE 95.9s J2 | MissingSegmentRecoveryTest.testLeaderRecovery <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: Expected a collection with one shard and two replicas\n   [junit4]    > null\n   [junit4]    > Live Nodes: [127.0.0.1:42849_solr, 127.0.0.1:43941_solr]\n   [junit4]    > Last available state: DocCollection(MissingSegmentRecoveryTest//collections/MissingSegmentRecoveryTest/state.json/9)={\n   [junit4]    >   \"pullReplicas\":\"0\",\n   [junit4]    >   \"replicationFactor\":\"2\",\n   [junit4]    >   \"shards\":{\"shard1\":{\n   [junit4]    >       \"range\":\"80000000-7fffffff\",\n   [junit4]    >       \"state\":\"active\",\n   [junit4]    >       \"replicas\":{\n   [junit4]    >         \"core_node1\":{\n   [junit4]    >           \"core\":\"MissingSegmentRecoveryTest_shard1_replica_n1\",\n   [junit4]    >           \"base_url\":\"https://127.0.0.1:42849/solr\",\n   [junit4]    >           \"node_name\":\"127.0.0.1:42849_solr\",\n   [junit4]    >           \"state\":\"active\",\n   [junit4]    >           \"type\":\"NRT\",\n   [junit4]    >           \"leader\":\"true\"},\n   [junit4]    >         \"core_node2\":{\n   [junit4]    >           \"core\":\"MissingSegmentRecoveryTest_shard1_replica_n2\",\n   [junit4]    >           \"base_url\":\"https://127.0.0.1:43941/solr\",\n   [junit4]    >           \"node_name\":\"127.0.0.1:43941_solr\",\n   [junit4]    >           \"state\":\"down\",\n   [junit4]    >           \"type\":\"NRT\"}}}},\n   [junit4]    >   \"router\":{\"name\":\"compositeId\"},\n   [junit4]    >   \"maxShardsPerNode\":\"1\",\n   [junit4]    >   \"autoAddReplicas\":\"false\",\n   [junit4]    >   \"nrtReplicas\":\"2\",\n   [junit4]    >   \"tlogReplicas\":\"0\"}\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([E0C710C4147CEA7B:B09288C74D5D5C66]:0)\n   [junit4]    > \tat org.apache.solr.cloud.SolrCloudTestCase.waitForState(SolrCloudTestCase.java:269)\n   [junit4]    > \tat org.apache.solr.cloud.MissingSegmentRecoveryTest.testLeaderRecovery(MissingSegmentRecoveryTest.java:105)\n[...]\n   [junit4]   2> NOTE: test params are: codec=HighCompressionCompressingStoredFields(storedFieldsFormat=CompressingStoredFieldsFormat(compressionMode=HIGH_COMPRESSION, chunkSize=4, maxDocsPerChunk=1, blockSize=790), termVectorsFormat=CompressingTermVectorsFormat(compressionMode=HIGH_COMPRESSION, chunkSize=4, blockSize=790)), sim=RandomSimilarity(queryNorm=true): {}, locale=ar-BH, timezone=Asia/Urumqi\n   [junit4]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_77 (64-bit)/cpus=16,threads=1,free=300978976,total=530055168\n   [junit4]   2> NOTE: All tests run in this JVM: [SolrCloudReportersTest, TestConfigSetsAPIExclusivity, TestCloudJSONFacetJoinDomain, RequestHandlersTest, TestRangeQuery, TestJsonFacetRefinement, ZkCLITest, ExternalFileFieldSortTest, LukeRequestHandlerTest, SimpleMLTQParserTest, AutoScalingHandlerTest, CdcrBootstrapTest, TestBulkSchemaConcurrent, CoreAdminHandlerTest, SuggestComponentTest, TestRuleBasedAuthorizationPlugin, CdcrUpdateLogTest, SpellCheckCollatorWithCollapseTest, SortByFunctionTest, MissingSegmentRecoveryTest]\n\n ",
+            "id": "comment-16099049"
+        }
+    ]
+}

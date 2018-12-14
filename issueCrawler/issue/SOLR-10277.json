@@ -1,0 +1,177 @@
+{
+    "id": "SOLR-10277",
+    "title": "On 'downnode', lots of wasteful mutations are done to ZK",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "6.5.1",
+            "7.0"
+        ],
+        "affect_versions": "5.5.3,                                            5.5.4,                                            6.0.1,                                            6.2.1,                                            6.3,                                            6.4.2",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "When a node restarts, it submits a single 'downnode' message to the overseer's state update queue.\n\nWhen the overseer processes the message, it does way more writes to ZK than necessary. In our cluster of 48 hosts, the majority of collections have only 1 shard and 1 replica. So a single node restarting should only result in ~1/40th of the collections being updated with new replica states (to indicate the node that is no longer active).\n\nHowever, the current logic in NodeMutator#downNode always updates every collection. So we end up having to do rolling restarts very slowly to avoid having a severe outage due to the overseer having to do way too much work for each host that is restarted. And subsequent shards becoming leader can't get processed until the `downnode` message is fully processed. So a fast rolling restart can result in the overseer queue growing incredibly large and nearly all shards winding up in a leader-less state until that backlog is processed.\n\nThe fix is a trivial logic change to only add a ZkWriteCommand for collections that actually have an impacted replica.",
+    "attachments": {
+        "SOLR-10277.patch": "https://issues.apache.org/jira/secure/attachment/12861171/SOLR-10277.patch",
+        "SOLR-10277-5.5.3.patch": "https://issues.apache.org/jira/secure/attachment/12858876/SOLR-10277-5.5.3.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-03-13T22:25:28+0000",
+            "content": "Hi Joshua,\n\nHowever, the current logic in NodeMutator#downNode always updates every collection.\n\nI am checking against Solr 5.5.3 since you have listed that as the 'Affected Versions' . Looking at https://github.com/apache/lucene-solr/blob/releases/lucene-solr/5.5.3/solr/core/src/java/org/apache/solr/cloud/overseer/NodeMutator.java#L65 it looks to me that it only updates those replicas of collection which belong to this node.  Am i missing something here? ",
+            "author": "Varun Thacker",
+            "id": "comment-15923092"
+        },
+        {
+            "date": "2017-03-14T01:53:26+0000",
+            "content": "It's only changing properties for replicas that correspond to this node. However, if you look at the whole method, especially 10 lines below, you'll find that it's always adding a ZkWriteCommand for each collection, regardless of whether any replica properties were touched. So it generates the necessary changes and a bunch of no-op updates for every other collection. ",
+            "author": "Joshua Humphries",
+            "id": "comment-15923390"
+        },
+        {
+            "date": "2017-03-14T23:53:31+0000",
+            "content": "Hi Joshua,\n\nand a bunch of no-op updates for every other collection.\n\nOkay I see what you're saying now. Will you want to submit a patch? Else I will take a look at it. ",
+            "author": "Varun Thacker",
+            "id": "comment-15925280"
+        },
+        {
+            "date": "2017-03-14T23:57:43+0000",
+            "content": "I have a patch and a test for 5.5.3. Looks like this particular file (NodeMutator.java) hasn't changed and is still basically the same at HEAD, so it should be easy to apply to 6.4/6.5, too.\n\nI'd like to actually get my patch deployed in our cluster so I can measure its impact to rolling-restarts of the cluster. ",
+            "author": "Joshua Humphries",
+            "id": "comment-15925290"
+        },
+        {
+            "date": "2017-03-15T00:01:02+0000",
+            "content": "Yes the patch should apply to master cleanly. You can always post the patch before testing and report back with the numbers once you have deployed it. Either way it's fine. \n\nI think it's an important fix for large clusters so I would like to get this in Solr 6.5  ",
+            "author": "Varun Thacker",
+            "id": "comment-15925296"
+        },
+        {
+            "date": "2017-03-15T00:40:10+0000",
+            "content": "I've attached a patch file that should cleanly apply to version 5.5.3, and hopefully to other versions to. ",
+            "author": "Joshua Humphries",
+            "id": "comment-15925340"
+        },
+        {
+            "date": "2017-03-15T01:12:09+0000",
+            "content": "Hi Joshua,\n\nThe patch didn't apply cleanly but was pretty simple to fix the couple of conflicts that I had with master.\n\nIt's great that we have a test for this. We already have https://github.com/apache/lucene-solr/blob/master/solr/core/src/test/org/apache/solr/cloud/SharedFSAutoReplicaFailoverUtilsTest.java#L83 which is similar to NodeMutatorTest#makeClusterState , but thats only because I had seen that test in the past for some other work. Should we put that method into a class like GenerateClusterStateMocks or something so thats it's more discoverable in the future and reuse that here ? \n\nLastly I just want to understand the motivation behind changing ClusterState#getCollections to use a LinkedHashSet instead of a HashSet. Do you think the ordering of the entries helps us in any way here?\n\nPatch looks great otherwise!  ",
+            "author": "Varun Thacker",
+            "id": "comment-15925372"
+        },
+        {
+            "date": "2017-03-15T01:33:04+0000",
+            "content": "Thanks for pointing out SharedFSAutoReplicaFailoverUtilsTest. I'll take a look to see how things could be consolidated a little better.\n\nThe change in ClusterState to use a LinkedHashSet is for deterministic ordering. If you remove that part of the patch, you'll find that the test no longer passes as iteration order over the collection names becomes non-deterministic. I saw that LinkedHash* is used in a few other places and figured it would not be objectionable. ",
+            "author": "Joshua Humphries",
+            "id": "comment-15925386"
+        },
+        {
+            "date": "2017-03-15T13:16:02+0000",
+            "content": "Oops. I was wrong about needing the LinkedHashSet in ClusterState.\n\nLooks like I solved the deterministic ordering issue twice and left both of the fixes in the patch. The other fix is where the test sorts the list of writes, and that alone suffices. So we can undo those changes in ClusterState.java. ",
+            "author": "Joshua Humphries",
+            "id": "comment-15926140"
+        },
+        {
+            "date": "2017-03-15T13:20:46+0000",
+            "content": "New (slightly smaller) patch file uploaded. Undoes change to ClusterState.java which turns out to be superfluous. ",
+            "author": "Joshua Humphries",
+            "id": "comment-15926163"
+        },
+        {
+            "date": "2017-03-30T02:37:16+0000",
+            "content": "Patch LGTM, any objections to merging this? ",
+            "author": "Scott Blum",
+            "id": "comment-15948297"
+        },
+        {
+            "date": "2017-03-30T02:43:49+0000",
+            "content": "Hi Scott,\n\nI was updating the patch and trying to reuse SharedFSAutoReplicaFailoverUtilsTest for the test case when it create a cluster state.\n\nGive me a coupe of hour. I just started working on it today evening and should have something up soon.\n\nYou can review and commit it then. ",
+            "author": "Varun Thacker",
+            "id": "comment-15948303"
+        },
+        {
+            "date": "2017-03-30T02:56:46+0000",
+            "content": "Sure thing, no rush!  Would love to get more eyes + miles on it. ",
+            "author": "Scott Blum",
+            "id": "comment-15948316"
+        },
+        {
+            "date": "2017-03-30T06:00:09+0000",
+            "content": "New patch which basically takes Joshua's patch and reuses existing test code to create a cluster state.\n\nThe test fails if we don't change NodeMutator\n\nWe probably need to make a couple of minor changes before committing ( addressing the nocommit etc ) ",
+            "author": "Varun Thacker",
+            "id": "comment-15948470"
+        },
+        {
+            "date": "2017-03-31T18:03:52+0000",
+            "content": "Hi Scott,\n\nAny comments on the last patch apart from addressing the nocommit ?\n\nJoshua curious if you deployed this on your cluster and how much improvements did you see?\n\nRegardless this should be a good candidate for Solr 6.5.1 as the fix is pretty safe. Joel Bernstein let me know if you're okay to commit this to the 6_5 branch as well ",
+            "author": "Varun Thacker",
+            "id": "comment-15951407"
+        },
+        {
+            "date": "2017-03-31T18:22:40+0000",
+            "content": "Hey, Varun,\n\nI actually just got it into our production cluster yesterday. It reduced\nthe average time to restart a node (just under 50 nodes) and have it fully\nactive (e.g. overseer queue go quiet, all collections updated) from about\n2.5 minutes down to 55 seconds. Our tools to examine and verify cluster\nstates also show that everything looked good.\n\n\n\nJosh Humphries\n\nFullStory <https://www.fullstory.com/>  |  Atlanta, GA\n\nSoftware Engineer\n\njh@fullstory.com\n\nOn Fri, Mar 31, 2017 at 2:04 PM, Varun Thacker (JIRA) <jira@apache.org>\n ",
+            "author": "Joshua Humphries",
+            "id": "comment-15951437"
+        },
+        {
+            "date": "2017-04-04T14:53:04+0000",
+            "content": "It'd be nice to release this fix in 6.5.1 \u2013 looks serious. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15955217"
+        },
+        {
+            "date": "2017-04-04T15:42:32+0000",
+            "content": "Agreed, Shalin Shekhar Mangar I'm actually OOO all week-- if you wanted to take point on getting this landed that would be super.  I reviewed all the live code previously, but not Varun Thacker's patch to the test.  (though to be honest I'm not super familiar with the test frameworks anyway) ",
+            "author": "Scott Blum",
+            "id": "comment-15955274"
+        },
+        {
+            "date": "2017-04-04T15:54:00+0000",
+            "content": "No problem, I'll review the patch and commit. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15955288"
+        },
+        {
+            "date": "2017-04-05T07:44:23+0000",
+            "content": "Patch removes the nocommit and fixes the tests. I didn't remove the limitation of always having a bad replica in ClusterStateMockUtil but worked around it in the new tests. We can fix this in a different issue. I also changed the NodeMutator#downNode method slightly to remove a few extra copies and a ZK call (via clusterState.getCollection).\n\nI'll commit after running precommit and all tests. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15956459"
+        },
+        {
+            "date": "2017-04-05T10:32:07+0000",
+            "content": "Commit 60303028debf3927e0c3abfaaa4015f73b88e689 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6030302 ]\n\nSOLR-10277: On 'downnode', lots of wasteful mutations are done to ZK ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15956634"
+        },
+        {
+            "date": "2017-04-05T10:34:13+0000",
+            "content": "Commit ef5db56632bdc2ec73a51bf393c6670318e80bd8 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ef5db56 ]\n\nSOLR-10277: On 'downnode', lots of wasteful mutations are done to ZK\n\n(cherry picked from commit 6030302) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15956636"
+        },
+        {
+            "date": "2017-04-05T10:35:57+0000",
+            "content": "Commit 8a2a409eca3ea3de6d31188deb8b532522f8e9e6 in lucene-solr's branch refs/heads/branch_6_5 from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8a2a409 ]\n\nSOLR-10277: On 'downnode', lots of wasteful mutations are done to ZK\n\n(cherry picked from commit 6030302)\n\n(cherry picked from commit ef5db56) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-15956639"
+        },
+        {
+            "date": "2017-04-05T10:37:16+0000",
+            "content": "Thanks everyone! ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15956643"
+        },
+        {
+            "date": "2017-04-05T17:26:58+0000",
+            "content": "Thank you Shalin! ",
+            "author": "Scott Blum",
+            "id": "comment-15957285"
+        }
+    ]
+}

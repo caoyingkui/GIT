@@ -1,0 +1,192 @@
+{
+    "id": "LUCENE-4364",
+    "title": "MMapDirectory makes too many maps for CFS",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [
+            "4.0",
+            "6.0"
+        ],
+        "affect_versions": "4.0-ALPHA",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "While looking at LUCENE-4123, i thought about this:\n\nI don't like how mmap creates a separate mapping for each CFS slice, to me this is way too many mmapings.\n\nInstead I think its slicer should map the .CFS file, and then when asked for an offset+length slice of that, it should be using .duplicate()d buffers of that single master mapping.\n\nthen when you close the .CFS it closes that one mapping.\n\nthis is probably too scary for 4.0, we should take our time, but I think we should do it.",
+    "attachments": {
+        "LUCENE-4364.patch": "https://issues.apache.org/jira/secure/attachment/12543913/LUCENE-4364.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-09-05T21:10:26+0000",
+            "content": "patch: I brought LUCENE-4124 up to speed as i needed it to solve this.\n\nthere are some TODOs and some things that should be cleaned up, but all tests pass. ",
+            "author": "Robert Muir",
+            "id": "comment-13449137"
+        },
+        {
+            "date": "2012-09-05T21:34:53+0000",
+            "content": "updated with some forgotten safety. since all slices are clones, they have to be added to the clones map in createSlice:\n\n        MMapSliceIndexInput input = new MMapSliceIndexInput(description, slices, offset, length, chunkSizePower, clones);\n        clones.put(input, true); // the sliced input is itself a clone, only the slicer holds the \"real\" mappings.\n        return input;\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13449164"
+        },
+        {
+            "date": "2012-09-05T22:22:24+0000",
+            "content": "Hey, I did not yet fully review the patch, but with ByteBuffers we can do the EOF case very easy (the problem Mike had in his CachedDirectory). ByteBuffer internally checks limit() in all cases, so you cannot read beyond the limit. So when we create a slicer, the last buffer could be created not by a simple duplicate(), but instead by ByteBuffer.slice() [which is also a duplicate, but with other start [in our case still 0], but with a limited length (the modulo of (startOffset + length) % bufsize). As ByteBuffer is doing the checks in all cases, a duplicate buffer with a shorter length makes reading behind EOF impossible. The checks are done in all cases, by explicitely giving a limit for the last buffer we can correctly support EOF with IndexOutofBoundsException. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449199"
+        },
+        {
+            "date": "2012-09-05T22:25:34+0000",
+            "content": "Uwe: this is how the whole patch works already. See the slice method.\n\n\nslices[slices.length-1].limit((int) (sliceEnd & chunkSizeMask));\n\n\n\nPlease apply the patch to review, and you can see that there are no added checks here. ",
+            "author": "Robert Muir",
+            "id": "comment-13449206"
+        },
+        {
+            "date": "2012-09-05T22:30:35+0000",
+            "content": "Sorry, i did not see that, your patch already does that!  ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449217"
+        },
+        {
+            "date": "2012-09-06T03:22:07+0000",
+            "content": "Further refactoring, i think this is much cleaner. \n\nThis whole slicing thing imo, is just really a specialized clone() with offset and length.\n\nSo i pushed it into the generic ByteBufferIndexInput itself (it uses super.clone, etc as normal).\n\nThis makes the CFS code here so dead simple:\n\n  /** Maps the cfs once, and returns sliced clones on request */\n  @Override\n  public IndexInputSlicer createSlicer(String name, IOContext context) throws IOException {\n    final MMapIndexInput cfs = (MMapIndexInput) openInput(name, context);\n    return new IndexInputSlicer() {\n      \n      @Override\n      public IndexInput openSlice(String sliceDescription, long offset, long length) throws IOException {\n        ensureOpen();\n        return cfs.slice(sliceDescription, offset, length);\n      }\n\n      @Override\n      public IndexInput openFullSlice() throws IOException {\n        ensureOpen();\n        return cfs.clone();\n      }\n      \n      @Override\n      public void close() throws IOException {\n        cfs.close();\n      }\n    };\n  }\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13449380"
+        },
+        {
+            "date": "2012-09-06T03:23:42+0000",
+            "content": "note we should add the bounds checks for offset/length to this .slice() method just as a sanity check (i had them in the original patch, sorry). ",
+            "author": "Robert Muir",
+            "id": "comment-13449381"
+        },
+        {
+            "date": "2012-09-06T03:55:58+0000",
+            "content": "just some minor cleanups and adding back those bounds checks i forgot. ",
+            "author": "Robert Muir",
+            "id": "comment-13449386"
+        },
+        {
+            "date": "2012-09-06T05:10:12+0000",
+            "content": "Hi, thats a great improvement. Very simple! In my opinion, we should maybe check, if we can remove the whole Slicer in all Indexinputs? Just make the slice(...) method return the current BufferedIndexInput-based one. This could be another issue, once this is in.\n\nAbout the patch:\n\n\tWith the IndexInputSlicer which has a private \"mastercopy\" of the originalIndexInput, the openFullSlice method is garanteed to have 0L as file pointer. We should maybe assert this (because this is important, as in contrast to MMapIndexInput.slice(), clone() returns a clone with the same filepointer as the original). So add a assert 0L == cloned.getFilePointer().\n\tI think we could minimize the code duplication in clone() and slice(). Just use slice() as only implementation and let clone() look like this (not tested):\n\n\n\n\npublic MMapIndexInput clone() {\n  final MMapIndexInput clone = this.slice(this.description, 0L, this.length);\n  try {\n    clone.seek(this.getFilePointer());\n  } catch (IOException ioe) {\n    throw new RuntimException(\"Cannot happen...\");\n  }\n  return clone;\n}\n\n\n\nBy that the code is not duplicated. The only downside is that it seeks two times on clone, but that should not be a problem. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449426"
+        },
+        {
+            "date": "2012-09-06T05:17:05+0000",
+            "content": "Uwe: seems like good ideas i think. I'm going to sleep so feel free to play. I just wanted to get some progress made tonight,\nbut I feel better about it.\n\nAdditionally for a directory like Mike's (with array-backed bytebuffer) or maybe a future RAMDir or whatever this would be reusable stuff I think. ",
+            "author": "Robert Muir",
+            "id": "comment-13449428"
+        },
+        {
+            "date": "2012-09-06T08:41:42+0000",
+            "content": "I combined the slicing and clone methods to be one. When doing this it now also supports slicing clones or slicing slices (as offset is added). I commented out the IllegalStateException, but we can reenable it to disallow.\nI also made in the abstract class all methods reading from buffers final, to help Hotspot (MMapIndexInput is already final, but this makes it more reuseable).\nI also removed the class name from some Exception messages like AlreadyClosed, because the toString() method already contains type. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449526"
+        },
+        {
+            "date": "2012-09-06T08:44:39+0000",
+            "content": "One question: Why did you change the chunkSize to be passed in ctor? For this patch its unrelated, or do I miss something. We now pass everything through ctor, but then its inconsequent to make the useUnmapHack to be a setter (unless we make it a static for all new MMapDirectories)? ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449529"
+        },
+        {
+            "date": "2012-09-06T10:51:07+0000",
+            "content": "it was an intermediate step. unlike unmaphack, its a little more broken for chunkSize to be a setter.\n\nwith one of the previous patches, i noticed that if you were to change this at certain times it could be bad news. so I wanted to prevent the possibility of problems... probably not an isssue now. ",
+            "author": "Robert Muir",
+            "id": "comment-13449555"
+        },
+        {
+            "date": "2012-09-06T10:56:45+0000",
+            "content": "We should put the IllegalStateException back. there is no sense in pretending to support slices from clones, its totally untested and not useful.\n\nIf its useful somehow in the future and we have good tests thats different, but currently its useless and untested. ",
+            "author": "Robert Muir",
+            "id": "comment-13449557"
+        },
+        {
+            "date": "2012-09-06T11:50:25+0000",
+            "content": "I have nothing against that, but it is not completely untested, look at the code  When you clone a slice, the offset of the original must be applied by the code when calling the private slice method - and that is done now. This was necessary to unify the clone and slice method to one common code. cloning is now only slice with 0..length.\n\nBut I agree we should not support this until we remove the IndexInputSlicer class at all and make every IndexInput sliceable (in a later issue). There is no chance that user code can call this method, as it is private to ByteBufferIndexInput. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449583"
+        },
+        {
+            "date": "2012-09-06T12:03:41+0000",
+            "content": "I forgot to mention: My patch also fixes a \"small bug\" in MMapIndexInput: If you closed a clone, this did not change it's state at all, the close() method of clones was completely ignored. I changed that to at least unset the buffers for this clone/slice, so later calls throw AlreadyClosed. Clones of that one (previously created) are not affected. The top-level cleanup also unsets all clones of course again, but thats fine. Theoretically, \"closed\" clones could be removed from the map, but that is unneeded, because they will diappear automatically (as soon as they are unreferenced). ",
+            "author": "Uwe Schindler",
+            "id": "comment-13449591"
+        },
+        {
+            "date": "2012-09-06T12:14:50+0000",
+            "content": "its completely untested except with offset=0 and length=length, thats my problem (that doesnt count).\n\nits also totally unnecessary to support: there is absolutely, positively, zero use-case.\nill change the patch to add it back. ill also remove the assert getFilePointer() == 0L (nothing depends on that). ",
+            "author": "Robert Muir",
+            "id": "comment-13449593"
+        },
+        {
+            "date": "2012-09-06T12:51:41+0000",
+            "content": "updated patch: I removed the assert 0L (its a contract of the method slice) from the openSlice method, and added back the IAE if you try to slice from a clone.\n\nas far as the openFullSlice, the assert is correct (for 4.x maybe), but in trunk we don't even need this method: its a back compat shim for reading older 3.x formatted .cfs files, which trunk no longer supports. this is just dead code: I removed it: we should deprecate it from 4.x ",
+            "author": "Robert Muir",
+            "id": "comment-13449605"
+        },
+        {
+            "date": "2012-09-06T13:03:24+0000",
+            "content": "while reviewing the CFS reading code i see the classic assert-should-be-check-put-return-value:\n\nassert !mapping.containsKey(id): \"id=\" + id + \" was written multiple times in the CFS\";\n        mapping.put(id, fileEntry);\n\n\n\nIll fix this and re-sync up the patch. ",
+            "author": "Robert Muir",
+            "id": "comment-13449615"
+        },
+        {
+            "date": "2012-09-06T13:20:47+0000",
+            "content": "re-synced to trunk after changing the assert to a hard check. ",
+            "author": "Robert Muir",
+            "id": "comment-13449635"
+        },
+        {
+            "date": "2012-09-06T15:15:06+0000",
+            "content": "This patch looks great!  MMapDir is so simple now ... and I love how slice is a method on BBII.  Very nice to nuke openFullSlice too. ",
+            "author": "Michael McCandless",
+            "id": "comment-13449729"
+        },
+        {
+            "date": "2012-09-07T12:26:47+0000",
+            "content": "updated patch: I added explicit CFS versions of all the mmap tests for better testing (so we dont rely upon the random tests or other tests).\n\nalso fixed the checks in seek to properly catch negative positions. previously if you seeked a slice that had offset > 0 (the start offset into the first mapped buffer), and passed a negative pos but pos was < -offset, we wouldnt catch the negative access, instead positioning ourselves to a negative getFilePointer and pointed at a previous file's bytes. \n\nI feel good about this patch. I'd like to commit to trunk soon if there are no objections. ",
+            "author": "Robert Muir",
+            "id": "comment-13450558"
+        },
+        {
+            "date": "2012-09-07T12:46:34+0000",
+            "content": "just a tweak adding a comment to explain the previous pos >= -offset thing.\n\nadditionally i changed the shift value back to >> in case pos+offset overflows (this is more clear to me that we will always get exception), but the handling is right, its always seek past EOF here. ",
+            "author": "Robert Muir",
+            "id": "comment-13450572"
+        },
+        {
+            "date": "2012-09-07T22:16:29+0000",
+            "content": "Hi Robert, patch with new tests look great! +1 to commit and also backport. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13451060"
+        },
+        {
+            "date": "2012-09-07T23:53:44+0000",
+            "content": "Hi Uwe, thanks for the vote of confidence and reviews and help. I'll commit to trunk tonight, give hudson a weekend at it, and backport monday if there are no issues.\n\nI don't expect any problems though, I think this is just as simple as before and we can move forwards to simplify CFS access. ",
+            "author": "Robert Muir",
+            "id": "comment-13451148"
+        },
+        {
+            "date": "2012-09-08T02:42:37+0000",
+            "content": "Committed to trunk only. lets bake it over the weekend. ",
+            "author": "Robert Muir",
+            "id": "comment-13451224"
+        },
+        {
+            "date": "2013-03-22T16:42:13+0000",
+            "content": "[branch_4x commit] Robert Muir\nhttp://svn.apache.org/viewvc?view=revision&revision=1382800\n\nLUCENE-4364: MMapDirectory makes too many maps for CFS ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610885"
+        },
+        {
+            "date": "2013-05-10T10:33:50+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13654043"
+        }
+    ]
+}

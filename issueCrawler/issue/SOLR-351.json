@@ -1,0 +1,79 @@
+{
+    "id": "SOLR-351",
+    "title": "external value source",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "1.3"
+        ],
+        "components": [
+            "search"
+        ],
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Need a way to rapidly do a bulk update of a single field for use as a component in a function query (no need to be able to search on it).\nIdea: create an ExternalValueSource fieldType that reads it's values from a file.  The file could be simple id,val records, and stored in the index directory so it would get replicated.  \n\nValues could optionally be updated more often than the searcher (hashCode/equals should take this into account to prevent caching issues).",
+    "attachments": {
+        "ExternalFileField.patch": "https://issues.apache.org/jira/secure/attachment/12367785/ExternalFileField.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12530820",
+            "date": "2007-09-27T19:45:35+0000",
+            "content": "Obstacle #1: how to find the index directory (we really need the solr core passed at some point - perhaps during FieldType.init()?\nIt would be nice of a SolrQueryRequest object was passed during all calls to things like getValueSource(), but it may be too late for that (and much more difficult).  "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-12531200",
+            "date": "2007-09-29T02:39:58+0000",
+            "content": "FieldType is abstract, so we can always add a getValueSource(SolrQueryRequest req, SchemaFIeld field) that delegates to getValueSource(SchemaFIeld field) by default.\n\n(ditto for the init method if needed ... i almost think we should do both since i can imagine situations where FieldType might want to go ahead and pre-compute some info, but doing something like this would raise a lot of questions about what to do when newSearchers are opened ... might be better to stick with the request type access for now untill we have stronger uses cases for anything else) "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12531203",
+            "date": "2007-09-29T03:18:12+0000",
+            "content": "> a lot of questions about what to do when newSearchers are opened\nYeah, it's not actually getValueSource() where one would normally want the request... ValueSource is like a Query - relatively independent of context.  getValues(IndexReader reader) is where you normally want it.. but there are layers of Lucene in between that know nothing of Solr. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12531250",
+            "date": "2007-09-29T15:26:28+0000",
+            "content": "Hmmm, due to pluggable query parsers patch, I pass around the QParser everywhere now, so perhaps\nit is easiest + consistent to extend that to getValueSource.\npublic ValueSource getValueSource(SchemaField field, QParser parser)\n\nEasy change... it's only called in one place in the source. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12531988",
+            "date": "2007-10-03T02:48:35+0000",
+            "content": "OK, the latest SOLR-334 patch includes external value source.\n\nHere is what the fieldType in the schema looks like:\n    <fieldType name=\"file\" class=\"solr.ExternalFileField\" keyField=\"id\" defVal=\"1\" stored=\"false\" indexed=\"false\"  valType=\"float\"/>\n\n\n\tkeyField will normally be the unique key field, but it doesn't have to be.\n\t\n\t\tit's OK to have a keyField value that can't be found in the index\n\t\tit's OK to have some documents without a keyField in the file (defVal is used as the default)\n\t\tit's OK for a keyField value to point to multiple documents (no uniqueness requirement)\n\t\n\t\n\tvalType is a reference to another fieldType to define the value type of this field (must currently be FloatField (float))\n\n\n\nThe format of the external file is simply\nkeyFieldValue=floatValue\nkeyFieldValue=floatValue\n\nSolr looks for the external file in the index directory under the name of\nexternal_<fieldname>  or  external_<fieldname>.*\n\nIf any files of the latter pattern appear, the last (after being sorted by name) will be used and previous versions will be deleted.  This is to help support systems where one may not be able to overwrite a file (like Windows, if the file is in use).\n\nIf the external file has already been loaded, and it is changed, those changes will not be visible until a commit has been done.\n\nThe external file may be sorted or unsorted by the key field, but it will be substantially slower (untested) if it isn't sorted. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12535001",
+            "date": "2007-10-15T22:47:48+0000",
+            "content": "Attaching patch (separated out from pluggable query parsers, but still depends on it).\nI'll commit shortly barring objections. "
+        },
+        {
+            "author": "J.J. Larrea",
+            "id": "comment-12535321",
+            "date": "2007-10-16T19:09:11+0000",
+            "content": "My apologies for these last-minute peanut-gallery comments, and especially if they're completely off-target (I've not yet used Function Queries), but reviewing the patch raised these questions and ideas:\n\n1. Why force a 1:1 mapping between the fieldname and the filename?  Could there ever be a be a situation where multiple fields would want to share the same file, e.g. if if the file is a sampling of a generic weighting function, or even if field-specific if it needs to be shared across multiple Solr instances/cores? \n\nWithin the current structure, an extra file=\"<baseFile>\" argument to ExternalFieldField and FileFloatSource couldn't hurt; it could still default to external_<fieldname>, relative paths could still resolve to ffs.indexDir, and the getLatestFile extension logic could still be applied, but specified names with relative or absolute paths would be allowed.\n\n2. Is ExternalFieldField useful apart from being used as input to function queries, e.g. could one sort or facet against it?\n\n2a. If not (or even if so), couldn't one get enhanced flexibility and simplicity by creating a function interface to FileFloatSource that uses a sub-ValueSource to obtain key values?  That way the domain of the mapping function isn't limited to a literal set of Terms.  For example, a function of the form\n\n\tfilemap( <keyFieldName>[, \"baseFilePath\" )\n\ncould be applied as, for example,\n\n\tboost( filemap( keyField ) )\n        boost( filemap( div( ord( someField ), const( 1426 ) ), \"/var/data/termBooster\" ) )    \n\nI'm thinking something like this (added to FunctionQParser):\n\n   vsParsers.put(\"filemap\", new VSParser() {\n      ValueSource parse(FunctionQParser fp) throws ParseException \n{\n        ValueSource source = fp.parseValSource();\n        fp.sp.expect(\",\");\n        String base = fp.sp.getQuotedString();\n(would also want to get the default in there)\n        return new FileFloatFunction(source, base);\n      }\n    });\n\nOne would think a FileFloatFunction could extend FieldCacheSource, but I assume there was a good reason the FC code was duplicated rather than references, e.g. limited access.\n\n2b. If the external file could be useful for sorting/faceting, and if it could be implemented as a Function as above, then perhaps ExternalFieldField could be recast as a more general FunctionField which takes a QueryParser.StrParser string in an attribute?\n\n  <fieldType name=\"file\" class=\"solr.FunctionField\" expression=\"filemap(id)\" stored=\"false\" indexed=\"false\" valType=\"float\"/>\n\nIs there any sense to these (even if the scope is way too large to be implemented in the foreseeable future)?\n\nI also have some thoughts on SOLR-334 which I'll write up in a few days. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12536681",
+            "date": "2007-10-22T14:23:46+0000",
+            "content": "Thanks for the review JJ, I had missed it earlier somehow (I just committed this code).\n\nre: specifying filename... yes, I thought it might possibly be useful in the future, esp being able to specify somewhere different than the index directory.  I simply left it out now because nothing is lost in deferring it.\n\n\n2. Is ExternalFieldField useful apart from being used as input to function queries, e.g. could one sort or facet against it?\n\nNot currently.  Perhaps in the future it would be possible to make it searchable... not sure.  And it seems like a good idea to allow sorting by a ValueSource in the future.  Faceting:  yes, I think so (again, in the future).\n\n\n2a. If not (or even if so), couldn't one get enhanced flexibility and simplicity by creating a function interface to FileFloatSource that uses a sub-ValueSource to obtain key values? That way the domain of the mapping function isn't limited to a literal set of Terms. For example, a function of the form\n\nHmmm, I hadn't thought of hooking it directly via a new type of function, but that would work.\nadd(1, filevalues(\"myexternalfilename\",\"float\") )\n\nI'm not sure I understand the form you picked though (a ValueSource param to filemap).\n\n\nOne would think a FileFloatFunction could extend FieldCacheSource, but I assume there was a good reason the FC code was duplicated rather than references, e.g. limited access.\n\nRight, Lucene doesn't allow write access to the FieldCache.\n\n\n2b. If the external file could be useful for sorting/faceting, and if it could be implemented as a Function as above, then perhaps ExternalFieldField could be recast as a more general FunctionField which takes a QueryParser.StrParser string in an attribute?\n\n<fieldType name=\"file\" class=\"solr.FunctionField\" expression=\"filemap(id)\" stored=\"false\" indexed=\"false\" valType=\"float\"/>\n\nSo a FunctionField would be a shortcut or alias to any function query expression... that's a pretty interesting idea.\nSince the signature for getValueSource now includes the QParser, this should be doable. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-12662959",
+            "date": "2009-01-12T13:50:27+0000",
+            "content": "This issue has been fixed by Yonik in revision 587098 and released with 1.3 "
+        }
+    ]
+}

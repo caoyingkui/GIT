@@ -1,0 +1,77 @@
+{
+    "id": "SOLR-3785",
+    "title": "Cluster-state inconsistent",
+    "details": {
+        "affect_versions": "4.0",
+        "status": "Open",
+        "fix_versions": [],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "Information in CloudSolrServer.getZkStateReader().getCloudState() (called cloudState below) seems to be inconsistent. \n\nI have a Solr running the leader of slice \"sliceName\" in collection \"collectionName\" - no replica to take over. I shut down this Solr, and I want to detect that there is now no leader active. \n\nI do e.g.\n\nZkNodeProps leader = cloudState.getLeader(indexName, sliceName);\nboolean notActive = (leader == null) || !leader.containsKey(ZkStateReader.STATE_PROP) || !leader.get(ZkStateReader.STATE_PROP).equals(ZkStateReader.ACTIVE);\n\n\nThis does not work. It seems like changing state of a shard does it not changed when this Solr goes down.\n\nI do e.g.\n\nZkNodeProps leader = cloudState.getLeader(indexName, sliceName);\nboolean notActive = (leader == null) || !leader.containsKey(ZkStateReader.STATE_PROP) || !leader.get(ZkStateReader.STATE_PROP).equals(ZkStateReader.ACTIVE) ||\n!leader.containsKey(ZkStateReader.NODE_NAME_PROP) || !cloudState.getLiveNodes().contains(leader.get(ZkStateReader.NODE_NAME_PROP))\n\n\nWhis works.\n\nIt seems like live-nodes of cloudState is updated when Solr goes down, but that some of the other info available through cloudState is not - e.g. getLeader().\n\nThis might already have already been solved on 4.x branch in a revision later than 1355667. Then please just tell me - thanks.\n\nRegards, Per Steffensen",
+    "attachments": {
+        "SOLR-3785.patch": "https://issues.apache.org/jira/secure/attachment/12543847/SOLR-3785.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13447688",
+            "date": "2012-09-04T13:43:23+0000",
+            "content": "Well, I added something like this last week, but I'm not sure it covers the case where there is no other replica to take over as leader.\n\nLast week, I noticed that when a leader goes down, no one removes the leader marker from the cluster state. I changed it so that the next candidate leader immediately does this before the leader election process kicks off - this lets you see the leader briefly go away until a new leader is elected. There has to be another leader candidate to publish that change currently though (this was an easy add, that's why I did it that way).\n\nTo get it to work where there is no new leader candidate, we have to change it so that the overseer does this I think.\n\nThoughts Sami? "
+        },
+        {
+            "author": "Per Steffensen",
+            "id": "comment-13447709",
+            "date": "2012-09-04T14:10:28+0000",
+            "content": "I guess in my version (revision 1355667) of the code, ZkStateReader is not even watching /collections/<collection-name>/leaders/. It is watching /live_nodes/. But I guess what you are telling me is, that even though ZkStateReader was watching /collections/<collection-name>/leaders/ it might not be notified that the leader has gone unless there is another one taking over?\n\nDid you change it so that /collections/<collection-name>/leaders/ is watched? So that only thing left is to make sure the leader-marker is removed even if there is no other to take over.\n\nRegards, Per Steffensen "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13447711",
+            "date": "2012-09-04T14:14:33+0000",
+            "content": "I guess in my version (revision 1355667) of the code, ZkStateReader is not even watching /collections/<collection-name>/leaders/. It is watching /live_nodes/. \n\nThe overseer watches /leaders I believe - and publishes results to the clusterstate.json.\n\nBut I guess what you are telling me is, that even though ZkStateReader was watching /collections/<collection-name>/leaders/ it might not be notified that the leader has gone unless there is another one taking over?\n\nOnly as of a few days go. The next candidate to take over immediately publishes a null leader which clears it from clusterstate.json\n\nDid you change it so that /collections/<collection-name>/leaders/ is watched? So that only thing left is to make sure the leader-marker is removed even if there is no other to take over.\n\nIt's already watched by the Overseer. The change is to make the Overseer remove leaders from ClusterState.json the same way it adds them. "
+        },
+        {
+            "author": "Sami Siren",
+            "id": "comment-13447717",
+            "date": "2012-09-04T14:26:06+0000",
+            "content": "The overseer watches /leaders I believe - and publishes results to the clusterstate.json.\n\nThe leader is announced by the new shard leader (ShardLeaderElectionContextBase). It adds the \"leader\" type of even with the required details into overseer queue. There are no watches related to this in overseer atm. Looks like we need to add one so that the leader=true can be cleared by overseer from clusterstate.json when the leader nodes change/go away.\n\nperhaps we could also rearrange the hierarchy slightly so that we could get away with only 1 watch:\n\n/leaders/<collection-name>-<slice-name> "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13447725",
+            "date": "2012-09-04T14:35:09+0000",
+            "content": "Ah, right, thanks. Now I remember seeing that. Probably part of why I went the route I did for clearing it.\n\n/leaders/<collection-name>-<slice-name>\n\nThat's probably fine? "
+        },
+        {
+            "author": "Per Steffensen",
+            "id": "comment-13447733",
+            "date": "2012-09-04T14:58:23+0000",
+            "content": "\nIt's already watched by the Overseer. The change is to make the Overseer remove leaders from ClusterState.json the same way it adds them.\n\nHmmm, not in my version (revision 1355667 on 4.x branch), I guess??? I cant find it in the code at least, but I might be wrong. The only thing I can see Overseer watching is \"/overseer/queue\" (and \"/overseer/queue-work\"), and the only ones I can find putting something in there is ZkController.publish and ElectionContext.runLeaderProcess which seems to only be used on startup, reconnect, recovery, leader-election etc, and not by any \"leaders\"-watcher. But again, I might very well be wrong.\n\nFact is that clusterstate.json in ZK and clusterState on CloudSolrServer.getZkStateReader().getCloudState() keeps reporting the shards on the shut-down Solr as \"active\" (in revision 1355667 of 4.x branch). Live-nodes in ZK and on CloudSolrServer.getZkStateReader().getCloudState() reports the Solr down correctly.\n\nRegards, Per Steffensen "
+        },
+        {
+            "author": "Sami Siren",
+            "id": "comment-13448695",
+            "date": "2012-09-05T13:04:57+0000",
+            "content": "Here's a patch that adds watches in Overseer for live nodes. When live nodes change the cluster state is sanitized and leader flags for shards that live in nodes other than the ones listed in live nodes are removed. "
+        },
+        {
+            "author": "Per Steffensen",
+            "id": "comment-13493888",
+            "date": "2012-11-09T10:35:39+0000",
+            "content": "Well, I believe the entire thing with the Overseer is a bad idea. It requires at least one Solr is running before you can trust the state-descriptions in ZK - even if this particular \"issue\" SOLR-3785 is solved using Overseer. We have clients that uses the state-descriptions (through CloudSolrServer/ZkStateReader) to detect if the Solr cluster is running well enough to use it. If all Solrs are down I believe it cannot be seen from the state (you can check live-nodes, and if no Solrs are running you know that you cant trust it).\n\nI think you should remove the Overseer entirely and modify ZkStateReader to be able to, single-handedly, look at the ZK state and calculate correct ClusterState. E.g. shard-state could be maintained by the Solr running the shard (as it is today), but as an ephemeral node that disappears when the Solr is not running. ZkStateReader should have logic that, when calculating a shard-state, looks at this ephemeral node, but if it is missing assumes \"down\"-state.\n\nRegards, Per Steffensen "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13494302",
+            "date": "2012-11-09T20:50:31+0000",
+            "content": "ZkStateReader should have logic that, when calculating a shard-state, looks at this ephemeral node, but if it is missing assumes \"down\"-state.\n\nThat's not a bad idea. "
+        }
+    ]
+}

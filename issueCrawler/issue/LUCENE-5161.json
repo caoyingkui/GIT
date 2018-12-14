@@ -1,0 +1,114 @@
+{
+    "id": "LUCENE-5161",
+    "title": "review FSDirectory chunking defaults and test the chunking",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Today there is a loop in SimpleFS/NIOFS:\n\ntry {\n          do {\n            final int readLength;\n            if (total + chunkSize > len) {\n              readLength = len - total;\n            } else {\n              // LUCENE-1566 - work around JVM Bug by breaking very large reads into chunks\n              readLength = chunkSize;\n            }\n            final int i = file.read(b, offset + total, readLength);\n            total += i;\n          } while (total < len);\n        } catch (OutOfMemoryError e) {\n\n\n\nI bet if you look at the clover report its untested, because its fixed at 100MB for 32-bit users and 2GB for 64-bit users (are these defaults even good?!).\n\nAlso if you call the setter on a 64-bit machine to change the size, it just totally ignores it. We should remove that, the setter should always work.\n\nAnd we should set it to small values in tests so this loop is actually executed.",
+    "attachments": {
+        "LUCENE-5161.patch": "https://issues.apache.org/jira/secure/attachment/12596929/LUCENE-5161.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-08-08T20:17:33+0000",
+            "content": "This patch makes the setter always work, and changes lucenetestcase to use small values for the chunking.\n\nI didnt adjust any defaults (maybe Uwe can help, he knows about the code in question) ",
+            "author": "Robert Muir",
+            "id": "comment-13733927"
+        },
+        {
+            "date": "2013-08-08T21:43:24+0000",
+            "content": "Thanks Robert for opening.\n\nIt is too late today, so I will respond tomorrow morning about the NIO stuff. I am now aware and inspected the JVM code, so I can explain why the OOMs occur in SimpleFSDir and NIOFSDir if you read large buffers. More details tomorrow, just one thing before: It has nothing to do with 32 or 64 bits, it is more limitations of the JVM with direct memory and heap size leading to the OOM under certain conditions. But the Integer.MAX_VALUE for 64 bit JVMs is just wrong, too (could also lead to OOM).\n\nIn general I would not make the buffers too large, so the junk size should be limited to not more than a few megabytes. Making them large brings no performance improvement at all, it just wastes memory in large thread-local direct buffers allocated internally by the JVM's NIO code. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13734047"
+        },
+        {
+            "date": "2013-08-08T21:52:03+0000",
+            "content": "Thanks Uwe, I will leave the issue for you tomorrow to fix the defaults.\n\nI can only say the chunking does not seem buggy (all tests pass with the randomization in the patch), so at least we have that. ",
+            "author": "Robert Muir",
+            "id": "comment-13734058"
+        },
+        {
+            "date": "2013-08-10T11:17:23+0000",
+            "content": "Hi,\n\nI will now explain the problems of SimpleFSDirectory and NIOFSDirectory and why the OOM oocurs:\n\nNIOFSDir uses a FileChannel to read from disk. This is generally a good idea to support lockless transfers (on windows unfortunaetly not). The issue here is some limitation in the internal JVM implementation: The big issue is the garbage collector. It is impossible for the native code to read from a file descriptor and let the results go directly to a native byte[] (e.g. a ByteBuffer.allocate() on heap or a byte[] in RandomAccessFile), because those are interruptible operations and are not synchronized. It may happen that JDK invokes the kernel read() method and give it the native pointer of the byte[] and suddenly the garbage collector jumps in (in another thread) and moves the byte[] to defragment the heap. As the code is in the kernel, there is nothing that can be done to prevent this code from writing outside byte[], once it was moved. Theoretically the JVM could lock the byte[] somehow to prevent the GC from moving it, but that is not how it is done.\n\nBecause of this problem FileChannel (and also RandomAccessFile) allocate a DirectBuffer if the buffer passed to write is a heap ByteBuffer (see http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/sun/nio/ch/IOUtil.java#211 and http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/sun/nio/ch/Util.java#60). Those direct byte buffers are allocated with SoftReferences to it, so they get garbage collected one memory gets low. But as you see from the code, the direct buffer is choosen to be at least the size of the requested transfer if none of these buffers is available a new one is allocated with the transfer size). And this s the big problem leading to the OOM. The maximum size of direct memory allocated outside of the JVM is limited by the heap size (I think 2 times heap).\n\nThe current chunk sizes are horrible: With 2 Gigabytes on 64 bit and mayn megabytes on 32 bit you allocate huge direct buffer outside of the JDK heap that consume memory and it is unlikely that they are freed again. So we should really limit the maximum size of those chunks to reasonable values. The chunking code is working (and is tested), so we should limit those read buffers to a sensible value.\n\nE.g., for windows everything greater than 64 MB is useless (see some references for transferTo). The only thing, we change by the chunk size, is the number of syscalls, but for reading 500 MB of index norms it makes no difference if you have 2 syscalls or 500 syscalls, the harddisk is the limiting factor).\n\nFor RandomAccessFile, the same is done: it internally allocates direct memory (in fact the current JDKs implement RandomAccessFile mostly through NIO using ByteBuffer.wrap()).\n\nThe above also explains why making a difference between 32 bit and 64 bits is useless. The OOM occurs not because of the bit size, but morre because the direct memory is like the Java heap a limitation by the underlying JDK. So we should not waste all this memory. To also note: In fact to transfer 500 MB you need at least the 500 MB byte[] as target for the transfer (using ByteBuffer.wrap as we do in NIOFSDir) on heap, but also 500 MB in direct memory, so we waste 1 Gigabyte!!! This is horrible inefficient.\n\nAlso note that NIOFSDir always has to copy the direct buffer to the heap buffer so this is an overhead. It might be a good idea to implement a second optimized NIOFSDir that uses DirectBuffers and does not copy all stuff to the heap. For the direct buffer chunks we can use similar code like in ByteBufferIndexInput (which is very effectove).\n\nI would default the chunk size in NIOFSDir to something around 1 to 32 megabyte, e.g. 2 Megabytes on 32 bit and 8 Megabytes on 64 bit. Definitely the current chunk sizes are way too large and waste physical memory we could use for something else!\n\nMaybe Michael McCandless can do some perf tests with NIOFSDir with radically lowered buffer sizes. I think it will not show any difference! ",
+            "author": "Uwe Schindler",
+            "id": "comment-13735851"
+        },
+        {
+            "date": "2013-08-10T12:54:37+0000",
+            "content": "in addition to the defaults, the javadocs that recommend large values should also be fixed ",
+            "author": "Robert Muir",
+            "id": "comment-13735895"
+        },
+        {
+            "date": "2013-08-10T13:17:32+0000",
+            "content": "Updated patch, setting the default size to 2*MERGE_BUFFER_SIZE.\n\nI don't see any difference in indexing or searching with the 1M doc wikipedia. I fired off the 10M doc one too (it takes hours here).\n\nIn general I think its obvious it doesnt much matter, because places are not really reading huge byte[]'s at init: most of those places (e.g. DV) are using things like blockpackedreader for better compression anyway.\n\nAnd for merging and so on, its totally dominated by merging of terms/postings! ",
+            "author": "Robert Muir",
+            "id": "comment-13735910"
+        },
+        {
+            "date": "2013-08-10T13:49:35+0000",
+            "content": "I finished the 10M wikipedia, here was the indexing time:\n\n\n\tpatch: 979888 ms\n\ttrunk: 991839 ms\n\n\n\nSo there is no degradation in indexing speed or searching speed. ",
+            "author": "Robert Muir",
+            "id": "comment-13735914"
+        },
+        {
+            "date": "2013-08-10T13:57:02+0000",
+            "content": "By the way I also fixed the TODO in this patch, which is unrelated but bad.\n\nIf one of our core directories throws exception in its ctor, i want the test to fail, not silently fall back to FSDirectory.open. If someone specifies a bogus -Dtests.directory, that should either test their supplied directory or fail! ",
+            "author": "Robert Muir",
+            "id": "comment-13735915"
+        },
+        {
+            "date": "2013-08-10T13:59:35+0000",
+            "content": "final patch: i will move forward to remove this trap. ",
+            "author": "Robert Muir",
+            "id": "comment-13735916"
+        },
+        {
+            "date": "2013-08-10T14:22:27+0000",
+            "content": "I would use oal.util.Rethrow.rethrow(e) instead of the RuntimeExceptionin in CommandlineUtil! This would make stack trace easier. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13735921"
+        },
+        {
+            "date": "2013-08-10T14:24:21+0000",
+            "content": "Thanks Uwe, ill do that! ",
+            "author": "Robert Muir",
+            "id": "comment-13735922"
+        },
+        {
+            "date": "2013-08-10T14:24:43+0000",
+            "content": "Commit 1512723 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1512723 ]\n\nLUCENE-5161: set sane default readChunkSizes, make the setter work, and test the chunking ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13735923"
+        },
+        {
+            "date": "2013-08-10T14:29:23+0000",
+            "content": "Commit 1512729 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1512729 ]\n\nLUCENE-5161: set sane default readChunkSizes, make the setter work, and test the chunking ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13735926"
+        },
+        {
+            "date": "2013-08-10T14:30:22+0000",
+            "content": "Thanks for the thorough investigation Uwe! ",
+            "author": "Robert Muir",
+            "id": "comment-13735927"
+        },
+        {
+            "date": "2013-10-05T10:19:15+0000",
+            "content": "4.5 release -> bulk close ",
+            "author": "Adrien Grand",
+            "id": "comment-13787106"
+        }
+    ]
+}

@@ -1,0 +1,157 @@
+{
+    "id": "SOLR-6465",
+    "title": "CDCR: fall back to whole-index replication when tlogs are insufficient",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "6.2"
+        ],
+        "components": [],
+        "type": "Sub-task",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "When the peer-shard doesn't have transaction logs to forward all the needed updates to bring a peer up to date, we need to fall back to normal replication.",
+    "attachments": {
+        "SOLR-6465.patch": "https://issues.apache.org/jira/secure/attachment/12796897/SOLR-6465.patch",
+        "1890.log.gz": "https://issues.apache.org/jira/secure/attachment/12823279/1890.log.gz",
+        "1858.log.gz": "https://issues.apache.org/jira/secure/attachment/12822824/1858.log.gz"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15224971",
+            "date": "2016-04-04T20:21:10+0000",
+            "content": "This is the first cut for this feature.\n\nThe CdcrRequestHandler supports a new asynchronous command called BOOTSTRAP which triggers a full index replication from a given master URL. There is a corresponding BOOTSTRAP_STATUS command which returns whether a bootstrap operation is running or either finished successfully or failed.\n\nThe \"shardcheckpoint\" command has been modified to return the max version across the index and update log using the same updateVersionToHighest logic used to initialize version buckets from tlog+index during startup/reload.\n\nThe CdcrReplicatorManager calls collectioncheckpoint to read the max version indexed on the target and then if it finds that there exists a gap in its tlog, asks the target cluster to bootstrap itself from the current shard leader on the source. During this time a flag is set in CdcrReplicatorState such that the CdcrReplicatorScheduler will not send any updates to the target cluster during this time. Once the bootstrap is complete, a collectioncheckpoint is called and the returned version is used to open a regular tlog reader using which normal cdcr replication mechanism takes over.\n\nA new test called CdcrBootstrapTest is added for this feature. There is some additional code in CdcrUpdateLog which allows one to convert an existing cluster with data to be a cdcr source.\n\nThere are plenty of nocommits and debug logging in this patch which I will work to resolve/remove in the next patches. I also found a few bugs for which I'll open separate issues.\n\nOpen items/todos:\n\n\tNow that we can bootstrap target clusters using the index files, we have no need to keep update logs around for a long time. Therefore, we can get rid of CdcrUpdateLog itself and make CDCR work with regular UpdateLog.\n\tIn the same vein, there is no need for replicating tlog files from leader to replicas on the source cluster so \"lastprocessedversion\", CdcrLogSynchronizer and tlog replication code be purged.\n\tThis patch currently stops regular CDCR updates from being sent to target leaders during bootstrap but that is not necessary as we can buffer them and apply after bootstrap completes.\n\tHardening is required against the bootstrap process racing with recovery. Normally this won't happen because bootstrap only happens on target shard leaders but if/when the leadership changes, I suspect bootstrap can continue to run for a while and race with core recovery. I haven't been able to trigger this yet in a test case but I'll continue to work on it.\n\tIn this patch, the bootstrap trigger thread is initiated on state change but if it exits due to a unhandled condition then the replication state is forever in bootstrapping mode and there is no corrective action except disabling and re-enabling CDCR replication. Although care has been taken to handle most failures but after implementing this, I feel that it is unnecessarily fragile and we are better off adding some logic in the scheduled replicator component than trying to do bootstrap only once on init.\n\tThe existing CDCR tests which test aspects related to tlog replication do not pass currently. Once we yank that code, this would be a non-issue.\n\tTests and more tests!\n\n "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-15228847",
+            "date": "2016-04-06T18:33:44+0000",
+            "content": "why the double lock in CdcrRequestHandler.handleBootstrapAction()\n\n\nboolean locked = bootstrapLock.tryLock();\n        try {\n          if (!locked) {\n            throw new SolrException(SolrException.ErrorCode.INVALID_STATE, \"A bootstrap action is already running\");\n          }\n          bootstrapLock.lock();\n\n\nisn't just one enough? "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15230458",
+            "date": "2016-04-07T15:56:27+0000",
+            "content": "Changes:\n\n\n\tRefactored bootstrap status runnable to an inner class called BootstrapStatusRunnable\n\tBootstrapStatusRunnable is closed when either CDCR is disabled via API or when the current core is no longer the leadder. It will cancel waiting for bootstrap if cdcr is stopped or if the current core is no longer the leader.\n\tRemoved the unused BootstrapService from CdcrRequestHandler\n\tAdded a CANCEL_BOOTSTRAP action in CdcrRequestHandler which will make a best effort to cancel a running bootstrap operation.\n\tIf CDCR is disabled on the source cluster of if the leader loses leadership then a cancel bootstrap message is sent to the target cluster.\n\n\n\nwhy the double lock in...\n\nThis has been removed to only use tryLock. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15239893",
+            "date": "2016-04-13T19:22:55+0000",
+            "content": "I'm going to start a branch because the current patch (and code for related issues) is becoming difficult to maintain. "
+        },
+        {
+            "author": "Dennis Gove",
+            "id": "comment-15243256",
+            "date": "2016-04-15T17:23:22+0000",
+            "content": "Does this apply to v5.5 or is it 6.x only? "
+        },
+        {
+            "author": "Dennis Gove",
+            "id": "comment-15245858",
+            "date": "2016-04-18T15:36:16+0000",
+            "content": "I was able to get this to apply to 5.5 by first applying https://issues.apache.org/jira/secure/attachment/12775961/SOLR-6273-plus-8263-5x.patch which is attached to SOLR-6273. I did need to make some minor tweaks to that patch as it didn't apply perfectly cleanly and left a couple of minor compilation errors (visibility of certain variables to extension classes). \n\nThis patch also required a few tweaks as it didn't apply cleanly but more-so it appears the patch contains Java lambdas which do not work in Java 7 or below.\n\ncommon.compile-core:\n    [javac] Compiling 25 source files to /Users/dgove1/dev/bfs/lucene-solr/solr/build/solr-core/classes/java\n    [javac] warning: [options] bootstrap class path not set in conjunction with -source 1.7\n    [javac] /Users/dgove1/dev/bfs/lucene-solr/solr/core/src/java/org/apache/solr/handler/CdcrRequestHandler.java:623: error: lambda expressions are not supported in -source 1.7\n    [javac]     Runnable thread = () -> {\n    [javac]                          ^\n    [javac]   (use -source 8 or higher to enable lambda expressions)\n    [javac] 1 error\n    [javac] 1 warning\n\n "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15245882",
+            "date": "2016-04-18T15:51:42+0000",
+            "content": "Hi Dennis Gove, this patch applies on master (maybe a bit out of date as master changes very quickly). I'll push a branch (off master) containing this patch shortly. It uses lambdas (not required of course) because it is my understanding that there may not be a new 5.6 feature release. But if such a release happens, I can change the code and merge back when required. "
+        },
+        {
+            "author": "Erick Erickson",
+            "id": "comment-15245884",
+            "date": "2016-04-18T15:53:10+0000",
+            "content": "Dennis:\n\nIf it's easy, could you add your tweaks to the SOLR-6273-plus-8263-5x.patch to 6273? When I put that patch up, it was in case we ever decided to back-port CDCR to 5x or if people (such as yourself) wanted to be brave. Since the 5x branch is getting more and more static your new version would be helpful if anyone else wants to go down that route for quite some time.\n\nOr are the tweaks small enough that anyone brave enough to apply that patch would also be find tweaking it easy?\n "
+        },
+        {
+            "author": "Dennis Gove",
+            "id": "comment-15245896",
+            "date": "2016-04-18T16:00:22+0000",
+            "content": "The tweaks were very small but they do change visibility of some things.\n\n1. in CdcrTransactionLog, close() is changed from protected to public.\n2. in TransactionLog, log and debug are changed from private to protected\n3. in UpdateLog, log and debug are changed from private to protected\n\nfull diff of changes is below. If we're comfortable with the visibility changes I'd be happy to add them to SOLR-6273.\n\n\ndiff --git a/solr/core/src/java/org/apache/solr/update/CdcrTransactionLog.java b/solr/core/src/java/org/apache/solr/update/CdcrTransactionLog.java\nindex f800f6f..e706733 100644\n--- a/solr/core/src/java/org/apache/solr/update/CdcrTransactionLog.java\n+++ b/solr/core/src/java/org/apache/solr/update/CdcrTransactionLog.java\n@@ -193,7 +193,7 @@ public class CdcrTransactionLog extends TransactionLog {\n   }\n\n   @Override\n-  protected void close() {\n+  public void close() {\n     try {\n       if (debug) {\n         log.debug(\"Closing tlog\" + this);\ndiff --git a/solr/core/src/java/org/apache/solr/update/TransactionLog.java b/solr/core/src/java/org/apache/solr/update/TransactionLog.java\nindex c8b8332..35020be 100644\n--- a/solr/core/src/java/org/apache/solr/update/TransactionLog.java\n+++ b/solr/core/src/java/org/apache/solr/update/TransactionLog.java\n@@ -63,8 +63,8 @@ import org.slf4j.LoggerFactory;\n  *\n  */\n public class TransactionLog implements Closeable {\n-  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());\n-  private static boolean debug = log.isDebugEnabled();\n+  protected static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());\n+  protected static boolean debug = log.isDebugEnabled();\n   private static boolean trace = log.isTraceEnabled();\n\n   public final static String END_MESSAGE=\"SOLR_TLOG_END\";\ndiff --git a/solr/core/src/java/org/apache/solr/update/UpdateLog.java b/solr/core/src/java/org/apache/solr/update/UpdateLog.java\nindex c5dc9a4..ad05d5f 100644\n--- a/solr/core/src/java/org/apache/solr/update/UpdateLog.java\n+++ b/solr/core/src/java/org/apache/solr/update/UpdateLog.java\n@@ -75,8 +75,8 @@ public class UpdateLog implements PluginInfoInitialized {\n   public static String LOG_FILENAME_PATTERN = \"%s.%019d\";\n   public static String TLOG_NAME=\"tlog\";\n\n-  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());\n-  private static boolean debug = log.isDebugEnabled();\n+  protected static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());\n+  protected static boolean debug = log.isDebugEnabled();\n   private static boolean trace = log.isTraceEnabled();\n\n   // TODO: hack\n\n "
+        },
+        {
+            "author": "Erick Erickson",
+            "id": "comment-15245925",
+            "date": "2016-04-18T16:18:42+0000",
+            "content": "As far as I'm concerned, just add the diff file to 6273 with a note. Anybody adventurous enough to apply CDCR to 5x will be well enough served just knowing somebody else's experience. "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-15247855",
+            "date": "2016-04-19T14:36:27+0000",
+            "content": "Shalin Shekhar Mangar, would the goal be to rely solely on the bootstrapping method to replicate indexes, instead of using the updates forwarding method (i.e., cdcr update logs) ? Or would it be a combination of bootstrapping and updates forwarding (based on the original update log, not the cdcr one) ? "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15247918",
+            "date": "2016-04-19T15:05:13+0000",
+            "content": "The goal is to rely on both based on the original update log. "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-15249622",
+            "date": "2016-04-20T10:37:50+0000",
+            "content": "It would be great indeed to be able to simplify the code as you proposed if we can rely on a bootstrap method. Below are some observations that might be useful.\n\nOne of the concern I have is related to the default size limit of the update logs. By default, it keeps 10 tlog files or 100 records. This will likely be too small for providing enough buffer for cdcr, and there might be a risk of a continuous cycle of bootstrapping replication. One could increase the values of \"numRecordsToKeep\" and \"maxNumLogsToKeep\" in solrconfig to accommodate the cdcr requirements. But this is an additional parameter that the user needs to take into consideration, and make configuration more complex. I am wondering if we could find a more appropriate default value for cdcr ?\n\nThe issue with increasing limits in the original update log compared to the cdcr update log is that the original update log will not clean old tlogs files (it will keep all tlogs up to that limit) that are not necessary anymore for the replication. For example, if one increase the maxNumLogsToKeep to 100 and numRecordsToKeep 1000, then the node will always have 100 tlogs files or 1000 records in the update logs, even if all of them has been replicated to the target clusters. This might cause unexpected issues related to disk space or performance.\n\nThe CdcrUpdateLog was managing this by allowing a variable size update log that removes a tlog when it has been fully replicated. But then this means we go back to where we were with all the added management around the cdcr update log, i.e., buffer, lastprocessedversion, CdcrLogSynchronizer, ...\n\nCdcr Buffer\n\nIf we get rid of the cdcr update log logic, then we can also get rid of the Cdcr Buffer (buffer state, buffer commands, etc.)\n\nCdcrUpdateLog\n\nI am not sure if we can get entirely rid of the CdcrUpdateLog. It includes logic such as sub-reader and forward seek that are necessary for sending batch updates. Maybe this logic can be moved in the UpdateLog ?\n\nCdcrLogSynchronizer\n\nI think it is safe to get rid of this. In the case where a leader goes down while a cdcr reader is forwarding updates, the new leader will likely miss the tlogs necessary to resume where the cdcr reader stopped. But in this case, it can fall back to bootstrapping.\n\nTlog Replication\n\nIf the tlogs are not replicated during a bootstrap, then tlogs on target will not be in synch. Could this cause any issues on the target cluster, e.g., in case of a recovery ? \nIf the target is itself configured as a source (i.e. daisy chain), this will probably cause issues. The update logs will likely contain gaps, and it will be very difficult for the source to know that there is a gap. Therefore, it might forward incomplete updates. But this might be a feature we could drop, as suggested in one of your comment on the cwiki. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15409777",
+            "date": "2016-08-05T17:42:07+0000",
+            "content": "Major changes:\n\n\tHardened the bootstrap and bootstrap status request code paths. The bootstrap is still done only once during init but I wrote chaos monkey style tests to exercise this path. Also see SOLR-9364\n\ttlog replication can be disabled via a parameter which is used by target clusters during bootstrap. This prevents tlogs from source leaders to be replicated to target leaders.\n\tAssert that we are the leader before starting bootstrap process\n\tBootstrap uses the same recovery lock to avoid racing with recovery and potentially corrupting the index\n\tCdcrReplicatorState is initialized eagerly rather than waiting for bootstrap to allow QUEUES action to work\n\tAdded a new test CdcrBootstrapTest#testBootstrapWithContinousIndexingOnSourceCluster to stress bootstrap during indexing load\n\tAll existing tests pass and precommit passes\n\n\n\nThe current patch implements the goal of this ticket which is to fall back to whole-index replication when tlogs are insufficient. Therefore, this patch does not remove CdcrUpdateLog and related functionality which can be a bit complicated as Renaud had pointed out. This patch also does not allow updates to be sent while a bootstrap is in progress. Doing that opens a can of worms because you need to carefuly co-ordinate with the leader the order of hard commit and start of buffering to avoid losing documents. Unless the source cluster has very high update rates, the replicator thread should be able to catch up even without this headstart.\n\nI plan to commit this patch as-is and open follow up issues for refactoring and other improvements. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15409884",
+            "date": "2016-08-05T18:35:39+0000",
+            "content": "\n\tUses the CdcrReplicatorState's httpclient for all bootstrap related activities i.e. submission, status and cancellation\n\n "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-15411330",
+            "date": "2016-08-08T05:36:11+0000",
+            "content": "Commit 153c2700450af1e1c4bd063d7d8b65cc4a726438 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=153c270 ]\n\nSOLR-6465: CDCR: fall back to whole-index replication when tlogs are insufficient "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-15411346",
+            "date": "2016-08-08T05:52:59+0000",
+            "content": "Commit cc3f3e8a8b37bba8c465beded466ba95e3c4a77d in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cc3f3e8 ]\n\nSOLR-6465: CDCR: fall back to whole-index replication when tlogs are insufficient\n\n(cherry picked from commit 153c2700450af1e1c4bd063d7d8b65cc4a726438) "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-15413788",
+            "date": "2016-08-09T16:10:49+0000",
+            "content": "My Jenkins had a CdcrBootstrapTest.testBootstrapWithContinousIndexingOnSourceCluster() failure on branch_6x that does not reproduce for me (I tried the repro line both with and without tests.method) - I'm attaching a compressed excerpt  from the build log for that run (1858.log.gz):\n\n\n  [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=CdcrBootstrapTest -Dtests.method=testBootstrapWithContinousIndexingOnSourceCluster -Dtests.seed=B8FE08D75B76C10A -Dtests.slow=true -Dtests.linedocsfile=/home/jenkins/lucene-data/enwiki.random.lines.txt -Dtests.locale=uk -Dtests.timezone=US/Aleutian -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n   [junit4] FAILURE  145s J7  | CdcrBootstrapTest.testBootstrapWithContinousIndexingOnSourceCluster <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: Document mismatch on target after sync expected:<20000> but was:<0>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([B8FE08D75B76C10A:6CBB438EBC2072F1]:0)\n   [junit4]    > \tat org.apache.solr.cloud.CdcrBootstrapTest.testBootstrapWithContinousIndexingOnSourceCluster(CdcrBootstrapTest.java:334)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15413890",
+            "date": "2016-08-09T17:33:40+0000",
+            "content": "Thanks Steve, I'll take a look. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-15417324",
+            "date": "2016-08-11T14:24:13+0000",
+            "content": "My Jenkins saw a different CdcrBootstrapTest fail on branch_6x: testConvertClusterToCdcrAndBootstrap() - again, it doesn't reproduce for me, regardless of inclusion of tests.method on the cmdline - I'm attaching a compressed excerpt from the build log for that run (1890.log.gz):\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=CdcrBootstrapTest -Dtests.method=testConvertClusterToCdcrAndBootstrap -Dtests.seed=C8BABD95B571310C -Dtests.slow=true -Dtests.linedocsfile=/home/jenkins/lucene-data/enwiki.random.lines.txt -Dtests.locale=th -Dtests.timezone=America/Argentina/Cordoba -Dtests.asserts=true -Dtests.file.encoding=US-ASCII\n   [junit4] FAILURE  138s J6  | CdcrBootstrapTest.testConvertClusterToCdcrAndBootstrap <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: Document mismatch on target after sync expected:<10000> but was:<0>\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([C8BABD95B571310C:1F6D92E2012EA94B]:0)\n   [junit4]    > \tat org.apache.solr.cloud.CdcrBootstrapTest.testConvertClusterToCdcrAndBootstrap(CdcrBootstrapTest.java:144)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n "
+        },
+        {
+            "author": "Erick Erickson",
+            "id": "comment-16063741",
+            "date": "2017-06-26T20:37:14+0000",
+            "content": "Shalin Shekhar Mangar Steve Rowe] Just noticed that this is still open but listed as fixed in CHANGES.txt for Solr 6.2. Can we close it? "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16064117",
+            "date": "2017-06-27T02:00:11+0000",
+            "content": "This was released in 6.2 "
+        }
+    ]
+}

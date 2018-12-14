@@ -1,0 +1,35 @@
+{
+    "id": "SOLR-6534",
+    "title": "Multipolygon query problem with datelineRule=ccwRect",
+    "details": {
+        "affect_versions": "4.9",
+        "status": "Open",
+        "fix_versions": [
+            "5.0"
+        ],
+        "components": [
+            "spatial"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "We are currently upgrading from Solr 4.1 to 4.9 and have observed some odd behavior with multipolygon queries now. It is difficult to describe what is happening so I took a screenshot with the documents and query area plotted on a map. You can see it here: http://imgur.com/iBpYLMh The blue areas represent the multipolygon and the purple areas represent the document footprints.\n\nThe query being used is as follows:\n\ngeo:\"Intersects(MULTIPOLYGON(((-3 2,4 2,4 8,-3 8,-3 2)),((-3 -11,4 -11,4 -4,-3 -4,-3 -11))))\"\nThis query returns all results when it should be returning only 8. If I run two separate queries with each individual polygon, I get 4 hits each as expected.\n\nI've narrowed this down to a problem with using 'datelineRule=ccwRect'. If I remove this setting, the query returns with the expected results. Unfortunately, this setting is required for our software though, since handling large polygon queries (spanning >180 degrees) are a requirement.\n\nHere are the relevant schema details:\n\n<field name=\"geo\" type=\"location_rpt\" indexed=\"true\" stored=\"false\"/>\n<fieldType name=\"location_rpt\" class=\"solr.SpatialRecursivePrefixTreeFieldType\" spatialContextFactory=\"com.spatial4j.core.context.jts.JtsSpatialContextFactory\"\ngeo=\"true\" distErrPct=\"0.1\" maxDistErr=\"0.000009\" units=\"degrees\"\ndatelineRule=\"ccwRect\" normWrapLongitude=\"true\" autoIndex=\"true\"/>",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "David Smiley",
+            "id": "comment-14140674",
+            "date": "2014-09-19T14:48:06+0000",
+            "content": "The root cause is a known-bug in Spatial4j's ShapeCollection computing it's bounding box geodetically (e.g. not euclidean): https://github.com/spatial4j/spatial4j/issues/77\nIt occurs when multiple shapes share the same longitudinal span, and results in a world-wrapping longitude.  ShapeCollection is new to v0.4 to handle all the MULTI* shapes in WKT plus GEOMETRYCOLLECTION.  Previously, Spatial4j relied on it's wrapper on a JTS Geometry \u2013 JtsGeometry.  JtsGeometry's computation of determining the geodetic bounding box has/had a similar bug too, but not this specific bug.  An easy way to use JtsGeometry in lieu of ShapeCollection is to switch back to the older WKT Parser that didn't create ShapeCollection's: wktShapeParserClass=\"com.spatial4j.core.io.jts.JtsWKTReaderShapeParser\" and I don't see the problem behavior.  But I think then the dateline rule is ignored and you must accept the width180 behavior.\n\nThe bounding box is generally something that's okay to be larger than a true/optimal bounding box but may make things slower.  However, RPT uses the bounding box of a shape in conjunction with distErrPct to determine to which grid detail it is to traverse the hierarchical grid.  Given a gigantic bounding box coupled with the default distErrPct of 2.5%, it approximates the query shape to be so large as to include the indexed data you didn't want.   At query time it's safe to set distErrPct to 0.0, which yields correct results:\n\ngeo:\"Intersects(MULTIPOLYGON(((-3 2,4 2,4 8,-3 8,-3 2)),((-3 -11,4 -11,4 -4,-3 -4,-3 -11)))) distErrPct=0.0\"\n\n\n\nFYI, I want to change the query-time default distErrPct to 0.0 as it rarely accounts for much of a performance difference and it yields more expected behavior.\n\nI don't believe the dateline rule is actually related; that was a red-herring in the bug report from what I can tell. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14140686",
+            "date": "2014-09-19T14:53:00+0000",
+            "content": "This issue can be left open I guess, or perhaps closed when query-time distErrPct becomes defaulted to 0 and/or ShapeCollection's bbox algorithm gets fixed.\n\nHere's the unit test I added to RandomSpatialOpFuzzyPrefixTreeTest (not committed) to help diagnose the problem:\n\n  @Test\n  public void testSOLR6534() throws IOException, ParseException {\n    JtsSpatialContextFactory factory = new JtsSpatialContextFactory();\n    factory.datelineRule = JtsWktShapeParser.DatelineRule.ccwRect;\n    //factory.wktShapeParserClass = JtsWKTReaderShapeParser.class;\n    this.ctx = factory.newSpatialContext();\n    this.grid = new GeohashPrefixTree(ctx, 11);\n    this.strategy = new RecursivePrefixTreeStrategy(grid, getClass().getSimpleName());\n//    Shape shape = ctx.readShapeFromWkt(\"GEOMETRYCOLLECTION(\" +\n//        \"ENVELOPE(-3,4,8,2), ENVELOPE(-3,4,-4,-11)\" +\n//        \")\");\n    Shape queryShape = ctx.readShapeFromWkt(\"MULTIPOLYGON(\" +\n        \"((-3 2,4 2,4 8,-3 8,-3 2)),((-3 -11,4 -11,4 -4,-3 -4,-3 -11))\" +\n        \")\");\n    final Rectangle indexedShape = ctx.makeRectangle(-9, -4, 3, 6);\n    final SpatialOperation operation = SpatialOperation.Intersects;\n    final boolean match = false;\n//    testOperation(\n//        indexedShape,\n//        operation,\n//        queryShape, false);\n    //inline testOperation so we can set distErr\n    adoc(\"0\", indexedShape);\n    commit();\n    final SpatialArgs args = new SpatialArgs(operation, queryShape);\n    args.setDistErr(0.0);\n    Query query = strategy.makeQuery(args);\n    SearchResults got = executeQuery(query, 1);\n    assert got.numFound <= 1 : \"unclean test env\";\n    if ((got.numFound == 1) != match)\n      fail(operation+\" I:\" + indexedShape + \" Q:\" + queryShape);\n    deleteAll();//clean up after ourselves\n  }\n\n "
+        }
+    ]
+}

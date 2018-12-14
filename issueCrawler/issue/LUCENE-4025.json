@@ -1,0 +1,85 @@
+{
+    "id": "LUCENE-4025",
+    "title": "ReferenceManager.maybeRefresh should allow the caller to block",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "ReferenceManager.maybeRefresh() returns a boolean today, specifying whether the maybeRefresh logic was executed by the caller or not. If it's false, it means that another thread is currently refreshing and the call returns immediately.\n\nI think that that's inconvenient to the caller. I.e., if you wanted to do something like:\n\nwriter.commit();\nsearcherManager.maybeRefresh();\nsearcherManager.acquire();\n\n\nIt'd be better if you could guarantee that when the maybeRefresh() call returned, the follow on acquire() will return a refreshed IndexSearcher. Even if you omit the commit instruction, it'd be good if you can guarantee that.\n\nI don't quite see the benefit of having the caller thread not block if there's another thread currently refreshing. In, I believe, most cases, you'd anyway have just one thread calling maybeRefresh(). Even if not, the only benefit of not blocking is if you have commit() followed by maybeRefresh() logic done by some threads, while other threads acquire searchers - maybe then you wouldn't care if another thread is currently doing the refresh?\n\nActually, I tend to think that not blocking is buggy? I mean, what if two threads do commit() + maybeRefresh(). The first thread finishes commit, enters maybeRefresh(), acquires the lock and reopens the Reader. Then the second thread does its commit(), enters maybeRefresh, fails to obtain the lock and exits. Its changes won't be exposed by SM until the next maybeRefresh() is called.\n\nSo it looks to me like current logic may be buggy in that sense?",
+    "attachments": {
+        "LUCENE-4025.patch": "https://issues.apache.org/jira/secure/attachment/12525157/LUCENE-4025.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-04-30T16:16:09+0000",
+            "content": "I'm torn here...\n\nAlways blocking seems dangerous because \"simple\" apps, that call .maybeRefresh() from searching threads, will suddenly see all search threads block when a reopen is happening ... I think it's too trappy to do that.  I think when it comes to concurrent code you should try hard to not have \"blocks all threads\" trappiness...\n\nBut I also agree it's a hassle now for callers that want to ensure specific changes are now visible... though, we do have NRTManager for that use case.\n\nMaybe we can add an optional boolean (doWait, defaulting to false) to maybeRefresh?  Or we a separate method for it (maybeRefreshAndWaitIfItsAlreadyHappening), or, we can make decoupled method (waitForRefreshToFinish) and change maybeRefresh to return 3 results (IS_CURRENT, DID_REFRESH, OTHER_THREAD_IS_REFRESHING)... or, something else? ",
+            "author": "Michael McCandless",
+            "id": "comment-13265004"
+        },
+        {
+            "date": "2012-04-30T16:55:46+0000",
+            "content": "isn't this exactly why things like the ExecutorService and/or Future APIs exist?  let the caller decide if they want the methods they call to be executed in the current thread or as part of a thread pool and/or block until the logic is executed (with a possible time limit) ",
+            "author": "Hoss Man",
+            "id": "comment-13265027"
+        },
+        {
+            "date": "2012-04-30T19:24:19+0000",
+            "content": "I'm torn here...\n\nI'm also torn here .\n\nAlways blocking seems dangerous because \"simple\" apps, that call .maybeRefresh() from searching threads, will suddenly see all search threads block when a reopen is happening\n\nmaybeRefresh says that you should call this periodically. I consider SearcherManager kind of advanced API. Calling maybeRefresh() on every search is like calling IndexReader.openIfChanged before every search. If we need to, let's document the implications of the method.\n\nNot blocking might be buggy, while blocking might affect your performance. I think that the performance issue is really and edge case of stupidity, while the former is a simple expectation. maybeRefresh documents that if it returns false, it might be that the next acquire won't return the most up-to-date IndexSearcher, but it doesn't give you any way to ensure that.\n\nAs for the extra API, can we start by unnecessarily complicating the API? It looks to me that the API is clear with plenty of sample code and documentation (Mike, you even wrote a couple of blog posts about it). It's just a matter of semantics and if we tell people to call maybeRefresh periodically, then let's help them by ensuring this call does something. ",
+            "author": "Shai Erera",
+            "id": "comment-13265132"
+        },
+        {
+            "date": "2012-04-30T20:40:53+0000",
+            "content": "my take on this is that if you really want this point in time semantics you are describing you should use your own application locking on top. You can simply use a read/write lock and acquire the write lock if you enter the \"commit\" block which I assume you don't do too frequently. The other option is to simply call maybeRefresh in an empty loop. The non-blocking fashion is a big asset here IMO since you can't build a non-blocking app with blocking components but you can do the other way around.\n\nNot blocking might be buggy, while blocking might affect your performance.\n\nthat is bogus IMO.   ",
+            "author": "Simon Willnauer",
+            "id": "comment-13265195"
+        },
+        {
+            "date": "2012-05-01T05:24:09+0000",
+            "content": "Calling maybeRefresh in an empty loop is not good. You'd want to at least add some sleep in between calls. And then you need to decide on the sleep interval. Complicate things.\n\nWhat's not clear to me is why was this API made non-blocking in the first place? Did someone complain about it being blocking?\n\nThe non-blocking fashion is a big asset here IMO since you can't build a non-blocking app with blocking components but you can do the other way around.\n\nThat's generally a correct statement, but who said that in the context of a ReferenceManager you want to build a non-blocking app?\n\nPerhaps a maybeRefreshBlocking() will be the best compromise after all. That method won't return anything and will just block on reopenLock. I'll create a patch, let's see how it looks first. While I'm at it, I'll rename reopenLock to refreshLock (reopenLock was from the time it was in SearcherManager). ",
+            "author": "Shai Erera",
+            "id": "comment-13265663"
+        },
+        {
+            "date": "2012-05-01T05:57:28+0000",
+            "content": "Patch adds maybeRefreshBlocking which blocks on refreshLock. It also:\n\n\n\tRenames reopenLock to refreshLock\n\tShares the refresh logic between maybeRefresh and maybeRefreshBlocking.\n\tSwitches to use ReentrantLock instead of Semaphore(1):\n\t\n\t\tIt allows to protectively obtain the lock in doMaybeRefresh (see comment in the code)\n\t\tIt is better in general because it's equivalent to Semaphore(1), yet protects against an accidental bug where someone changes Semaphore(1) to Semaphore(>1).\n\t\n\t\n\n\n\nI'll add a CHANGES entry after the patch is reviewed and we agree on the approach. ",
+            "author": "Shai Erera",
+            "id": "comment-13265675"
+        },
+        {
+            "date": "2012-05-01T13:41:45+0000",
+            "content": "Approach & patch look good!\n\nMaybe change javadocs to state that \"you must call maybeRefresh or maybeRefreshBlocking periodically\" (now each one states you must call that one).  Also maybe say \"if another thread is currently refreshing, this method blocks until that thread completes\". ",
+            "author": "Michael McCandless",
+            "id": "comment-13265800"
+        },
+        {
+            "date": "2012-05-01T14:29:10+0000",
+            "content": "Thanks Mike. I updated the javadoc as you suggest and added a CHANGES entry.\n\nI think this is ready to commit. ",
+            "author": "Shai Erera",
+            "id": "comment-13265836"
+        },
+        {
+            "date": "2012-05-01T14:45:22+0000",
+            "content": "+1, looks good.  Thanks Shai! ",
+            "author": "Michael McCandless",
+            "id": "comment-13265842"
+        },
+        {
+            "date": "2012-05-01T15:26:46+0000",
+            "content": "Committed rev 1332699.\n\nI also added randomly calling it from TestSearcherManager.\n\nThanks Mike for the review ! ",
+            "author": "Shai Erera",
+            "id": "comment-13265861"
+        }
+    ]
+}

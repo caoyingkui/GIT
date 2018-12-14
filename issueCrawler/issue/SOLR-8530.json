@@ -1,0 +1,158 @@
+{
+    "id": "SOLR-8530",
+    "title": "Add HavingStream to Streaming API and StreamingExpressions",
+    "details": {
+        "components": [
+            "SolrJ"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.4",
+            "7.0"
+        ],
+        "affect_versions": "6.0",
+        "status": "Resolved",
+        "resolution": "Implemented",
+        "priority": "Minor"
+    },
+    "description": "The goal here is to support something similar to SQL's HAVING clause where one can filter documents based on data that is not available in the index. For example, filter the output of a reduce(....) based on the calculated metrics.\n\n\nhaving(\n  reduce(\n    search(.....),\n    sum(cost),\n    on=customerId\n  ),\n  q=\"sum(cost):[500 TO *]\"\n)\n\n\n\nThis example would return all where the total spent by each distinct customer is >= 500. The total spent is calculated via the sum(cost) metric in the reduce stream.\n\nThe intent is to support as the filters in the having(...) clause the full query syntax of a search(...) clause. I see this being possible in one of two ways. \n\n1. Use Lucene's MemoryIndex and as each tuple is read out of the underlying stream creating an instance of MemoryIndex and apply the query to it. If the result of that is >0 then the tuple should be returned from the HavingStream.\n\n2. Create an in-memory solr index via something like RamDirectory, read all tuples into that in-memory index using the UpdateStream, and then stream out of that all the matching tuples from the query.\n\nThere are benefits to each approach but I think the easiest and most direct one is the MemoryIndex approach. With MemoryIndex it isn't necessary to read all incoming tuples before returning a single tuple. With a MemoryIndex there is a need to parse the solr query parameters and create a valid Lucene query but I suspect that can be done using existing QParser implementations.",
+    "attachments": {
+        "SOLR-8530.patch": "https://issues.apache.org/jira/secure/attachment/12845412/SOLR-8530.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-01-08T22:27:42+0000",
+            "author": "Joel Bernstein",
+            "content": "Is there a specific reason to use an index for the comparison logic? We could also add a ComparisonOperation interface and implement the basic comparison logic. \n\n\nhaving(reduce(), gt(\"x\", 100))\n\n\n\n\nAnd with boolean operators\n\n\nhaving(rollup(), or(gt(\"x\", 100), lt(\"x\", 500)))\n\n ",
+            "id": "comment-15090073"
+        },
+        {
+            "date": "2016-01-08T22:35:25+0000",
+            "author": "Joel Bernstein",
+            "content": "Then we could also throw away the HavingStream that comes with the SQLHandler which relies on Presto classes.  ",
+            "id": "comment-15090089"
+        },
+        {
+            "date": "2016-01-08T23:57:00+0000",
+            "author": "Dennis Gove",
+            "content": "A ComparisonOperation is another good option. \n\nMy thinking for using an index is three-fold. First, a desire to not ask users to learn yet another way to do comparisons. If they already know the Solr syntax they can use that directly in this stream. And second to support even the non simple comparisons without having to implement them. For example a date range filter. This assumes that at some point we'll support metrics over dates but I think that's a reasonable assumption. And third, given the JDBCStream this provides a way for someone to do textual based queries over a subset of documents out of a join of Solr and non-Solr supplied documents. Obviously one could do a textual search over the Solr supplied stream directly but that may not be possible over the JDBC supplied stream.\n\nThat said, I'm not adverse to a ComparisonOperation. I just feel that a full index support gives us a lot of power going forward. ",
+            "id": "comment-15090228"
+        },
+        {
+            "date": "2016-01-09T01:26:35+0000",
+            "author": "Joel Bernstein",
+            "content": "I think it makes sense to have two implementations:\n\nMatchStream: Uses an in-memory index to match Tuples.\nHavingStream: Uses a ComparisionOperation to match Tuples.\n\nOne of the things we can think over is a specific stream for doing parallel alerting. The MatchStream is a step in that direction. ",
+            "id": "comment-15090316"
+        },
+        {
+            "date": "2017-01-02T02:15:50+0000",
+            "author": "Joel Bernstein",
+            "content": "I returned to the HavingStream as part of SOLR-8593.\n\nWhat I found during the implementation is that both implementations described in this ticket are compatible in the same HavingStream implementation. \n\nWhat Dennis Gove originally described was indexing a document on the fly and the using a Lucene/Solr query to implement the boolean logic.\n\nWhat I described is implementing the boolean logic as stream operations that would handle typical SQL Having comparisons (=, <, >, <>, >=, <=). \n\nI have  implemented the HavingStream I described as part of SOLR-8593 with syntax that looks like this:\n\n\nhaving(expr, booleanOp)\n\n\n\nWhere booleanOp is a new type of operation that returns TRUE or FALSE for each tuple. The basic boolean operations have been implemented, such as:\n\n\nhaving(expr, and(gt(field1, 5), lt(field1, 10)))\n\n\n\nThis would emit tuples from the underlying expr where field1 is greater than 5 and less than 10.\n\nTo implement what Dennis Gove had in mind, we can add a new boolean operation called match. The match operation will index the tuple in an in-memory index and then match a Lucene/Solr query against it. Here is the sample syntax:\n\n\nhaving(expr, match(\"field1:[5 TO 10]\"))\n\n\n\nThe match boolean operation could then be intermingled with other boolean operations, for example:\n\n\nhaving(expr, and(gt(field2, 8), match(\"body:(hello world)\")))\n\n\n\nDepending on the progress of the SOLR-8593, I may strip out the HavingStream implementation and commit it with this ticket, so it can be ready for Solr 6.4.\n\n\n\n ",
+            "id": "comment-15792021"
+        },
+        {
+            "date": "2017-01-02T15:33:30+0000",
+            "author": "David Smiley",
+            "content": "Nice plan Joel.\n\nRE naming... maybe include the string \"solr\" in some way, e.g. \"solrMatch\"?  or \"solrPredicate\"?  \"match\" by itself seems too generic/ambiguous to me. ",
+            "id": "comment-15793050"
+        },
+        {
+            "date": "2017-01-02T16:03:25+0000",
+            "author": "Dennis Gove",
+            "content": "One problem I ran into when I was approaching the Match (or SolrMatch, I like David's idea about naming) implementation was that the classes needed for in-memory index don't exist in the SolrJ library. This means it would create a dependency on something outside SolrJ. If I remember correctly, the specific pieces I was trying to implement was the parsing of a Solr query to a Lucene compatible query. This is because the in-memory index requires Lucene syntax while I wanted the SolrMatch to accept Solr syntax. ",
+            "id": "comment-15793092"
+        },
+        {
+            "date": "2017-01-02T16:42:24+0000",
+            "author": "Joel Bernstein",
+            "content": "We ran into the same problem when we implemented the classify() function which needed access to the analyzers. We ended up placing the ClassifyStream in core: org.apache.solr.handler.\n\nThis means the classify() function can only be run via the /stream handler rather then as a stand alone solrj client. But in scenarios where we have functions that require integration with Solr core classes I think this makes senses. \n\n ",
+            "id": "comment-15793146"
+        },
+        {
+            "date": "2017-01-02T16:44:47+0000",
+            "author": "Joel Bernstein",
+            "content": "Yep, makes sense. ",
+            "id": "comment-15793150"
+        },
+        {
+            "date": "2017-01-03T18:13:11+0000",
+            "author": "Joel Bernstein",
+            "content": "Patch with tests. ",
+            "id": "comment-15795704"
+        },
+        {
+            "date": "2017-01-03T22:09:44+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1da283ef2c673b2effac834da1de1cb94c0118bb in lucene-solr's branch refs/heads/master from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1da283e ]\n\nSOLR-8530: Add HavingStream to Streaming API and StreamingExpressions ",
+            "id": "comment-15796347"
+        },
+        {
+            "date": "2017-01-03T22:09:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 5bbd4d6765d69d245131d049a2551c0534c1180d in lucene-solr's branch refs/heads/master from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5bbd4d6 ]\n\nSOLR-8530: Add tests from the HavingStream ",
+            "id": "comment-15796348"
+        },
+        {
+            "date": "2017-01-03T22:10:07+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit db7d2ff1629e7ae45a405eebdcdde1c68664d01f in lucene-solr's branch refs/heads/master from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=db7d2ff ]\n\nSOLR-8530: Updated CHANGES.txt ",
+            "id": "comment-15796350"
+        },
+        {
+            "date": "2017-01-03T22:30:41+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2f7d6fc0fa3de7e2f1d09823d9ef4c6ee08e9d44 in lucene-solr's branch refs/heads/branch_6x from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2f7d6fc ]\n\nSOLR-8530: Add HavingStream to Streaming API and StreamingExpressions ",
+            "id": "comment-15796407"
+        },
+        {
+            "date": "2017-01-03T22:30:43+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 297b1789092f4f9b3a2cfb91da397e5034708486 in lucene-solr's branch refs/heads/branch_6x from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=297b178 ]\n\nSOLR-8530: Add tests from the HavingStream ",
+            "id": "comment-15796408"
+        },
+        {
+            "date": "2017-01-03T22:30:45+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 00af5fff4d096000b0cde9066a599f68076c1862 in lucene-solr's branch refs/heads/branch_6x from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=00af5ff ]\n\nSOLR-8530: Fixed javadoc ",
+            "id": "comment-15796409"
+        },
+        {
+            "date": "2017-01-03T22:30:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d8a58146c3155a13f9bb8c46eb2d2878301426d3 in lucene-solr's branch refs/heads/branch_6x from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d8a5814 ]\n\nSOLR-8530: Updated CHANGES.txt ",
+            "id": "comment-15796410"
+        },
+        {
+            "date": "2017-01-04T01:37:33+0000",
+            "author": "Joel Bernstein",
+            "content": "This is reopened to support having comparisons on aggregates. ",
+            "id": "comment-15796835"
+        },
+        {
+            "date": "2017-01-04T02:07:14+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ccdbb6ac0e0094985e5145c84b3cc2814ababf1d in lucene-solr's branch refs/heads/master from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ccdbb6a ]\n\nSOLR-8530: Add support for single quoted aggregate HAVING comparisons ",
+            "id": "comment-15796890"
+        },
+        {
+            "date": "2017-01-04T02:21:10+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 93d1bba8f2194970ca736bee993cedea24e66b91 in lucene-solr's branch refs/heads/branch_6x from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=93d1bba ]\n\nSOLR-8530: Add support for single quoted aggregate HAVING comparisons ",
+            "id": "comment-15796914"
+        },
+        {
+            "date": "2017-01-06T01:47:08+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit b32cd82318f5c8817a8383e1be7534c772e6fa13 in lucene-solr's branch refs/heads/master from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b32cd82 ]\n\nSOLR-8530: Add support for aggregate HAVING comparisons without single quotes ",
+            "id": "comment-15803191"
+        },
+        {
+            "date": "2017-01-06T02:00:22+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7ae9ca85d9d920db353d3d080b0cb36567e206b2 in lucene-solr's branch refs/heads/branch_6x from Joel Bernstein\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7ae9ca8 ]\n\nSOLR-8530: Add support for aggregate HAVING comparisons without single quotes ",
+            "id": "comment-15803218"
+        }
+    ]
+}

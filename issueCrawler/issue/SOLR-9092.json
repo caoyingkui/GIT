@@ -1,0 +1,90 @@
+{
+    "id": "SOLR-9092",
+    "title": "Add safety checks to delete replica/shard/collection commands",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Minor"
+    },
+    "description": "We should verify the delete commands against live_nodes to make sure the API can atleast be executed correctly\n\nIf we have a two node cluster, a collection with 1 shard 2 replica. Call the delete replica command against for the replica whose node is currently down.\n\nYou get an exception:\n\n\n<response>\n   <lst name=\"responseHeader\">\n      <int name=\"status\">0</int>\n      <int name=\"QTime\">5173</int>\n   </lst>\n   <lst name=\"failure\">\n      <str name=\"192.168.1.101:7574_solr\">org.apache.solr.client.solrj.SolrServerException:Server refused connection at: http://192.168.1.101:7574/solr</str>\n   </lst>\n</response>\n\n\n\nAt this point the entry for the replica is gone from state.json . The client application retries since an error was thrown but the delete command will never succeed now and an error like this will be seen-\n\n\n<response>\n   <lst name=\"responseHeader\">\n      <int name=\"status\">400</int>\n      <int name=\"QTime\">137</int>\n   </lst>\n   <str name=\"Operation deletereplica caused exception:\">org.apache.solr.common.SolrException:org.apache.solr.common.SolrException: Invalid replica : core_node3 in shard/collection : shard1/gettingstarted available replicas are core_node1</str>\n   <lst name=\"exception\">\n      <str name=\"msg\">Invalid replica : core_node3 in shard/collection : shard1/gettingstarted available replicas are core_node1</str>\n      <int name=\"rspCode\">400</int>\n   </lst>\n   <lst name=\"error\">\n      <lst name=\"metadata\">\n         <str name=\"error-class\">org.apache.solr.common.SolrException</str>\n         <str name=\"root-error-class\">org.apache.solr.common.SolrException</str>\n      </lst>\n      <str name=\"msg\">Invalid replica : core_node3 in shard/collection : shard1/gettingstarted available replicas are core_node1</str>\n      <int name=\"code\">400</int>\n   </lst>\n</response>\n\n\n\nFor create collection/add-replica we check the \"createNodeSet\" and \"node\" params respectively against live_nodes to make sure it has a chance of succeeding.\n\nWe should add a check against live_nodes for the delete commands as well.\n\nAnother situation where I saw this can be a problem - A second solr cluster cloned from the first but the script didn't correctly change the hostnames in the state.json file. When a delete command was issued against the second cluster Solr deleted the replica from the first cluster.\n\nIn the above case the script was buggy obviously but if we verify against live_nodes then Solr wouldn't have gone ahead and deleted replicas not belonging to its cluster.",
+    "attachments": {
+        "SOLR-9092.patch": "https://issues.apache.org/jira/secure/attachment/12823095/SOLR-9092.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-05-10T09:51:44+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "The delete replica API already has a 'onlyIfDown' parameter. I think you want to add a `onlyIfLive` parameter? The delete replica API is supposed to delete non-live replicas from cluster state and I think that should be the default because otherwise how else would you remove a replica which has been decommissioned. If we change the default to be onlyIfLive=true then that's a major back-compat break for this API. ",
+            "id": "comment-15277872"
+        },
+        {
+            "date": "2016-05-11T23:43:57+0000",
+            "author": "Anshum Gupta",
+            "content": "Agreed that changing the default of onlyIfLive to true would break back-compat, but we still need to fix this. This could easily spiral into a bigger problem with large clusters. Also, we should fix whatever is returned to the user in terms of failure/success. If it's a failure, the user should have a way to at least retry and clean up whatever cruft was left behind.\nIf we choose to return a success, we should be responsible for returning more information about what was not cleaned up from the disk in a manner that makes it easier to parse and process for the users. ",
+            "id": "comment-15281005"
+        },
+        {
+            "date": "2016-05-12T11:50:26+0000",
+            "author": "Varun Thacker",
+            "content": "otherwise how else would you remove a replica which has been decommissioned.\n\nFair point. One caveat though - for people who aren't using legacyCloud=true ( default ) , if ever the node comes back up the collection will be created , which will be puzzling to the user \nBut maybe we should stop optimizing for this as we want to move to \"zk as truth\" sooner rather than later. ",
+            "id": "comment-15281442"
+        },
+        {
+            "date": "2016-05-13T18:06:24+0000",
+            "author": "Jessica Cheng Mallet",
+            "content": "We do want to delete the replica from cluster state even if the node doesn't appear under live_nodes, but it shouldn't send the core admin UNLOAD to the node unless it's appearing under live_nodes. In the situation where the node is down and we want to remove it from the cluster state, we would rely on the deleteCoreNode call to have it removed: https://github.com/apache/lucene-solr/blob/master/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionMessageHandler.java#L634 ",
+            "id": "comment-15282925"
+        },
+        {
+            "date": "2016-08-10T17:13:07+0000",
+            "author": "Varun Thacker",
+            "content": "I started to revisit this issue. Took a quick crack at it \n\nThe approach I've taken is - before sending the core UNLOAD command verify if the core is part of a live node. If the node isn't part of live_nodes then it would fail anyways. So this check won't break back-compat. The cluster state info still gets deleted. It will protect us from the second scenario mentiond on the ticket\n\nAnother situation where I saw this can be a problem - A second solr cluster cloned from the first but the script didn't correctly change the hostnames in the state.json file. When a delete command was issued against the second cluster Solr deleted the replica from the first cluster. In the above case the script was buggy obviously but if we verify against live_nodes then Solr wouldn't have gone ahead and deleted replicas not belonging to its cluster.\n\nJust wanted to get some feedback before writing tests etc. ",
+            "id": "comment-15415600"
+        },
+        {
+            "date": "2016-08-12T18:54:42+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "+1 to the patch. To summarise, we always delete the replica from the cluster state. But we attempt to send the core admin delete request only if that node is actually up. No new parameters are introduced. ",
+            "id": "comment-15419305"
+        },
+        {
+            "date": "2016-08-13T12:30:28+0000",
+            "author": "Varun Thacker",
+            "content": "Updated patch which compiles against master.\n\nAll the tests and precommit passes. I'll commit this now ",
+            "id": "comment-15419900"
+        },
+        {
+            "date": "2016-08-13T12:31:16+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1d9be84cb67ed5e57bcd60ae483f45d3abd09bd5 in lucene-solr's branch refs/heads/master from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1d9be84 ]\n\nSOLR-9092: In the deletereplica commandand add a live check before calling delete core ",
+            "id": "comment-15419901"
+        },
+        {
+            "date": "2016-08-13T12:32:07+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 45f9b6b1ffcae19bd43a523c0d8e62af5b71fafc in lucene-solr's branch refs/heads/branch_6x from Varun Thacker\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=45f9b6b ]\n\nSOLR-9092: In the deletereplica commandand add a live check before calling delete core ",
+            "id": "comment-15419902"
+        },
+        {
+            "date": "2016-08-13T12:32:26+0000",
+            "author": "Varun Thacker",
+            "content": "Thanks Jessica for brining it up! ",
+            "id": "comment-15419903"
+        },
+        {
+            "date": "2016-08-26T13:58:41+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close resolved issues after 6.2.0 release. ",
+            "id": "comment-15438950"
+        }
+    ]
+}

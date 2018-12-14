@@ -1,0 +1,81 @@
+{
+    "id": "SOLR-6460",
+    "title": "Keep transaction logs around longer",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [],
+        "components": [],
+        "type": "Sub-task",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Transaction logs are currently deleted relatively quickly... but we need to keep them around much longer to be used as a source for cross-datacenter recovery.  This will also be useful in the future for enabling peer-sync to use more historical updates before falling back to replication.",
+    "attachments": {
+        "SOLR-6460.patch": "https://issues.apache.org/jira/secure/attachment/12670989/SOLR-6460.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Ramkumar Aiyengar",
+            "id": "comment-14117536",
+            "date": "2014-09-01T16:26:21+0000",
+            "content": "I have a patch in to make this configurable and test this better in SOLR-6359, could be a good start if someone picked that up. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-14117807",
+            "date": "2014-09-02T00:47:08+0000",
+            "content": "Some of the current tlog/peer-sync code won't work well with increased limits.\nOne simple example is peer-sync sends all the docs in a single message (non-streaming)... obviously bad when the number of docs grows (guaranteed to result in an OOM exception).  This is why this issue is separate from raising the peer-sync limit.\nIIRC, another area of concern is that tlogs are kept open until they are deleted (and thus we'll exhaust file descriptors).\nOther code (like peersync code) needs to be audited to ensure that even if we keep gigabytes of log files around, they won't all be read during a peersync request (i.e. peersync limit needs to be decoupled from tlog lifetime).  Some of this issue is just ensuring that no bad things happen when we drastically increase the tlog lifetime limit. "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-14146174",
+            "date": "2014-09-24T10:25:09+0000",
+            "content": "Hi, \n\nhere is an initial analysis and proposal of the modifications of the UpdateLog for the CDCR scenario.\nMost of the original workflow of the UpdateLog can be left untouched. It is necessary however to keep the concept of \"maximum number of records to keep\" (except for the cleaning of old transaction logs) in order to not interfere with the normal workflow.\n\nCleaning of Old Transaction Logs\n\nThe logic to remove old tlog files should be modified so that it relies on pointers instead of a limit defined by the maximum number of records to keep.\nThe UpdateLog should be the one in charge of keeping the list of pointers and of managing their life-cycle (or to deleguate it to the LogReader which is presented next). Such a pointer, denoted LogPointer, should be composed of a tlog file and of an associated file pointer.\n\nLog Reader\n\nThe UpdateLog must provide a log reader, denoted LogReader, that will be used by the CDC Replicator to search, scan and read the update logs. The LogReader will wrap a LogPointer and hide its management (e.g., instantiation, increment, release).\n\nThe operations that must be provided by the LogReader are:\n\n\tScan: move LogPointer to next entry\n\tRead: read a log entry specified by the LogPointer\n\tLookup: lookup a version number - this will be performed during the initialisation of the CDC Replicator / election of a new leader, therefore rarely.\n\n\n\nThe LogReader must not only read olf tlog files, but also the new tlog file (i.e., transaction log being written). This requires specific logic, since a LogReader can be exhausted at a time t1 and have new entries available at a time t2.\n\nLog Index\n\nIn order to support efficient lookup of version numbers across a large number of tlog files, we need a pre-computed index of version numbers across tlog files.\nThe index could be designed as a list of tlog files, associated with their lower and upper bound in term of version numbers. The search will then read this index to find quickly the tlog files containing a given version number, then read the tlog file to find the associated entry.\nHowever, a single tlog file can be large in certain scenarios. Therefore, we could add another secondary index per tlog file. This index will contain a list of <version, pointer> pairs. This will allow the LogReader to quickly find an entry without having to scan the full tlog file. This index will be created and managed by the TransactionLog.\nThis secondary index however duplicates the version number for each log entry. A possible optimisation is to modify the format of the transaction log so that the version number is not stored as part of the log entry.\n\nTransaction Log\n\nThe TransactionLog class is opening the tlog file in the constructor. This could be problematic with a large numbers of tlog files, as it will exhaust the file descriptors. One possible solution is to create a subclass for read only mode that will not open the file in the constructor. Instead, the file will be opened and closed on-demand by using the TransactionLog#LogReader. \nThe CDCR Update Logs will take care of converting old transaction log objects into a read-only version.\nThis has however indirect consequences on the initialisation of the UpdateLog, more precisely in the recovery phase (#recoverFromLog), as the UpdateLog might write a commit (line 1418) at the end of an old tlog during replaying.\n\nIntegration within the UpdateHandler\n\nWe will have to extend the UpdateHandler constructor in order to have the possibility to switch the UpdateLog implementation based on some configuration keys in the solrconfig.xml file. "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-14146499",
+            "date": "2014-09-24T16:39:58+0000",
+            "content": "Here is a first patch with an initial implementation of the CdcrUpdateLog which includes:\n\n\ta cleaning of the old logs based on log pointers\n\ta log reader that reads both the old and new tlog files.\nMany nocommit or todos, but this might provide enough materials for discussion.\n\n "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-14153430",
+            "date": "2014-09-30T17:25:12+0000",
+            "content": "A new patch that introduces efficient seeking over a list of transaction log files. Efficient seeking is achieved by adding metadata (version number) to tlog filename and by leveraging the filesystem's index. The tlog filename has now the following syntax:\n\n\"tlog.${logId}.${startVersion}\"\n\n\n "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-14156672",
+            "date": "2014-10-02T15:36:15+0000",
+            "content": "Here is the latest patch which includes an optimisation to reduce the number of opened files and some code cleaning. To summarise, the current patch provides the following:\n\nCleaning of Old Transaction Logs\n\nThe CdcrUpdateLog removes old tlogs based on pointers instead of a fixed size limit.\n\nLog Reader\n\nThe CdcrUpdateLog provides a log reader with scan and seek operations. A log reader is associated to a log pointer, and is taking care of the life-cycle of the pointer.\n\nLog Index\n\nTo improve the efficiency of the seek operation of the log reader, an index of transaction log files has been added. This index enables to quickly lookup a tlog file based on a version number. This index is implemented by adding a version number to the tlog filename and by leveraging the file system index. This solution was choosen as it was simpler and more robust than managing a separate disk-based index.\n\nNumber of Opened Files\n\nTransactionLog has been extended to automatically (1) close the output stream when its refeference count reaches 0, and (2) reopen the output stream on demand. \nThe new tlog (the current tlog being written) is kept open at all time. When a transaction log is pushed to the old tlog list, its reference count is decremented, which might trigger the closing of the output stream. \nThe output stream is reopened in two cases:\n\n\tduring recovery, to write a commit to the end of an uncapped tlog file;\n\twhen a log reader is accessing it.\n\n\n\nAt the moment, the logic is splitted into two classes (TransactionLog and CdcrTransactionLog). We should probably merge the two in the final version.\n\nIntegration within the UpdateHandler\n\nThere is a nocommit in the UpdateHandler to force the instantiation of the CdcrUpdateLog instead of the UpdateLog. We need to decide how user will configure this and modify the UpdateHandler appropriately. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14241013",
+            "date": "2014-12-10T12:21:40+0000",
+            "content": "Why can't his be committed independent of CDCR? is it  anyway dependent ? "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-14241396",
+            "date": "2014-12-10T17:13:25+0000",
+            "content": "Cdcr is dependent on those modifcations, but this extension is not dependent of Cdcr.\nAll the modifications were implemented as an extension of the original update log. The reason to keep it separated was to avoid to push unexpected problems in the other parts of Solr Cloud. \nThis extension can be easily integrated into the original update log / transaction log. Maybe this could be integrated when we will be more confident with it. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14241402",
+            "date": "2014-12-10T17:17:46+0000",
+            "content": "Cdcr is dependent on those modifications, but this extension is not dependent of Cdcr.\n\nI thought so .So, this can go in without the rest of CDCR itself. I would love as many issues to be checked in independently so that reviewing becomes a lot easier.  "
+        },
+        {
+            "author": "Renaud Delbru",
+            "id": "comment-14242411",
+            "date": "2014-12-11T11:28:32+0000",
+            "content": "The latest version of the update log extension for cdcr. In addition of the previously described features, we extended the transaction log to compute and store the number of records in a tlog file. \nThe patch SOLR-6819 is required for executing the unit tests. "
+        }
+    ]
+}

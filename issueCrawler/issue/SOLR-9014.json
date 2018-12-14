@@ -1,0 +1,189 @@
+{
+    "id": "SOLR-9014",
+    "title": "Deprecate and reduce usage of ClusterState methods which may make calls to ZK via the lazy collection reference",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.1",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "ClusterState has a bunch of methods such as getSlice and getReplica which internally call getCollectionOrNull that ends up making a call to ZK via the lazy collection reference. Many classes use these methods even though a DocCollection object is available. In such cases, multiple redundant calls to ZooKeeper can happen if the collection is not watched locally. This is especially true for Overseer classes which operate on all collections.\n\nWe should audit all usages of these methods and replace them with calls to appropriate DocCollection methods.",
+    "attachments": {
+        "SOLR-9014.patch": "https://issues.apache.org/jira/secure/attachment/12800473/SOLR-9014.patch",
+        "SOLR-9014-deprecate-getCollections.patch": "https://issues.apache.org/jira/secure/attachment/12802301/SOLR-9014-deprecate-getCollections.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-04-20T20:26:45+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This is turning out to be interesting. We have to revisit a few assumptions:\n\n\n\tThe Overseer has a wait loop to see a certain condition to be true in many places. The earlier assumption was that updateClusterState was expensive and therefore it was better to wait until you see the state. But not that we have lazy collections and a collection specific forceUpdateCollection, the wait loop is actually as expensive because it ends up reading the collection state from ZooKeeper \u2013 sometime as frequently as 100ms. We should return the resolved reference from ZkStateReader#forceUpdateCollection and use it in such places.\n\tThe ClusterState#getCollections was supposed to be lightweight i.e. it just read and returned the names of known collections from local cached state. This was changed in SOLR-6629 to resolve the reference. This means that it ends up going to ZK for each non-watched collection. So API calls like downnode etc are way more expensive than needed. It is better to start returning a List<DocCollection> from this method instead.\n\n ",
+            "id": "comment-15250642"
+        },
+        {
+            "date": "2016-04-20T23:05:02+0000",
+            "author": "Scott Blum",
+            "content": "Hard to get the right context in mind in all these cases, eh?\n\n1. If the overseer had set a watch on the collection it cared about, it would be more efficient to wait and loop.  Maybe we could fix this via SOLR-8323?  Overseer could set a temporary watch on things it cared about.\n\nOne thing puzzles me in what you said tho; if the collection is lazy but existent, I think forceUpdateCollection() is basically exactly as efficient as just polling the lazy collection.  So going back to forceUpdateCollection() won't make it any better.  But in cases where the collection is watching, looping is far more efficient.\n\n2) Agreed, maybe we should expose getCollectionStates() or getCollectionNames(). ",
+            "id": "comment-15250898"
+        },
+        {
+            "date": "2016-04-21T00:50:29+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "You are right. I was confused. I haven't dug into SOLR-8323 yet but if you say so  ",
+            "id": "comment-15251031"
+        },
+        {
+            "date": "2016-04-22T15:56:16+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I found SOLR-9030 while working on this issue. ",
+            "id": "comment-15254121"
+        },
+        {
+            "date": "2016-04-25T06:49:27+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Here's a first pass at cleaning this up.\n\nI tried to change getCollections to return DoCollection objects instead of collection names but somehow it tickles SOLR-9030 even more. I'll take another shot at it in a bit. ",
+            "id": "comment-15255975"
+        },
+        {
+            "date": "2016-04-25T20:22:36+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 922265b478296992189434040517368cf93d1b09 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=922265b ]\n\nSOLR-9014: Deprecate and reduce usage of ClusterState methods which may make calls to ZK via the lazy collection reference ",
+            "id": "comment-15256974"
+        },
+        {
+            "date": "2016-04-25T20:36:14+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Scott Blum \u2013 In SOLR-6629, we added a CollectionRef.get() call in ClusterState.getCollections but reading the code again, I no longer understand why it was necessary. Is there ever a chance that the collectionStates inside ClusterState.java would ever have a collection that cannot be resolved? ",
+            "id": "comment-15257000"
+        },
+        {
+            "date": "2016-04-25T23:53:22+0000",
+            "author": "Scott Blum",
+            "content": "Yes, unfortunately.  ClusterState.collectionStates is driven (in part) by /solr/collections/<children>.  In particular, if /solr/collections/foo exists, the foo collection is not being watched, and /solr/collections/foo/state.json does NOT exist, then the collection will appear in collectionStates as a LazyCollectionRef, but it won't resolve to a DocCollection since there's no state.json.  We don't poll or watch for the existence of the state.json for non-watched collections.\n\nWatched collections don't have this problem, due to how interestingCollections vs. watchedCollections is handled in ZkStateReader.\n\nWe should figure out if there's a better API for ClusterState to handle this more efficiently.  If you naively remove the guard in ClusterState.getCollections(), what will happen is a lot of calling code will break.  For example, in Assign.getNodeNameVsShardCount(), the caller loops over the returned set of collection names, calling clusterState.getCollection(collectionName) and expecting the result to be non-null.  We would either need to update all those callers to check, or else have LazyCollectionRef.get() return an empty DocCollection if the node doesn't exist. ",
+            "id": "comment-15257276"
+        },
+        {
+            "date": "2016-04-26T13:20:38+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Yes, unfortunately. ClusterState.collectionStates is driven (in part) by /solr/collections/<children>. In particular, if /solr/collections/foo exists, the foo collection is not being watched, and /solr/collections/foo/state.json does NOT exist, then the collection will appear in collectionStates as a LazyCollectionRef, but it won't resolve to a DocCollection since there's no state.json. We don't poll or watch for the existence of the state.json for non-watched collections.\n\nThis is what I don't understand. If /solr/collections/foo exists, won't the collection exist either in legacy clusterstate.json or in /solr/collections/foo/state.json? Granted that there is an edge case where a collection might be under construction but otherwise this should hold true? So if the goal is to return a Set of names of collections, why must we try to resolve each entry in ClusterState.collectionStates? ",
+            "id": "comment-15258069"
+        },
+        {
+            "date": "2016-04-26T18:05:25+0000",
+            "author": "Scott Blum",
+            "content": "Correct, the edge case is what we're guarding against here.  I would be completely on board with making collectionStates() cheap, but we would need to go update all the call sites to guard against that edge case; ie, using a key returned from collectionStates(), all the call sites need to expect that getCollection(key) might return null. ",
+            "id": "comment-15258576"
+        },
+        {
+            "date": "2016-05-04T10:44:33+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I tried doing this (burned a few days actually) but there are just too many places to fix and thinking more on this, it just feels like a hack and a bad API. I think a better approach may be to ensure that we always create the collection znode and state.json together in one go, maybe as a 'multi' transaction. This would require a lot of cleanup e.g. bootstrapping mode may need to go away, ZkController.createCollectionZkNode must be purged, ZkCli's linkConfig command would no longer operate if the collection doesn't exist (do people even use it that way?) but I think we should do it. ",
+            "id": "comment-15270462"
+        },
+        {
+            "date": "2016-05-04T15:15:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 451feb0f8ea820e21dbf3a55c7a5664d2f750803 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=451feb0 ]\n\nSOLR-9014: Deprecate and reduce usage of ClusterState methods which may make calls to ZK via the lazy collection reference\n(cherry picked from commit 922265b) ",
+            "id": "comment-15270802"
+        },
+        {
+            "date": "2016-05-04T15:18:54+0000",
+            "author": "Scott Blum",
+            "content": "I don't know... seems like a dicey game to try to ensure that no collection node can ever exist without a state.json.  Even the process of migrating state format would have to be transactional.  It seems really tricky to both get all the edge cases right and convince ourselves there's never a legitimate use case (like having a non-collection just for holding shared config).\n\nI think what I would most be in favor of is deprecating the existing API and return a Map<String, DocCollection> to at least avoid the cases where we're doing double lookups today.  Most callers are iterating over the returned set and fetching individual DocCollections in a loop, which causes a second lookup, which is the real problem.  You can never avoid doing at least one lookup anyway.\n\nAn alternate, wacky idea, is to do the same thing but return a custom Map implementation that lazily determines the map contents. ",
+            "id": "comment-15270817"
+        },
+        {
+            "date": "2016-05-04T15:23:46+0000",
+            "author": "Scott Blum",
+            "content": "BTW, I'm surprised this was super tricky.  There aren't really that many callers.  I count:\n\n\n16 - solr-core\n 9 - solr-core-tests\n 2 - solr-test-framework\n 5 - solrj\n 1 - solrj-tests\n\n ",
+            "id": "comment-15270829"
+        },
+        {
+            "date": "2016-05-04T15:28:04+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "No, actually, I segued into my idea of creating the state.json together with the collection znode which took so much time. Also, somehow returning List<DocCollection> from ClusterState.getCollections seems to trigger SOLR-9030 much more often. I'll take another crack at it even though I don't like this solution so much. ",
+            "id": "comment-15270838"
+        },
+        {
+            "date": "2016-05-04T16:11:57+0000",
+            "author": "Shawn Heisey",
+            "content": "As you read this, remember that I have never looked at a single line of any of zookeeper code in Solr, so I'm a strictly 30,000-foot-view guy with only a little bit of practical experience with SolrCloud.  I do have some opinions about the things I do understand.\n\nbootstrapping mode may need to go away, ZkController.createCollectionZkNode must be purged, ZkCli's linkConfig command would no longer operate if the collection doesn't exist (do people even use it that way?)\n\nI have never liked bootstrapping mode.  I know that we need a way for somebody to convert a non-cloud install to a cloud install, but bootstrapping has always felt like an extreme hack, producing strange collections that I would want to remove from production as quickly as possible.  Perhaps bootstrapping can be moved to the scripting layer... but I'm sure a lot of thought will need to go into it.\n\nI can't say anything about ZkController.createCollectionZkNode, because I don't know the code.\n\nQuite some time ago, I was really surprised to learn that linkconfig would work on a collection that didn't even exist yet.  Although I can see the appeal, I believe that we should not have multiple ways to achieve the same result.  Unless a config with the same name as the collection happens to exist, collection.configName should be a required parameter on the CREATE action of the Collections API. ",
+            "id": "comment-15270907"
+        },
+        {
+            "date": "2016-05-04T17:31:50+0000",
+            "author": "Mark Miller",
+            "content": "You have bootstrapping because SolrCloud did not even have a Collections API in 4.0. ",
+            "id": "comment-15271036"
+        },
+        {
+            "date": "2016-05-04T17:34:16+0000",
+            "author": "Mark Miller",
+            "content": "bootstrapping mode may need to go away,\n\nIdeally, stateFormat=1, bootstrapping, predefined cores, legacyCloudMode would have all gone away completely in 6x.\n\nTests have been what makes it sticky to do though. Hopefully we can do it for 7x. ",
+            "id": "comment-15271041"
+        },
+        {
+            "date": "2016-05-04T20:40:49+0000",
+            "author": "David Smiley",
+            "content": "Ideally, stateFormat=1, bootstrapping, predefined cores, legacyCloudMode would have all gone away completely in 6x.\n\n+1 to that!  numShards as a System property is evil. ",
+            "id": "comment-15271396"
+        },
+        {
+            "date": "2016-05-04T22:52:42+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tDeprecates the ClusterState.getCollections method and introduces a new getCollectionsMap method.\n\tRemoves a redundant call at ZkController.publishAndWaitForDownStates\n\tFixed SQLHandler.open which called getCollections twice, once to get size and then again to actually get the set of collection names\n\n\n\nAs I said earlier this change trips SOLR-9030 a lot more. I'll fix that issue first before I commit this patch. ",
+            "id": "comment-15271584"
+        },
+        {
+            "date": "2016-05-04T22:54:24+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Shawn, we should fix linkConfig \u2013 I don't think we should support that use-case. We should also remove bootstrapping, it is long overdue. I'll create an issue though I won't have the time to attack it soon. ",
+            "id": "comment-15271586"
+        },
+        {
+            "date": "2016-05-04T23:52:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit f5497a33e29d087dc0e87ccc697e85f5018d8702 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f5497a3 ]\n\nSOLR-9014: Deprecate ClusterState.getCollections and introduce a new ClusterState.getCollectionsMap instead ",
+            "id": "comment-15271658"
+        },
+        {
+            "date": "2016-05-05T00:02:58+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6ade99947a6e123e3783eb3c3799525e4328e8bc in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6ade999 ]\n\nSOLR-9014: Fix javadoc ",
+            "id": "comment-15271668"
+        },
+        {
+            "date": "2016-05-05T10:33:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7bfaa51079aaea13630bcadc8054ba91277b6e04 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7bfaa51 ]\n\nSOLR-9014: Deprecate ClusterState.getCollections and introduce a new ClusterState.getCollectionsMap instead\n(cherry picked from commit f5497a3) ",
+            "id": "comment-15272171"
+        },
+        {
+            "date": "2016-05-05T10:33:47+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7ce1c2cb74e3c66a22d7ffc07ef392d651848212 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7ce1c2c ]\n\nSOLR-9014: Fix javadoc\n(cherry picked from commit 6ade999) ",
+            "id": "comment-15272172"
+        },
+        {
+            "date": "2016-05-05T10:52:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Let's create separate issues for the other improvements discussed here.\n\nThanks to all who have contributed! ",
+            "id": "comment-15272194"
+        },
+        {
+            "date": "2016-05-09T21:59:18+0000",
+            "author": "Hoss Man",
+            "content": "\nManually correcting fixVersion per Step #S5 of LUCENE-7271 ",
+            "id": "comment-15277138"
+        }
+    ]
+}

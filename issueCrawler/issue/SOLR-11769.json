@@ -1,0 +1,79 @@
+{
+    "id": "SOLR-11769",
+    "title": "Sorting performance degrades when useFilterForSortedQuery is enabled and there is no filter query specified",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "search"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.3"
+        ],
+        "affect_versions": "4.10.4",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "The performance of sorting degrades significantly when the useFilterForSortedQuery is enabled, and there's no filter query specified.\n\nSteps to Reproduce:\n\n1. Set useFilterForSortedQuery=true in solrconfig.xml\n2. Run a  query to match and return a single document. Also add sorting\n\n\tExample /select?q=foo:123&sort=bar+desc\n\n\n\n\nHaving a large index (> 10 million documents), this yields to a slow response (a few hundreds of milliseconds on average) even when the resulting set consists of a single document.\n\nObservation 1:\n\n\tDisabling useFilterForSortedQuery improves the performance to < 1ms\n\n\n\nObservation 2:\n\n\tRemoving the sort improves the performance to < 1ms\n\n\n\nObservation 3:\n\n\tKeeping the sort, and adding any filter query (such as fq=*:*) improves the performance to < 1 ms.\n\n\n\n\nAfter profiling SolrIndexSearcher.java found that the bottleneck is on \nDocSet bigFilt = getDocSet(cmd.getFilterList()); \n\nwhen cmd.getFilterList()) is passed in as null. This is making getDocSet() function collect document ids every single time it is called without any caching.\n\n\n\n1394     if (useFilterCache) {\n1395       // now actually use the filter cache.\n1396       // for large filters that match few documents, this may be\n1397       // slower than simply re-executing the query.\n1398       if (out.docSet == null) {\n1399         out.docSet = getDocSet(cmd.getQuery(), cmd.getFilter());\n1400         DocSet bigFilt = getDocSet(cmd.getFilterList());\n1401         if (bigFilt != null) out.docSet = out.docSet.intersection(bigFilt);\n1402       }\n1403       // todo: there could be a sortDocSet that could take a list of\n1404       // the filters instead of anding them first...\n1405       // perhaps there should be a multi-docset-iterator\n1406       sortDocSet(qr, cmd);\n1407     }",
+    "attachments": {
+        "SOLR-11769_Optimize_MatchAllDocsQuery_more.patch": "https://issues.apache.org/jira/secure/attachment/12902969/SOLR-11769_Optimize_MatchAllDocsQuery_more.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-12-18T04:39:36+0000",
+            "content": "I think the solution is as simple as wrapping lines 1400 & 1401 in a new if block to check that getFilterList is non-null and non-empty.  I think the idea of \"useFilterForSortedQuery\" is still relevant when there are no filters because the query is also considered, and will be cached here (on line 1399 call to getDocSet) and thus benefit from the optimization. ",
+            "author": "David Smiley",
+            "id": "comment-16294516"
+        },
+        {
+            "date": "2017-12-18T23:01:43+0000",
+            "content": "Thanks David Smiley.\n\nAs suggested, I've changed lines 1400-1401 to following and verified that the performance improves while the result set remains the same. \n\n\n        List<Query> filterList = cmd.getFilterList();\n        if (filterList != null && !filterList.isEmpty()) {\n          DocSet bigFilt = getDocSet(cmd.filterList);\n          if (bigFilt != null) {\n            out.docSet = out.docSet.intersection(bigFilt);\n          }\n        }\n\n ",
+            "author": "Betim Deva",
+            "id": "comment-16295810"
+        },
+        {
+            "date": "2017-12-20T05:01:39+0000",
+            "content": "I couldn't help myself today but dig deeper here and figure out why there would be a slow-down even without the above change.  The result is a more broader improvement for match-all-docs (:) scenarios that is not specific to the particular useFilterForSortedQuery situation above.  Essentially SolrIndexSearcher.getProcessedFilter would return an empty pf if there are no queries or filters (the semantics mean match-all-docs).  But there is the \"answer\" field that could be populated with getLiveDocs, and pf.answer is examined by getDocSet so it can return early.  I also optimized DocSetUtil.createDocSet to check that the query arg is a MatchAllDocsQuery and the live docs is \"instantiated\", allowing us to return that directly.\n\nThe only quirky thing about this was a test failure I fixed in TestSolrQueryParser that checked the filter cache insert delta after executing a query.  The additional call to getLiveDocs in this patch by getProcessedFilter occurred which got in the cache and increased the counter an additional time.  An assumption I make in the getProcessedFilter change is that returning getLiveDocs is either cheap or a forlorn conclusion that it will ultimately be instantiated at some point any way so might as well get it on with.  Alternatively, it's caller could instead check for this case (e.g. filter == null && postFilter == null then return getLiveDocs)?  But that seems less clean since \"answer\" is there for a reason so why avoid it.\n\nYonik Seeley can you please review this?  It intersects with modifications you've done in the past.\n\nAs an aside, I think it would be good if more DocSet methods in SolrIndexSearcher move over to DocSetUtil so that we can keep the unwieldily SolrIndexSearcher tamed.  Essentially I suggest a similar change as I did for the SolrDocumentFetcher refactoring but for DocSets.  With such a change, it would have access to the searcher and not need it in the methods. ",
+            "author": "David Smiley",
+            "id": "comment-16297889"
+        },
+        {
+            "date": "2017-12-20T11:07:02+0000",
+            "content": "We just need to be careful about returning cached sets where we did not before (and check that we never modify sets returned, as well as document that the returned set should not be modified).\nFor DocSetUtil.createDocSet specifically, it feels like potentially returning liveDocs should either be moved to a higher level caching function, or we should rename createDocSet since it can now sometimes just return an existing shared set. ",
+            "author": "Yonik Seeley",
+            "id": "comment-16298292"
+        },
+        {
+            "date": "2018-02-16T04:01:23+0000",
+            "content": "\nYonik: That's a good point \u2013 \"createDocSet\" ought to have a result that is safe to modify.  However note that you made createDocSet return DocSetUtil.getDocSet( answer, searcher ) at the very end, which is expressly documented to not have a result that is safe to modify since it can set LiveDocs.  Maybe an indirect caller here, SolrIndexSearcher.getDocSet(Query query) and getDocSet(Query, DocSet) ought to then concern themselves with calling this on the results of getDocSetNC because these methods are cache aware.\n\nSeparately, I've been poking around this related code and noticed this DocSetProducer thing.  I'm skeptical we should have it.  Firstly it's a Solr thing but most Queries are implemented at the Lucene level.  Secondly, I think we can achieve the same by grabbing the Weight then Scorer and then the DocIdSetIterator, then pass to BitSetIterator.getFixedBitSetOrNull(iter).  That should work with a some Lucene and Solr queries, ",
+            "author": "David Smiley",
+            "id": "comment-16366589"
+        },
+        {
+            "date": "2018-02-23T20:50:22+0000",
+            "content": "The original problem is easily fixed; I should commit this so that it can get into 7.3.   The larger refactorings can be postponed to a new issue. ",
+            "author": "David Smiley",
+            "id": "comment-16374948"
+        },
+        {
+            "date": "2018-02-28T17:38:49+0000",
+            "content": "Commit ef989124f345af46a905d1196bc589ef37b221c9 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ef98912 ]\n\nSOLR-11769: optimize useFilterForSortedQuery=true when no filter queries ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16380719"
+        },
+        {
+            "date": "2018-02-28T17:39:43+0000",
+            "content": "Commit 9b3d68843beb5e0a834d6847446a480742665805 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9b3d688 ]\n\nSOLR-11769: optimize useFilterForSortedQuery=true when no filter queries\n\n(cherry picked from commit ef98912) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16380721"
+        },
+        {
+            "date": "2018-02-28T17:41:36+0000",
+            "content": "Thanks for reporting this. ",
+            "author": "David Smiley",
+            "id": "comment-16380725"
+        }
+    ]
+}

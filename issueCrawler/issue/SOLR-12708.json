@@ -1,0 +1,52 @@
+{
+    "id": "SOLR-12708",
+    "title": "Async collection actions should not hide failures",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "Admin UI",
+            "Backup/Restore"
+        ],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "7.4",
+        "resolution": "Unresolved",
+        "status": "Patch Available"
+    },
+    "description": "Async collection API may hide failures\u00a0compared to sync version.\u00a0OverseerCollectionMessageHandler::processResponses\u00a0structures errors differently in the response, that hides failures from most evaluators.\u00a0RestoreCmd did not\u00a0receive, nor handle async addReplica issues.\n\nSample create collection sync and async result with invalid solrconfig.xml:\n\n{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":32104},\n\"failure\":{\n\"localhost:8983_solr\":\"org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException:Error from server at http://localhost:8983/solr: Error CREATEing SolrCore 'name4_shard1_replica_n1': Unable to create core [name4_shard1_replica_n1] Caused by: The content of elements must consist of well-formed character data or markup.\",\n\"localhost:8983_solr\":\"org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException:Error from server at http://localhost:8983/solr: Error CREATEing SolrCore 'name4_shard2_replica_n2': Unable to create core [name4_shard2_replica_n2] Caused by: The content of elements must consist of well-formed character data or markup.\",\n\"localhost:8983_solr\":\"org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException:Error from server at http://localhost:8983/solr: Error CREATEing SolrCore 'name4_shard1_replica_n2': Unable to create core [name4_shard1_replica_n2] Caused by: The content of elements must consist of well-formed character data or markup.\",\n\"localhost:8983_solr\":\"org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException:Error from server at http://localhost:8983/solr: Error CREATEing SolrCore 'name4_shard2_replica_n1': Unable to create core [name4_shard2_replica_n1] Caused by: The content of elements must consist of well-formed character data or markup.\"}\n}\n\n\nvs async:\n\n{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":3},\n\"success\":{\n\"localhost:8983_solr\":{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":12}},\n\"localhost:8983_solr\":{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":3}},\n\"localhost:8983_solr\":{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":11}},\n\"localhost:8983_solr\":{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":12}}},\n\"myTaskId2709146382836\":{\n\"responseHeader\":{\n\"status\":0,\n\"QTime\":1},\n\"STATUS\":\"failed\",\n\"Response\":\"Error CREATEing SolrCore 'name_shard2_replica_n2': Unable to create core [name_shard2_replica_n2] Caused by: The content of elements must consist of well-formed character data or markup.\"},\n\"status\":{\n\"state\":\"completed\",\n\"msg\":\"found [myTaskId] in completed tasks\"}}\n\n\nProposing adding failure node to the results, keeping backward compatible but correct result.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-09-19T12:15:06+0000",
+            "content": "Any review would be greatly appreciated. ",
+            "author": "Mano Kovacs",
+            "id": "comment-16620510"
+        },
+        {
+            "date": "2018-09-21T19:13:02+0000",
+            "content": "Hi Mano,\n\nThanks for the patch!\n\nI'm curious about the 10 minute latch countdown timeout. Shouldn't we wait forever here?\u00a0\n\nSo here we're doing something different wrt success and failure . If the add replica call has a failure we're adding it back to the main response but if it's a success then we will end up skipping it ( at this point results.get(\"success\") will always be null ) .\u00a0\u00a0\n\nocmh.addReplica(clusterState, new ZkNodeProps(propMap), addResult, ()-> {\n  countDownLatch.countDown();\n  Object addResultFailure = addResult.get(\"failure\");\n  if (addResultFailure != null) {\n    SimpleOrderedMap failure = (SimpleOrderedMap) results.get(\"failure\");\n    if (failure == null) {\n      failure = new SimpleOrderedMap();\n      results.add(\"failure\", failure);\n    }\n    failure.addAll((NamedList) addResultFailure);\n  } else {\n    SimpleOrderedMap success = (SimpleOrderedMap) results.get(\"success\");\n    if (success == null) {\n      success = new SimpleOrderedMap();\n      results.add(\"success\", success);\n    }\n    success.addAll((NamedList) addResult.get(\"success\"));\n  }\n});\n\nCan't we do this instead which will append the results directly to the main object? We do this for the remaining\u00a0add replicas as the last step of the restore\n\nocmh.addReplica(clusterState, new ZkNodeProps(propMap), results, ()-> {\n  countDownLatch.countDown();\n});\n\n\u00a0 ",
+            "author": "Varun Thacker",
+            "id": "comment-16624052"
+        },
+        {
+            "date": "2018-09-26T13:10:40+0000",
+            "content": "Hello Varun Thacker, thank you for the review!\n\nI'm curious about the 10 minute latch countdown timeout. Shouldn't we wait forever here? \nI think if we would wait forever, any downstream command that stuck or never get result would keep this job hanging as well. I would worry about the robustness here. This part of the code creates a bunch of empty cores (one per shards) in parallel. Considering a larger, 200-300 shard cluster, this might take longer than 10 minutes if the overseer queue is already behind, so 10 minutes in fact might be problematic. However, if Overseer is getting behind much more than that, it would seriously hurt the stability of the cluster anyway. I increase this wait for an hour, if you agree, which would leave plenty of time for overseer to process the core creation on a relatively large collection, but still ensures that the job is getting cancelled if one task stucks.\n\nSo here we're doing something different wrt success and failure . If the add replica call has a failure we're adding it back to the main response but if it's a success then we will end up skipping it ( at this point results.get(\"success\") will always be null ) . \nI have to be honest and admit that I copied the full block from CreateShardCmd.java. I think the code is doing the right thing there. In both branches of the if the code checks if the main results has success/failure node already, and creates if necessary. Then adds the corresponding addResult field into the main one. The only difference is that the failure recalled before the if block.\n\nCan't we do this instead which will append the results directly to the main object? We do this for the remaining add replicas as the last step of the restore\nThen we may let the downstream call override certain other fields that might be populated. I think isolation makes it more error-prone. I think this was Dat's original intent as well in CreateShardCmd, but not sure. ",
+            "author": "Mano Kovacs",
+            "id": "comment-16628739"
+        },
+        {
+            "date": "2018-09-28T21:59:49+0000",
+            "content": "I have to be honest and admit that I copied the full block from CreateShardCmd.java. I think the code is doing the right thing there. In both branches of the if the code checks if the main results has success/failure node already, and creates if necessary. Then adds the corresponding addResult field into the main one. The only difference is that the failure recalled before the if block.\nI think the usage of this code block is correct in CreateShardCmd but not where we are using it in the patch. Here's why : CreateShardCmd is one core admin API call . So the response is either a success or failure. Hence the if-else block covers it.\n\nIn this patch, there are multiple add-replica calls who's response we are acknowledging. So there can be replicas that came back with success and some that failed. If there is a failure we will just add the failure response back to the results and not the success ones .\n\nThis way we process requests and responses are very complicated for some reason and we should improve it in general . But do you see what I am seeing here?\n\n\u00a0\n\n\u00a0 ",
+            "author": "Varun Thacker",
+            "id": "comment-16632585"
+        },
+        {
+            "date": "2018-10-15T13:24:55+0000",
+            "content": "Varun Thacker, thank you for the explanation! I am a still a bit behind, I think I don't understand one part.\n\nCreateShardCmd is one core admin API call . So the response is either a success or failure. Hence the if-else block covers it.\nI don't understand this part. I used this command as base, as similarly to the restore command; create shard operation involves adding multiple replicas. I think this addReplica command in CreateShardCmd is called multiple due to this for-cycle. I assume this is the reason why multiple failures could be catched.\n\nThis way we process requests and responses are very complicated for some reason and we should improve it in general . But do you see what I am seeing here?\nNot sure. I think it is more beneficial to see every failure, instead of the first/last one. Especially since they are executed parallel and might have side-effects that require cleanup. ",
+            "author": "Mano Kovacs",
+            "id": "comment-16650196"
+        }
+    ]
+}

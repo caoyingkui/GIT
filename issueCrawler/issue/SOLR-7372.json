@@ -1,0 +1,168 @@
+{
+    "id": "SOLR-7372",
+    "title": "Limit LRUCache by RAM usage",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "5.2",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Now that SOLR-7371 has made DocSet impls Accountable, we should add an option to LRUCache to limit itself by RAM.\n\nI propose to add a 'maxRamBytes' configuration parameter which it can use to evict items once the total RAM usage of the cache reaches this limit.",
+    "attachments": {
+        "SOLR-7372.patch": "https://issues.apache.org/jira/secure/attachment/12724253/SOLR-7372.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-04-09T15:59:50+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Simple patch:\n\n\tLRUCache implements Accountable\n\tThe values are used to calculate the ram usage\n\tAdded a simple test\n\n\n\nThis makes it possible to limit the heap usage of the query result cache and the filter cache. This won't work for the document cache because the Document class isn't accountable.\n\nTODO:\n\n\tTake the keys's ram usage into account. For example, TermsQuery can be big.\n\tHave a humanized format for the maxRamBytes e.g. maxRamBytes=512M should be possible.\n\n ",
+            "id": "comment-14487571"
+        },
+        {
+            "date": "2015-04-09T16:42:08+0000",
+            "author": "Erick Erickson",
+            "content": "I like this a lot. even when people have correctly sized the cache at first, they can add docs and have problems. I can imagine someone wanting to monitor when this limit is tripped rather than size, is that possible via JMX?\n\nNot asking you to add that, just wondering if it'd be easy some time in the future. ",
+            "id": "comment-14487639"
+        },
+        {
+            "date": "2015-04-09T16:53:51+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I like this a lot. even when people have correctly sized the cache at first, they can add docs and have problems. I can imagine someone wanting to monitor when this limit is tripped rather than size, is that possible via JMX?\n\nYeah, good point. I can easily add another counter to track eviction due to RAM usage. ",
+            "id": "comment-14487659"
+        },
+        {
+            "date": "2015-04-09T17:34:43+0000",
+            "author": "Erick Erickson",
+            "content": "Cool! ",
+            "id": "comment-14487715"
+        },
+        {
+            "date": "2015-04-09T21:12:05+0000",
+            "author": "Yonik Seeley",
+            "content": "We only need to  throw an exception if not Accountable for items being put in the cache right?\nOld items that are bring removed (or overwritten) must be Accountable since they got added somehow.\n\nAlso, it's going to be relatively easy to blow this out of the water on purpose, or even by accident.\n\n1) Do facet.method=enum on a high cardinality field like \"ID\" and thus put a million small items in the cache.\n2) start searching normally and the cache size will stay at a million, regardless of the size of items we put in (since removeEldestEntry is only called once for each put).\n\nAfter a quick browse of LinkedHashMap, I didn't see an obvious easy/fast way to remove the oldest entry, so I'm not sure how to fix.\n\nFor the calculation of amount of RAM taken up... perhaps we should estimate the minimum that a key + internal map node would take up?\nFor the query cache in particular, it's going to be common for query keys to take up more memory than the actual DocSlice. ",
+            "id": "comment-14488292"
+        },
+        {
+            "date": "2015-04-10T07:52:13+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\nAlso, it's going to be relatively easy to blow this out of the water on purpose, or even by accident.\n1) Do facet.method=enum on a high cardinality field like \"ID\" and thus put a million small items in the cache.\n2) start searching normally and the cache size will stay at a million, regardless of the size of items we put in (since removeEldestEntry is only called once for each put).\n\nI don't understand. We evict items on each put when:\n\nif (size() > limit || (maxRamBytes != Long.MAX_VALUE && ramBytesUsed.get() > maxRamBytes)) {\n...\n}\n\n\n\nI indexed 2.4M docs with a UUID 'id' and searched with:\n\nq=*:*&facet=on&facet.field=id&facet.method=enum&facet.limit=1000\n\n\nThe filterCache stats are:\n\nclass:org.apache.solr.search.LRUCache\nversion:1.0\ndescription:LRU Cache(maxSize=512, initialSize=512)\nsrc:null\nstats:\nlookups:1103\nhits:102\nhitratio:0.09\ninserts:1001\nevictions:489\nsize:512\nmaxRamBytes:1048576\nramBytesUsed:18528\nwarmupTime:0\ncumulative_lookups:1103\ncumulative_hits:102\ncumulative_hitratio:0.09\ncumulative_inserts:1001\ncumulative_evictions:489\n\n\n\nTried with facet.limit=1000000 too:\n\nclass:org.apache.solr.search.LRUCache\nversion:1.0\ndescription:LRU Cache(maxSize=512, initialSize=512)\nsrc:null\nstats:\nlookups:1001001\nhits:0\nhitratio:0\ninserts:1001002\nevictions:1000490\nsize:512\nmaxRamBytes:1048576\nramBytesUsed:18528\nwarmupTime:0\ncumulative_lookups:1001001\ncumulative_hits:0\ncumulative_hitratio:0\ncumulative_inserts:1001002\ncumulative_evictions:1000490\n\n ",
+            "id": "comment-14489116"
+        },
+        {
+            "date": "2015-04-10T12:01:25+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Okay, I understand what you were saying. We just evict one (oldest) entry per put operation but that is not sufficient to guarantee that the bytes occupied by the cache is less than the configured limit. We somehow need to keep removing the least recently used items until the ram size drops below the limit. ",
+            "id": "comment-14489494"
+        },
+        {
+            "date": "2015-04-10T14:52:40+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Here's a patch which takes care of all of Yonik's comments:\n\n\n\tRemoved the Accountable instanceof check for values in removeEldestEntry and the old items during put\n\tWe use the LinkedHashMap.getEntrySet().iterator() to remove least-recently-used items until the ram usage drops below the limit. The removeEldestEntry javadocs say the following:\n\n\n\t<p>This method typically does not modify the map in any way,\n\tinstead allowing the map to modify itself as directed by its\n\treturn value.  It <i>is</i> permitted for this method to modify\n\tthe map directly, but if it does so, it <i>must</i> return\n\t<tt>false</tt> (indicating that the map should not attempt any\n\tfurther modification).  The effects of returning <tt>true</tt>\n\tafter modifying the map from within this method are unspecified.\n\n\n\tAn estimate of the LinkedHashMap.Entry and key is also used for the calculation.\n\n ",
+            "id": "comment-14489728"
+        },
+        {
+            "date": "2015-04-10T16:11:10+0000",
+            "author": "Yonik Seeley",
+            "content": "Ah, I had assumed that iterator() was most recent to least recent, but it looks like it's the reverse.\nPatch looks good!\n\nramBytesUsed doesn't really need to be AtomicLong... it's only modified in synchronized contexts.  Then ramBytesUsed() could just synchronize also... it shouldn't matter given how infrequently that will be called (just to show stats in the admin, right?).  That's just a minor nit that doesn't really matter though - I imagine you'd be hard pressed to actually see any difference in performance. ",
+            "id": "comment-14489866"
+        },
+        {
+            "date": "2015-04-11T00:56:54+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tChanged AtomicLong to a simple long because it is always read/written inside synchronized(map)\n\tChanged ramBytesUsed() to also use the same synchronization\n\tRenamed 'evictionsDueToRamBytes' to 'evictionsRamUsage' \u2013 this counter will track number of evictions that happen because we exceeded the maxRamBytes - please note Erick Erickson.\n\n\n\nI'll commit this shortly. ",
+            "id": "comment-14490660"
+        },
+        {
+            "date": "2015-04-11T04:16:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tI renamed the maxRamBytes parameter to maxRamMB so that people don't have to convert size in megabytes and gigabytes from bytes.\n\tI also added the description of maxRamMB parameter for LRUCache in solrconfig.xml (used only for query result cache).\n\n\n\nI think this is ready. ",
+            "id": "comment-14490767"
+        },
+        {
+            "date": "2015-04-11T04:23:34+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672811 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1672811 ]\n\nSOLR-7372: Limit memory consumed by LRUCache with a new 'maxRamMB' config parameter ",
+            "id": "comment-14490770"
+        },
+        {
+            "date": "2015-04-11T04:24:55+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672812 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672812 ]\n\nSOLR-7372: Limit memory consumed by LRUCache with a new 'maxRamMB' config parameter ",
+            "id": "comment-14490771"
+        },
+        {
+            "date": "2015-04-11T04:27:28+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks for the review, Yonik! ",
+            "id": "comment-14490773"
+        },
+        {
+            "date": "2015-04-11T04:30:25+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Re-opening due to Java7 incompatibility on 5x ",
+            "id": "comment-14490775"
+        },
+        {
+            "date": "2015-04-11T04:32:32+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672815 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672815 ]\n\nSOLR-7372: Fix Java7 compatibility ",
+            "id": "comment-14490777"
+        },
+        {
+            "date": "2015-04-12T16:05:55+0000",
+            "author": "Erick Erickson",
+            "content": "Cool, thanks! ",
+            "id": "comment-14491551"
+        },
+        {
+            "date": "2015-04-13T16:55:43+0000",
+            "author": "Noble Paul",
+            "content": "make these new fields editable ",
+            "id": "comment-14492651"
+        },
+        {
+            "date": "2015-04-14T05:05:58+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Noble Paul for pointing out that this needs to be added to ConfigOverlay. How do I specify this config parameter without a default value? ",
+            "id": "comment-14493567"
+        },
+        {
+            "date": "2015-04-14T05:09:53+0000",
+            "author": "Noble Paul",
+            "content": "That is not the default value. It is the type information in this case it is \"20\" means an XML attribute with an integer type ",
+            "id": "comment-14493575"
+        },
+        {
+            "date": "2015-04-14T05:10:43+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Ah, okay. Thanks. I'll commit your patch. ",
+            "id": "comment-14493578"
+        },
+        {
+            "date": "2015-04-14T05:12:54+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1673358 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1673358 ]\n\nSOLR-7372: Enable maxRamMB to be configured via the Config APIs on filterCache and queryResultCache ",
+            "id": "comment-14493580"
+        },
+        {
+            "date": "2015-04-14T05:13:45+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1673359 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1673359 ]\n\nSOLR-7372: Enable maxRamMB to be configured via the Config APIs on filterCache and queryResultCache ",
+            "id": "comment-14493581"
+        },
+        {
+            "date": "2015-09-18T12:15:38+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This was released in 5.2 ",
+            "id": "comment-14847337"
+        }
+    ]
+}

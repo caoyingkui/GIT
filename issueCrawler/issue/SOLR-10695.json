@@ -1,0 +1,49 @@
+{
+    "id": "SOLR-10695",
+    "title": "Optimize implicit routing for nodes containing multiple shards",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "6.5.1",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I asked a question on the Solr mailing list about some odd behavior I was seeing when using implicit routing. Here is a snippet from my question:\n\n\"I created a collection using the implicit router, created 10 shards, named shard1, shard2, etc. I indexed 3000 documents to each shard, routed by setting the route field on the documents in my schema. All works fine, I verified there are 3000 documents in each shard. \n\nThe odd behavior I am seeing is when I try to route a query to a specific shard. I submitted a simple query to shard1 using the request parameter route=shard1. The query comes back fine, but when I looked in the logs, it looked like it was issuing 3 separate requests:\n\n1. The original query to shard1\n2. A 2nd query to shard1 with the parameter ids=a bunch of document ids\n3. The original query to a random shard (changes every time I run the query)\"\n\nShalin Shekhar Mangar said that the behavior I was seeing was due to the fact that a node has more than 1 shard from the same collection, and upon being routed to such a node, the original shard is selected randomly, not taking the route parameter into account. To quote:\n\n\"So to recap, this is happening because you have more than one shard1\nhosted on a node. Easy workaround is to have each shard hosted on a\nunique node. But we can improve things on the solr side as well by 1)\nhaving SolrJ resolve requests down to node name and core name, 2)\nhaving the collection name to core name resolution take route param\ninto account. Both 1 and 2 can solve the problem.\"\n\nShalin asked me to log a JIRA for this, wasn't sure if I should log as a bug or enhancement. He suggested 2 potential solutions (above). I am up for attempting to implement one of these solutions. Does anyone have any more input, or a preference as to how this is addressed? It seems to me like 2 would be the more robust solution.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-05-16T13:11:09+0000",
+            "content": "I'm curious what would happen if you added a parameter &distrib=false to the query, purely as a troubleshooting step.\n\nSince you're presumably sending the request directly to the correct core, my thought is that this will work, and it might cause the spurious request to be suppressed.\n\nAlthough I don't think what you're seeing is technically a bug, it might represent an opportunity for enhancement, so I think Shalin's request for this issue was a good idea.\n\nCan you enable NTP to ensure that the clocks on the servers are perfectly synced, and check the relative timestamps of those log entries to determine what order they are happening?  If there are multiple servers involved, making sure their clocks are synced is a critical step. ",
+            "author": "Shawn Heisey",
+            "id": "comment-16012336"
+        },
+        {
+            "date": "2017-05-16T15:10:29+0000",
+            "content": "I am running this all on my local machine, with only 1 node, so I don't think time syncing should be an issue (but I can still try if you want).\n\nBy the way, I am doing all of this just through a rest client, to eliminate as many layers as possible, but I do see the same behavior through SolrJ as well.\n\nBy adding &distrib=false to the request, I only get the 3rd query (the query to the random shard), and I get no results back (since the data I am requesting is not on that shard). This seems in line with Shalin's theory of it picking a random shard initially and then going into distributed mode and issuing the request to the other (correct) shard (producing the other 2 queries).\n\nIn terms of timestamps, I see the requests in the order they are originally listed in the description. ",
+            "author": "Chris Troullis",
+            "id": "comment-16012550"
+        },
+        {
+            "date": "2017-05-20T13:52:35+0000",
+            "content": "I found the code in SolrJ that would need to be changed to address this, in CloudSolrClient.sendRequest. Like Shalin was saying originally, currently it is only using the route parameter to  resolve down to the node level. This could be changed to do something like if the route param is specified, and it only points to a single shard, use the specific core url for the replica on each node. This way, the request will be sent directly to a replica on a node instead of going to a random replica first and being redirected/going down the distributed path. This doesn't handle the case of having more than 1 replica for the same shard on a single node (as it would always pick the first one, and thus wouldn't be load balanced), but I'm not sure how realistic of a scenario that is.\n\nI also noticed that in this code path, if the \"collection\" request parameter is set, then it does use the full core url of the replica. Technically this can be used to replicate the behavior of the proposed change above, but I'm not sure that is what this \"collection\" parameter is supposed to be used for. Does anyone know what the purpose of it is supposed to be/why we are resolving down to the full core url if it is passed in?\n\nI would be happy to submit a patch for any changes, just want to see if people think it is worth doing before I actually change anything. ",
+            "author": "Chris Troullis",
+            "id": "comment-16018455"
+        },
+        {
+            "date": "2017-05-21T16:26:10+0000",
+            "content": "but I'm not sure that is what this \"collection\" parameter is supposed to be used for\n\nWith CloudSolrClient, the collection request parameter is used to determine which collection will be targeted by the request\n\nSOLR-7155 added a collection parameter to most methods in SolrClient.  While this might seem like an addition for Cloud, it also made it possible to easily access multiple cores via one HttpSolrClient object.\n\nBefore SOLR-7155, there were two ways with CloudSolrClient to choose a collection for requests to operate on.  One was the setDefaultCollection method, the other was a collection parameter in the request. ",
+            "author": "Shawn Heisey",
+            "id": "comment-16018875"
+        },
+        {
+            "date": "2017-06-10T15:06:18+0000",
+            "content": "Sorry for the delayed response. That is interesting. While debugging in CloudSolrClient, it looks like if the Collection parameter is provided, then the request URL is resolved all the way down to the replica, whereas if it is not provided, then the URL is only resolved to the collection. See this code snippet:\n\n\n    if (reqParams.get(UpdateParams.COLLECTION) == null) {\n            url = ZkCoreNodeProps.getCoreUrl(nodeProps.getStr(ZkStateReader.BASE_URL_PROP), collection);\n    } else {\n            url = coreNodeProps.getCoreUrl();\n   }\n\n\n\nWhat is odd to me is that this behavior is only invoked if that specific collection request parameter is present, but not if the collection is specified via default collection or via the collection parameter in a request method. It seems like the behavior between these 3 ways of specifying the collection should be consistent?\n\nFurthermore, I'm curious what the purpose of this distinction is in the first place (in terms of resolving the URL to a specific replica vs the collection). It seems like the end result is the same whichever path you go down. If you make the request to a specific replica, it will forward the request on to any additional necessary shards, if you make the request just to the collection, it will pick a shard/replica at random and that replica will forward on to any other necessary shards. \n\nFor the original purpose of this ticket, in the case where you have multiple shards for a collection on a single node and are providing a routing key, resolving directly to the replica is more efficient, as you will land directly onto a replica for the shard you are routing to, skipping the unnecessary steps of picking a random replica and forwarding the request.\n\nThoughts? Maybe I am misunderstanding and am completely off base here. ",
+            "author": "Chris Troullis",
+            "id": "comment-16045565"
+        }
+    ]
+}

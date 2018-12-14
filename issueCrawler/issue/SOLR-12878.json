@@ -1,0 +1,102 @@
+{
+    "id": "SOLR-12878",
+    "title": "FacetFieldProcessorByHashDV is reconstructing FieldInfos on every instantiation",
+    "details": {
+        "type": "Bug",
+        "status": "Resolved",
+        "labels": "",
+        "fix_versions": [
+            "7.6",
+            "master (8.0)"
+        ],
+        "components": [
+            "Facet Module"
+        ],
+        "priority": "Major",
+        "resolution": "Duplicate",
+        "affect_versions": "7.5"
+    },
+    "description": "The FacetFieldProcessorByHashDV constructor is currently calling:\n\n\nFieldInfo fieldInfo = fcontext.searcher.getSlowAtomicReader().getFieldInfos().fieldInfo(sf.getName());\n\n\n\nWhich is reconstructing FieldInfos each time.  Simply switching it to:\n\n\nFieldInfo fieldInfo = fcontext.searcher.getFieldInfos().fieldInfo(sf.getName());\n\n\n\u00a0\ncauses it to use the cached version of FieldInfos in the SolrIndexSearcher.\n\nOn my index the FacetFieldProcessorByHashDV is 2-3 times slower than the legacy facets without this fix.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16653744",
+            "content": "Pull Request:  https://github.com/apache/lucene-solr/pull/473\n\nNote: I also updated the remaining collect method that was not using advanceExact to use it.  This is a separate commit in the PR and can be split out into a separate issue if needed. ",
+            "author": "Tim Underwood",
+            "date": "2018-10-17T15:37:43+0000"
+        },
+        {
+            "id": "comment-16669185",
+            "content": "I wonder why FacetFieldProcessorByHashDV instantiated so often? I guess it should be significant for comparatively short queries? Anyway caching fieldInfo make sense. Not sure if it should asserted anyhow.  ",
+            "author": "Mikhail Khludnev",
+            "date": "2018-10-30T18:49:50+0000"
+        },
+        {
+            "id": "comment-16669596",
+            "content": "It looks like maybe\u00a0FacetFieldProcessorByHashDV is created once per field that is being faceted on?\u00a0 In my case for the query I've been testing I'm faceting on 41 different fields.\u00a0 So\u00a0fcontext.searcher.getSlowAtomicReader().getFieldInfos() was being called 41 times for each query. ",
+            "author": "Tim Underwood",
+            "date": "2018-10-31T04:41:38+0000"
+        },
+        {
+            "id": "comment-16670338",
+            "content": "The fix looks correct to me. \u00a0\u00a0searcher.getSlowAtomicReader().getFieldInfos() should be called exactly once (by SolrIndexSearcher) and never again.  To prevent this error from popping up again, I think it should be cached at SlowCompositeReaderWrapper and not in SolrIndexSearcher.  Note it caches other things (albeit on-demand).  SCRW is only used by Solr ever since it was ejected from Lucene.\n ",
+            "author": "David Smiley",
+            "date": "2018-10-31T16:22:32+0000"
+        },
+        {
+            "id": "comment-16671164",
+            "content": "Tim Underwood, considering David Smiley's input, could you please cache fieldinfos at SlowCompositeReaderWrapper and add somewhere in test assert that getFieldInfos() returns the same instance everytime. Please keep advanceExact() aside for a while. I appreciate your contribution.  ",
+            "author": "Mikhail Khludnev",
+            "date": "2018-11-01T06:40:40+0000"
+        },
+        {
+            "id": "comment-16673290",
+            "content": "Sure.\u00a0 I've updated the pull request with what I'm currently playing with:\u00a0 https://github.com/apache/lucene-solr/pull/473\n\nThere are currently 3 commits in there:\n\n1 - The original FacetFieldProcessorByHashDV.java change to avoid calling\u00a0getSlowAtomicReader\n\n2 - The change requested by David Smiley to move the caching of FieldInfos from SolrIndexSearcher to\u00a0\n\nSlowCompositeReaderWrapper\n\n3 - Adding a check in TestUtil.checkReader to verify that LeafReader.getFieldInfos() returns a cached copy along with\u00a0the changes required to make that pass.\u00a0 Specifically there are several places that construct an empty FieldInfos instance so I just created a static FieldInfos.EMPTY instance that can be referenced.\u00a0 Also, MemoryIndexReader needed to be modified to cache a copy of its FieldInfos.\u00a0 The constructor was already\u00a0looping over the fields so I just added it there (vs creating it lazily).\n\n\u00a0\n\nWhat are your thoughts on #3?\u00a0 Is it a good idea to require LeafReader instances to cache their FieldInfos?\n\nIt seems like something like this is a common pattern across the codebase (both Lucene and Solr):\n\nreader.getFieldInfos().fieldInfo(field)\n\n\nSo it might be desirable to make sure FieldInfos isn't always being recomputed?\n\n\u00a0\n\nI'm still verifying that I've checked that all LeafReader.getFieldInfos() implementations perform the caching and that all tests pass (I'm seeing a few failures but they seem unrelated).\u00a0 ",
+            "author": "Tim Underwood",
+            "date": "2018-11-02T15:42:56+0000"
+        },
+        {
+            "id": "comment-16673334",
+            "content": "There are 2 other LeafReader implementations not caching their FieldInfos:\n\n\torg.apache.solr.search.CollapsingQParserPlugin.ReaderWrapper\n\torg.apache.solr.handler.component.ExpandComponent.ReaderWrapper\n\n\n\nBoth have code that is basically this:\n\n@SuppressWarnings(\"resource\") LeafReader uninvertingReader = UninvertingReader.wrap(\n    new ReaderWrapper(searcher.getSlowAtomicReader(), field),\n    Collections.singletonMap(field, UninvertingReader.Type.SORTED)::get);\n\n\nNote the\u00a0searcher.getSlowAtomicReader() call which means moving the caching of FieldInfos into\u00a0SlowCompositeReaderWrapper will help in this case!\n\nHere is part of the code from\u00a0UninvertingReader.wrap:\n\npublic static LeafReader wrap(LeafReader in, Function<String, Type> mapping) {\n  boolean wrap = false;\n\n  // Calculate a new FieldInfos that has DocValuesType where we didn't before\n  ArrayList<FieldInfo> newFieldInfos = new ArrayList<>(in.getFieldInfos().size());\n  for (FieldInfo fi : in.getFieldInfos()) {\n    DocValuesType type = fi.getDocValuesType();\n\n\nNote the 2 immediate calls to in.getFieldInfos().\u00a0 So... I'll add the FieldInfo caching to both of those ReaderWrapper classes since it would help.\n\n\u00a0 ",
+            "author": "Tim Underwood",
+            "date": "2018-11-02T16:05:13+0000"
+        },
+        {
+            "id": "comment-16673346",
+            "content": "I've updated commit #3 of the PR with the changes to those ReaderWrapper classes and also added a JavaDoc note to LeafReader.getFieldInfo() that the instances should be cached by implementations of LeafReader. ",
+            "author": "Tim Underwood",
+            "date": "2018-11-02T16:13:28+0000"
+        },
+        {
+            "id": "comment-16673477",
+            "content": "Excellent work Tim!  Lets not touch Lucene in this issue; okay?  Create a separate LUCENE issue for that if you like.  I don't think it's a big deal if the FieldInfos returned is the same or not provided that it's a fast call. ",
+            "author": "David Smiley",
+            "date": "2018-11-02T17:46:49+0000"
+        },
+        {
+            "id": "comment-16673499",
+            "content": "Sure.\u00a0 What's the next step?\u00a0 Would you like me to squish commits 1 and 2 or just leave as-is?\u00a0 Should I break out the ReaderWrapper changes from commit 3 or just completely leave out commit 3 for now?\n\nAs long as the\u00a0SlowCompositeReaderWrapper caching of FieldInfos makes it in I'm happy \u00a0. It would be great for that change to make it in time for 7.6 since that would make it possible for me to move all of my faceting over to the JSON facets. ",
+            "author": "Tim Underwood",
+            "date": "2018-11-02T18:06:48+0000"
+        },
+        {
+            "id": "comment-16673589",
+            "content": "I think file a Lucene issue that has all of your changes.  Lucene issues can touch Solr, but the other way around is to be avoided (I do sometimes but sparingly).  Suggested title: \"LeafReader.getFieldInfo\" should always return the same instance.  It'd get my vote but I'd like no less than 2 business days for the opportunity for another +1 before committing. ",
+            "author": "David Smiley",
+            "date": "2018-11-02T19:25:35+0000"
+        },
+        {
+            "id": "comment-16673593",
+            "content": "Debatably I could move this issue and retitle but I think a fresh/clean issue with a Lucene oriented title & description is better here. ",
+            "author": "David Smiley",
+            "date": "2018-11-02T19:29:15+0000"
+        },
+        {
+            "id": "comment-16673754",
+            "content": "Done:\u00a0LUCENE-8557 ",
+            "author": "Tim Underwood",
+            "date": "2018-11-02T22:26:59+0000"
+        }
+    ]
+}

@@ -1,0 +1,49 @@
+{
+    "id": "SOLR-1220",
+    "title": "UnInvertedField performance improvement on fields with an extremely large number of values",
+    "details": {
+        "affect_versions": "1.4",
+        "status": "Closed",
+        "fix_versions": [
+            "1.4"
+        ],
+        "components": [
+            "search"
+        ],
+        "type": "Improvement",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Our setup is :\n\n\n\tabout 34M lucene documents of bibliographic and full text content\n\tindex currently 115GB, will at least double over next 6 months\n\tmoving to support real-time-ish updates (maybe 5 min delay)\n\n\n\nWe facet on 8 fields, 6 of which are \"normal\" with small numbers of\ndistinct values.  But 2 faceted fields, creator and subject, are huge,\nwith 18M and 9M terms respectively.  \n\nOn a server with 2xquad core AMD 2382 processors and 64GB memory, java\n1.6.0_13-b03, 64 bit run with \"-Xmx15192M -Xms6000M -verbose:gc\", with\nthe index on Intel X25M SSD, on start-up the elapsed time to create\nthe 8 facets is 306 seconds (best time).  Following an index reopen,\nthe time to recreate them in 318 seconds (best time).\n\n[We have made an independent experimental change to create the facets\nwith 3 async threads, that is, in parallel, and also to decouple them\nfrom the underlying index, so our facets lag the index changes by the\ntime to recreate the facets.  With our setup, the 3 threads reduced\nfacet creation elapsed time from about 450 secs to around 320 secs,\nbut this will depend a lot on IO capabilities of the device containing\nthe index, amount of file system caching, load, etc]\n\nAnyway, we noticed that huge amounts of garbage were being collected\nduring facet generation of the creator and subject fields, and tracked\nit down to this decision in UnInvertedField univert():\n\n     if (termNum >= maxTermCounts.length) \n{\n       // resize, but conserve memory by not doubling\n       // resize at end??? we waste a maximum of 16K (average of 8K)\n       int[] newMaxTermCounts = new int[maxTermCounts.length+4096];\n       System.arraycopy(maxTermCounts, 0, newMaxTermCounts, 0, termNum);\n       maxTermCounts = newMaxTermCounts;\n     }\n\nSo, we tried the obvious thing:\n\n\n\tallocate 10K terms initially, rather than 1K\n\textend by doubling the current size, rather than adding a fixed 4K\n\tfree unused space at the end (but only if unused space is\n\"significant\") by reallocating the array to the exact required size\n\n\n\nAnd also:\n\n\n\tcreated a static HashMap lookup keyed on field name which remembers\nthe previous allocated size for maxTermCounts for that field, and\ninitially allocates that size + 1000 entries\n\n\n\nThe second change is a minor optimisation, but the first change, by\neliminating thousands of array reallocations and copies, greatly\nimproved load times, down from 306 to 124 seconds on the initial load\nand from 318 to 134 seconds on reloads after index updates.  About\n60-70 secs is still spend in GC, but it is a significant improvement.\n\nUnless you have very large numbers of facet values, this change won't\nhave any positive benefit.\n\nThe core part of our change is reflected by this diff against revision 785058:\n\n***************\n\n\t\n\t\n\t\t\n\t\t\n\t\t\t222,232 ****\n\t\t\n\t\t\n\t\n\t\n\n\n\n        int termNum = te.getTermNumber();\n\n        if (termNum >= maxTermCounts.length) \n{\n!         // resize, but conserve memory by not doubling\n!         // resize at end??? we waste a maximum of 16K (average of 8K)\n!         int[] newMaxTermCounts = new int[maxTermCounts.length+4096];\n          System.arraycopy(maxTermCounts, 0, newMaxTermCounts, 0, termNum);\n          maxTermCounts = newMaxTermCounts;\n        }\n\n\u2014 222,232 ----\n\n        int termNum = te.getTermNumber();\n\n        if (termNum >= maxTermCounts.length) \n{\n!         // resize by doubling - for very large number of unique terms, expanding\n!         // by 4K and resultant GC will dominate uninvert times.  Resize at end if material\n!         int[] newMaxTermCounts = new int[maxTermCounts.length*2];\n          System.arraycopy(maxTermCounts, 0, newMaxTermCounts, 0, termNum);\n          maxTermCounts = newMaxTermCounts;\n        }\n\n***************\n\n\t\n\t\n\t\t\n\t\t\n\t\t\t331,338 ****\n\t\t\n\t\t\n\t\t\t331,346 ----\n\t\t\n\t\t\n\t\n\t\n\n\n\n      numTermsInField = te.getTermNumber();\n      te.close();\n\n+     // free space if outrageously wasteful (tradeoff memory/cpu)\n+\n+     if ((maxTermCounts.length - numTermsInField) > 1024) \n{ // too much waste!\n+       int[] newMaxTermCounts = new int[numTermsInField];\n+       System.arraycopy(maxTermCounts, 0, newMaxTermCounts, 0, numTermsInField);\n+       maxTermCounts = newMaxTermCounts;\n+    }\n+\n      long midPoint = System.currentTimeMillis();\n\n      if (termInstances == 0) {\n        // we didn't invert anything",
+    "attachments": {
+        "Udiff.txt": "https://issues.apache.org/jira/secure/attachment/12410760/Udiff.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12719924",
+            "date": "2009-06-16T04:50:20+0000",
+            "content": "Thanks Kent, but the patch was mangled by JIRA.\nThe normal procedure is to do an \"svn diff > SOLR-NNN.patch\" and attach that file to the issue via \"attachFile\".\nThat also allows you to click the \"grant license to ASF\" button to help us with our intellectual property tracking. "
+        },
+        {
+            "author": "Kent Fitch",
+            "id": "comment-12719952",
+            "date": "2009-06-16T07:00:42+0000",
+            "content": "Hi Yonik, attached patch as requested "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-12720195",
+            "date": "2009-06-16T15:41:52+0000",
+            "content": "Committed. Thanks Kent!\n\nA future little optimization could collect a list of byte[] for maxTermCount and then do a single resize at the end. "
+        },
+        {
+            "author": "Grant Ingersoll",
+            "id": "comment-12775773",
+            "date": "2009-11-10T15:52:08+0000",
+            "content": "Bulk close for Solr 1.4 "
+        }
+    ]
+}

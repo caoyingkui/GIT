@@ -1,0 +1,176 @@
+{
+    "id": "SOLR-11444",
+    "title": "Improve Aliases.java and comma delimited collection list handling",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "7.2"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "While starting to look at SOLR-11299 I noticed some brittleness in assumptions about Strings that refer to a collection.  Sometimes they are in fact references to comma separated lists, which appears was added with the introduction of collection aliases (an alias can refer to a comma delimited list).  So Java's type system kind of goes out the window when we do this.  In one case this leads to a bug \u2013 CloudSolrClient will throw an NPE if you try to write to such an alias.  Sending an update via HTTP will allow it and send it to the first in the list.\n\nSo this issue is about refactoring and some little improvements pertaining to Aliases.java plus certain key spots that deal with collection references.  I don't think I want to go as far as changing the public SolrJ API except to adding documentation on what's possible.",
+    "attachments": {
+        "SOLR_11444_Aliases.patch": "https://issues.apache.org/jira/secure/attachment/12890777/SOLR_11444_Aliases.patch",
+        "SOLR-11444.patch": "https://issues.apache.org/jira/secure/attachment/12892301/SOLR-11444.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-10-06T16:36:51+0000",
+            "content": "This patch is a WIP; I know I broke something and I'm working out what it was.\n\nSome random notes:\n\n\tCloudSolrClient: send write to 1st in alias list\n\tMore consistently use StrUtils.splitSmart instead of String.split\n\tJoel Bernstein TupleStream.getSlices looks identical to CloudSolrClient.getSlices.  Why did you copy code and commit it unmodified?  Perhaps there is more duplicated code; I didn't check.\n\n\n ",
+            "author": "David Smiley",
+            "id": "comment-16194818"
+        },
+        {
+            "date": "2017-10-06T17:26:15+0000",
+            "content": "I suspect what happened was that the getSlices implementation was different at one point in time and then made the same. I'm not sure if I'm the one that did this or not, as it's been refactored a number of times I believe. If they are identical now it makes sense to just use the CloudSolrClient version. ",
+            "author": "Joel Bernstein",
+            "id": "comment-16194909"
+        },
+        {
+            "date": "2017-10-06T17:37:03+0000",
+            "content": "I also believe the get slices logic was in a number of different places in the streaming code with slightly different implementations. It was then moved to the TupleStream where it's shared by all the stream sources.  So when that consolidation was done it probably took the most up to date version in CloudSolrClient.\n\nI think it does make sense to use the CloudSolrClient version rather then having the TupleStream have this logic.   ",
+            "author": "Joel Bernstein",
+            "id": "comment-16194919"
+        },
+        {
+            "date": "2017-10-12T04:26:49+0000",
+            "content": "New patch.  All existing tests pass.  Probably ready to commit but would love a review on some points.\n\nNew behavior: collection references in the URL path can now be comma delimited lists, just as is already possible with the little-known collection parameter.  Thus you can now do http://localhost:8983/solr/collection1,collection2/select?....  The point of this is to have better consistency in treatment between both options, which in turn helps make the code to process them easier and more maintainable, removing gotcha edge-cases that were present.  I propose that this collection parameter in 8.0 be purely internal (or removed entirely?), thus not supported in SolrJ as it's needless, I think \u2013 similar to qt.\n\nCloudSolrClient\n\n\trequest(): The collection parameter is now fetched as top precedence, instead of the argument/param to the method.  Although it might seem this is a break in semantics, I'm doubtful since code I replaced in this class (in sendRequest()) used to compose the URL to Solr differently depending on wether a collection parameter was present.  After all, HttpSolrCall (Solr side) considers collection first (assuming the path isn't a core name).  FYI Mark Miller\n\tNew: you can now index (update) documents to an alias (or collection list) that references more than one collection.  It's routed to the first in the list. This change matches Solr's existing behavior (as implemented by HttpSolrCall).\n\tsendRequest(): improved clarity of gathering the URL list; no intended change in behavior.\n\n\n\nHttpSolrCall & V2HttpCall  (FYI Noble Paul)\n\n\tMost changes are just a refactor to improve the code.\n\tCollections in the path are parsed comma-delimited now to be consistent with collection param.\n\tgetAuthCtx(): Now trusts/honors collectionList when present, instead of duplicating or adding special case logic of how to detect the collections, thus easier to maintain.  Anshum Gupta do you think this is fine?\n\n\n\nAliasIntegrationTest\n\n\tUpdated to ensure we more thoroughly tested all the ways that one can refer to collection lists and aliases. This includes comma delimited collection references in the URL path now.\n\tTest indexing with CloudSolrClient to multi-collection alias.\n\n\n\nClusterStateProvider\n\n\tSimplified a bit, removing one method.  FYI Ishan Chattopadhyaya.  Perhaps instead of keeping getAlias and removing getCollectionName; the reverse could be done?  I dunno, I could go either way.  There is a caller that specifically wants to know if it was alias-resolved which would be awkward to use getCollectionName to detect that.\n\n\n\nSQL handler, SolrSchema\n\n\tgetTableMap: instead of attempting to expand the alias to its target collection, simply pretend the alias is itself a table/collection.  I believe this should work, whereas the code it replaces assumed incorrectly that an alias maps to one collection when in fact it's (potentially) a comma delimited list \u2013 and I believe the related in streaming expressions here doesn't support collection references that are comma delimited.  That could be added by I left that as a TODO.  FYI Kevin Risden\n\n ",
+            "author": "David Smiley",
+            "id": "comment-16201420"
+        },
+        {
+            "date": "2017-10-12T05:03:11+0000",
+            "content": "Do these changes affect SOLR-10181 or SOLR-11218? I doubt it's relevant to 10181.\n\nI wrote two additional tests in AliasIntegrationTest to verify what happens when you delete aliases with naming issues. These now both fail whereas only one failed before after applying both this patch and 10181. 10181 was not committed...\n\nThis is the test that now fails: testDeleteAliasWithExistingCollectionName. When I wrote it originally, it passed. Whether that behavior was intended/correct I'm not quite sure but we should agree on the correct behavior. The step that fails now has the comment \"// Now we should still transitively see collection_new\". I'm not sure that's proper behavior, but it was true before.\n\nThe gist of these tests is \"what happens when an alias and collection have the same name when you delete? The scenario I'm worried about is that people create a collection then need to re-index completely and want to just alias things. This is the sequence\n1> create collection old_collection\n2> decide to change the schema so create new_collection and index/verify\n3> don't want to change the client app so create an alias old_collection->new_collection\n4> delete old_collection\nNOTE: this test has a different alias to old_collection too!\n\nI won't be able to look in detail until at least Friday. \n\nThe other new test I wrote exercises the situation where you have an alias that points to two collections. What happens when you delete one of the underlying collections? At this point we get a \"no live servers\", which is arguably correct, in which case we probably should error out when deleting a collection that any alias points to. Which if we agree is probably a separate JIRA. ",
+            "author": "Erick Erickson",
+            "id": "comment-16201445"
+        },
+        {
+            "date": "2017-10-12T12:22:16+0000",
+            "content": "Changes for SQL sounds reasonable to me. I think streaming expressions support aliases now. When it was originally implemented not sure that was the case. ",
+            "author": "Kevin Risden",
+            "id": "comment-16201866"
+        },
+        {
+            "date": "2017-10-13T20:18:17+0000",
+            "content": "Erick Erickson This issue, SOLR-11444, should not change the semantics of either of those issues (SOLR-10181 or SOLR-11218).  However both issues touch the same files as this one and so there will be some merge conflicts for one or both of us to get through if our mutual work overlaps.\n\nIf there are no further comments, I'd like to commit this Monday and let the tests beat on it a bit.  In a subsequent commit I can adjust Solr's documentation to point out that collection references in the path can be a comma delimited list (new).  I should add some docs too. ",
+            "author": "David Smiley",
+            "id": "comment-16204123"
+        },
+        {
+            "date": "2017-10-13T20:55:36+0000",
+            "content": "-1 until we resolve the additional test issue in SOLR-11218. I hope to have some time this weekend to dig further.\n\nThe issue for me is that testDeleteAliasWithExistingCollectionName fails with the patch on this JIRA but did not before. The reason I'm persnickety about this one is that this scenario doing the wrong thing is very painful.\n\nA common strategy for reindexing from scratch is to create a new collection, index to that and then define an alias to switch atomically. Problem is that it's often the case that the user won't already have an alias set up, so you wind up with an alias and collection name that are identical, but the alias does not point to the collection named the same. So far, so good.\n\nBut now I want to delete the old collection. If the alias is followed it deletes the wrong collection. Here's an abbreviated set of steps.\n\n> create collection old\n> create collection new\n> alias old->new\n> delete old\n\nIf that sequence deletes the new collection it's pretty bad.\n\nNow, it may just be that the test isn't doing what I think, I really didn't have time to look yet. I'll see what I can get through this weekend.\n\nThe second test in SOLR-11218 with the nocommit is a separate concern, \"it does what it does\" may be fine there. ",
+            "author": "Erick Erickson",
+            "id": "comment-16204174"
+        },
+        {
+            "date": "2017-10-13T21:33:02+0000",
+            "content": "No prob Erick; I'll investigate and see what's going wrong.  BTW I didn't know aliases could be named after existing collections!  Seems like something possibly hard to get right. ",
+            "author": "David Smiley",
+            "id": "comment-16204226"
+        },
+        {
+            "date": "2017-10-14T00:07:08+0000",
+            "content": "Yeah, when I realized that we were recommending that and didn't have a test for it it kind of scared me.\n\nSeveral things though:\n1> I'm interested in preventing this \"delete the wrong collection\" issue, not necessarily keeping this behavior.\n2> The test could very well not be doing what I think\n3> I'm also interested in codifying the intended behavior with tests.\n\nIf it gets too hairy (and I'm thinking of all the persist pain and and agony for solr.xml historically) we could consider alternatives like preventing having an alias with the same name as a collection. People could get by if they\n\n> index to new collection\n> have a maintenance window in which they\n>> deleted the old collection\n>> created an alias with the old name and pointed to the new collection\n\nOnce that was done the first time, they wouldn't have the problem again as they are now using an alias not a collection even though it has the same name as the old (deleted) collection. This pre-supposes they can't/won't change whatever the app is to use an alias in the first place.\n\nHmmmm, I'm starting to think that preventing an alias from being created with the same name as an existing collection is the way to go. Supporting the current behavior would be for people who do it that way now and can't/won't change client(s) to use an alias. And there is a way to get by without changing the client above, albeit it'd be a bit of a pain, but not much frankly.\n\nAnd it's not even an all-or-none thing. Say I have collectionA. I create an alias to it (aliasA->collectionA). Now I can switch over my client(s) to use aliasA on whatever schedule I want, one at a time or all at once. When they're all done and tested I can reindex to collectionB and then switch aliasA->collectionB.\n\nWDYT? I can claim that having an alias and a collection with the same name is inherently unsafe/confusing without any qualms at all.\n\nThat would leave the question of what we should do at initialization time if we find a collection and alias with the same name from something previous though. Big fat ERROR THIS HAS UNDEFINED BEHAVIOR message or something? ",
+            "author": "Erick Erickson",
+            "id": "comment-16204379"
+        },
+        {
+            "date": "2017-10-14T03:18:27+0000",
+            "content": "I applied the patch in SOLR-11218 over my working copy which has the changes here.  (there were some straight-forward merge conflicts in the test).  I ran testDeleteAliasWithExistingCollectionName  It failed only because of one assertEquals that I think is incorrect:\n\n    // Now we should still transitively see collection_new\n    res = cluster.getSolrClient().query(\"collection_old_reserve\", new SolrQuery(\"*:*\"));\n    assertEquals(1, res.getResults().getNumFound());\n\n\nThis doesn't make sense to me \u2013 the alias collection_old_reserve points to the collection collection_old and thus it should find three documents.  No?  In looking at code for aliases a great deal lately, aliases point to collections only, not to other aliases.  Thus you cannot get yourself into an infinite loop A -> B -> A    (not possible) ",
+            "author": "David Smiley",
+            "id": "comment-16204446"
+        },
+        {
+            "date": "2017-10-14T03:39:47+0000",
+            "content": "In looking at code for aliases a great deal lately, aliases point to collections only, not to other aliases.\n\nTo clarify, I mean the code that uses aliases (lots of which affected by SOLR-11444 here) it was clear that aliases are not recursively resolved, and thus you can't get yourself into an infinite loop.  That said, now that I look carefully at the alias creation validation code, it does not forbid creating aliases pointing to aliases, and there is even a test that shows it's not forbidden!  But no test (in AliasIntegrationTest) actually uses (searches with) this alias pointing to an alias.  I added a simple try to do so to validate my understanding of the code and it indeed failed.\n\nAll this conversation about SOLR-11218 really ought to be on that issue, alas.  Too late?   Hey Mark Miller you added aliases originally and have some insight I'm sure.  IMO, we shouldn't let someone create an alias to an alias.  As I mentioned above, Solr will let you do it but it doesn't actually work, and may be tricky to support with safety. ",
+            "author": "David Smiley",
+            "id": "comment-16204455"
+        },
+        {
+            "date": "2017-10-14T17:37:16+0000",
+            "content": "IIRC, that test in SOLR-11218 used to work in which case the behavior is now different (and, I think, correct). Of course I may be mis-remembering...\n\nLet's claim I'm remembering correctly for a second though: the test testDeleteAliasWithExistingCollectionName used to work but was only showing incorrect behavior. That lends weight to the discussions in SOLR-11488 and SOLR-11489 I think. At least we should beef up the tests a lot to have faith that\n1> the behavior is what we expect\n2> future changes don't unexpectedly break things\nI'd prefer a more systemic change of course.\n\nTo be clear, the discussions at SOLR-11488 and SOLR-11489 should not hold up this JIRA. In fact I'd be loathe to do either of them before this one is committed.\n\nAnd on a side note, WDYT about including the bits from SOLR-11488 that dis-allows deleting a collection if any alias points to it in this JIRA? The nocommit test testDeleteOneOfTwoCollectionsAliased in SOLR-11218 exercises that and IIRC we get an error if we query on an alias after deleting only one of the collections pointed to by it. ",
+            "author": "Erick Erickson",
+            "id": "comment-16204755"
+        },
+        {
+            "date": "2017-10-14T20:40:23+0000",
+            "content": "This patch fixes a bug I was just puzzling over. While reading code in HttpSolrCall, I couldn't figure out how it was possible to find an alias from a node not part of that alias... finally I set up a test, and found that in fact it did fail...\n\n\n{\n  \"error\":{\n    \"metadata\":[\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"org.apache.zookeeper.KeeperException$SessionExpiredException\"],\n    \"msg\":\"Could not load collection from ZK: test1\",\n    \"code\":400}}\n\n\n\nThat was from a 4 node cluster with collection test1 aliased as test1alias that had 1 shard and replication factor 1, which were allocated to nodes on port 8981 and 8982, from which all seemed normal, but errors like this occured if one tried to use the test1alias name from the node on port 8983 \n\nI was about to file a bug but then I applied this patch since it seemed to be in exactly the section of code that didn't make sense, and poof the issue disappeared  ",
+            "author": "Gus Heck",
+            "id": "comment-16204819"
+        },
+        {
+            "date": "2017-10-14T21:54:15+0000",
+            "content": "Ugh; looks like I'm wrong about something: While I saw no explicit alias recursive resolution, there was in effect one level of this in HttpSolrCall due to the second call site of looking up aliases.  I found this via shelving this patch's changes while keeping the AliasIntegrationTest changes (including specifically your test for alias of an alias) and running it in a debugger and seeing it work.  However note while it did work, it didn't work when the collection/alias was specified as a parameter \u2013 searchSeveralWays tests many ways to refer to the intended collection/alias.  This double-resolution was not previously tested \u2013 so who knows wether it was supposed to work this way.  Perhaps it was intended since the creating of an alias pointing to an alias was tested even though it was forgotten to test actually using it.  \n\nWhere does this leave us...?  Well... we could add explicit double-resolution support and test, but do this with a system property flag? Then we remove in 8.0; I don't like aliases pointing to aliases.\n\nAnd on a side note, WDYT about including the bits from SOLR-11488 that dis-allows deleting a collection if any alias points to it in this JIRA?\n\nI reviewed that patch and commented there that I liked it. ",
+            "author": "David Smiley",
+            "id": "comment-16204835"
+        },
+        {
+            "date": "2017-10-15T18:32:07+0000",
+            "content": "My attempt to reconcile recent changes by Andrzej Bialecki  with this JIRA, there were some merge conflicts.\n\nNote, there is one /nocommit in HttpSolrCall that I'd like David to take a glance at to see if it makes sense, I was getting an AIOOB there because the path was just \"/select\" and idx == -1 so path.substring(idx) failed.\n\nI'm going to use this as a base for beefing up tests in SOLR-11218. ",
+            "author": "Erick Erickson",
+            "id": "comment-16205240"
+        },
+        {
+            "date": "2017-10-15T18:33:51+0000",
+            "content": "Oops, attached the wrong patch last time. ",
+            "author": "Erick Erickson",
+            "id": "comment-16205242"
+        },
+        {
+            "date": "2017-10-16T20:06:14+0000",
+            "content": "Your change RE path & idx makes total sense Erick.\n\nI'll improve this further as I indicated to do a double-resolution of Aliases (alias -> alias -> collection) to be supported and then test it works.  Conditionally supporting and eventually removing support for it ought to be a separate issue.  This issue here is mostly a refactoring with minor improvements related to consistency: consistency of comma delimited collection/alias lists in the path, and ensuring CloudSolrClient can route an update to a multi-collection alias just as HttpSolrCall already can. ",
+            "author": "David Smiley",
+            "id": "comment-16206524"
+        },
+        {
+            "date": "2017-10-17T21:24:52+0000",
+            "content": "Updated patch.  I think it's ready.\n\n\n\tdouble-resolve of an alias.  This used to not be supported by JoinQParser nor streaming expressions but now it works since I put this logic in Aliases.java where it can be shared.  I added some TODOs about this feature being dubious.\n\tClusterStateProvider: getAlias -> resolveAlias and changed semantics to return input if not an alias.  The extra alias indirection happens here (new).\n\tAliases.java: decided to remove a convenience method I added in the last patch.  And changed one of the newer methods I added to be resolveAlias with same semantics as the one in ClusterStateProvider.\n\tSolrTestCaseJ4: new getCloudSolrClient(MiniSolrCloudCluster cluster) to randomly pick a cluster state provider based on either ZK or HTTP.  FYI Ishan Chattopadhyaya.  Perhaps MSCC.getClient's impl should random().usually() do what it does now (it's probably fastest) and otherwise use the HTTP provider one (perhaps slower?)?\n\n\n\nnote: some streaming expressions code here and CloudSolrClient's http cluster state provider are coded in such a way that will probably be wrong or break if aliases and collections have the same name.  This is an observation I see, not a change induced by this patch.  ",
+            "author": "David Smiley",
+            "id": "comment-16208358"
+        },
+        {
+            "date": "2017-10-19T04:02:31+0000",
+            "content": "Commit e001f352895c83652c3cf31e3c724d29a46bb721 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e001f35 ]\n\nSOLR-11444: Improve consistency of collection alias handling and collection list references.\nOther refactorings of nearby code too. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16210544"
+        },
+        {
+            "date": "2017-10-19T04:05:08+0000",
+            "content": "Commit da71587196eccefd8b58923dc162916c808762a9 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=da71587 ]\n\nSOLR-11444: Improve consistency of collection alias handling and collection list references.\nOther refactorings of nearby code too.\n\n(cherry picked from commit e001f35) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16210545"
+        },
+        {
+            "date": "2017-10-20T03:07:37+0000",
+            "content": "Commit f47221002311fe80f4fbcb337dc8e7b985aa7347 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f472210 ]\n\nSOLR-11444: Fix AliasIntegrationTest when masked collection is null ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16212093"
+        },
+        {
+            "date": "2017-10-20T03:08:22+0000",
+            "content": "Commit 31d24ea293836e8b12b69ca49d76cec1aa459996 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=31d24ea ]\n\nSOLR-11444: Fix AliasIntegrationTest when masked collection is null\n\n(cherry picked from commit f472210) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16212094"
+        },
+        {
+            "date": "2017-11-18T04:22:30+0000",
+            "content": "Commit 6f99196e816761706e616325b3b2399867c571cc in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6f99196 ]\n\nSOLR-11444: CloudSolrClient could have thrown an NPE if the collection doesn't exist.\nRefactor: Tidy the exception throwing ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16257914"
+        },
+        {
+            "date": "2017-11-18T04:23:16+0000",
+            "content": "Commit 35bd3310aa6f0907f1b9582fdbda9516e742e3c9 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=35bd331 ]\n\nSOLR-11444: CloudSolrClient could have thrown an NPE if the collection doesn't exist.\nRefactor: Tidy the exception throwing\n\n(cherry picked from commit 6f99196) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16257915"
+        }
+    ]
+}

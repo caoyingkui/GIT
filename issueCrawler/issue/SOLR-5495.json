@@ -1,0 +1,185 @@
+{
+    "id": "SOLR-5495",
+    "title": "Recovery strategy for leader partitioned from replica case.",
+    "details": {
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.9"
+        ],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "We need to work out a strategy for the case of:\n\nLeader and replicas can still talk to ZooKeeper, Leader cannot talk to replica.\n\nWe punted on this in initial design, but I'd like to get something in.",
+    "attachments": {
+        "SOLR-5495.patch": "https://issues.apache.org/jira/secure/attachment/12640880/SOLR-5495.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13830709",
+            "date": "2013-11-23T17:34:06+0000",
+            "content": "In this case, the only real communication path is through zookeeper.\n\nCouple ideas I have thought about - seems tricky in general though:\n\n\n\thave the leader publish the replica as down - this is tricky because the replica may be publishing it's own states - perhaps we publish it with a special marker, and the overseer will not write a new state for that replica until one is published acking that it has seen the marker and acted accordingly?\n\n\n\n\n\thave a zk queue that leaders can publish to, asking for a recovery - replicas monitor the queue and check it at startup - if they are in it, they enter recovery and remove the queue entry - Overseer could also periodically clear the queue\n\n\n\nJust a quick 30 sec dump of some initial thoughts...looking for other ideas and may offer some more myself. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13958938",
+            "date": "2014-04-03T16:30:03+0000",
+            "content": "Hi Mark,\n\nI'm finally starting work on this ... I like both of your ideas above; of the two, I like the latter a little more so will start there and see what shakes out. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13974430",
+            "date": "2014-04-18T20:11:33+0000",
+            "content": "Here is a first patch that shows the direction I'm heading with this. A few things to note about this patch that are worth discussing (sorry it's a bit long winded but want to be sure we're all on the same page about this solution):\n\n1) I found a handy class named SocketProxy in the ActiveMQ project and \"borrowed\" it here to help simulate network partitions, such as between the leader and replica, while keeping the ZooKeeper connection alive. I'm aware of the IpTables class (from SOLR-5482) but the advantage of SocketProxy is it is just native Java so runs w/o sudo and on any platforms that don't have iptables. This of course requires a little trickery when setting up your test as you need to insert the proxy in-front of the Jetty nodes, which is being accomplished by setting a proxyPort on the JettySolrRunner, see HttpPartitionTest.createJetty. I'm guessing we can build this into a test base class if we like this approach and think it will be useful for other tests.\n\n2) I ended up going with Mark's idea #1 except I don't see where / why we need to worry about the replica publishing it's own state? In other words, what really matters, is that the leader cannot send a request to the replica, so to me, the leader's view of the replica is what matters. In my patch, the leader will publish the state of the replica as \"down\" when it encounters a communication error when trying to send a request to a replica. See ZkController.ensureReplicaInLeaderInitiatedRecovery() method, which is called from the DistributedUpdateProcessor.doFinish() method.\n\nSo I've thought about this in some detail and I think it will work itself out without us having to coordinate state changes. So let's just say the leader set the state to \"down\" and for some weird reason (which I can't really see how it would happen), the replica reset it's state to \"active\". This would make the replica a candidate for receiving requests again, which would just lead to another error, leading to the leader re-setting the state to \"down\". In a nutshell, if the leader can't talk to the replica over http, it's state gets set to \"down\".\n\nOne idea I did have for this is to have the leader pass the ClusterState.zkClusterStateVersion along in every request, thus allowing the replica to compare the version it is working with and if they are different, then have the replica force a state update from ZK and act accordingly. It shouldn't be too bad to implement this if we think it will be useful? Version would be passed along like the distrib.update param is today.\n\n3) Even if more coordination is needed for #2 ^ at some point the replica gets marked as being in the down state. This ensures the leader stops trying to send requests to that replica (via the DOWN filter in the call to getReplicaProps to determine the set of Nodes to forward requests to). The leader also needs to determine if it should send the CoreAdminAction.REQUESTRECOVERY command to the downed replica's core. This occurs over HTTP, which I think is correct because if the leader can't send the recover command to the replica, then sending docs is futile as well. What I've done here is to build upon the existing code in DistributedUpdateProcessor's doFinish method to attempt sending that command every 5 secs for up to 10 minutes so long as the node is still listed as a /live_nodes in ZK. If that changes, I stop trying to hit that node from the leader since a node that is no longer live will do full recovery when it comes back.\n\nI like this leader-initiated recovery approach because the leader's view of the replica is what matters, so I felt creating a self-initiating recovery process by which the replica realizes its state got changed by the leader doesn't do much if the HTTP connection between the leader and replica is still down.\n\n4) Of course, there's no guarantee that connectivity will be restored within 10 minutes, so the re-try loop described in #3 ^ will timeout and the leader will stop trying to tell the replica to recover. At this point, the replica should be marked down so at least the leader is no longer trying to send requests to it, so I think the shard is in a safe state wrt consistency but after the 10 minutes, there's nothing to tell the replica to recover from the down state. Do we want the leader to just try forever? Seems like not ... Maybe this is where an ops alert could be inserted to have someone go investigate why the partition is longer than 10 minutes. Appreciate any advice on how to handle this better.\n\n5) You'll notice that I'm using a HashSet containing replicaUrl's in ZkController to keep track of replicas that are in the \"leader-initiated\" recovery process, see: ZkController.replicasInLeaderInitiatedRecoveryHandling. This approach is needed because there are many DistributedUpdateProcessor's that may be receiving a flood of errors concurrently when connectivity to a replica is lost. I didn't want the leader trying to set the state to DOWN more than once when it sees a bunch of errors or to have more than one thread per replica trying to send the recovery command. There might be a better location for this code than the ZkController (maybe ZkStateReader).\n\nAs for testing, I think the unit test (HttpPartitionTest) is pretty close to the scenario we're trying to capture in this ticket.\n\nSpecifically, it tests the following process:\n\na. setup proxies in-front of all Jetty servers (3 in this test) by overriding the createJetty method.\nb. create a collection with 1 shard and rf=2\nc. send doc 1 to leader, which gets forwarded to replica successfully\nd. partition occurs (using SocketProxy); however the ZK connection between the replica remains in tact (which is the crux of this issue); the leader remains the same throughout this test\ne. send doc 2 to leader\nf. leader send doc 2 to replica fails due to comm error, asynchronous call to doFinish starts the leader-initiated recovery process\ng. leader marks replica as being down, which means it will stop trying to send requests to the replica until the situation improves as the ZkStateReader.getReplicaProps() filters out \"downed\" nodes. At this point, the leader is also trying to tell the replica to recover from a background thread.\nh. partition is restored\ni. send doc 3\nj. replica recovery succeeds asynchronously, test waits until it sees the replica in the \"active\" state\nk. test verifies both the leader and the replica have docs 1,2,3 using requests to the /get handler\n\nNext, the test performs the same basic process but for 1000 docs while dropping and restoring the connectivity between the leader and replica every 100 docs.\n\nI should mention that without the code in this patch, the replica will most certainly be out of sync and not know it, which of course is a no-no for a CP system (btw: I used real test-driven development methodology here by writing the test first and then implementing until the test passes).\n\nThe one minor concern I have with this test right now is the Thread.sleep(2000) before restoring connectivity with the proxy. I had to introduce this because the test was progressing too fast for the recovery process to kick-in, thus leading to test failures. I think this is OK to wait a little bit because that is more reflective of a running cluster and things do take a little time to propagate around the cluster. Just wanted to draw attention to this so you're clear it was intentional to give things time to work. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13975362",
+            "date": "2014-04-21T03:21:02+0000",
+            "content": "which I can't really see how it would happen\n\nConsider that we might have other states in the future as well - and / or, there can be backed up requests. Or what about races with the replica doing it's own recovery and having a down tossed in there by the leader. It's tricky to promise anything.\n\nThis would make the replica a candidate for receiving requests again, which would just lead to another error\n\nIs that guaranteed though? What if a connection recovers and it doesn't lead to another error?\n\nIf it all bears out in testing though, perhaps that's all fine.\n\nI found a handy class named SocketProxy\n\n+1 - it's great to be able to do this as part of the standard tests in Java. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13975363",
+            "date": "2014-04-21T03:22:59+0000",
+            "content": "I'll try and do a code review soon by the way. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13975366",
+            "date": "2014-04-21T03:26:25+0000",
+            "content": "Or what about races \n\nTo expand, I guess my main worry is around a leader telling a replica it's down right before it publishes it's active, so the down is basically ignored. I have not thought it thorough fully, but that is the type of thing I'm worried about. We don't want any races around a replica realizing it's been marked as down - we have to make sure it receives that message and doesn't ever think it properly recovered when it's missing a doc it would have buffered or something. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13975460",
+            "date": "2014-04-21T07:26:33+0000",
+            "content": "Just to be sure, I'd want to add that SOLR-5991 might intersect (not overlap) with the work on this one. I'll put a note in there (as well) about this one so whoever plans to work on that knows about changes happening as a part of this issue. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13975641",
+            "date": "2014-04-21T15:35:51+0000",
+            "content": "Thanks for the feedback! Mainly I just wanted clarification on that issue and if your intuition tells you it may be an issue, then that's sufficient for me to think harder and come up with something more robust around the leader marking the replica as \"down\". "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13981661",
+            "date": "2014-04-25T21:41:42+0000",
+            "content": "Here's an updated patch that builds upon the previous one, same basic approach of leader-initiated recovery but with some added coordination between the leader and partitioned replica using a znode: /collections/<collection>/leader_initiated_recovery/<shard>/<replicaCoreName> (see ZkController.getLeaderInitiatedRecoveryZnodePath).\n\nThe basic idea here is in addition to the leader marking the replica down, a separate znode is used to track the replica's transition from down -> recovering -> active. So the leader marks the replica as down (which removes it from participating in queries and update requests) and also creates this special znode. When the replica finally gets the \"you need to recover\" command from the leader, it changes the value of this znode to \"recovering\". When recovery succeeds, the replica deletes the znode as it's no longer needed. If the leader, while trying to send the recovery command (see LeaderInitiatedRecoveryThread), sees the replica as being \"active\" but the znode wasn't ack'd, then the leader can set the state to down again. As stated before, I don't see where the replica would do this, but if it happens, we now have a better way to handle it. Bottom line is with this special znode, the replica cannot stay in the \"active\" state until it acks the leader's command to recover by transitioning the znode appropriately.\n\nThe special znode is also useful if the nagging leader fails before the bad replica receives the message. The idea here is that the new leader can query ZK for any of these \"leader-initiated-recovery\" znodes for its shard and if there are any in the \"down\" state, then it can start up the nag loop for each bad replica; a znode in the down state means the replica hasn't received the recovery command yet (see: ElectionContext$ShardLeaderElectionContext.startLeaderInitiatedRecoveryOnReplicas).\n\nThere is a unit test that covers the leader failing over to a new leader and resuming the \"nag\" loop on the downed replica. There's one area where I'm not 100% sure if it is correct yet ... in the shouldIBeLeader method in ShardLeaderElectionContext, I check to see if a previous leader marked this core \"down\" and if so, return false to indicate this node should not be the leader. I think this works OK for RF=3 but I'm worried about RF=2 situations where this check prevents a leader from being elected. The main idea behind this check is that if the leader forces the shard state to \"down\", the core.getCoreDescriptor().getCloudDescriptor().getLastPublished() method can still return active so I needed this additional check on the znode. I suppose we could try to update the lastPublished state when it changes but didn't see how to go about that? (or if that was even a good idea).\n\nAnother area where I'm not 100% sold on is the 10-minute max wait and then timeout loop in the LeaderInitiatedRecoveryThread. 10 mins is arbitrary but it seems like it shouldn't just run forever. One idea I had was to use JMX to raise some event / notification to allow monitoring tools to alert ops team of this issue. Curious if there's anything else in SolrCloud related to notifying of issues that need ops attention?\n\nLastly, I did give some thought to a self-initiating recovery approach where the \"trying to recover\" loop runs on the replica itself as that is more immune to leader changes and there's already a recover retry loop in place via the RecoveryStrategy thread. As I understand it, a self-initiating approach would work something like:\n\n1) leader receives error when trying to forward update request to replica\n2) leader marks replica as down in ZK\n3) replica receives state change notification (at some point), replica must iterate over all cores hosted on that node looking for cores marked as down\n4) for each \"down\" core on the node found in step 3, try recovering in a loop\n\nThis is all straight-forward to implement. However, the main problem with this approach is in step 4, when starting recovery, the replica updates its state to \"recovering\" in ZK immediately. When a replica is \"recovering\" the leader still tries to forward updates to it (the updates get stashed in the tlog until recovery is complete). This works in normal circumstances because the replica assumes there is no partition between it and the leader so it's OK to go into the recovering state and continue receiving updates. The problem here though is the network may still be partitioned, so the leader keeps trying to forward docs and receiving errors. From the leader's perspective, we're right back at step 1 above.\n\nOf course, it would be possible to introduce a new state that would prevent the leader from sending updates while the replica sorted itself out, but I'm hesitant to introduce a new state as that has broader repercussions in the code base. I'm mentioning this here in case someone else has some better ideas around this self-initiating approach. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13981762",
+            "date": "2014-04-25T23:23:55+0000",
+            "content": "Awesome! Hope to read that closely this weekend.  "
+        },
+        {
+            "author": "Otis Gospodnetic",
+            "id": "comment-13981852",
+            "date": "2014-04-26T02:26:26+0000",
+            "content": "One idea I had was to use JMX to raise some event / notification to allow monitoring tools to alert ops team of this issue. Curious if there's anything else in SolrCloud related to notifying of issues that need ops attention?\n\n+1 for bringing this up - not that I'm aware of, but I also didn't look very closely.  This may deserve a standalone JIRA!  Perhaps relying on ZK for notifications would work? "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13986829",
+            "date": "2014-05-01T18:17:36+0000",
+            "content": "Updated patch to fix compilation error after backing out SOLR-5473 and tighten up the unit test, such as reducing the amount of time it waits before healing a partition. Also cleaned up a few minor issues in the LeaderInitiatedRecoveryThread loop. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13990836",
+            "date": "2014-05-06T17:11:47+0000",
+            "content": "I'd like to dig into this more, but on a glance this morning, this looks like great stuff - thanks Tim! "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-13991498",
+            "date": "2014-05-07T02:54:56+0000",
+            "content": "Thanks for the review Mark! I think there are still some weird interactions going on with this code and the waitForLeaderToSeeDownState stuff as I'm seeing some exceptions like the following in a good sized cluster when I knock over replicas during heavy indexing. Leader doesn't see down state, it sees the \"recovering\" state.\n\n2014-05-07 02:34:03,112 [Thread-3531] ERROR solr.cloud.ZkController  - There was a problem making a request to the leader:org.apache.solr.client.solrj.SolrServerException: Timeout occured while waiting response from server at: http://host:8985/solr\n        at org.apache.solr.client.solrj.impl.HttpSolrServer.executeMethod(HttpSolrServer.java:562)\n        at org.apache.solr.client.solrj.impl.HttpSolrServer.request(HttpSolrServer.java:210)\n        at org.apache.solr.client.solrj.impl.HttpSolrServer.request(HttpSolrServer.java:206)\n        at org.apache.solr.cloud.ZkController.waitForLeaderToSeeDownState(ZkController.java:1528)\n        at org.apache.solr.cloud.ZkController.registerAllCoresAsDown(ZkController.java:372)\n        at org.apache.solr.cloud.ZkController.access$000(ZkController.java:87)\n        at org.apache.solr.cloud.ZkController$1.command(ZkController.java:229)\n        at org.apache.solr.common.cloud.ConnectionManager$1$1.run(ConnectionManager.java:166)\n\nIn short, I there are still a few little issues that didn't show up in unit testing. So I'm going to flog this area of the code a bit more tomorrow morning! "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13992858",
+            "date": "2014-05-08T15:48:27+0000",
+            "content": "Commit 1593312 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1593312 ]\n\nSOLR-5495: Hardening recovery scenarios after the leader receives an error trying to forward an update request to a replica. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13994552",
+            "date": "2014-05-11T13:51:09+0000",
+            "content": "Commit 1593791 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1593791 ]\n\nSOLR-5495: Fix HttpPartitionTest to dynamically select the port the Jetty and the SocketProxy binds to, was causing Jenkins failures. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14002710",
+            "date": "2014-05-20T02:07:28+0000",
+            "content": "Commit 1596103 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596103 ]\n\nSOLR-5495: Raise the amount of time the test waits for replicas to become active after partitions are healed (to address intermittent Jenkins failures) "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14002746",
+            "date": "2014-05-20T03:38:44+0000",
+            "content": "Commit 1596107 from Timothy Potter in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1596107 ]\n\nSOLR-5495: Port over from trunk. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14003626",
+            "date": "2014-05-20T16:56:28+0000",
+            "content": "The CHANGES.txt entry for trunk and 4x are in different sections.\ntrunk: 5.0 section\n4x: 4.9 section "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14003638",
+            "date": "2014-05-20T17:04:21+0000",
+            "content": "Commit 1596315 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596315 ]\n\nSOLR-5495: Re-arrange location of SOLR-5495 and SOLR-5468 in CHANGES.txt "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14004999",
+            "date": "2014-05-21T18:05:54+0000",
+            "content": "Commit 1596636 from Timothy Potter in branch 'dev/trunk'\n[ https://svn.apache.org/r1596636 ]\n\nSOLR-5495: Print cluster state in assertion failure messages if a leader cannot be found to determine root cause of HttpPartitionTest failures in Jenkins. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14005009",
+            "date": "2014-05-21T18:11:27+0000",
+            "content": "Commit 1596637 from Timothy Potter in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1596637 ]\n\nSOLR-5495: Print cluster state in assertion failure messages if a leader cannot be found to determine root cause of HttpPartitionTest failures in Jenkins "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14037941",
+            "date": "2014-06-19T21:45:06+0000",
+            "content": "What's the current status of this? I see a lot of commits, but still in progress. I actually still hope to review it, but who knows. I have not touched anything in like a month or more now so I expect a huge backlog of crap will stand before me. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14038015",
+            "date": "2014-06-19T22:28:20+0000",
+            "content": "Hi Mark,\n\nI think it is ready to go, but was hoping for a review from you before closing. It's been committed to trunk and branch_4x. Tests seem to be passing on Jenkins and I've seen it work in some large clusters. If you can give it a quick once-over, I'd appreciate it.\n\nTim "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14042362",
+            "date": "2014-06-24T16:58:20+0000",
+            "content": "Marking this as resolved as it's included in the 4.9 release. Would definitely appreciate a review from Mark and others when convenient ... can open a new JIRA for any issues found with this implementation going forward. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14058879",
+            "date": "2014-07-11T15:11:49+0000",
+            "content": "I did a quick review of the code and read your comments above more thoroughly. I did not do a low level review. From that mid level though, this looks like a great change and even if there are any issues, the changes look like good improvements and we should just work through anything that comes up as a result of them.\n\nAs I work on anything in that area, I'll look at some parts more closely. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14058888",
+            "date": "2014-07-11T15:18:48+0000",
+            "content": "Hi Mark,\n\nAwesome, thanks for the review ... there's one area in the CoreAdminHandler waitForState that could use your review.\n\n              // TODO: This is funky but I've seen this in testing where the replica asks the\n              // leader to be in recovery? Need to track down how that happens ... in the meantime,\n              // this is a safeguard \n              boolean leaderDoesNotNeedRecovery = (onlyIfLeader != null && \n                  onlyIfLeader && \n                  core.getName().equals(nodeProps.getStr(\"core\")) &&\n                  ZkStateReader.RECOVERING.equals(waitForState) && \n                  ZkStateReader.ACTIVE.equals(localState) && \n                  ZkStateReader.ACTIVE.equals(state));\n\n\nBasically, at some point, I was seeing replicas ask active leaders to recover, which I didn't think was a valid thing to do. I actually haven't seen this occur in any of my testing so maybe I was just confused. We can definitely remove that code if it's not valid, but wanted to make you aware that I had it in there  "
+        }
+    ]
+}

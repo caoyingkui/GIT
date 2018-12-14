@@ -1,0 +1,114 @@
+{
+    "id": "SOLR-3215",
+    "title": "We should clone the SolrInputDocument before adding locally and then send that clone to replicas.",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.0-BETA",
+            "6.0"
+        ],
+        "components": [],
+        "type": "Improvement",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "If we don't do this, the behavior is a little unexpected. You cannot avoid having other processors always hit documents twice unless we support using multiple update chains. We have another issue open that should make this better, but I'd like to do this sooner than that. We are going to have to end up cloning anyway when we want to offer the ability to not wait for the local add before sending to replicas.\n\nCloning with the current SolrInputDocument, SolrInputField apis is a little scary - there is an Object to contend with - but it seems we can pretty much count on that being a primitive that we don't have to clone?",
+    "attachments": {
+        "SOLR-3215.patch": "https://issues.apache.org/jira/secure/attachment/12518280/SOLR-3215.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13228881",
+            "date": "2012-03-14T01:36:27+0000",
+            "content": "I'd like to commit this soon. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-13228889",
+            "date": "2012-03-14T01:52:25+0000",
+            "content": "Not sure I understand the problem this is solving.  version is added to the SolrInputDocument and then that can be indexed locally and sent to replicas.  DistributedUpdateProcessor should come right before RunUpdateProcessor (or are you assuming we might support random update processors in-between? Are there use cases for this?) "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13228893",
+            "date": "2012-03-14T02:00:07+0000",
+            "content": "A couple use cases:\n\n1. You don't want documents to have every processor applied to them twice. Intuitively, you expect that processors that run after the distrib processor will not hit the document sent to replicas before the docs are sent to replicas - but it will. Barring future features (like the JIRA around update chains and solrcloud), there is no way currently to have an update processor only hit a document once when they go to a replica.\n\n2. When we want to offer the option of adding locally and sending to replicas at the same time, we still need this, and we don't want to get people used to the current odd behavior because you couldn't even easily duplicate it (not that i think you'd want to) if you wanted to add locally and send to replicas in parallel. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13280394",
+            "date": "2012-05-21T19:21:21+0000",
+            "content": "\nDistributedUpdateProcessor should come right before RunUpdateProcessor (or are you assuming we might support random update processors in-between? Are there use cases for this?)\n\nthe main scenerio i've seen/heard mentioned is the idea of processors that are computationally cheap, but increase the size of the document significantly (ie: clone a big ass text field and strip the html from the clone) so you want it to happen after distrib (on every replica) to minimize the amount of data sent over the wire.\n\n\n\nIntuitively, you expect that processors that run after the distrib processor will not hit the document sent to replicas before the docs are sent to replicas - but it will.\n\nto clarify (because i kept not-understanding what the crux of the issue was here so if i post this comment i'll remember next time w/o needing to ask mark on IRC again) if we do NOT clone the doc, there is a race condition where local processors executing after the distrib processor may modify the documents before the are serialized and forwarded to one or more shards.\n\none way to avoid this would be to stop treating the \"local\" replica as special, and instead have distrib forward back to localhost (via HTTP) just like every other replica) and abort the current request.  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13280405",
+            "date": "2012-05-21T19:32:52+0000",
+            "content": "Are there use cases for this?\n\nWhat about the sig update proc or others that do something like modify the updateTerm on the update command - this type of thing does not get distributed as we turn update commands into update requests, and the mapping doesn't cover updateTerm. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13280415",
+            "date": "2012-05-21T19:49:18+0000",
+            "content": "What about the sig update proc or others that do something like modify the updateTerm on the update command - this type of thing does not get distributed as we turn update commands into update requests, and the mapping doesn't cover updateTerm.\n\nthat seems like a complicity distinct problem ... as i mentioned in SOLR-3473, the distrib update proc really needs to be aware of all properties of the AddUpdateCommand and serializes/deserialize that info when forwarding to the leader (and all of the replicas) .. in the case of \"updateTerm\" it's not even enough to make sure the shard leader and all replicas know about it \u2013 other docs in other shards might also need to be deleted. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13280455",
+            "date": "2012-05-21T20:32:34+0000",
+            "content": "one way to avoid this would be to stop treating the \"local\" replica as special\n\nJust to point out explicitly: currently we have to offer this (local is special) as well though - it's a requirement for our current 'super safe' mode that we add locally first. So unless we also address some other issues, we'd have to allow things to happen both ways.\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13281318",
+            "date": "2012-05-22T23:39:31+0000",
+            "content": "Cloning with the current SolrInputDocument, SolrInputField apis is a little scary - there is an Object to contend with - but it seems we can pretty much count on that being a primitive that we don't have to clone?\n\n... currently we have to offer this (local is special) as well though - it's a requirement for our current 'super safe' mode that we add locally first.\n\nStrawman suggestion: instead of using simple SolrInputDocument.clone(), with the scariness miller mentioned about some processor maybe creating a field value that isn't Clonable, what if instead we:\n\n\tuse the JavaBinCodec to serialize the SolrInputDocument to a byte[]\n\thang onto that byte[] while doing the local add\n\tthen (re)use that byte[] in all of the requests to the remote replicas\n\n\n\nnot sure how easy the resuse of the byte[] would be given the existing SolrJ API but...\n\n\n\tEven if some field values aren't Clonable primatives, they have to be serializable using the codec or we already have a bigger bug to worry about the the risk of concurrent mods to the object\n\tBonus: we only pay the cost of serializing the SolrInputDocument once on the leader, not N times for N replicas.\n\tOnly \"downside\" i can think of is that the leader has to buffer the whole doc in memory as a byte[] instead of streaming it \u2013 but if we assume most shards will have more then N replicas, the trade off seems worth it \u2013 to me anyway (optimize to use more RAM and save time/cpu in serializing redundently)\n\n\n\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13281350",
+            "date": "2012-05-23T01:48:17+0000",
+            "content": "Are there use cases for this?)\n\nFWIW: the other use case that just occurred to me today is trying to use any update processors that deal with multiple field values (either existing processors people may have written, or any of the new ones added by SOLR-2802, or SOLR-2599) in conjunction with field updating (SOLR-139) which is implemented as part of the DistributedUpdateProcessor.\n\nie: if you want to have a multivalued \"all_prices\" field, and a single valued \"lowest_price\" field that you populate using a combination of CloneFieldUpdateProcessorFactory + MinFieldValueUpdateProcessorFactory \u2013 that will need to happen after the DistributedUpdateProcessor in order to ensure all the values are available if someone does field update to \"add\" a value to \"all_prices\".\n "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13407648",
+            "date": "2012-07-06T01:25:57+0000",
+            "content": "we need to reevaluate this in regards to the update processor work that hossman did - this may not be needed unless something else prompts it "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13407649",
+            "date": "2012-07-06T01:38:10+0000",
+            "content": "I think this is still pretty damn important:\n\n1) nothing stops people from putting other processors between DistributeUpdateProcessorFactory and RunUpdateProcessorFactory\n2) several use cases identified above are simpler (or require) putting processors between DistributeUpdateProcessorFactory and RunUpdateProcessorFactory\n3) any processor put between DistributeUpdateProcessorFactory and RunUpdateProcessorFactory is a time bomb of unpredictability w/o some sort of cloning. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13408708",
+            "date": "2012-07-07T16:25:11+0000",
+            "content": "nothing stops people from putting other processors between DistributeUpdateProcessorFactory and RunUpdateProcessorFactory\n\nYonik has argued we shouldn't support this rather than cloning. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13412221",
+            "date": "2012-07-11T22:26:26+0000",
+            "content": "bulk fixing the version info for 4.0-ALPHA and 4.0 all affected issues have \"hoss20120711-bulk-40-change\" in comment "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13413775",
+            "date": "2012-07-13T14:27:03+0000",
+            "content": "Okay, I'm going to put this in. I'll wait a bit to see if Yonik pipes in first. "
+        },
+        {
+            "author": "Lance Norskog",
+            "id": "comment-13415861",
+            "date": "2012-07-17T03:15:30+0000",
+            "content": "Can I suggest the concept of a \"preprocessed\" or \"flattened\" or \"read-only\" document? \n\nEach processor would have the responsibility to say \"I only changed un-flattened documents\". After all, update processors can also do things like logging- it would not be ok to skip the logger just because it is above the DistributedProcessor stage.\n\nIf you want, you can add a marker interface for DistributedProcessor that means \"I alter documents\". The update process chain handler can skip these processors. "
+        }
+    ]
+}

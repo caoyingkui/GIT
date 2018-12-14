@@ -1,0 +1,65 @@
+{
+    "id": "SOLR-3857",
+    "title": "DIH: SqlEntityProcessor with \"simple\" cache broken",
+    "details": {
+        "affect_versions": "3.6.1,                                            4.0-BETA",
+        "status": "Open",
+        "fix_versions": [],
+        "components": [
+            "contrib - DataImportHandler"
+        ],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "The wiki describes a usage of CachedSqlEntityProcessor like this:\n\n\n<entity name=\"y\" query=\"select * from y where xid=${x.id}\" processor=\"CachedSqlEntityProcessor\">\n\n\n\nThis creates what the code refers as a \"simple\" cache.  Rather than build the entire cache up-front, the cache is built on-the-go.  I think this has limited use cases but it would be nice to preserve the feature if possible.\n\nUnfortunately this was not included in any (effective) unit tests, and SOLR-2382 entirely broke the functionality for 3.6/4.0-alpha+ .  At a first glance, the fix may not be entirely straightforward.\n\nThis was found while writing tests for SOLR-3856.",
+    "attachments": {
+        "SOLR-3857.patch": "https://issues.apache.org/jira/secure/attachment/12573936/SOLR-3857.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mikhail Khludnev",
+            "id": "comment-13459392",
+            "date": "2012-09-20T06:58:05+0000",
+            "content": "James,\n\nCould you explain what can be actually cached in N+1 scenario (where xid=${x.id}) ?  "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13459727",
+            "date": "2012-09-20T16:44:13+0000",
+            "content": "Mikhail,\n\nBased on reading the wiki, I imagine the purpose would be if the child entity was a lookup table where not all the keys were used but some of the keys join to many parent rows.  This would save it from having to read and cache the entire table if not the whole table is needed.  Also, it would prevent any key from being read more than once from the db.\n\nThis sounds like a very narrow use-case and I'm tempted to say that this feature is removed in 4.0 (and was broken in 3.6)!  On the other hand, someone somewhere is probably using it and its very much technically feasible.  So I'd hate to take away something just because the first implementation was poor and re-implementing it would be a little work.  Then again, if it depends on me to be fixing this, I'm not so sure it'll be ready for 4.0...\n\nI also still have significant test-case re-writing yet to do so who knows what other bugs I can find doing that.  Hopefully no more but I have seen sporatic complaints from users that 3.6/4.0 isn't working exactly like 3.5 and prior.   "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13600070",
+            "date": "2013-03-12T14:34:03+0000",
+            "content": "see SOLR-4561 for a suggested fix, although it may not be valid. "
+        },
+        {
+            "author": "Sudheer Prem",
+            "id": "comment-13600088",
+            "date": "2013-03-12T15:11:25+0000",
+            "content": "Updated SOLR-4561 with a valid fix. "
+        },
+        {
+            "author": "James Dyer",
+            "id": "comment-13603786",
+            "date": "2013-03-15T20:10:39+0000",
+            "content": "Here is a working patch based on the fix Sudheer Prem suggested on SOLR-4561.  All tests pass and it restores pre-3.6 functionality.\n\nThe way this feature works (and always has) is by creating a new cache for every key.  If using the default cache impl, this means a 1-element SortedMap in memory in addition to your data.  In addition all of these 1-element caches are kept in a map, keyed by the query text with tokens replaced.  This is why Sudheer's fix needs to replace tokens first and then see if the cache exists second, because each version of the query gets its own cache.  Using SortedMapBackedCache (the default), this is merely a memory waste (and possibly a net gain if you are caching far less data).  But the point of the recent cache refactorings is to allow for pluggable cache implementations, including those that persist data to disk.  Clearly this behavior is not going to work for the general case.\n\nWhile the way it ought to work is easy to conceptualize, the DIH structure doesn't make it easy.  The query's tokens get replaced several calls up the stack from the cache layer.\n\nThose who want this functionality can apply and build with this patch.  But perhaps a better way is simply to put a subselect in your child entity query.  For instance:\n\n\n<entity name=\"parent\" query=\"SELECT * FROM PARENT\" pk=ID\">\n <entity name=\"child\" cacheImpl=\"SortedMapBackedCache\" query=\"SELECT * FROM CHILD WHERE CHILD_ID IN (SELECT CHILD_ID FROM PARENT)\" />\n</entity>\n\n \n\nAlthough this does not give you lazy loading, it does cause only the needed data to be cached. "
+        },
+        {
+            "author": "Sudheer Prem",
+            "id": "comment-13604119",
+            "date": "2013-03-16T05:18:46+0000",
+            "content": "If my understanding is correct, those who are using this approach to use 'simple' cache query for the child entity, note one important thing:\n\nThis approach checks only the current query with the previous query, NOT with all previous queries.\nAs the caching is happening after the query initialization is done and the query execution is happening during the initialization, if any previously cached query needs to be used again, the query will get executed again and the old cache will get replaced with new cache. This will have negative performance impact as the same query gets executed and replace the cache multiple times.\n\nFor example: If the child query is: \"select * from table where param=\n{parent.field1}\n\" and the parent.field1 are (1,2,1,2,1,2,1,2), the child query will get executed for all ${parent.field1} values!\n\nTo avoid this, make sure that, the query for the parent entity is ORDERED using the parameter/parameters used in the query for the child entity. \n\nIf ordering is impossible due to performance reasons,there are two ways to handle this scenario:\n\n1. All queries after the token replacement should be cached (using an implementation of Set?) in the SqlEntityProcessor class \n   OR\n2. Add a new API in the DIHCacheSupport to tell whether the cache exists for a query or not\n\nThen perform the check before the query initialization. "
+        },
+        {
+            "author": "Sudheer Prem",
+            "id": "comment-13604136",
+            "date": "2013-03-16T06:37:35+0000",
+            "content": "James Dyer, \n\nI really like the idea of sub-query approach in the child.\n\nIn the example stated above, the resulting cache will contain the subset of rows for all documents from the child tables. \nIs there any way I can select the records from the cache for each document? especially the relationship between the parent and child table are many to many.\n\nA Transformer or something similar to it?\n "
+        }
+    ]
+}

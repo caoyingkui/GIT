@@ -1,0 +1,59 @@
+{
+    "id": "SOLR-6236",
+    "title": "Need an optional fallback mechanism for selecting a leader when all replicas are in leader-initiated recovery.",
+    "details": {
+        "affect_versions": "None",
+        "status": "Open",
+        "fix_versions": [],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved"
+    },
+    "description": "Offshoot from discussion in SOLR-6235, key points are:\n\nTim: In ElectionContext, when running shouldIBeLeader, the node will choose to not be the leader if it is in LIR. However, this could lead to no leader. My thinking there is the state is bad enough that we would need manual intervention to clear one of the LIR znodes to allow a replica to get past this point. But maybe we can do better here?\n\nShalin: Good question. With careful use of minRf, the user can retry operations and maintain consistency even if we arbitrarily elect a leader in this case. But most people won't use minRf and don't care about consistency as much as availability. For them there should be a way to get out of this mess easily. We can have a collection property (boolean + timeout value) to force elect a leader even if all shards were in LIR. What do you think?\n\nMark: Indeed, it's a current limitation that you can have all nodes in a shard thinking they cannot be leader, even when all of them are available. This is not required by the distributed model we have at all, it's just a consequence of being over restrictive on the initial implementation - if all known replicas are participating, you should be able to get a leader. So I'm not sure if this case should be optional. But iff not all known replicas are participating and you still want to force a leader, that should be optional - I think it should default to false though. I think the system should default to reasonable data safety in these cases.\nHow best to solve this, I'm not quite sure, but happy to look at a patch. How do you plan on monitoring and taking action? Via the Overseer? It seems tricky to do it from the replicas.\n\nTim: We have a similar issue where a replica attempting to be the leader needs to wait a while to see other replicas before declaring itself the leader, see ElectionContext around line 200:\nint leaderVoteWait = cc.getZkController().getLeaderVoteWait();\nif (!weAreReplacement)\n{ waitForReplicasToComeUp(weAreReplacement, leaderVoteWait); }\nSo one quick idea might be to have the code that checks if it's in LIR see if all replicas are in LIR and if so, wait out the leaderVoteWait period and check again. If all are still in LIR, then move on with becoming the leader (in the spirit of availability).\n\n\nBut iff not all known replicas are participating and you still want to force a leader, that should be optional - I think it should default to false though. I think the system should default to reasonable data safety in these cases.\nShalin: That's the same case as the leaderVoteWait situation and we do go ahead after that amount of time even if all replicas aren't participating. Therefore, I think that we should handle it the same way. But to help people who care about consistency over availability, there should be a configurable property which bans this auto-promotion completely.\nIn any case, we should switch to coreNodeName instead of coreName and open an issue to improve the leader election part.",
+    "attachments": {
+        "SOLR-6236.patch": "https://issues.apache.org/jira/secure/attachment/12657661/SOLR-6236.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14073585",
+            "date": "2014-07-24T20:12:07+0000",
+            "content": "Here's a rough sketch of progress so far on this issue ... a few key points about this problem and the patch:\n\nAt a high-level, the issue boils down to giving SolrCloud operators a way to either a) manually force a leader to be elected, or b) set an optional configuration property that triggers the force leader behavior after seeing so many failed recoveries due to no leader. So this can be considered an optional availablity-over-consistency mode with respect to leader-failover.\n\nThis patch solves the case where replicas in leader-initiated recovery keep failing to recover because there is no leader. This could occur if a replica is put into leader-initiated recovery but then the leader dies before the replica(s) recovers. Currently, the replica will never get out of recovery, i.e. it will end up in a loop of recovery -> recovery_failed. It will never become the leader and the shard will be offline. This is most likely to occur with collections using RF=2.\n\nThe patch leverages a special value for the leader-initiated recovery znode: \"force_leader\", which can be set manually (using ZK directly) or automatically once a configurable threshold of recovery failures is exceeded forceLeaderFailedRecoveryThreshold. \n\nOnce a replica sees that is is in the \"force_leader\" state, it will try to force itself to become the leader. As Mark mentions above, this behavior is disabled by default.\n\nThe HttpPartitionTest has been updated to verify this scenario, see: testRf3WithForcedLeaderElection(). The idea there is to partition off replicas and then kill the leader before the partitioned replicas have recovered. Next, I simulate a sys admin manually setting the leader-initiated recovery znode for one of the replicas to \"force_leader\", at which point the replica forces itself to become the leader and then the other replica recovers against it. To be clear, you'll see that doc #2 is lost in this test and only 1 & 3 exist in the recovered replicas, which is why this behavior must be disabled by default.\n\nWhen relying on forceLeaderFailedRecoveryThreshold > 0 to have the force leader process kick-in automatically, we have to pick one of the replicas in leader-initiated recovery. For this, I chose to pick the replica with the latest ctime on the leader-initiated znode, i.e. the one that was added to recovery last. I also check to make sure the node hosting that replica is \"live\". See: ElectionContext#checkForceLeader\n\nThat covers replicas in leader-initiated recovery but you can also end up without the ability to select a leader when replicas are not in leader-initiated recovery. For instance, imagine a scenario where a replica loses its connection to ZK and once the connection is re-established, that replica will put itself into the down state and then try to recover. If the leader is lost before the Zk connection problem on the replica is sorted out, then the replica will end up failing to recover. For now, I'm just adding the leader-initiated znode for that replica which then activates the process described above, or a sys admin could do that manually as well. That said, I still need to flush this scenario out in more detail.\n\nSo at this point, the patch gives us something to discuss (or at the very least poke fun at) to harden the leader election process when replicas need to recover and there is no leader to recover from. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14073604",
+            "date": "2014-07-24T20:28:07+0000",
+            "content": "Nice, sounds like good stuff. A lot to digest in there, but I hope to dig in a little deeper before long as well. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14088534",
+            "date": "2014-08-07T00:35:22+0000",
+            "content": "I've started looking at this more. Have to spend some more time with the patch. That all still sounds good to me.\n\nI still think, ideally, if all replicas are participating in a shard, things would just repair by default. The best you can do in that case anyway is to restart the shard and have everyone participate in the election. Seems the system should just do that then without the restart or a manual step or a change in config. It's only when all replicas can't participate that it's dangerous. \n\nA further improvement though, and I think perhaps hard to do.\n\nI'm +1 on adding this functionality. I have some questions around how the forceLeaderFailedRecoveryThreshold works and when it's reset, but I'll spend some time looking at that patch for that first. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14089283",
+            "date": "2014-08-07T14:47:03+0000",
+            "content": "Thanks for digging into this. Agreed on the behavior when all are participating. Mostly what I'm trying to tackle in this ticket is when something goes bad leading to replicas being down and then the leader fails and doesn't come back in a timely manner. I want to give operators a way to get the replicas that are available back to \"active\". From what I've seen, no amount of restarting will allow the replica to recover because it's previous leader is gone.\n\nI'm working on the following additional test case: using a 1x2 collection (shards x rf), zk session fails on leader and replica (around the same time), but instead of bringing the leader back, it remains down. The replica, when trying to recovery (after losing its session) won't ever recover. There should be a way for that replica to \"force\" itself as the leader to get the collection back online in a degraded state. "
+        },
+        {
+            "author": "Timothy Potter",
+            "id": "comment-14096040",
+            "date": "2014-08-13T20:12:52+0000",
+            "content": "I wasn't able to get a test working that showed a replica not being able to become the leader after it loses its ZK session and its leader goes down around the same time (on trunk). Every time I ran that scenario, the replica became the leader, which is a good thing. I've heard about cases in the field where this happens, so am still trying to simulate it in a test environment. Basically, I've tried expiring the ZK session on the replica and then killing the Jetty hosting the leader and the replica always becomes the leader as expected.\n\nAlso, I'm reworking / rethinking this patch as the previous approach works fine in a test environment but won't work in general. The problem is when a replica is trying to decide if it should force itself to be the leader, it doesn't really take the state of other replicas into account. It just kind of assumes the others are in a bad state since it can't recover. So in one case, a replica could decide to not force itself thinking another replica will do it, which might not ever happen. Conversely, it could decide to force itself when a better candidate is maybe just being slow at becoming the leader. Mainly, I think these are areas that need more investigation before this approach is vetted out. I definitely like giving operators the ability to \"force_leader\" by updating the leader-initiated recovery status for a replica, but I'm not so sure about a replica doing that itself (without the intervention of a human operator). "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-14104995",
+            "date": "2014-08-21T03:31:29+0000",
+            "content": "Basically, I've tried expiring the ZK session on the replica and then killing the Jetty hosting the leader and the replica always becomes the leader as expected.\n\nWe actually fixed that specific issue  by having replicas accept updates from leaders even if zk is dc'd \n\nWithout that, it's much harder to find, but still possible. "
+        }
+    ]
+}

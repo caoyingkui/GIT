@@ -1,0 +1,115 @@
+{
+    "id": "SOLR-11542",
+    "title": "Add URP to route time partitioned collections",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Sub-task",
+        "fix_versions": [
+            "7.2"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Assuming we have some time partitioning metadata on an alias (see SOLR-11487 for the metadata facility), we'll then need to route documents to the right collection.  I propose a new URP.  (edit: originally it was thought DistributedURP would be modified but thankfully we can avoid that).\n\nThe scope of this issue is:\n\n\tdecide on some alias metadata names & semantics\n\tdecide the collection suffix pattern.  Read/write code (needed to route).\n\tthe routing code\n\n\n\nNo new partition creation nor deletion happens is this issue.",
+    "attachments": {
+        "SOLR_11542_time_series_URP.patch": "https://issues.apache.org/jira/secure/attachment/12895129/SOLR_11542_time_series_URP.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-10-24T20:44:04+0000",
+            "content": "Proposed collection alias metadata:\n\n\tThe document field containing the timestamp to route on.  What to call this?  I'm not sure.  Perhaps it should contain \"router.field\" as a suffix, which is the existing collection parameter for designating the field to route on within the collection.  It could be given the same name but maybe that would be confusing?  FWIW ElasticSearch has a \"Rollover Index\" API call with some similarities to this feature... so maybe \"rollover\" might be the prefix?  or \"partitioned\"?  I'm not sure I like these much; perhaps just \"router.field\" is fine as-is.  It's scoped to the alias.\n\n\n\nThat's it so far.  Perhaps no TZ param needed at this juncture if the dates are UTC... TZ will nonetheless be useful later in interpreting a \"gap\" to create new partitions.  It's also risky to have a TZ param that changes the interpretation of the collection names since what if the TZ param is changed.\n\nProposed collection naming convention:\naliasname_yyyy-MM-dd_HH_mm_ss.  Collection names have limitations (no colons) so can't just use ISO8601.  Because it's not IS08601, I figure don't try to look too close to it \u2013 thus no T separator.  Furthermore it may be abbreviated so that it does not have trailing zeros or symbols.  Perhaps it should nonetheless always end in a 'Z' so that there is no user misunderstanding with the eventual addition of a TZ alias metadata? ",
+            "author": "David Smiley",
+            "id": "comment-16217655"
+        },
+        {
+            "date": "2017-10-25T04:02:33+0000",
+            "content": "I've started on some tests... which will also be useful to debug/understand the code path through DistributedURP.\n\nWhat to do when a document's timestamp precedes the earliest collection?  Probably fail \u2013 but could be parameterized later to ignore/drop. ",
+            "author": "David Smiley",
+            "id": "comment-16218064"
+        },
+        {
+            "date": "2017-10-29T21:03:48+0000",
+            "content": "some confusion from the peanut gallery...\n\nCan you elaborate a bit on why you see changes to DUP neccessary to support time based partitioning as opposed to a new DocRouter?  I see you initially explored this idea in SOLR-9690 but abandoned that appraoch \u2013 can you explain how do you see the concerns/problems being easier to deal with via features in DUP?\n\n(ie: needing to fail if a doc uses a Timestamp that doesn't match an existing is going to be a problem regardless of what bit of code maps timestamps to shard names)\n\nMy naive assumption is that all the problematic edge cases will still be problematic edge cases, but that a new DocRouter makes the most conceptual sense and should require the least amount of (new) spaghetti code \u2013 not to mention it would in theory be more performant since it would allow CloudSolrClient to route documents directly to the correct shard.\n\nIn any event: I'm confused as to what caused you to make the leap from \"new DocRouter\" to \"Helper class for DUP\" \u2013 if you could walk folks through that thought process it might be helpful to others besides myself. ",
+            "author": "Hoss Man",
+            "id": "comment-16224209"
+        },
+        {
+            "date": "2017-10-30T03:20:08+0000",
+            "content": "The parent issue here is SOLR-11299 \"Time partitioned collections (umbrella issue)\"; please read the first comment, first paragraph which briefly mentions two ways to go about this, with a reference to SOLR-9562 as having background discussion on the merits of both approaches.  Multiple people had their take, which is nice to see.\n\nThere's definitely a trade-off and I don't think it's an obvious choice.  Purely from a coding/implementation perspective, I'd much prefer to go with shard based partitions and thus a custom DocRouter amongst other things.  It leverages Solr's internals better.  But from a practical / requirements perspective & scale, I think collection based partitions will satisfy more users \u2013 especially when you consider the ability to have collections that themselves have numShards > 1.\n\nI don't want to leave things more complex than what they were, to the extent I can help it.  I improved some collection alias handling in SOLR-11444 which was related to this stuff.  With regards to DURP, Gus and I have made some minor improvements; I'm sure more could be done. In this issue here, I don't want to add more LOC to DURP; instead very likely a helper of sorts, not unlike how DURP has such helpers/collaborators already like AtomicUpdateDocumentMerger.  Perhaps an additional URP preceding DURP could be done alternatively but nonetheless some tweaks to DURP will be needed either way.  I'm looking closer at the details tomorrow. ",
+            "author": "David Smiley",
+            "id": "comment-16224345"
+        },
+        {
+            "date": "2017-11-01T04:30:37+0000",
+            "content": "Attached is a patch with my work in progress, including a test (that passes).  There are various nocommits and TODOs.  I'm super glad to have seen that I don't need to hack DURP! (I need to retitle the issue accordingly).  What I did is modify DistributedUpdateProcessorFactory to conditionally wrap DURP with a new URP that I've tentatively named TimePartitionedUpdateProcessor here.  This URP uses the SolrCmdDistributor facility used by DURP.\n\nKudos to Mark Miller on SolrCmdDistributor which I think is very well designed and reusable.\n\nThe new URP needs to know for what time-partioned alias the local Solr core is related to.  To keep this lookup fast, I decided on a core property \"timePartitionAliasName\" that can be specified on core creation.  It's technically redundant with information in Aliases but it seems expensive to look one's self up in Aliases since the core's collection name would be on the value side of one of the aliases.\n\nThe URP uses SolrCmdDistributor.RetryNode and not StdNode.  It's not quite clear when to use either.\n\nIt's a TODO to route the request to the shard leader that corresponds with the docRouter key; instead it just picks whatever the first leader is right now.\n\nI want to test this with TolerantUpdateProcessor to ensure any routing mishaps (i.e. too old doc) needn't fail the whole request. ",
+            "author": "David Smiley",
+            "id": "comment-16233635"
+        },
+        {
+            "date": "2017-11-04T04:29:11+0000",
+            "content": "New patch:\n\n\tEnsured URPs prior to DURP do not get re-run at this alias/collections level distributed phase.  Note: I ought to test that this actually works as expected ...\n\tThrow helpful error if somehow the alias doesn't exist anymore yet we receive an indexing request.  (dubious situation).  But note it can still distribute requests if the alias exists but simply doesn't include the collection receiving the update any longer.\n\tCache the parsing of the timestamps. Will re-parse if the Alias instance is modified.\n\tAdded tests for time parsing\n\tAdded tests to try different approaches on batch vs separate and which collection to send the request to, and commitWithin.\n\n\n\nStill dependent on SOLR-11487 (metadata). And still want to test more, namely with TolerantUpdateProcessor. ",
+            "author": "David Smiley",
+            "id": "comment-16238767"
+        },
+        {
+            "date": "2017-11-08T05:15:13+0000",
+            "content": "New patch:\n\n\tTested use with TolerantUpdateProcessorFactory. It's not essential but I wanted to make sure it worked.\n\tTested that URPs prior to DURP will only execute once despite the extra layer of distributed-ness we add here.\n\tNow using alias metadata (SOLR-11487) \"router.field\" to see which field we should route on.\n\n\n\nThe test does some Solr configuration using a purely restful approach, and using the new V2 API at that.  It's awkward but works.  I discovered a bug whose fix is included in this patch \u2013 the V2 API wasn't forwarding requests when the receiving node doesn't have an appropriate core.  I'll file a separate issue.\n\nOnce the dependencies are committed, I think this patch is ready to commit. ",
+            "author": "David Smiley",
+            "id": "comment-16243391"
+        },
+        {
+            "date": "2017-11-16T20:09:37+0000",
+            "content": "Commit df5a5f949b1a28feff0cc25fe13c95b502feac31 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=df5a5f9 ]\n\nSOLR-11542: TimePartitionedUpdateProcessor URP ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16255893"
+        },
+        {
+            "date": "2017-11-16T20:10:22+0000",
+            "content": "Commit 81a9637fd0288851a56ce3c957fbaf267b1ad696 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=81a9637 ]\n\nSOLR-11542: TimePartitionedUpdateProcessor URP\n\n(cherry picked from commit df5a5f9) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16255895"
+        },
+        {
+            "date": "2017-11-16T20:15:30+0000",
+            "content": "Committed.  Before this is usable to many users, we still need SOLR-11617 to set Alias metadata via an API.  Further issues will make it more useful, like adding and removing collections automatically. ",
+            "author": "David Smiley",
+            "id": "comment-16255900"
+        },
+        {
+            "date": "2017-11-22T14:31:01+0000",
+            "content": "I was thinking the name of this URP ought to change to TimeRoutedAliasUpdateProcessor. ",
+            "author": "David Smiley",
+            "id": "comment-16262599"
+        },
+        {
+            "date": "2017-12-01T04:25:25+0000",
+            "content": "Commit 7877f5a511a60e44f2dabd45ac1d6f84626b1161 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7877f5a ]\n\nSOLR-11542: Rename TimePartitionedUpdateProcessor to TimeRoutedAliasUpdateProcessor ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16273922"
+        },
+        {
+            "date": "2017-12-01T04:30:09+0000",
+            "content": "Commit 7deca62501ec7484ea54d292fe0131c78384e95f in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7deca62 ]\n\nSOLR-11542: Rename TimePartitionedUpdateProcessor to TimeRoutedAliasUpdateProcessor\n\n(cherry picked from commit 7877f5a) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16273925"
+        },
+        {
+            "date": "2018-07-26T16:22:32+0000",
+            "content": "Commit e2b08a4d473e68ca5f1b868cc55f550585221be7 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e2b08a4 ]\n\nSOLR-11542: Add more logging via @LogLevel to diagnose rare failures ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16558506"
+        },
+        {
+            "date": "2018-07-26T16:23:02+0000",
+            "content": "Commit 8120d84219d77a04ca3663d0f85e47641d7bd5be in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8120d84 ]\n\nSOLR-11542: Add more logging via @LogLevel to diagnose rare failures\n\n(cherry picked from commit e2b08a4) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16558508"
+        }
+    ]
+}

@@ -1,0 +1,187 @@
+{
+    "id": "LUCENE-4509",
+    "title": "Make CompressingStoredFieldsFormat the new default StoredFieldsFormat impl",
+    "details": {
+        "components": [
+            "core/store"
+        ],
+        "fix_versions": [
+            "4.1"
+        ],
+        "affect_versions": "None",
+        "priority": "Minor",
+        "labels": "",
+        "type": "Wish",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "What would you think of making CompressingStoredFieldsFormat the new default StoredFieldsFormat?\n\nStored fields compression has many benefits\u00a0:\n\n\tit makes the I/O cache work for us,\n\tfile-based index replication/backup becomes cheaper.\n\n\n\nThings to know:\n\n\teven with incompressible data, there is less than 0.5% overhead with LZ4,\n\tLZ4 compression requires ~ 16kB of memory and LZ4 HC compression requires ~ 256kB,\n\tLZ4 uncompression has almost no memory overhead,\n\ton my low-end laptop, the LZ4 impl in Lucene uncompresses at ~ 300mB/s.\n\n\n\nI think we could use the same default parameters as in CompressingCodec :\n\n\tLZ4 compression,\n\tin-memory stored fields index that is very memory-efficient (less than 12 bytes per block of compressed docs) and uses binary search to locate documents in the fields data file,\n\t16 kB blocks (small enough so that there is no major slow down when the whole index would fit into the I/O cache anyway, and large enough to provide interesting compression ratios\u00a0; for example Robert got a 0.35 compression ratio with the geonames.org database).\n\n\n\nAny concerns?",
+    "attachments": {
+        "LUCENE-4509.patch": "https://issues.apache.org/jira/secure/attachment/12551651/LUCENE-4509.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-10-26T18:58:33+0000",
+            "content": "I am a strong +1 for this idea.\n\nI only have one concern, about the defaults. How would this work with laaaarge documents (e.g. those massive Hathitrust book-documents) that might be > 16KB in size?\n\nDoes this mean with the default CompressingStoredFieldsIndex setting that now he pays 12-bytes/doc in RAM (because docsize > blocksize)?\nIf so, lets think of ways to optimize that case. ",
+            "author": "Robert Muir",
+            "id": "comment-13485115"
+        },
+        {
+            "date": "2012-10-26T20:01:03+0000",
+            "content": "Nice timing Adrien... I was just going to ask how we could enable this easiest in Solr (or if it should in fact be the default).\n\nOne data point: 100GB of compressed stored fields == 6.25M index entries == 75MB RAM\nThat seems decent for a default. ",
+            "author": "Yonik Seeley",
+            "id": "comment-13485154"
+        },
+        {
+            "date": "2012-10-26T20:06:27+0000",
+            "content": "I think its ok too. I just didnt know if we could do something trivial like store the offsets-within-the-blocks as packed ints,\nso that it optimizes for this case anyway (offset=0) and only takes a 8bytes+1bit instead of 12 bytes.\n\nBut i don't have a real understanding of what this thing does when docsize > blocksize, i havent dug in that much.\n\nin any case I think it should be the default: its fast and works also for tiny documents with lots of fields.\nI think people expect the index to be compressed in some way and the stored fields are really wasteful today. ",
+            "author": "Robert Muir",
+            "id": "comment-13485163"
+        },
+        {
+            "date": "2012-10-26T20:30:29+0000",
+            "content": "I'd say to make progress for the default we want to look at:\n\n\tmake a concrete impl of CompressingStoredFieldsFormat called Lucene41, hardwired to the defaults and add file format docs?\n  This way, we don't have to support all of the Compression options/layouts in the default codec (if someone wants that, \n  encourage them to make their own codec with the Compressed settings they like). Back compat is much \n  less costly as the parameters are fixed. File format docs are easier \n\tshould we s/uncompression/decompression/ across the board?\n\ttests already look pretty good. I can try to work on some additional ones to try to break it like we did with BlockPF.\n\tthere is some scary stuff (literal decompressions etc) uncovered by the clover report: https://builds.apache.org/job/Lucene-Solr-Clover-4.x/49/clover-report/org/apache/lucene/codecs/compressing/CompressionMode.html We should make sure any special cases are tested.\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13485182"
+        },
+        {
+            "date": "2012-10-26T20:44:17+0000",
+            "content": "How would this work with laaaarge documents that might be > 16KB in size?\n\nActually 16kB is the minimum size of an uncompressed chunk of documents. CompressingStoredFieldsWriter fills a buffer with documents until its size is >= 16kb, compresses it and then flushes to disk. If all documents are greater than 16kB then all chunks will contain exactly one document.\n\nIt also means you could end up having a chunk that is made of 15 documents of 1kb and 1 document of 256kb. (And in this case there is no performance problem for the 15 first documents given that uncompression stops as soon as enough data has been uncompressed.)\n\nDoes this mean with the default CompressingStoredFieldsIndex setting that now he pays 12-bytes/doc in RAM (because docsize > blocksize)? If so, lets think of ways to optimize that case.\n\nProbably less than 12. The default CompressingStoredFieldsIndex impl uses two packed ints arrays of size numChunks (the number of chunks, <= numDocs). The first array stores the doc ID of the first document of the chunk while the second array stores the start offset of the chunk of documents in the fields data file.\n\nSo if your fields data file is fdtBytes bytes, the actual memory usage is ~ numChunks * (ceil(log2(numDocs)) + ceil(log2(fdtBytes))) / 8.\n\nFor example, if there are 10M documents of 16kB (fdtBytes ~= 160GB), we'll have numChunks == numDocs and a memory usage per document of (24 + 38) / 8 = 7.75 => ~ 77.5 MB of memory overall.\n\n100GB of compressed stored fields == 6.25M index entries == 75MB RAM\n\nThanks for the figures, Yonik! Did you use RamUsageEstimator to compute the amount of used memory? ",
+            "author": "Adrien Grand",
+            "id": "comment-13485187"
+        },
+        {
+            "date": "2012-10-26T21:12:42+0000",
+            "content": "But if we worry about this worst-case (numDocs == numChunks), maybe we should just increase the chunk size (for example, ElasticSearch uses 65 kB by default).\n\n(Another option would be to change the compress+flush trigger to something like\u00a0: chunk size >= 16 kB AND number of documents in the chunk >= 4.) ",
+            "author": "Adrien Grand",
+            "id": "comment-13485201"
+        },
+        {
+            "date": "2012-10-26T21:15:16+0000",
+            "content": "Well you say you use a separate packed ints structure for the offsets right? so these would all be zero? ",
+            "author": "Robert Muir",
+            "id": "comment-13485203"
+        },
+        {
+            "date": "2012-10-26T21:16:43+0000",
+            "content": "should we s/uncompression/decompression/ across the board?\n\nIf decompression sounds better, let's do this!\n\nhere is some scary stuff (literal decompressions etc) uncovered by the clover report. We should make sure any special cases are tested.\n\nI can work on it next week. ",
+            "author": "Adrien Grand",
+            "id": "comment-13485205"
+        },
+        {
+            "date": "2012-10-26T21:27:38+0000",
+            "content": "Well you say you use a separate packed ints structure for the offsets right? so these would all be zero?\n\nThese are absolute offsets in the fields data file. For example, when looking up a document, it first performs a binary search in the first array (the one that contains the first document IDs of every chunk). The resulting index is used to find the start offset of the chunk of compressed documents thanks to the second array. When you read data starting at this offset in the fields data file, there is first a packed ints array that stores the uncompressed length of every document in the chunk, and then the compressed data. I'll add file formats docs soon... ",
+            "author": "Adrien Grand",
+            "id": "comment-13485211"
+        },
+        {
+            "date": "2012-10-26T21:33:10+0000",
+            "content": "No, I'm referring to the second packed ints structure (start offset within a block) ",
+            "author": "Robert Muir",
+            "id": "comment-13485218"
+        },
+        {
+            "date": "2012-10-31T18:02:30+0000",
+            "content": "Committed:\n\n\ttrunk      r1404215\n\tbranch 4.x r1404216\n\n ",
+            "author": "Adrien Grand",
+            "id": "comment-13488026"
+        },
+        {
+            "date": "2012-10-31T19:02:02+0000",
+            "content": "I think Adrien accidentally resolved the wrong issue  ",
+            "author": "Robert Muir",
+            "id": "comment-13488099"
+        },
+        {
+            "date": "2012-11-01T00:19:32+0000",
+            "content": "Here is a patch that adds a new Lucene41StoredFieldsFormat class with file format docs. ",
+            "author": "Adrien Grand",
+            "id": "comment-13488372"
+        },
+        {
+            "date": "2012-11-01T00:42:58+0000",
+            "content": "I forgot to say: oal.codecs.compressing needs to be moved to lucene-core before applying this patch. ",
+            "author": "Adrien Grand",
+            "id": "comment-13488388"
+        },
+        {
+            "date": "2012-11-01T00:44:06+0000",
+            "content": "Do we know whats happening with the recent test fail?\n\nant test  -Dtestcase=TestCompressingStoredFieldsFormat -Dtests.method=testBigDocuments -Dtests.seed=37812FE503010D20 -Dtests.multiplier=3 -Dtests.nightly=true -Dtests.slow=true -Dtests.linedocsfile=/home/hudson/lucene-data/enwiki.random.lines.txt -Dtests.locale=es_PR -Dtests.timezone=America/Sitka \n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13488389"
+        },
+        {
+            "date": "2012-11-01T01:05:14+0000",
+            "content": "I think I abuse atLeast to generate documents sizes and because the test ran with tests.multipliers=true and tests.nightly=true, documents got too big, hence the OOME. I'll commit a fix shortly. ",
+            "author": "Adrien Grand",
+            "id": "comment-13488399"
+        },
+        {
+            "date": "2012-11-01T01:34:51+0000",
+            "content": "In the fdt we write docBase of the first document in the chunk: Can you explain why this is needed?\n\nWe already redundantly write this in the fdx right? (or in the DISK_DOC case its implicit).\n\nIt seems to me in visitDocument() we should be getting the docBase and startPointer too from the index,\nsince it knows both. ",
+            "author": "Robert Muir",
+            "id": "comment-13488413"
+        },
+        {
+            "date": "2012-11-01T01:40:35+0000",
+            "content": "Actually i guess we dont know it for DISK_DOC. But it seems unnecessary for MEMORY_CHUNK ? ",
+            "author": "Robert Muir",
+            "id": "comment-13488414"
+        },
+        {
+            "date": "2012-11-01T01:59:38+0000",
+            "content": "Right, the docBase could be known from the index with MEMORY_CHUNK, but on the other hand duplicating the information helps validating that we are at the right place in the fields data file (there are corruption tests that use this docBase). Given that the chunk starts with a doc base and the number of docs in the chunk, it gives the range of documents it contains. The overhead should be very small given that this VInt is repeated at most every \n{compressed size of 16KB}\n. But I have no strong feeling about it, if you think we should remove it, then let's do it. ",
+            "author": "Adrien Grand",
+            "id": "comment-13488418"
+        },
+        {
+            "date": "2012-11-01T02:10:09+0000",
+            "content": "I don't feel strongly about it either... was just reading the docs and noticed the redudancy. \n\nBut you are right: its just per-chunk anyway. And i like the corruption check...! ",
+            "author": "Robert Muir",
+            "id": "comment-13488420"
+        },
+        {
+            "date": "2012-11-12T23:53:28+0000",
+            "content": "Updated file format docs, you need to move lucene/codecs/src/java/org/apache/lucene/codecs/compressing to lucene/core/src/java/org/apache/lucene/codecs in addition to applying the patch. ",
+            "author": "Adrien Grand",
+            "id": "comment-13495764"
+        },
+        {
+            "date": "2012-11-13T03:02:20+0000",
+            "content": "Docs look good, +1 to commit.\n\nA few suggestions:\n\n\tunder known limitations maybe replace documents with \"individual documents\" to make it clear you are talking about 2 gigabyte documents and not files? I think someone was confused on that already a little bit.\n\trather than repeating the formulas for signed vlong (zigzag), we could link to it? https://developers.google.com/protocol-buffers/docs/encoding#types\n\tseparately if we find ourselves using this more often, maybe we should just add it to DataOutput/Input (the vlong version would be enough). We\n  already use this in kuromoji's ConnectionCosts.java too...\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13495889"
+        },
+        {
+            "date": "2012-11-13T15:52:15+0000",
+            "content": "Thanks Robert for your comments, I replaced \"documents\" with \"individual documents\" and added a link to the protobuf docs.\n\nCommitted:\n\n\ttrunk      r1408762\n\tbranch 4.x r1408796\n\n ",
+            "author": "Adrien Grand",
+            "id": "comment-13496268"
+        },
+        {
+            "date": "2013-03-22T16:12:13+0000",
+            "content": "[branch_4x commit] Adrien Grand\nhttp://svn.apache.org/viewvc?view=revision&revision=1416082\n\nMove oal.codec.compressing tests from lucene/codecs to lucene/core (should have been done as part of LUCENE-4509 when I moved the src folder).\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610473"
+        },
+        {
+            "date": "2013-03-22T16:17:13+0000",
+            "content": "[branch_4x commit] Adrien Grand\nhttp://svn.apache.org/viewvc?view=revision&revision=1408796\n\nLUCENE-4509: Enable stored fields compression in Lucene41Codec (merged from r1408762).\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610552"
+        },
+        {
+            "date": "2013-03-22T16:21:21+0000",
+            "content": "[branch_4x commit] Adrien Grand\nhttp://svn.apache.org/viewvc?view=revision&revision=1404276\n\nLUCENE-4509: New tests to try to break CompressingStoredFieldsFormat... (merged from r1404275)\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610613"
+        },
+        {
+            "date": "2013-03-22T16:22:22+0000",
+            "content": "[branch_4x commit] Adrien Grand\nhttp://svn.apache.org/viewvc?view=revision&revision=1403032\n\nLUCENE-4509: improve test coverage of CompressingStoredFieldsFormat (merged from r1403027).\n ",
+            "author": "Commit Tag Bot",
+            "id": "comment-13610625"
+        }
+    ]
+}

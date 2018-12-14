@@ -1,0 +1,116 @@
+{
+    "id": "SOLR-11916",
+    "title": "new SortableTextField using docValues built from the original string input",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "Schema and Analysis"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "7.3",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "I propose adding a new SortableTextField subclass that would functionally work the same as TextField except:\n\n\tdocValues=\"true|false\" could be configured, with the default being \"true\"\n\tThe docValues would contain the original input values (just like StrField) for sorting (or faceting)\n\t\n\t\tBy default, to protect users from excessively large docValues, only the first 1024 of each field value would be used \u2013 but this could be overridden with configuration.\n\t\n\t\n\n\n\n\nConsider the following sample configuration:\n\n<field name=\"title\" type=\"text_sortable\" docValues=\"true\"\n       indexed=\"true\" docValues=\"true\" stored=\"true\" multiValued=\"false\"/>\n<fieldType name=\"text_sortable\" class=\"solr.SortableTextField\">\n  <analyzer type=\"index\">\n   ...\n  </analyzer>\n  <analyzer type=\"query\">\n   ...\n  </analyzer>\n</fieldType>\n\n\nGiven a document with a title of \"Solr In Action\"\n\nUsers could:\n\n\tSearch for individual (indexed) terms in the \"title\" field: q=title:solr\n\tSort documents by title ( sort=title asc ) such that this document's sort value would be \"Solr In Action\"\n\n\n\nIf another document had a \"title\" value that was longer then 1024 chars, then the docValues would be built using only the first 1024 characters of the value (unless the user modified the configuration)\n\nThis would be functionally equivalent to the following existing configuration - including the on disk index segments - except that the on disk DocValues would refer directly to the \"title\" field, reducing the total number of \"field infos\" in the index (which has a small impact on segment housekeeping and merge times) and end users would not need to sort on an alternate \"title_string\" field name - the original \"title\" field name would always be used directly.\n\n<field name=\"title\" type=\"text\"\n       indexed=\"true\" docValues=\"true\" stored=\"true\" multiValued=\"false\"/>\n<field name=\"title_string\" type=\"string\"\n       indexed=\"false\" docValues=\"true\" stored=\"false\" multiValued=\"false\"/>\n<copyField source=\"title\" dest=\"title_string\" maxCharsForDocValues=\"1024\" />",
+    "attachments": {
+        "SOLR-11916.patch": "https://issues.apache.org/jira/secure/attachment/12907940/SOLR-11916.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-01-26T22:42:20+0000",
+            "content": "Cool!\n\nmaxChars raises some concerns that need to be documented and cared for in the code.  We'd have a field with docValues, but it's value isn't necessarily a substitute for the \"stored\" version.  We have code in places right now that will need to know about this exception to useDocValueAsStored.  Perhaps this fieldType overrides useDocValuesAsStored() to see if maxChars=-1 (no limit) so it can vary it's output based on that? ",
+            "author": "David Smiley",
+            "id": "comment-16341722"
+        },
+        {
+            "date": "2018-01-26T23:05:53+0000",
+            "content": "Hmmm... good point.\n\nI thought that since this new type didn't go out of it's way to enable \"useDocValuesAsStored\" that it was a non-issue and the docValues would never be used in place of a stored value (but even if that were true, we should definitely have a test proving it)\n\nSkimming the relevant code now I realize that as a FieldProperty, the schemaVersion is the only thing that drives the (default) value of USE_DOCVALUES_AS_STORED regardless of the FieldType impl \u2013 so you are absolutely correct, we need to do \"something\" in SortableTextField to account for this propery.\nPerhaps this fieldType overrides useDocValuesAsStored() to see if maxChars=-1 (no limit) so it can vary it's output based on that?\n\u00a0\n Hmm ... My concern with that approach is that it might be confusing the users how explicitly set useDocValuesAsStored=\"true\" stored=\"false\" on a fieldType (or field) \u2013 perhaps w/o even being aware of the default maxChars safety valve \u2013 and then don't understand why they aren't getting any values back?\n\nOne possibility would be be for SortableTextField.init to override the (implicit) default useDocValuesAsStored=(schemaVersion>1.6) with it's own default based on useDocValuesAsStored=(maxChars==-1) and fail with a server error (on init) if a configuration includes an explicit useDocValuesAsStored=true maxChars=\"anything other then -1\" ?\n\nPersonally, my vote would be \u2013 at least initially \u2013 to just say \"useDocValuesAsStored is not supported for SortableTextField\", set the default appropriately & fail on init if anyone tries to explicitly set it to \"true\" .... but since FieldProperites can be set on both the fieldType and the field I don't think it would even be possible for a fieldType to stop someone from creating a <field type=\"some_sortable_text\" useDocValuesAsStored=\"true\" ... is it? ",
+            "author": "Hoss Man",
+            "id": "comment-16341765"
+        },
+        {
+            "date": "2018-01-26T23:08:17+0000",
+            "content": "NOTE: I edited the issue description to update the example configuration from using maxChars=\"1024\" to maxCharsForDocValues=\"1024\" ... i forgot when creating this Jira that that i had made that option a bit more verbose in the patch to avoid any risk that people might asume it limited the number of characters being indexed ",
+            "author": "Hoss Man",
+            "id": "comment-16341768"
+        },
+        {
+            "date": "2018-01-30T05:38:25+0000",
+            "content": "re: useDocValuesAsStored \u2013 here's my straw man proposal after sleeping on it a bit...\n\n\n\tSortableTextField.init should override the schemaVersion based implicit default in FieldType.init\n\t\n\t\tthis means by default, no fieldType/field using SortableTextField w/default to useDocValuesAsStored\n\t\n\t\n\tSortableTextField.createFields should be aware of the effective value of SchemaField.useDocValuesAsStored and if it's true: fail (at index time) if any field values being added are longer then the (effective) maxCharsForDocValues\n\t\n\t\tthis error message should be very clear about what's happening, mentioning both maxCharsForDocValues, and useDocValuesAsStored.\n\t\n\t\n\n\n\nNet result: \n\n\tclients that try to add huge values to fields with maxCharsForDocValues=small may get 2 diff behaviors depending on field's useDocValuesAsStored:\n\t\n\t\tif useDocValuesAsStored==false:\n\t\t\n\t\t\tdocvalues are truncated\n\t\t\n\t\t\n\t\tif useDocValuesAsStored==true:\n\t\t\n\t\t\trequest fails because solr can't \"fit\" the huge value into the \"small\" limit that's been configured\n\t\t\n\t\t\n\t\n\t\n\tie: \"the schema told us doc values should be limited to 'small' and to use doc values as if they were stored fields, and we can't meet those two expectations for your 'huge' field value, so we're rejecting it\"\n\n\n\n\n...i'm pretty sure this is all doable (even if the useDocValuesAsStored is specified on either the fieldType or the field) and i'll test it out soon. ",
+            "author": "Hoss Man",
+            "id": "comment-16344527"
+        },
+        {
+            "date": "2018-01-30T15:03:08+0000",
+            "content": "+1 awesome \u2013 best of both worlds  ",
+            "author": "David Smiley",
+            "id": "comment-16345180"
+        },
+        {
+            "date": "2018-01-30T17:32:44+0000",
+            "content": "Just wanted to say this is indeed a fairly common scenario in my (limited) Solr experience. I had a number of use cases with an indexed field that required faceting over the original input (this would work with this type of field too, right?). The workaround with a different copyTo field wasn't too pretty... ",
+            "author": "Dawid Weiss",
+            "id": "comment-16345484"
+        },
+        {
+            "date": "2018-02-01T01:26:51+0000",
+            "content": "\nre: useDocValuesAsStored \u2013 here's my straw man proposal after sleeping on it a bit...\n\nI've updated the patch to implement this along with new tests.\n\nUnless there are additional concerns/suggestions, i'll move forward w/committing & backporting tommorow.\n\n\n\nI had a number of use cases with an indexed field that required faceting over the original input (this would work with this type of field too, right?).\n\nYep yep ... absolutely.\n\nFor example, this sort of logic is currently in TestSortableTextField.testSimpleSearchAndFacets() ...\n\n\nassertU(adoc(\"id\",\"1\", \"whitespace_stxt\", \"how now brown cow ?\"));\nassertU(adoc(\"id\",\"2\", \"whitespace_stxt\", \"how now brown cow ?\"));\nassertU(adoc(\"id\",\"3\", \"whitespace_stxt\", \"holy cow !\"));\nassertU(adoc(\"id\",\"4\", \"whitespace_stxt\", \"dog and cat\"));\n\nassertU(commit());\n\nfinal String facet = \"whitespace_stxt\";\nfinal String search = \"whitespace_stxt\";\n// facet.field\nfinal String fpre = \"//lst[@name='facet_fields']/lst[@name='\"+facet+\"']/\";\nassertQ(req(\"q\", search + \":cow\", \"rows\", \"0\", \n            \"facet.field\", facet, \"facet\", \"true\")\n        , \"//*[@numFound='3']\"\n        , fpre + \"int[@name='how now brown cow ?'][.=2]\"\n        , fpre + \"int[@name='holy cow !'][.=1]\"\n        , fpre + \"int[@name='dog and cat'][.=0]\"\n        );\n\n// json facet\nfinal String jpre = \"//lst[@name='facets']/lst[@name='x']/arr[@name='buckets']/\";\nassertQ(req(\"q\", search + \":cow\", \"rows\", \"0\", \n            \"json.facet\", \"{x:{ type: terms, field:'\" + facet + \"', mincount:0 }}\")\n        , \"//*[@numFound='3']\"\n        , jpre + \"lst[str[@name='val'][.='how now brown cow ?']][int[@name='count'][.=2]]\"\n        , jpre + \"lst[str[@name='val'][.='holy cow !']][int[@name='count'][.=1]]\"\n        , jpre + \"lst[str[@name='val'][.='dog and cat']][int[@name='count'][.=0]]\"\n        );\n\n\n\n...allthough in the actual test: the \"whitespace_stxt\" field is copyFielded into many other fields w/ slightly diff configurations, and the \"facet\" and \"search\" variables are assigned in nested loops to prove that the \"search\" field behavior is consistent as long as the fields are indexed & the \"facet\" field behavior is consistent as long as the fields have docValues.\n\n(In the latest patch, I even updated this to include a traditional TextField copy in the \"search\" permutations, and a traditional StrField copy in the \"facet\" permutations.)\n ",
+            "author": "Hoss Man",
+            "id": "comment-16347859"
+        },
+        {
+            "date": "2018-02-01T17:40:40+0000",
+            "content": "Commit 95122e14481a4dd623e184ca261f8bf158fd3a7c in lucene-solr's branch refs/heads/master from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=95122e1 ]\n\nSOLR-11916: new SortableTextField which supports analysis/searching just like TextField, but also sorting/faceting just like StrField ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16348981"
+        },
+        {
+            "date": "2018-02-01T18:52:01+0000",
+            "content": "Commit fb0e04e5bc0e79eb137e2e7944a2933a19163c35 in lucene-solr's branch refs/heads/branch_7x from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fb0e04e ]\n\nSOLR-11916: new SortableTextField which supports analysis/searching just like TextField, but also sorting/faceting just like StrField\n\n(cherry picked from commit 95122e14481a4dd623e184ca261f8bf158fd3a7c) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16349106"
+        },
+        {
+            "date": "2018-02-01T18:54:55+0000",
+            "content": "thanks for the feedback folks. ",
+            "author": "Hoss Man",
+            "id": "comment-16349109"
+        },
+        {
+            "date": "2018-03-30T22:02:30+0000",
+            "content": "Guess this is intended only for very simple sort use cases that do not require any ICU collation etc? So if you have any non-English text you\u2019d probably need to fall back to the copyField trick anyway. Which begs the question whether Sortable in class name is promising too much? Facetable or TextFileldWithDV could be other choices? ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16420986"
+        },
+        {
+            "date": "2018-03-30T22:08:30+0000",
+            "content": "TextFileldWithDV or something similar is too limiting in terms of other future fields that might also support both analysis and docvalues (see SOLR-11917) ... likewise Facetable would be very missleading for people who currently facet on\u00a0TextField (via uninversion) and see the individual \u2013 post-analysis \u2013 terms as the facet constraints.\n\n\"Sortable\" was chosen to convey it's primary usecase is for \"sorting\" on text fields in the same way you can \"sort\" on StrField ",
+            "author": "Hoss Man",
+            "id": "comment-16420992"
+        },
+        {
+            "date": "2018-03-30T22:31:01+0000",
+            "content": "It would be neat if there was a <analyzer type=\"docValues\"> to customize the docValue encoding.  This would address Jan's point? ",
+            "author": "David Smiley",
+            "id": "comment-16421023"
+        },
+        {
+            "date": "2018-03-30T22:38:06+0000",
+            "content": "That is a major part of what's proposed in SOLR-11917 \u2013 along with a suggested approach for refactoring SortableTextField to be syntactic sugar after the fact. ",
+            "author": "Hoss Man",
+            "id": "comment-16421028"
+        },
+        {
+            "date": "2018-03-31T07:54:10+0000",
+            "content": "Hoss, thanks for the pointer, being able to configure analyzer for docValue would solve this, so the name can still keep its promise, although changing analyzer for docValue to support Norwegian sorting may break faceting on the same field, which brings you back to copyField anyways  ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16421209"
+        }
+    ]
+}

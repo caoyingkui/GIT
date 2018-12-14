@@ -1,0 +1,119 @@
+{
+    "id": "LUCENE-3573",
+    "title": "TaxonomyReader.refresh() is broken, replace its logic with reopen(), following IR.reopen pattern",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "modules/facet"
+        ],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "When recreating the taxonomy index, TR's assumption that categories are only added does not hold anymore.\nAs result, calling TR.refresh() will be incorrect at best, but usually throw an AIOOBE.",
+    "attachments": {
+        "LUCENE-3573.patch": "https://issues.apache.org/jira/secure/attachment/12503622/LUCENE-3573.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2011-11-14T14:32:37+0000",
+            "content": "Attached patch for trunk adds two tests:\n\n\tone of them is opening a new TR and passes\n\tthe other is refreshing the TR and fails.\n\n ",
+            "author": "Doron Cohen",
+            "id": "comment-13149653"
+        },
+        {
+            "date": "2011-11-14T14:55:55+0000",
+            "content": "+1. I think that we should nuke refresh() and adopt the IR approach, even though I don't like the 'maybe' and 'if', might as well make the API consistent. So instead of refresh() we'll have a static TR.openIfChanged that either returns null (no changes, or the taxonomy wasn't recreated) or a new instance in case it was recreated.\n\nNote that unlike IndexReader, if the taxonomy index wasn't recreated, openIfChanged will modify the internal state of TR. That's ok since the taxonomy index was built for it: existing TR instances (that weren't refreshed) won't be affected as they won't know about the new categories (and taxonomy index doesn't support deletes) and the caller can use the same TR instance in that case.\n\nWhatever we end up doing, we should remove refresh(). Even though we're not committed to back-compat yet (it's all experimental), I think it is dangerous if we'll simply modify refresh() behavior, because users may not be aware of the change. So a new method is a must.\n\nBesides that, the test looks good. Was there any reason to add it to TestTaxonomyCombined? ",
+            "author": "Shai Erera",
+            "id": "comment-13149661"
+        },
+        {
+            "date": "2011-11-14T15:24:41+0000",
+            "content": "I agree about keeping the same notions as IR. \n\nreturns null (no changes, or the taxonomy wasn't recreated) \n\nIn fact I was thinking of a different \"contract\".\n\nSo we have two approaches here for the returned value:\n\n\n\tOption A:\n\t\n\t\tnew TR - if the taxonomy was recreated.\n\t\tnull - if the taxonomy was either not modified or just grew.\n\t\n\t\n\n\n\n\n\tOption B:\n\t\n\t\tnew TR - if the taxonomy was modified (either recreated or just grew)\n\t\tnull - if the taxonomy was not modified.\n\t\n\t\n\n\n\nOption A is simpler to implement, but I think it has two drawbacks:\n\n\tit is confusingly different from that of IR\n\tthe fact that the TR was refreshed is hidden from the caller.\n\n\n\nOption B is a bit more involved to implement:\n\n\twould need to copy arrays' data from old TR to new one in case the taxonomy only grew\n\n\n\nI started to implement option B but now rethinking this...\n\nWas there any reason to add it to TestTaxonomyCombined?\n\nGood point, should probably move this to TestDirectoryTaxonomyReader. ",
+            "author": "Doron Cohen",
+            "id": "comment-13149684"
+        },
+        {
+            "date": "2011-11-14T15:30:55+0000",
+            "content": "One more thing \n\n\tIn approach B, the fact that the taxonomy just grew simply allows an optimization (read only the new ordinals), and so it is not a part of the API logic, and the only logic is - was the taxonomy modified or not.\n\tIn approach A, this fact is part of the API logic.\n\n ",
+            "author": "Doron Cohen",
+            "id": "comment-13149687"
+        },
+        {
+            "date": "2011-11-14T16:47:09+0000",
+            "content": "My thinking is that today refresh() modifies the internal state, and does so in an optimized manner (however I think we thought there might be concurrency issues with it). And people (whoever they are) got used to it. And the TaxonomyReader does not imply in any way that it is an index (i.e. we've been thinking about implementing the taxonomy as a serialized FST maybe).\n\nSo in fact, let's not call it openIfChanged, because may not be meaningful. We can call it reload() maybe (just to have a better name). Now the question is whether we want to trust javadocs to note that the returned value may not be equals to the given one (ala the old IndexReader.reopen()), or follow the same IR concept where reload() is static.\n\nIf we want to follow IR semantics fully, then option B is the right one. But can it be done in an optimized manner? I bet we won't have any concurrency issues with it ... ",
+            "author": "Shai Erera",
+            "id": "comment-13149737"
+        },
+        {
+            "date": "2011-11-15T04:15:30+0000",
+            "content": "I thought about it more, and I really think that we should go with option A. The common case is that the taxonomy index is not recreated, however it may be updated very frequently. TR.refresh() denotes exactly that \u2013 it refreshes the internal state of the TaxonomyReader. This method must be very efficient. I.e., with NRT, people rely on IR.openIfChanged to only open new segments, which is what DTR.refresh() does (calls IR.openIfChanged).\n\nSo putting the name aside, we should have the method X() which either returns null (and updates or not the internal state) or returns a new TR. Unfortunately refresh() is not a bad name (reload() sounds more drastic and less efficient), so maybe refreshIfChanged? ",
+            "author": "Shai Erera",
+            "id": "comment-13150229"
+        },
+        {
+            "date": "2011-11-15T07:29:47+0000",
+            "content": "So in fact, let's not call it openIfChanged, because may not be meaningful.\n\nYes this bothered me too. \n\nso maybe refreshIfChanged?\n\n... let's stick to refresh() (but...)\n\nCurrent refresh impl is efficient in that (1) arrays only grow if needed (2) caches only cleaned from wrong 'invalid ordinals'. In that, it relies on that the taxonomy can only grow (unless it is recreated, hence this issue).\n\nSo I now think it would be best to modify slightly refresh() - in case it detects that the taxonomy was created, it will throw a new (checked) exception - telling the application that this TR cannot be refreshed but the app can open a new TR.\n\nThis way there is no 3-way logic - either the TR was refreshed or it was not.\n\nAnd while we are at this, refresh() is void. I think it would be useful to return boolean, indicating whether any refresh took place. ",
+            "author": "Doron Cohen",
+            "id": "comment-13150279"
+        },
+        {
+            "date": "2011-11-15T07:41:56+0000",
+            "content": "This way there is no 3-way logic - either the TR was refreshed or it was not.\n\n+1.\n\nAnd while we are at this, refresh() is void. I think it would be useful to return boolean, indicating whether any refresh took place.\n\n+1. ",
+            "author": "Shai Erera",
+            "id": "comment-13150286"
+        },
+        {
+            "date": "2011-11-15T14:05:25+0000",
+            "content": "Patch, in principle ready to commit, though I plan to go through it once more.\n\nIn this patch:\n\n\tnew tests moved to TestDirectoryTaxonomyReader\n\tan exception added: InconsistentTaxonomyException\n\twhen the reader cannot refresh because the taxonomy was recreated since the last time open/refresh, that exception is thrown and the application should open a fresh taxonomy reader.\n\n\n\nBumped into 3 TODO's while working on this:\n\n\tFilterIndexReader does not implement getCommitUserData(). Once this is fixed can resolvethe TODO in TestIndexClose. I'll open an issue later.\n\tTR.refresh() should return a boolean indicating anything was changed (issue).\n\tDTW.rollback() seems wrong to me - it rollback the internal IW, which also closes it, but then it refreshes its internal TR, seems wrong...\n\n ",
+            "author": "Doron Cohen",
+            "id": "comment-13150503"
+        },
+        {
+            "date": "2011-11-16T06:34:20+0000",
+            "content": "Patch looks good ! Few minor comments:\n\n\n\tDirTW: shoudl --> should\n\tCan we name 'taxoCreateTimeToCommit' just 'taxoCreateTime'?\n\tOpenMode.CREATE.equals(openMode) can be OpenMode.CREATE == openMode\n\tPerhaps DirTW.commit() can call commit(null) to reduce code duplication? IndexWriter anyway calls commit(null) in its commit(), so it's not an error to call iw.commit(null).\n\t\n\t\tSame for prepareCommit()\n\t\n\t\n\tI think that DirectoryTaxonomyReader.DIR_TAXONOMY_CREATE_TIME_PROP should be in DirTW since it is the one writing it. We also have this notion in other places in the code, i.e. TermInfosWriter declares the format constants, and other classes reference them.\n\t\n\t\tAlso, how about renaming it to INDEX_CREATE_TIME, since technically it is the index that has been recreated. This is to avoid confusion when storing this time in e.g. the search index's commit data, which we do in order to synchronize the taxo and search indices.\n\t\n\t\n\tMaybe for debugging add a message to InconsistentTaxonomyException which will tell us that the taxo has been recreated + the recreate time?\n\n\n\nAbout the other comments:\n\nFilterIndexReader does not implement getCommitUserData(). Once this is fixed can resolvethe TODO in TestIndexClose. I'll open an issue later.\n\nWe need a separate issue to write a test which ensures FilterIndexReader overrides all non-final methods of IndexReader. But why not fix FIR to override getCommitData in this issue? It's a simple fix, no need for the TODO (or any change to TestIndexClose) and it is technically related to the issue, as it exposes a bug in FIR.\n\nTR.refresh() should return a boolean indicating anything was changed (issue).\n\nI prefer that we change the method signature once. Why not modify it to return a boolean? Isn't that a simple change?\n\nDTW.rollback() seems wrong to me\n\nI added it when TW was changed to extend TwoPhaseCommit. I'll take a look. Thanks for raising that. ",
+            "author": "Shai Erera",
+            "id": "comment-13151057"
+        },
+        {
+            "date": "2011-11-16T08:31:59+0000",
+            "content": "DTW.rollback() seems wrong to me\n\nI modified the method impl to call close() instead of refreshReader() and added an appropriate test to DirTWTest to assert that following rollback, no more actions are allowed on DirTW.\n\nSeparately, I think that we should add ensureOpen() to DirTW so that if you call its API after rollback()/close(), you get a proper exception rather than random exceptions (like NPE). I will open an issue for that (and cover the rollback changes there too). ",
+            "author": "Shai Erera",
+            "id": "comment-13151089"
+        },
+        {
+            "date": "2011-11-16T12:59:46+0000",
+            "content": "Thanks for the review and comments Shai, and also thanks for taking care of DTW.rollback() in LUCENE-3579.\n\nI fixed the typos and the == as suggested.\n\nname 'taxoCreateTimeToCommit' just 'taxoCreateTime'\n\nGiven your further comment renamed it to 'taxoIndexCreateTime'\n\nPerhaps DirTW.commit() can call commit(null)\n\nI considered this when first coding, as it would have compacted the code. But felt uncomfortable (still do) relying on a non documented behavior of IW.commit(null).\n\nDirectoryTaxonomyReader.DIR_TAXONOMY_CREATE_TIME_PROP should be in DirTW + renaming to INDEX_CREATE_TIME\n\nDone.\n\nadd a message to InconsistentTaxonomyException\n\nAdded.\n\nBut why not fix FIR to override getCommitData in this issue?\n\nDone. Now it feels a bit wrong that this will not appear in lucene/CHANGES since this issue is in lucene/contrib. Guess this is not too bad...?\n\nTR.refresh() should return a boolean indicating anything was changed (issue). I prefer that we change the method signature once...\n\nGood point. Added a test case in TestDirectoryTaxonomyReader for this. ",
+            "author": "Doron Cohen",
+            "id": "comment-13151177"
+        },
+        {
+            "date": "2011-11-16T13:27:23+0000",
+            "content": "Hmm, now that there is a test for LTW.rollback() my changes fail LTW's testRollback() because LTW.close() now may call IW.commit(Map) (which it did not do before my changes).\n\nFor fixing this:\n\n\tadded private doClose() which closes IW and nullifies it, and calls closeResources().\n\trollback() calls doClose() instead of close().\n\n\n\nAlso, rollback() now made synchronized. ",
+            "author": "Doron Cohen",
+            "id": "comment-13151188"
+        },
+        {
+            "date": "2011-11-16T14:41:07+0000",
+            "content": "\nFor fixing this:\n\n    added private doClose() which closes IW and nullifies it, and calls closeResources().\n    rollback() calls doClose() instead of close().\n\nAlso, rollback() now made synchronized.\n\nGood catch. It is dangerous that rollback is not sync'ed when commit/prepare/close are.\n\n+1 to commit ! ",
+            "author": "Shai Erera",
+            "id": "comment-13151237"
+        },
+        {
+            "date": "2011-11-16T15:40:40+0000",
+            "content": "Final patch.\n\nAlso updated the user-guide about refresh() behavior.\n\nRemoved the changes entry - for facet this would go only into 3x.\n\nPlanning to commit this soon. ",
+            "author": "Doron Cohen",
+            "id": "comment-13151272"
+        },
+        {
+            "date": "2011-11-17T12:31:55+0000",
+            "content": "Committed:\n\n\tr1202754 - trunk\n\tr1203165 - 3x\n\n ",
+            "author": "Doron Cohen",
+            "id": "comment-13152024"
+        }
+    ]
+}

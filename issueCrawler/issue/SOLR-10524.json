@@ -1,0 +1,206 @@
+{
+    "id": "SOLR-10524",
+    "title": "Better ZkStateWriter batching",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [
+            "6.6",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "There are several JIRAs (I'll link in a second) about trying to be more efficient about processing overseer messages as the overseer can become a bottleneck, especially with very large numbers of replicas in a cluster. One of the approaches mentioned near the end of SOLR-5872 (15-Mar) was to \"read large no:of items say 10000. put them into in memory buckets and feed them into overseer....\".\n\nThis JIRA is to break out that part of the discussion as it might be an easy win whereas \"eliminating the Overseer queue\" would be quite an undertaking.",
+    "attachments": {
+        "SOLR-10524-dragonsinth.patch": "https://issues.apache.org/jira/secure/attachment/12867010/SOLR-10524-dragonsinth.patch",
+        "SOLR-10524.patch": "https://issues.apache.org/jira/secure/attachment/12866369/SOLR-10524.patch",
+        "SOLR-10524-NPE-fix.patch": "https://issues.apache.org/jira/secure/attachment/12866914/SOLR-10524-NPE-fix.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-05-04T09:38:51+0000",
+            "content": "Patch for this ticket. Thanks Noble Paul for the raw patch. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-15996443"
+        },
+        {
+            "date": "2017-05-04T21:35:03+0000",
+            "content": "Cao Manh Dat Looks good. \n\nThis should be able to dramatically reduce the state update operations when overseer is under heavy load\n\nI have made the method Overseer#sortItems() as public static . Can you please write simple JUnits to test the order of items produced by that method? \n\nScott Blum is it possible for u to take a look at the patch , especially the changes made to DistributedQueue ",
+            "author": "Noble Paul",
+            "id": "comment-15997473"
+        },
+        {
+            "date": "2017-05-04T21:56:09+0000",
+            "content": "Couple of thoughts:\n\n1) In the places where you've changed Collection -> List, I would go one step further and make it a concrete ArrayList, to a) explicitly convey that the returned list is a mutable copy rather than a view of internal state and b) explicitly convey that sortAndAdd() is operating efficiently on said lists.\n\n2) DQ.remove(id): don't you want to unconditionally knownChildren.remove(id), even if the ZK delete succeeds?\n\n3) DQ.remove(id): there is no need to loop here, in fact you'll get stuck in an infinite loop if someone else deletes the node you're targeting.  The reason there's a loop in removeFirst() is because it's trying a different id each iteration.\n\nSuggested remove(id) impl:\n\n\n  public void remove(String id) throws KeeperException, InterruptedException {\n    // Remove the ZK node *first*; ZK will resolve any races with peek()/poll().\n    // This is counterintuitive, but peek()/poll() will not return an element if the underlying\n    // ZK node has been deleted, so it's okay to update knownChildren afterwards.\n    try {\n      String path = dir + \"/\" + id;\n      zookeeper.delete(path, -1, true);\n    } catch (KeeperException.NoNodeException e) {\n      // Another client deleted the node first, this is fine.\n    }\n    updateLock.lockInterruptibly();\n    try {\n      knownChildren.remove(id);\n    } finally {\n      updateLock.unlock();\n    }\n  }\n\n ",
+            "author": "Scott Blum",
+            "id": "comment-15997500"
+        },
+        {
+            "date": "2017-05-04T23:13:29+0000",
+            "content": "Kind of a side note, but I got distracted when looking at this by IntelliJ claiming that these were unreferenced. Are they necessary?\n\n    private final DistributedMap runningMap;\n    private final DistributedMap completedMap;\n    private final DistributedMap failureMap;\n    private final Stats zkStats; ",
+            "author": "Erick Erickson",
+            "id": "comment-15997569"
+        },
+        {
+            "date": "2017-05-05T03:46:40+0000",
+            "content": "Updated patch for ticket. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-15997762"
+        },
+        {
+            "date": "2017-05-05T05:06:47+0000",
+            "content": "Updated patch DistributedQueue LGTM ",
+            "author": "Scott Blum",
+            "id": "comment-15997804"
+        },
+        {
+            "date": "2017-05-05T07:59:54+0000",
+            "content": "\n\n\tThe tmp list in the sortItems method should also be a LinkedList otherwise tmp.remove(0) becomes expensive.\n\tI ran the OverseerTest#testPerformance method which simulates a worst case scenario of 20000 mixed collection updates and it shows that update_state invocations drop two order of magnitude from 20011 to 131.\n\tHowever the overall time does not change that much. Drops from 3m 3s 531ms without the patch to 2m 53s 282ms. Presumably when real world latencies between overseer and zk is accounted for, the difference should be larger. I'd like for us to benchmark this with a remote ZK host to see how much does this patch increase the overseer throughput.\n\tThis patch process messages in an order different from the state update queue but always removes the first element. This is wrong and can cause a lot of problems in the cluster if overseer fails over and restarts processing. We must remove the message that was processed.\n\tAlso now that the order of processing is different, we must have tests that assert that the right items are removed from the queue at all times even during overseer restarts. The bar of testing for this kind of change has to be very high!\n\tIs all the re-sorting logic even necessary? It seems that the intention is to workaround the batching logic inside ZkStateWriter. Why not remove the batching logic (when switching between collections) from ZkStateWriter altogether? It will simplify both places.\n\n ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15997903"
+        },
+        {
+            "date": "2017-05-05T09:14:40+0000",
+            "content": "Updated patch for this ticket after a discussion with Noble Paul and Shalin Shekhar Mangar. Here are result of OverseerTest.testPerformance()\n\nWithout the patch\nOverseer loop finished processing: \n\t avgRequestsPerSecond: 0.00809284358238982\n\t 5minRateRequestsPerSecond: 0.0\n\t 15minRateRequestsPerSecond: 0.0\n\t avgTimePerRequest: 123564881129000000\n\t medianRequestTime: 123564881129000000\n\t 75thPcRequestTime: 123564881129000000\n\t 95thPcRequestTime: 123564881129000000\n\t 99thPcRequestTime: 123564881129000000\n\t 999thPcRequestTime: 123564881129000000\nop: am_i_leader, success: 3, failure: 0\n\t avgRequestsPerSecond: 0.024318192042511424\n\t 5minRateRequestsPerSecond: 0.2726342664775392\n\t 15minRateRequestsPerSecond: 0.35201956953766844\n\t avgTimePerRequest: 353111000000\n\t medianRequestTime: 116973000000\n\t 75thPcRequestTime: 116973000000\n\t 95thPcRequestTime: 1733875000000\n\t 99thPcRequestTime: 1733875000000\n\t 999thPcRequestTime: 1733875000000\nop: update_state, success: 20011, failure: 0\n\t avgRequestsPerSecond: 162.28792277377633\n\t 5minRateRequestsPerSecond: 106.44733871784089\n\t 15minRateRequestsPerSecond: 89.86620980167666\n\t avgTimePerRequest: 213680000000\n\t medianRequestTime: 205539000000\n\t 75thPcRequestTime: 221076000000\n\t 95thPcRequestTime: 253206000000\n\t 99thPcRequestTime: 282888000000\n\t 999thPcRequestTime: 548583000000\nop: state, success: 20001, failure: 0\n\t avgRequestsPerSecond: 162.44457624784178\n\t 5minRateRequestsPerSecond: 107.66013079551965\n\t 15minRateRequestsPerSecond: 91.18766381210062\n\t avgTimePerRequest: 13250000000\n\t medianRequestTime: 11459000000\n\t 75thPcRequestTime: 16188000000\n\t 95thPcRequestTime: 21414000000\n\t 99thPcRequestTime: 39280000000\n\t 999thPcRequestTime: 67098000000\n\n\nWith the patch\nOverseer loop finished processing: \n\t avgRequestsPerSecond: 0.00802836931576006\n\t 5minRateRequestsPerSecond: 0.0\n\t 15minRateRequestsPerSecond: 0.0\n\t avgTimePerRequest: 124556932520000000\n\t medianRequestTime: 124556932520000000\n\t 75thPcRequestTime: 124556932520000000\n\t 95thPcRequestTime: 124556932520000000\n\t 99thPcRequestTime: 124556932520000000\n\t 999thPcRequestTime: 124556932520000000\nop: am_i_leader, success: 3, failure: 0\n\t avgRequestsPerSecond: 0.024113954682119472\n\t 5minRateRequestsPerSecond: 0.2726342664775392\n\t 15minRateRequestsPerSecond: 0.35201956953766844\n\t avgTimePerRequest: 306734000000\n\t medianRequestTime: 116296000000\n\t 75thPcRequestTime: 116296000000\n\t 95thPcRequestTime: 1417483000000\n\t 99thPcRequestTime: 1417483000000\n\t 999thPcRequestTime: 1417483000000\nop: update_state, success: 52, failure: 0\n\t avgRequestsPerSecond: 0.4181288003958347\n\t 5minRateRequestsPerSecond: 0.4\n\t 15minRateRequestsPerSecond: 0.4\n\t avgTimePerRequest: 2117982000000\n\t medianRequestTime: 2054633000000\n\t 75thPcRequestTime: 2212862000000\n\t 95thPcRequestTime: 2648609000000\n\t 99thPcRequestTime: 4582074000000\n\t 999thPcRequestTime: 6145919000000\nop: state, success: 20001, failure: 0\n\t avgRequestsPerSecond: 161.02141495173862\n\t 5minRateRequestsPerSecond: 107.06882627730678\n\t 15minRateRequestsPerSecond: 91.09679521134835\n\t avgTimePerRequest: 17483000000\n\t medianRequestTime: 16009000000\n\t 75thPcRequestTime: 22093000000\n\t 95thPcRequestTime: 32283000000\n\t 99thPcRequestTime: 46404000000\n\t 999thPcRequestTime: 117668000000\n\n\nAs we can see, the number of update_state is much reduced from 20011 to 52. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-15997975"
+        },
+        {
+            "date": "2017-05-05T10:53:05+0000",
+            "content": "Yes, I like this. Same performance, much smaller changes and no chance of something going wrong in the cluster because of processing re-ordered messages. +1 to commit.\n\nThere are optimizations we can do on the read side using multi-get. Lets open another issue to explore that as well. Oops, zookeeper has no multi-get.\n\nAs a side note, there is a bug in the nsToMs method in testOverseer \u2013 it actually assumes the nanoseconds as milliseconds and the converts them to nano seconds! I'll fix it separately.  ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15998138"
+        },
+        {
+            "date": "2017-05-05T17:23:48+0000",
+            "content": "So if I were preparing an \"executive summary\", there would be several take-aways:\n\n1> The number of update state operations, i.e. the number of times state is actually written to ZK is drastically lower under heavy load; by a factor of almost 400!\n\n2> One implication here is that the number of state change notifications that ZK has to send out, and thus the number of times the state gets read by Solr nodes is also decreased by that same factor. So the fact that the state-read operations throughput is the same should be evaluated in light of the fact that there will be many fewer of them.\n\n3> One thing not captured by the numbers is that the size of the Overseer queue is much less like to spin out of control due to both <2> and the fact that we're reading/ordering/processing batches of up to 10,000 messages at once.\n\n4> Even though some of the throughput numbers haven't changed (am_i_leader for instance), they'll spend much less time waiting to be carried out due to 1-3. Plus only three points may make a circle, but isn't enough data to make a good generalization from \n\nIs this fair? Accurate? Complete? I'm looking for something to present to those users who have seen the Overseer queue grow to the 100s of K, effectively making their cluster unusable.\n\nThanks for this work! As collections get larger and larger this has become a very significant pain-point. ",
+            "author": "Erick Erickson",
+            "id": "comment-15998613"
+        },
+        {
+            "date": "2017-05-06T01:47:43+0000",
+            "content": "I will commit the patch soon if no one have any objection. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-15999217"
+        },
+        {
+            "date": "2017-05-08T09:21:29+0000",
+            "content": "Commit 20c4886816ceae96af9d99a5e99f5cd9037d8ef4 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=20c4886 ]\n\nSOLR-10524: Explore in-memory partitioning for processing Overseer queue messages ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16000492"
+        },
+        {
+            "date": "2017-05-08T10:02:11+0000",
+            "content": "Thanks for the summary Erick Erickson.\n\n3> One thing not captured by the numbers is that the size of the Overseer queue is much less like to spin out of control due to both <2> and the fact that we're reading/ordering/processing batches of up to 10,000 messages at once.\n\nWe aren't reading them 10k at a time because there is no multi-read in ZK. However we write the results of the processing once per 10K messages or 2.5 seconds or whenever the queue goes empty whichever happens earlier.\n\nThe rest looks okay. SOLR-10619 fixes an even bigger problem with the distributed queue used by overseer so we'll see even bigger gains after it is resolved. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16000535"
+        },
+        {
+            "date": "2017-05-08T10:03:54+0000",
+            "content": "Cao Manh Dat \u2013 please rename this issue and edit the description in CHANGES.txt \u2013 there is no in-memory partitioning being done here. We are simply improving batching in overseer for messages coming from mixed collections to reduce ZK collection state writes. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16000537"
+        },
+        {
+            "date": "2017-05-08T10:08:22+0000",
+            "content": "Scott Blum there is no multi-read available in ZK in the newer versions also right?  ",
+            "author": "Noble Paul",
+            "id": "comment-16000546"
+        },
+        {
+            "date": "2017-05-08T10:20:21+0000",
+            "content": "However there is an asynchronous version of getData()\n\n\n  /**\n     * The asynchronous version of getData.\n     *\n     * @see #getData(String, Watcher, Stat)\n     */\n    public void getData(final String path, Watcher watcher,\n            DataCallback cb, Object ctx){\n}\n\n\nshould we run tests to compare if it can give us an advantage? I guess it should\n\nAnother optimization is doing multiple deletes from the workQueue using the following method\n\n /**\n     * The asynchronous version of multi.\n     *\n     * @see #multi(Iterable)\n     */\n    public void multi(Iterable<Op> ops, MultiCallback cb, Object ctx) {\n\n ",
+            "author": "Noble Paul",
+            "id": "comment-16000564"
+        },
+        {
+            "date": "2017-05-08T15:48:15+0000",
+            "content": "It seems that the cmd.collection == null check in maybeFlushBefore is needed, patch attached to re-instate/illustrate. ",
+            "author": "Christine Poerschke",
+            "id": "comment-16000952"
+        },
+        {
+            "date": "2017-05-08T16:01:28+0000",
+            "content": "Shalin Shekhar Mangar Hmmm, maybe a better way to phrase it is that we process the queue in batches of up to 10,000? I didn't mean to convey that the Zookeeper read was in batches that size, just that we processed them up to that many at once. ",
+            "author": "Erick Erickson",
+            "id": "comment-16000982"
+        },
+        {
+            "date": "2017-05-08T16:04:05+0000",
+            "content": "Thanks Christine, please go ahead and commit your patch. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16000989"
+        },
+        {
+            "date": "2017-05-08T20:57:08+0000",
+            "content": "I'm seeing the errors below when running the StreamExpressionTest. I suspect it's related to this ticket. I've been adding tests the past couple of days but only started seeing this today:\n\n\n Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239409 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239410 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239411 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239412 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239413 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239413 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239414 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop\n   [junit4]   2> java.lang.NullPointerException\n   [junit4]   2> 239415 ERROR (OverseerStateUpdate-97928916256817164-127.0.0.1:51485_solr-n_0000000000) [n:127.0.0.1:51485_solr    ] o.a.s.c.Overseer Exception in Overseer main queue loop ",
+            "author": "Joel Bernstein",
+            "id": "comment-16001514"
+        },
+        {
+            "date": "2017-05-08T21:01:02+0000",
+            "content": "It seems that the cmd.collection == null check in maybeFlushBefore is needed, patch attached to re-instate/illustrate.\nYes, lots of tests are failing without this. ZkStateWriterTest fails if I apply Christine's patch though, some more changes are needed ",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "id": "comment-16001523"
+        },
+        {
+            "date": "2017-05-08T21:32:19+0000",
+            "content": "Yeah, I just switched over to branch_6x and I'm not getting the failures there. Looks like it's this ticket. ",
+            "author": "Joel Bernstein",
+            "id": "comment-16001581"
+        },
+        {
+            "date": "2017-05-08T23:55:19+0000",
+            "content": "ZkStateWriterTests.testZkStateWriterBatching() is written for exactly the behavior we wanted to change here.   That test needs an overhaul.  Patch forthcoming. ",
+            "author": "Scott Blum",
+            "id": "comment-16001810"
+        },
+        {
+            "date": "2017-05-09T00:24:56+0000",
+            "content": "Fixes ZkStateWriterTest, etc ",
+            "author": "Scott Blum",
+            "id": "comment-16001841"
+        },
+        {
+            "date": "2017-05-09T00:29:51+0000",
+            "content": "Looks good +1 for commit ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16001846"
+        },
+        {
+            "date": "2017-05-09T00:34:07+0000",
+            "content": "Commit 972e342fee7a02e71300a9739b9971e63708589b in lucene-solr's branch refs/heads/master from Scott Blum\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=972e342 ]\n\nSOLR-10524: Build fix for NPE\n\nIntroduced by ZkStateWriter batching optimizations. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16001855"
+        },
+        {
+            "date": "2017-05-09T00:35:03+0000",
+            "content": "Thanks Cao Manh Dat, committed to master. ",
+            "author": "Scott Blum",
+            "id": "comment-16001856"
+        },
+        {
+            "date": "2017-05-09T07:07:20+0000",
+            "content": "Commit 9cab9c0cf2777a21a81386be2262e84da2bca751 in lucene-solr's branch refs/heads/branch_6x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9cab9c0 ]\n\nSOLR-10524: Explore in-memory partitioning for processing Overseer queue messages ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16002191"
+        },
+        {
+            "date": "2017-05-09T07:07:24+0000",
+            "content": "Commit 5c626dc9e0a488d43e9a2f41947fd2ec3b0b046f in lucene-solr's branch refs/heads/branch_6x from Scott Blum\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5c626dc ]\n\nSOLR-10524: Build fix for NPE\n\nIntroduced by ZkStateWriter batching optimizations. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16002192"
+        },
+        {
+            "date": "2017-12-19T18:22:51+0000",
+            "content": "GitHub user slackhappy opened a pull request:\n\n    https://github.com/apache/lucene-solr/pull/294\n\n    ZkStateReader: cache LazyCollectionRef\n\n    SOLR-10524 introduced zk state update batching, with\n    a default interval of 2 seconds.  That opens\n    the door for a simple, time-based cache on the read side\n    to address the issue described in SOLR-8327\n\nYou can merge this pull request into a Git repository by running:\n\n    $ git pull https://github.com/slackhappy/lucene-solr cloud_cache_lazy_collection_ref\n\nAlternatively you can review and apply these changes as the patch at:\n\n    https://github.com/apache/lucene-solr/pull/294.patch\n\nTo close this pull request, make a commit to your master/trunk branch\nwith (at least) the following in the commit message:\n\n    This closes #294\n\n\ncommit e7c6a6773f1d01d2ddb0dbce6cdbaeff52e78376\nAuthor: John Gallagher <jgallagher@slack-corp.com>\nDate:   2017-12-19T16:57:25Z\n\n    ZkStateReader: cache LazyCollectionRef\n\n    SOLR-10524 introduced zk state update batching, with\n    a default interval of 2 seconds.  That opens\n    the door for a simple, time-based cache on the read side\n    to address the issue described in SOLR-8327\n\n ",
+            "author": "ASF GitHub Bot",
+            "id": "comment-16297192"
+        }
+    ]
+}

@@ -1,0 +1,125 @@
+{
+    "id": "SOLR-9438",
+    "title": "Shard split can lose data",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.2.1",
+            "6.3",
+            "7.0"
+        ],
+        "affect_versions": "4.10.4,                                            5.5.2,                                            6.1,                                            6.2",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Critical"
+    },
+    "description": "Solr\u2019s shard split can lose documents if the parent/sub-shard leader is killed (or crashes) between the time that the new sub-shard replica is created and before it recovers. In such a case the slice has already been set to \u2018recovery\u2019 state, the sub-shard replica comes up, finds that no other replica is up, waits until the leader vote wait time and then proceeds to become the leader as well as publish itself as active. If the former leader node comes back online, the overseer seeing that all replicas of the sub-shard are now \u2018active\u2019, sets the parent slice as \u2018inactive\u2019 and the new sub-shard as \u2018active\u2019.",
+    "attachments": {
+        "SOLR-9438.patch": "https://issues.apache.org/jira/secure/attachment/12825340/SOLR-9438.patch",
+        "SOLR-9438-split-data-loss.log": "https://issues.apache.org/jira/secure/attachment/12827089/SOLR-9438-split-data-loss.log",
+        "SOLR-9438-false-replication.log": "https://issues.apache.org/jira/secure/attachment/12827206/SOLR-9438-false-replication.log"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-08-24T21:04:12+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "A simple fix is for the overseer to check live node information before setting the parent shard as \u2018invalid\u2019. This will work because by the time the leader vote wait period expires, the killed former-leader\u2019s ephemeral nodes should have expired.\n\nBut it gets trickier if the leader comes back online and recovers from this new (incomplete) replica. This will again mark the sub-shard as active. To prevent this, the overseer must ensure that the live node of the sub-shard leader still exists (with the same sequence number assigned at the time of split) before changing the sub-slice state to active. ",
+            "id": "comment-15435682"
+        },
+        {
+            "date": "2016-08-24T21:07:40+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "We should also mark the slice to recovery_failed in case we find the live_node has changed. Any sub-shard in this new state should not be forwarded updates. It will also be a clear indication that the shard split operation has failed and must be re-tried. ",
+            "id": "comment-15435688"
+        },
+        {
+            "date": "2016-08-24T21:23:22+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "The test which attempts to tickle this. This is not deterministic as it tries to kill the leader at just the right time. We retry a few times and timeout after 2 minutes. Beasting this test around 50 times has reproduced the bug once. This test works around SOLR-9440 by calling cloudClient.getZkStateReader().registerCore(\"collection1\"); ",
+            "id": "comment-15435733"
+        },
+        {
+            "date": "2016-08-29T15:52:04+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Patch with the test updated to master. ",
+            "id": "comment-15446247"
+        },
+        {
+            "date": "2016-08-30T20:19:19+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Beasting this test sometimes fails with nodes not recovering even after working around SOLR-9440. I finally found the cause:\n\n  [beaster]   2> 232316 ERROR (coreZkRegister-123-thread-1-processing-n:127.0.0.1:54683_ x:collection1_shard1_0_replica0 s:shard1_0 c:collection1 r:core_node7) [n:127.0.0.1:54683_ c:collection1 s:shard1_0 r:core_node7 x:collection1_shard1_0_replica0] o.a.s.c.ZkContainer :org.apache.solr.common.SolrException: Error getting leader from zk for shard shard1_0\n  [beaster]   2> \tat org.apache.solr.cloud.ZkController.getLeader(ZkController.java:994)\n  [beaster]   2> \tat org.apache.solr.cloud.ZkController.register(ZkController.java:900)\n  [beaster]   2> \tat org.apache.solr.cloud.ZkController.register(ZkController.java:843)\n  [beaster]   2> \tat org.apache.solr.core.ZkContainer.lambda$registerInZk$0(ZkContainer.java:181)\n  [beaster]   2> \tat org.apache.solr.common.util.ExecutorUtil$MDCAwareThreadPoolExecutor.lambda$execute$0(ExecutorUtil.java:229)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)\n  [beaster]   2> \tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)\n  [beaster]   2> \tat java.lang.Thread.run(Thread.java:745)\n  [beaster]   2> Caused by: org.apache.solr.common.SolrException: There is conflicting information about the leader of shard: shard1_0 our state says:http://127.0.0.1:54683/collection1_shard1_0_replica1/ but zookeeper says:http://127.0.0.1:49547/collection1_shard1_0_replica1/\n  [beaster]   2> \tat org.apache.solr.cloud.ZkController.getLeader(ZkController.java:975)\n  [beaster]   2> \t... 7 more\n\n\n\nThe problem is that restarting the node (which assigns a new port number) sometimes confuses the hell out of SolrCloud and then such nodes keep their old port number in cluster state and never recover, can't elect leaders etc. I have a suspicion that this behavior is intentional. I'll keep digging. ",
+            "id": "comment-15450041"
+        },
+        {
+            "date": "2016-09-05T17:40:14+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This log is from a run which reproduced this bug. A newly created replica logs the following:\n\n38737 INFO  (parallelCoreAdminExecutor-8-thread-1-processing-n:127.0.0.1:42309_ 9208de91-9c97-4a42-94f5-9e00e3b6189b388000949708638 CREATE) [n:127.0.0.1:42309_ c:collection1 s:shard1_1 r:core_node8 x:collection1_shard1_1_replica0] o.a.s.c.ShardLeaderElectionContext Was waiting for replicas to come up, but they are taking too long - assuming they won't come back till later\n\n\n\nAfter this point, this replica becomes the leader (with 0 docs inside!) and eventually when the old replica comes back up, it syncs with this empty index and loses all data except for whatever was indexed after the split. ",
+            "id": "comment-15465468"
+        },
+        {
+            "date": "2016-09-06T15:11:00+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "The attached SOLR-9438-false-replication.log shows another kind of failure. \n\n\n\tWe create the sub-shard replica and restart the leader node\n\tThe leader comes back online. The replica tries to recover.\n\tLeader reports its version as 0\n\tReplica seeing the master version as 0, assumes it is an empty index, reports the replication successful\n\tsub-shard becomes active.\n\n\n\nThe root cause is that after split we do not commit and so the commit timestamp (used for version checks) is not written to the index. If the leader is restarted, the IndexWriter.close calls a commit on close. Upon restart, the leader will report its version as 0 even though it contains data. ",
+            "id": "comment-15467650"
+        },
+        {
+            "date": "2016-09-06T15:14:01+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "A scenario related to the above that I ran into is that if this new replica becomes the leader, any one else trying to replicate from the leader will also report replication successful with 0 docs. ",
+            "id": "comment-15467657"
+        },
+        {
+            "date": "2016-09-06T21:01:42+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Patch with a simplified testSplitWithChaosMonkey() that doesn't restart repeatedly (to avoid the port change problems) and yet reproduces all bugs on beasting.\n\nI also added another test called testSplitStaticIndexReplication which tickles the bug related to commit data not being present. A fix for this is also included.\n\nThere are still a few nocommits. ",
+            "id": "comment-15468555"
+        },
+        {
+            "date": "2016-09-08T20:59:25+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Changes:\n\n\tWe record the parent leader node name and the ephemeral owner of its live node (zk session id which created the live node) at the start of the split process.\n\tThese two pieces of information called \"shard_parent_node\" and \"shard_parent_zk_session\" respectively, are stored in the cluster state along with the slice information.\n\tWhen all replicas of all sub-shards are live, the overseer checks if the parent leader node is still live and if its ephemeral owner is still the same. If yes, it switches the sub-shard states to active and parent to inactive. If not, it  changes the sub-shard state to a newly introduced \"recovery_failed\" state.\n\tAny shard in \"recovery_failed\" state does not receive any indexing or querying traffic.\n\tI beefed up the test to check for both outcomes and to assert that all documents that were successfully indexed are visible on a distributed search. Additionally, if the split succeeds, we also assert that all replicas of the sub-shards are consistent i.e. have the same number of docs.\n\tFixed a test bug where concurrent watcher invocations on collection state would shutdown the leader node again even after the test had restarted it already to assert document counts.\n\n\n\nResults of beasting are looking good as far as this particular bug is concerned, but there is a curious failure where one and only core stays down and times out the waiting for recovery check. I'm still digging. ",
+            "id": "comment-15474984"
+        },
+        {
+            "date": "2016-09-09T17:05:50+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "The test failure due to only one node remaining down was because sometimes the parent leader node itself is selected to host the new sub-shard replica. When we shutdown that node at the right time, the add replica call fails but the replica has already been created in the cluster state. Since the physical core doesn't actually exist, it will never recover and stay in down state.\n\nChanges:\n\n\tThe test now checks if all replicas actually exist as a core before we wait for recovery and for sub-shards to switch states.\n\tThe split shard API puts sub-shards into recovery_failed state itself if the parent leader changes before any replicas can be created.\n\n\n\nI've been beasting this test and so far everything looks good but I'll continue beasting for a little while more. ",
+            "id": "comment-15477607"
+        },
+        {
+            "date": "2016-09-12T11:06:27+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Fixed comments and javadocs in a few places. I beasted this test overnight for more than 500 runs and everything looks good! I'll commit this shortly. ",
+            "id": "comment-15483810"
+        },
+        {
+            "date": "2016-09-12T11:31:05+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit f177a660f5745350207dc61b46396b49404fd383 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f177a66 ]\n\nSOLR-9438: Shard split can be marked successful and sub-shard states switched to 'active' even when one or more sub-shards replicas do not recover due to the leader crashing or restarting between the time the replicas are created and before they can recover ",
+            "id": "comment-15483857"
+        },
+        {
+            "date": "2016-09-12T11:38:54+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1b03c940398de384c60fb0083a82ddb601db3909 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1b03c94 ]\n\nSOLR-9438: Shard split can be marked successful and sub-shard states switched to 'active' even when one or more sub-shards replicas do not recover due to the leader crashing or restarting between the time the replicas are created and before they can recover\n\n(cherry picked from commit f177a66) ",
+            "id": "comment-15483874"
+        },
+        {
+            "date": "2016-09-12T11:51:28+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 8027eb9803c2248a427f45c3771d1cb88d57f4b1 in lucene-solr's branch refs/heads/branch_6_2 from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8027eb9 ]\n\nSOLR-9438: Shard split can be marked successful and sub-shard states switched to 'active' even when one or more sub-shards replicas do not recover due to the leader crashing or restarting between the time the replicas are created and before they can recover\n\n(cherry picked from commit f177a66)\n\n(cherry picked from commit 1b03c94) ",
+            "id": "comment-15483908"
+        },
+        {
+            "date": "2016-09-21T03:03:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Closing after 6.2.1 release ",
+            "id": "comment-15508554"
+        }
+    ]
+}

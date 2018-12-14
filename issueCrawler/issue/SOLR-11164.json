@@ -1,0 +1,130 @@
+{
+    "id": "SOLR-11164",
+    "title": "OriginalScoreFeature causes NullPointerException during feature logging with SolrCloud mode.",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "contrib - LTR"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.1",
+            "master (8.0)"
+        ],
+        "affect_versions": "6.6",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "In FeatureTransfer, OriginalScoreFeature uses original Query instance preserved in LTRScoringQuery for the evaluation.\nThis query is set in RankQuery#wrap during QueryComponent#process.\n\nWith SolrCloud mode, document searches take two steps: finding top-N document ids, and filling documents of found ids.\nIn this case, FeatureTransformer works in the second step and tries to extract features with LTRScoringQuery built in QueryComponent#prepare.\nHowever, because the second step doesn't call QueryComponent#process, the original query of LTRScoringQuery remains null and this causes NullPointerException while evaluating OriginalScoreFeature.\n\nWe can get the original query from ResultContext which is an argument of DocTransformer#setContext, thus this problem can solve by using it if LTRScoringQuery doesn't have correct original query.",
+    "attachments": {
+        "SOLR-11164_master.patch": "https://issues.apache.org/jira/secure/attachment/12882274/SOLR-11164_master.patch",
+        "SOLR-11164_master_v2.patch": "https://issues.apache.org/jira/secure/attachment/12883643/SOLR-11164_master_v2.patch",
+        "SOLR-11164.patch": "https://issues.apache.org/jira/secure/attachment/12879288/SOLR-11164.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-08-07T20:46:46+0000",
+            "content": "I have tested the provided patch, despite it is indeed returning a score, it is not the score from the original query.  Having said that, it will return the calculation of the 2nd phase query, while doing the re-ranking applying the model, rather than the original query. ",
+            "author": "Jonathan Gonzalez",
+            "id": "comment-16117235"
+        },
+        {
+            "date": "2017-08-08T01:29:12+0000",
+            "content": "Jonathan Gonzalez\nThank you for testing the patch! As you say, it will return the calculation of the 2nd phase query. However, in my understanding, this query is built from the parameter of \"q\" and thus it should be same as 1st phase query.\n\nDetails are as below. In short, both 1st phase request and 2nd phase request have same \"q\" parameter and it will be set to ResultContext.\n\n1. OriginalScoreFeature uses rb.getQuery() for calculating the original score, which is given by RankQuery#wrap.\n  https://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/contrib/ltr/src/java/org/apache/solr/ltr/search/LTRQParserPlugin.java#L220\n  https://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java#L427\n\n2. As following codes, ResultContext is built from ResponseBuilder and it use rb.getQuery() as the query.\n  https://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java#L367\n  https://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/response/BasicResultContext.java#L42\n\n3. Query parsed from \"q\" is set the query of ResponseBuilder during preparing phase, which is executed in both 1st and 2nd phase.\n  https://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java#L160-L167\n\n4. In distributed process, QueryComponent sets original parameters when builds the 2nd phase request as following codes (i.e., same \"q\" parameter as 1st phase).\n  https://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java#L1287-L1288 ",
+            "author": "Yuki Yano",
+            "id": "comment-16117698"
+        },
+        {
+            "date": "2017-08-10T19:27:29+0000",
+            "content": "Yuki Yano, Jonathan Gonzalez, Ryan Yacyshyn\nThank you for reporting and looking into this here (SOLR-11164) and on SOLR-11180 and SOLR-11220 tickets.\n\n... it is not the score from the original query. ...\n\nPerhaps we could extend the test to compare the original feature value returned in the fl with the score returned in fl when LTR was not used?\n(With that in mind in SOLR-11223 i went and extended the TestLTROnSolrCloud coverage in two parts: part 1 includes the addition of local original_resultX_score variables capturing the original score but part 2 is unexpectedly failing i.e. if rq is not specified then no features are returned.) ",
+            "author": "Christine Poerschke",
+            "id": "comment-16122167"
+        },
+        {
+            "date": "2017-08-14T05:09:07+0000",
+            "content": "Christine Poerschke Jonathan Gonzalez Ryan Yacyshyn\nI investigated these issues and found that score=0.0 has special meaning for DocTransformer.\n\nIn SolrCloud, scores are calculated in the first-trip and score fields are filled after the second-trip by the distributed node.\nhttps://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java#L1359\n\nBy this reason, in the second-trip, DocSlice is created with empty scores.\nhttps://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/handler/component/QueryComponent.java#L356\n\nWhile transforming documents, scores of DocSlice is referred by DocStreamer and set 0.0 if scores are missing.\nhttps://github.com/apache/lucene-solr/blob/releases/lucene-solr/6.6.0/solr/core/src/java/org/apache/solr/response/DocsStreamer.java#L170\n\nBecause DocSlice doesn't have scores, 0.0 is always passed to DocTransformer#transform as the score. Without rq parameter, docsWereNotReranked=true and this causes the issue reported in SOLR-11180 and SOLR-11220.\n\nIn conclusion, there are two problems with transforming OriginalScoreFeature in SolrCloud mode.\n\n1. Without rq, OriginalScoreFeature always returns 0.0 because the correct score isn't passed to DocTransformer#transform.\n\n2. With rq, FeatureTransformer causes NPE because the original query isn't set correctly in LTRScoringQuery. ",
+            "author": "Yuki Yano",
+            "id": "comment-16125251"
+        },
+        {
+            "date": "2017-08-14T05:13:18+0000",
+            "content": "I attached new patch (generated by git diff branch_6x). This patch contains changes of SOLR-11223 and tests for comparing original scores. ",
+            "author": "Yuki Yano",
+            "id": "comment-16125254"
+        },
+        {
+            "date": "2017-08-14T09:26:50+0000",
+            "content": "With new patch, the reported case of SOLR-11180 seems to work fine.\n\nwithout re-ranking : http://localhost:8983/solr/gettingstarted/query?q=test&fl=id,score,%5Bfeatures%5D\n\n{\n  \"responseHeader\":{\n    \"zkConnected\":true,\n    \"status\":0,\n    \"QTime\":10,\n    \"params\":{\n      \"q\":\"test\",\n      \"fl\":\"id,score,[features]\"}},\n  \"response\":{\"numFound\":2,\"start\":0,\"maxScore\":1.7527907,\"docs\":[\n      {\n        \"id\":\"GB18030TEST\",\n        \"[features]\":\"originalScore=1.7527907\",\n        \"score\":1.7527907},\n      {\n        \"id\":\"UTF8TEST\",\n        \"[features]\":\"originalScore=1.5209608\",\n        \"score\":1.5209608}]\n  }}\n\n\n\nwith re-ranking : http://localhost:8983/solr/gettingstarted/query?q=test&rq=\\{!ltr%20model=model%20reRankDocs=100}&fl=id,score,[features]\n\n{\n  \"responseHeader\":{\n    \"zkConnected\":true,\n    \"status\":0,\n    \"QTime\":12,\n    \"params\":{\n      \"q\":\"test\",\n      \"fl\":\"id,score,[features]\",\n      \"rq\":\"{!ltr model=model reRankDocs=100}\"}},\n  \"response\":{\"numFound\":2,\"start\":0,\"maxScore\":0.87639534,\"docs\":[\n      {\n        \"id\":\"GB18030TEST\",\n        \"[features]\":\"originalScore=1.7527907\",\n        \"score\":0.87639534},\n      {\n        \"id\":\"UTF8TEST\",\n        \"[features]\":\"originalScore=1.5209608\",\n        \"score\":0.7604804}]\n  }}\n\n ",
+            "author": "Yuki Yano",
+            "id": "comment-16125457"
+        },
+        {
+            "date": "2017-08-16T00:42:51+0000",
+            "content": "Christine Poerschke\nIs it better to create the patch from the master branch? ",
+            "author": "Yuki Yano",
+            "id": "comment-16128158"
+        },
+        {
+            "date": "2017-08-16T11:00:03+0000",
+            "content": "Is it better to create the patch from the master branch?\n\nGood question. Yes, I think so, typically patches are against master branch (unless the issue is broken only in (say) branch_7x) and once committed to master branch it would be cherry-pick backported to other branches. https://wiki.apache.org/solr/HowToContribute has (much) more detailed info e.g. including ant precommit etc. ",
+            "author": "Christine Poerschke",
+            "id": "comment-16128629"
+        },
+        {
+            "date": "2017-08-17T06:25:42+0000",
+            "content": "Christine Poerschke\nThank you for your reply! I refactored codes and recreated new patch SOLR-11164_master.patch from the master branch. This patch resolves the problem of this issue (SOLR-11164) and also related issues (SOLR-11180 and SOLR-11220). ",
+            "author": "Yuki Yano",
+            "id": "comment-16130000"
+        },
+        {
+            "date": "2017-08-17T18:33:25+0000",
+            "content": "Thanks Yuki Yano for the new patch against master branch!\n\n(It will work of course but I have doubts re: hard-coding the special interpretation of 0.0f meaning \"no score\" in another place and therefore have proposed SOLR-11254 DocTransformer.transform signature change as a way to avoid that.) ",
+            "author": "Christine Poerschke",
+            "id": "comment-16130976"
+        },
+        {
+            "date": "2017-08-18T00:35:53+0000",
+            "content": "Christine Poerschke\nI agree with you. Using 0.0f as \"no score\" implicitly make codes hard to understand. I'll wait for merging SOLR-11254  ",
+            "author": "Yuki Yano",
+            "id": "comment-16131536"
+        },
+        {
+            "date": "2017-08-25T01:51:59+0000",
+            "content": "Christine Poerschke\nI attached new patch based on the change of SOLR-11254. ",
+            "author": "Yuki Yano",
+            "id": "comment-16141057"
+        },
+        {
+            "date": "2017-08-25T11:02:20+0000",
+            "content": "Thanks Yuki Yano for the rebased patch!\n\nI'm attaching patch with two more small revisions:\n\n\tremoval of duplicate setOriginalQuery call\n\tin TestLTROnSolrCloud keep the variable number of shards/replica/shards-per-node but adjust shards-per-node and numberOfNodes logic\n\n\n\nWill run ant precommit and re-run tests after lunch, and then commit to master and branch_7x (for 7.1 release). ",
+            "author": "Christine Poerschke",
+            "id": "comment-16141484"
+        },
+        {
+            "date": "2017-08-25T14:35:08+0000",
+            "content": "Commit 492265014b549d5517e5ec25ffdd0e5557a4ed39 in lucene-solr's branch refs/heads/master from Christine Poerschke\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4922650 ]\n\nSOLR-11164, SOLR-11180, SOLR-11220: Fix NullPointerException and always-returns-zero contrib/ltr OriginalScoreFeature issues in SolrCloud mode.\n(Yuki Yano, Jonathan Gonzalez, Ryan Yacyshyn, Christine Poerschke) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16141691"
+        },
+        {
+            "date": "2017-08-25T14:50:43+0000",
+            "content": "Commit f4b3d5644a98191ef2b18b3a6604774abaf0c339 in lucene-solr's branch refs/heads/branch_7x from Christine Poerschke\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f4b3d56 ]\n\nSOLR-11164, SOLR-11180, SOLR-11220: Fix NullPointerException and always-returns-zero contrib/ltr OriginalScoreFeature issues in SolrCloud mode.\n(Yuki Yano, Jonathan Gonzalez, Ryan Yacyshyn, Christine Poerschke) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16141705"
+        },
+        {
+            "date": "2017-08-25T14:52:41+0000",
+            "content": "Thanks everyone! ",
+            "author": "Christine Poerschke",
+            "id": "comment-16141710"
+        },
+        {
+            "date": "2017-10-17T11:03:30+0000",
+            "content": "Bulk close after 7.1.0 release ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16207324"
+        }
+    ]
+}

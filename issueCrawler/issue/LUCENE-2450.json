@@ -1,0 +1,78 @@
+{
+    "id": "LUCENE-2450",
+    "title": "Explore write-once attr bindings in the analysis chain",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "modules/analysis"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I'd like to propose a new means of tracking attrs through the analysis\nchain, whereby a given stage in the pipeline cannot overwrite attrs\nfrom stages before it (write once).  It can only write to new attrs\n(possibly w/ the same name) that future stages can see; it can never\nalter the attrs or bindings from the prior stages.\n\nI coded up a prototype chain in python (I'll attach), showing the\nequivalent of WhitespaceTokenizer -> StopFilter -> SynonymFilter ->\nIndexer.\n\nEach stage \"sees\" a frozen namespace of attr bindings as its input;\nthese attrs are all read-only from its standpoint.  Then, it writes to\nan \"output namespace\", which is read/write, eg it can add new attrs,\nremove attrs from its input, change the values of attrs.  If that\nstage doesn't alter a given attr it \"passes through\", unchanged.\n\nThis would be an enormous change to how attrs are managed... so this\nis very very exploratory at this point.  Once we decouple indexer from\nanalysis, creating such an alternate chain should be possible \u2013 it'd\nat least be a good test that we've decoupled enough \n\nI think the idea offers some compelling improvements over the \"global\nread/write namespace\" (AttrFactory) approach we have today:\n\n\n\tInjection filters can be more efficient \u2013 they need not\n    capture/restoreState at all\n\n\n\n\n\tNo more need for the initial tokenizer to \"clear all attrs\" \u2013\n    each stage becomes responsible for clearing the attrs it \"owns\"\n\n\n\n\n\tYou can truly stack stages (vs having to make a custom\n    AttrFactory) \u2013 eg you could make a Bocu1 stage which can stack\n    onto any other stage.  It'd look up the CharTermAttr, remove it\n    from its output namespace, and add a BytesRefTermAttr.\n\n\n\n\n\tIndexer should be more efficient, in that it doesn't need to\n    re-get the attrs on each next() \u2013 it gets them up front, and\n    re-uses them.\n\n\n\nNote that in this model, the indexer itself is just another stage in\nthe pipeline, so you could do some wild things like use 2 indexer\nstages (writing to different indexes, or maybe the same index but\nsomehow with further processing or something).\n\nAlso, in this approach, the analysis chain is more informed about the\nwhat each stage is allowed to change, up front after the chain is\ncreated.  EG (say) we will know that only 2 stages write to the term\nattr, and that only 1 writes posIncr/offset attrs, etc.  Not sure\nif/how this helps us... but it's more strongly typed than what we have\ntoday.\n\nI think we could use a similar chain for processing a document at the\nfield level, ie, different stages could add/remove/change different\nfields in the doc....",
+    "attachments": {
+        "LUCENE-2450.patch": "https://issues.apache.org/jira/secure/attachment/12444140/LUCENE-2450.patch",
+        "pipeline.py": "https://issues.apache.org/jira/secure/attachment/12443959/pipeline.py"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-05-07T12:40:39+0000",
+            "content": "Attached patch.\n\nRun it like this: python pipeline.py, and it analyzes the silly\nsentence \"this is a test of the emergency broadcast system\", producing\nthis output:\n\n\nTERM=test pos=3\nTERM=emergency pos=6\nTERM=911 pos=6\nTERM=broadcast pos=7\nTERM=television pos=7\nTERM=tv pos=7\nTERM=system pos=8\n\ndone!\n\n\n\nIt's very much just a prototype \u2013 I cheat in certain places (eg I\ndon't have strongly typed attrs, just a single Anything class) \u2013 but\nthe gist of the idea is visible. ",
+            "author": "Michael McCandless",
+            "id": "comment-12865127"
+        },
+        {
+            "date": "2010-05-07T13:36:27+0000",
+            "content": "I think that's a very interesting idea Mike !\n\nIndeed, some Attributes (or I'll risk saying many attributes) are read-only. Most of the filters operate on the TermAttribute, but only few (none?) change the Offset, Position etc. Also, custom Attributes are more than likely to be read-only as usually only special, custom, filters handle them. I assume that capturing/restoring a state is not a no-op, and for large analysis pipelines might incur unnecessary overhead for many attributes. Besides the (possible) performance gain, this might simplify how atts are handled today by custom code - once a token has been produced by the Tokenizer, its position is pretty much determined. It's usually changed by filters like stw-filter etc., but usually there's only one such filter in the chain.\n\nI've tried to read your python script, but w/o much success (and it's not the script to blame ). I'll wait for a more concrete Java example  ",
+            "author": "Shai Erera",
+            "id": "comment-12865150"
+        },
+        {
+            "date": "2010-05-07T15:09:18+0000",
+            "content": "TokenFilters that need to capture & restore state should also be more efficient, since they only need to capture attrs \"live\" at their point in the pipeline.  Ie, the attrs added by future stages in the pipeline are not visible to it and don't need to be captured.\n\nAlso, when custom attrs are added to the pipeline solely for communication b/w stages, the consuming stage can remove the attr from the namespace of all stages after it. ",
+            "author": "Michael McCandless",
+            "id": "comment-12865192"
+        },
+        {
+            "date": "2010-05-10T19:31:51+0000",
+            "content": "OK I ported it (roughly) to Java \u2013 gonna need some serious Uwe help to get the generics right \n\nI also made a simplistic example (TestStages)... it just analyzes a canned sentence (same from above) using WhitespaceTokenizer, LowercaseFilter, StopFilter, SynonymFilter (borrowed from LIA2), all converted from TokenStream to Stage, the class that impls a single stage of the pipeline.\n\nThat test also does a simplistic perf test \u2013 analyzing that canned text many times with that pipeline \u2013 the write-once attr bindings gets ~9% speedup. ",
+            "author": "Michael McCandless",
+            "id": "comment-12865887"
+        },
+        {
+            "date": "2010-05-10T19:56:36+0000",
+            "content": "Another benefit of the stage model: you can just stack stages onto the\nend of an existing pipeline to change things up.\n\nIe, you don't need to \"own\" the AttrFactory of the whole chain, eg to\nmake sure certain specific impls are used for certain attrs.\n\nIf you want/need a different attr impl, the stage just removes the\nlast one and binds its own impl \u2013 every stage has full freedom to\nalter the attr bindings visible to stages after it. ",
+            "author": "Michael McCandless",
+            "id": "comment-12865896"
+        },
+        {
+            "date": "2010-05-13T10:23:29+0000",
+            "content": "This sounds interesting, currently i only see problems with multi-interface attr implementations, but we can simply drop them for trunk. I have to go through the patch and understand more how it is intended to work. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12867104"
+        },
+        {
+            "date": "2010-05-13T10:25:14+0000",
+            "content": "New patch attached.\n\nThis patch adds a new pipeline stage called AppendingStage.  You\nprovide it multiple things to analyze (currently as a String[], but we\ncan generalize that), and it will step through them one at a time,\nlogically appending their tokens.\n\nYou also give it posIncrGap and offsetGap, which it adds in on\nswitching to the next field.\n\nI think this is a compelling way to handle fields with multiple\nvalues, and it can make our \"decouple indexing from analysis\" even\nstronger.\n\nIe, today indexer is hardwired to call analyzer's\ngetPositionIncrementGap/getOffsetGap.\n\nBut with this AppendingStage approach, how multi-valued fields are\nappended is purely an analysis detail, hidden to the indexer.  EG you\ncould make a stage that inserts some kind of marker token on each\nfield transition, instead.  And since it's a fully pluggable stage,\nyou're free to move it anywhere (beginning, middle, end) in your\npipeline. ",
+            "author": "Michael McCandless",
+            "id": "comment-12867105"
+        },
+        {
+            "date": "2010-10-04T19:39:05+0000",
+            "content": "What are our thoughts on devising a plan to move forward with this?\n\nCan we produce a \"not-so-sophisticated\" backwards layer for our existing attributes model?\nI think such a thing could really propel this forwards, for example we wouldn't need to deprecate the\nexisting APIs necessarily, or maybe over time, but we could at least offer an alternative.\n\nAt first when looking at this, admittedly I was a bit skeptical, but the more I think about it the more I like it.\n\nThere are big traps in the existing model, for example clearAttributes! I think pretty much every analysis\ncomponent that isn't in lucene itself that I've checked doesn't do this one right... and I'm talking simple \nones (not ones that use context, etc)\n\nI think in the short term we need to at least consider implementing LUCENE-2609 as an immediate solution\nfor the deficiencies in our current analysis system... in other words provide a toolkit for users who want\nto write their own analysis components, to test them easily and avoid these traps.\n\nBut i'm starting to think this model is also more natural, and would make it easier for users to write their\nown analysis components without having bugs... we are supposed to be a library and I think this is too\nhard at the moment.\n\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-12917727"
+        },
+        {
+            "date": "2016-11-16T14:04:07+0000",
+            "content": "I really like the ideas here!  It would make capture/restore cheaper.  Some filters like WordDelimiterFilter don't use capture/restore, I think, in the name of efficiency but then it only knows about some built-in attributes, not custom ones people add.  The heavy-weight aspect of capture/restore is my main beef with the current design. ",
+            "author": "David Smiley",
+            "id": "comment-15670481"
+        }
+    ]
+}

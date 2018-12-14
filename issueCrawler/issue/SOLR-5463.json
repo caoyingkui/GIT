@@ -1,0 +1,441 @@
+{
+    "id": "SOLR-5463",
+    "title": "Provide cursor/token based \"searchAfter\" support that works with arbitrary sorting (ie: \"deep paging\")",
+    "details": {
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.7",
+            "6.0"
+        ],
+        "components": [],
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "I'd like to revist a solution to the problem of \"deep paging\" in Solr, leveraging an HTTP based API similar to how IndexSearcher.searchAfter works at the lucene level: require the clients to provide back a token indicating the sort values of the last document seen on the previous \"page\".  This is similar to the \"cursor\" model I've seen in several other REST APIs that support \"pagnation\" over a large sets of results (notable the twitter API and it's \"since_id\" param) except that we'll want something that works with arbitrary multi-level sort critera that can be either ascending or descending.\n\nSOLR-1726 laid some initial ground work here and was commited quite a while ago, but the key bit of argument parsing to leverage it was commented out due to some problems (see comments in that issue).  It's also somewhat out of date at this point: at the time it was commited, IndexSearcher only supported searchAfter for simple scores, not arbitrary field sorts; and the params added in SOLR-1726 suffer from this limitation as well.\n\n\u2014\n\nI think it would make sense to start fresh with a new issue with a focus on ensuring that we have deep paging which:\n\n\n\tsupports arbitrary field sorts in addition to sorting by score\n\tworks in distributed mode\n\n\n\nBasic Usage\n\n\tsend a request with sort=X&start=0&rows=N&cursorMark=*\n\t\n\t\tsort can be anything, but must include the uniqueKey field (as a tie breaker)\n\t\t\"N\" can be any number you want per page\n\t\tstart must be \"0\"\n\t\t\"*\" denotes you want to use a cursor starting at the beginning mark\n\t\n\t\n\tparse the response body and extract the (String) nextCursorMark value\n\tReplace the \"*\" value in your initial request params with the nextCursorMark value from the response in the subsequent request\n\trepeat until the nextCursorMark value stops changing, or you have collected as many docs as you need",
+    "attachments": {
+        "SOLR-5463__straw_man__MissingStringLastComparatorSource.patch": "https://issues.apache.org/jira/secure/attachment/12618961/SOLR-5463__straw_man__MissingStringLastComparatorSource.patch",
+        "SOLR-5463-randomized-faceting-test.patch": "https://issues.apache.org/jira/secure/attachment/12622664/SOLR-5463-randomized-faceting-test.patch",
+        "SOLR-5463__straw_man.patch": "https://issues.apache.org/jira/secure/attachment/12615352/SOLR-5463__straw_man.patch",
+        "SOLR-5463.patch": "https://issues.apache.org/jira/secure/attachment/12618721/SOLR-5463.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Hoss Man",
+            "id": "comment-13826056",
+            "date": "2013-11-19T01:33:57+0000",
+            "content": "\nI've been reading up on the internals of IndexSearcher.searchAfter and the associated PagingFieldCollector used (as well as some of the problems encountered in SOLR-1726) and I'm not convinced it could be a slam dunk to try and use them directly in Solr:\n\n\n\tIndexSearcher.searchAfter/PagingFieldCollector relies on the \"client\" (ie: Solr) passing back the FieldDoc of the last doc returned, and has expectations that the (lucene) docid contained in that FieldDoc will be meaningful\n\t\n\t\tWe could perhaps serialize a representation of the \"last\" FieldDoc to include the the response of each request, and the deserialize that into a suitable imposter object on the \"searchAfter\" request \u2013 but there is still the problem of the internal docid which will be missleading in a multishard distributed solr setup)\n\t\n\t\n\tThere are a varity of code paths in SolrIndexSearcher for executing searches and it's not immediately obvious (to me) if/when it would make sense to augment each of those paths with PagingFieldCollector  (see yonik's comment in SOLR-1726 about faceting).\n\n\n\nWith that in mind, the approach i'm going to pursue (largely for my own sanity) is:\n\n\n\tAttempt a minimally invasive straw man implimentation of \"searchAfter\" type functionality that works in distributed mode \u2013 ideally w/o modifying any existing Solr code.\n\tUse this straw man implementation to sanity check that the end user API is useful\n\tBuild up good comprehensive (passing) tests against this straw man\n\tcircle back and revisit the implementation details looking for oportunities to:\n\t\n\t\trefactor to eliminate similar code duplication\n\t\timprove performance\n\t\n\t\n\n\n\nMy current idea is to implement this straw man solution using a new SearchComponent that would run after QueryComponent, along hte lines of...\n\n\n\tprepare:\n\t\n\t\tNo-Op unless \"searchAfter\" param is specified\n\t\t\n\t\t\tUse some marker value to mean \"first page\"\n\t\t\n\t\t\n\t\tassert that start==0 (doesn't make sense when using searchAfter)\n\t\tassert that uniqueKey is one of the sort fields (to ensure consistent ordering)\n\t\tif searchAfter param value indicates this is not the first request:\n\t\t\n\t\t\tdeserialize the token it into a list of sort values\n\t\t\tadd a new PostFilter that restricts to documents based on those values and the sort directions (same basic logic as PagingFieldCollector)\n\t\t\n\t\t\n\t\n\t\n\tprocess:\n\t\n\t\tNo-Op unless \"searchAfter\" param is specified\n\t\tdo nothing if this is a shard request\n\t\tfor regular old single node solr requests: serialize the sort values of the last doc in the Doc List (that QueryComponent has already built) and put it in the response as the \"next\" searchAfter token\n\t\n\t\n\tfinishStage:\n\t\n\t\tNo-Op unless \"searchAfter\" param is specified and stage is \"DONE\"\n\t\tserialize the sort values of the last doc in the Doc List (that QueryComponent already merged) and put it in the response as the \"next\" searchAfter token\n\t\n\t\n\n\n\n "
+        },
+        {
+            "author": "Robert Muir",
+            "id": "comment-13827064",
+            "date": "2013-11-19T23:04:56+0000",
+            "content": "\nWe could perhaps serialize a representation of the \"last\" FieldDoc to include the the response of each request, and the deserialize that into a suitable imposter object on the \"searchAfter\" request \u2013 but there is still the problem of the internal docid which will be missleading in a multishard distributed solr setup)\n\nI disagree. The fieldDoc only contains the values that were sorted on. This is what is minimal and necessary to do paging \n\nIf solr wants to avoid lucene docids for some reason (e.g. because it does not yet implement searcher leases), then perhaps when using this feature (at least for now) the uniqueid should always be added as a tiebreak to the sort. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13830092",
+            "date": "2013-11-22T16:31:54+0000",
+            "content": "I disagree. The fieldDoc only contains the values that were sorted on. This is what is minimal and necessary to do paging\n\nFieldDoc subclasses ScoreDoc which includes the internal docid \u2013 and PagingFieldCollector does look at it.  But as you say: as long as we include uniqueKey in the fields (which i already mentioned) then the docid in the FieldDoc shouldn't matter since (i think?) it's only used as a tie breaker.\n\nIf solr wants to avoid lucene docids for some reason (e.g. because it does not yet implement searcher leases) ...\n\nI'm glad you brought up searcher leases, because i wanted to mention it before but i forgot...\n\n\n\tI have no idea how to even try to implement searcher leases in a sane way in a distribted solr setup, given that we want clients to be able to hit any replica on subsequent requests.\n\tFor my use cases, I actively do NOT want a searcher lease when doing deep paging: if documents matching my searcher, but on high pages i have not loaded yet, get deleted from the index, i don't want them included in the results once i get to that page just because they were a match X minutes ago when my search started.\n\n\n\nI think what makes the most sense is to ensure we can support deep paging w/o searcher leases, and then if/when searcher leases are supported people who want both can have both.\n\n\n\nI'm attaching my current progress with a straw man impl + tests.  It includes the basic functionality & tests for doing deep paging on a single node solr setup using numeric sorts.\n\nThere are an absurd number of nocommits in this patch: most of them are in the impl and i'm not worried about them because im hoping the impl can ultimately be thrown out; some are in the test because of additional tests i want to write; some are in the test because of silly limitations in the impl.\n\nOnly one class of nocommits really concerns me at this point and that's the issue of dealing with String sorts \u2013 the way Solr's distributed sorting code deals with fields that use SortField.Type.STRING (and presumably SolrTield.Type.STRING_VAL) results in the coordinator node having a String object even though the underlying FieldComparator expects/uses BytesRef as the comparison value.  \n\nI could probably hack arround this, and convert the Strings back to BytesRef myself in the DeepPaging code \u2013 but this actually smells like a more fundamental problem we should address.  It seems to be the same root problem that sarowe has been looking into in SOLR-5354 in order to play nicer with custom FieldTypes: safely \"serializing\" the true sort object (regardless of what it is) between shards->coordinator, and then deserializing it & using the real FieldComparator for each field to do the aggregated sorting of the docs from each shard.\n\n\n\nIn any case, my next step is to get a some distributed tests setup and working against this straw man impl, and then dig into throwing away the straw man impl and trying to replace it with PagingFieldCollector \u2013 posibly with a side diversion to help sarowe fix the underlying problems in SOLR-5354 first. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13833325",
+            "date": "2013-11-27T01:39:37+0000",
+            "content": "updated the straw man to included distributed search support.\n\nI still want to beef up the randomized testing some more before moving on to replacing the straw man with a lower level impl using the PagingCollector "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13834381",
+            "date": "2013-11-28T00:13:33+0000",
+            "content": "Added simple support for sorts involving score, and added randomized testing of multi-level sorts, both in single node and distributed modes.\n\nnext up i'm going to look into improving the serialization of the totem to make it work better with strings and CUSTOM SortFields \u2013 which requires leveraging the improvements sarowe is working on in SOLR-5354. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13838307",
+            "date": "2013-12-03T23:14:12+0000",
+            "content": "The totem serialization now takes advantage of the work done in SOLR-5354 so that searchAfter now plays nice with basic string sorting and custom sort functions.  \n\nOne limitation i uncovered however is that MissingStringLastComparatorSource (which ironically is used by both sortMissingLast and sortMissingFirst) throws UsupOpEx for a large number of it's methods, which makes it impossible to use to filter out docs that are \"before\" the searchAfter totem.  It should be fixable, but i've punted on this for now. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13838490",
+            "date": "2013-12-04T01:58:59+0000",
+            "content": "Whoops ... last patch was stale and didn't have the randomized string fields for testing. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13841530",
+            "date": "2013-12-06T18:43:53+0000",
+            "content": "Patch update...\n\n\n\tadditional tests that mix deletes & updates with walking a cursor\n\tmore randomization of the types of queries being run\n\tmore hardening of the SearchAfterTotem class (it should be useful beyond the strawman)\n\tmore tests for the SearchAfterTotem serialization\n\tmore tests of bad input/usage\n\thook strawman component into example to try it out\n\n\n\n...at this point i was going to pursue tweaking the user facing API a bit, so that the \"next\" totem was never null, it always corrisponds to the last doc returned, and clients would check for 0 docs coming back to know when they are \"done\" and the \"next\" totem returned would be the same as the one they sent.  If we do this, usecases like \"i want every doc matching this query, and if there are no more, i want to remember where i left off and contiue again later\" would be possible if the client uses a compatible sort (ie: a timestamp field)\n\nHowever.... when manually using this with the example configs in order to sanity check that that was going to feel right as an API, i discovered problems where the queryResultCache was coming into play and never getting past \"page\" 3.  I felt stupid for not thinking to test this earlier, and updated the test configs to include queryResultCache, but i can't reproduce with a failure ... still not sure why.\n\nNeed to investigate this further before doing anything else. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13841598",
+            "date": "2013-12-06T19:46:04+0000",
+            "content": "However.... when manually using this with the example configs in order to sanity check that that was going to feel right as an API, i discovered problems where the queryResultCache was coming into play and never getting past \"page\" 3. I felt stupid for not thinking to test this earlier, and updated the test configs to include queryResultCache, but i can't reproduce with a failure ... still not sure why.\n\nAll the new tests pass for me with the latest patch.\n\nI'm never getting past \"page\" 2 (rather than 3) - searchAfter=<the page 2 totem> returns the same totem, along with the same page 2 results. \n\nMaybe not unexpected, but when I commented out <<queryResultWindowSize>20</queryResultWindowSize> and set <queryResultMaxDocsCached> to a number smaller than the rows param, I can get past page 2 - success getting as far as page 5, in fact.\n\nSeems like the queryResultCache isn't paying attention to all query params?  (I don't know the code myself.) From solrconfig.xml - a literal reading is that only the q, sort, start and rows params are taken into consideration:\n\n\n    <!-- Query Result Cache\n         \n         Caches results of searches - ordered lists of document ids\n         (DocList) based on a query, a sort, and the range of documents requested.  \n      -->\n\n "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13841635",
+            "date": "2013-12-06T20:03:58+0000",
+            "content": "I'm never getting past \"page\" 2 (rather than 3) - searchAfter=<the page 2 totem> returns the same totem, along with the same page 2 results. \n\nI was wrong - I wasn't including page 1 (searchAfter=*) in the page count - searchAfter=<the page 3 totem> returns itself for me.\n\nAlso, if it were the case that the queryResultCache were ignoring the searchAfter param, then pages 2 and 3 would return the same results as the first page, which is not the case...\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13841715",
+            "date": "2013-12-06T21:13:49+0000",
+            "content": "All the new tests pass for me with the latest patch.\n\nRight, i may not have been clear before but the problem that confuses me is: Even with queryResultCaching enabled in the tests, they pass \u2013 and do not exhibit the same problems i'm seeing when manually using searchAfter with the example configs.\n\nAlso, if it were the case that the queryResultCache were ignoring the searchAfter param, then pages 2 and 3 would return the same results as the first page, which is not the case...\n\nWhen searchAfter=* is used, the search itself is no differnet then a regular query, it can be cached, or re-used from an existing cached query \u2013 the only thing special that happens is that the DeepPagingComponent knows it needs to compute the \"nextSearchAfter\" totem.  Once you request \"page #2\" (with a searchAfter other then \"*\", then a PostFilter is used, and you can see from the cache stats that it's not considered a hit on the initial query \u2013 so far so good, but as you mentioned \"page #3\" is where we start to see the same data as page #2 returned because it's a \"cache hit\".\n\nIt would not suprise me at all if there is a bug in my DeepPagingComponent that was causing caching to be used when it shouldn't be (even though i think i did everything right in the PostFilter) ... what suprises me is how easy it is to reproduce manually, but how hard it is to reproduce in the automated tests. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13841825",
+            "date": "2013-12-06T22:43:01+0000",
+            "content": "Ah, HA!\n\nThe reason the tests weren't failing is because i was an idiot and hadn't configured the queryResultCache properly in the test configs.\n\nnow that i've made the tests fail, i can finally start trying to figure out why the tests fail. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13841831",
+            "date": "2013-12-06T22:47:13+0000",
+            "content": "i was an idiot and hadn't configured the queryResultCache properly in the test configs.\n\naha - no wrapping <query> tags... yeah when I add that, boom, failures  "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13841929",
+            "date": "2013-12-07T00:17:16+0000",
+            "content": "cause of caching bug was trivially silly...\n\nI hadn't bothered implementing hashCode or equals on the PostFilter used in the straw man because:\n\n\tI implemented it to always return \"false\" from \"getCache()\" so Solr should never try to cache them anyways\n\tI figured the Object base impls (based on Object identity) would be fine in any cases where they might get called.\n...forgetting that...\n\teven though my PostFilters were never getting cached, they were still getting used as part of the QueryResultCache key for the main query\n\tThe Query class overrides Object's hashCode & equals to compare boosts, and my PostFilter class was inheriting that w/o augmenting it \u2013 so instances of my PostFilter were all being treated a equal\n\n\n\nEverything works as expected now with caching enabled, and all tests pass. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13843681",
+            "date": "2013-12-09T23:20:50+0000",
+            "content": "Ok, updated patch making the change in user semantics I mentioned wanting to try last week.  Best way to explain it is with a walk through of a simple example (note: if you try the current strawman code, the \"numFound\" and \"start\" values returned in the docList don't match what i've pasted in the examples below \u2013 these examples show what the final results should look like in the finished solution)\n\nInitial requests using searchAfter should always start with a totem value of \"*\"\n\nhttp://localhost:8983/solr/deep?q=*:*&rows=20&sort=id+desc&searchAfter=*\n{\n  \"responseHeader\":{\n    \"status\":0,\n    \"QTime\":2},\n  \"response\":{\"numFound\":32,\"start\":-1,\"docs\":[\n      // ...20 docs here...\n    ]\n  },\n  \"nextSearchAfter\":\"AoEjTk9L\"}\n\n\n\nThe nextSearchAfter token returned by this request tells us what to use in the second request...\n\nhttp://localhost:8983/solr/deep?q=*:*&rows=20&sort=id+desc&searchAfter=AoEjTk9L\n{\n  \"responseHeader\":{\n    \"status\":0,\n    \"QTime\":7},\n  \"response\":{\"numFound\":32,\"start\":-1,\"docs\":[\n      // ...12 docs here...\n    ]\n  },\n  \"nextSearchAfter\":\"AoEoMDU3OUIwMDI=\"}\n\n\n\nSince this result block contains fewer rows then were requested, the client could automatically stop, but the nextSearchAfter is still returned, and it's still safe to request a subsequent page (this is the fundemental diff from the previous patches, where nextSearchAfter was set to null anytime the code could tell there were no more results ...\n\nhttp://localhost:8983/solr/deep?q=*:*&wt=json&indent=true&rows=20&fl=id,price&sort=id+desc&searchAfter=AoEoMDU3OUIwMDI=\n{\n  \"responseHeader\":{\n    \"status\":0,\n    \"QTime\":1},\n  \"response\":{\"numFound\":32,\"start\":-1,\"docs\":[]\n  },\n  \"nextSearchAfter\":\"AoEoMDU3OUIwMDI=\"}\n\n\n\nNote that in this case, with no docs included in the response, the nextSearchAfter totem is the same as the input.\n\nFor some sorts this makes it possible for clients to \"resume\" a full walk of all documents matching a query \u2013 picking up where they let off if more documents are added to the index that match (for example: when doing an ascending sort on a numeric uniqueKey field that always increases as new docs are added, sorting by a timestamp field (asc) indicating when documents are crawled, etc...)\n\nThis also works as you would expect for searches that don't match any documents...\n\nhttp://localhost:8983/solr/deep?q=text:bogus&rows=20&sort=id+desc&searchAfter=*\n{\n  \"responseHeader\":{\n    \"status\":0,\n    \"QTime\":21},\n  \"response\":{\"numFound\":0,\"start\":-1,\"docs\":[]\n  },\n  \"nextSearchAfter\":\"*\"}\n\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13843687",
+            "date": "2013-12-09T23:30:11+0000",
+            "content": "The one significant change i still want to make before abandoming this straw man and moving on to using PaginatingCollector under the covers is to rethink the vocabulary.\n\nat the Lucene/IndexSearcher level, this functionality is leveraged using a \"searchAfter\" param which indicates the exact \"FieldDoc\" returned by a previous search.  The name makes a lot of sense in this API given that the FieldDoc you specify is expected to come from a previous search, and you are specifying that you want to \"search for documents after this document\" in the ocntext of the specified query/sort.\n\nFor the Solr request API however, I feel like this terminology might confuse people.  I'm concerned people might think they can use the uniqueKey of the last document they got on the previous page (instead of realizing they need to specify the special token they were returned as part of that page).\n\nMy thinking is that from a user perspective, we should call this functionality a \"Result Cursor\" and rename the request param and response key appropriately. something along the lines of...\n\nhttp://localhost:8983/solr/deep?q=*:*&rows=20&sort=id+desc&cursor=AoEjTk9L\n{\n  \"responseHeader\":{\n    \"status\":0,\n    \"QTime\":7},\n  \"response\":{\"numFound\":32,\"start\":-1,\"docs\":[\n      // ... docs here...\n    ]\n  },\n  \"cursorContinue\":\"AoEoMDU3OUIwMDI=\"}\n\n\n\n\n\tsearchAfter => cursor\n\tnextSearchAfter => cursorContinue\n\n\n\nWhat do folks think? "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13843748",
+            "date": "2013-12-10T00:16:41+0000",
+            "content": "\n\n\tsearchAfter => cursor\n\tnextSearchAfter => cursorContinue\n\n\n\n+1\n\nI'm concerned people might think they can use the uniqueKey of the last document they got on the previous page\n\nI tried making this mistake (using the trailing unique id (\"NOK\" in this example) as the searchAfter param value, and I got the following error message:\n\n\n{\n  \"responseHeader\":{\n    \"status\":400,\n    \"QTime\":2},\n  \"error\":{\n    \"msg\":\"Unable to parse search after totem: NOK\",\n    \"code\":400}}\n\n\n\n(edit: cursorContinue => cursor in the sentence below)\n\nI think that error message should include the param name (cursor) that couldn't be parsed.\n\nAlso, maybe it would be useful to include a prefix that will (probably) never be used in unique ids, to visually identify the cursor as such: like always prepending '*'?  So your example of the future would become:\n\nhttp://localhost:8983/solr/deep?q=*:*&rows=20&sort=id+desc&cursor=*AoEjTk9L\n{\n  \"responseHeader\":{\n    \"status\":0,\n    \"QTime\":7},\n  \"response\":{\"numFound\":32,\"start\":-1,\"docs\":[\n      // ... docs here...\n    ]\n  },\n  \"cursorContinue\":\"*AoEoMDU3OUIwMDI=\"}\n\n\n\nThe error message when someone gives an unparseable cursor could then include this piece of information: \"cursors begin with an asterisk\". "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13843774",
+            "date": "2013-12-10T00:48:33+0000",
+            "content": "Another idea about the cursor: the Base64-encoded text is used verbatim, including the trailing padding '=' characters - these could be stripped out for external use (since they're there just to make the string length divisible by four), and then added back before Base64-decoding.  In a URL non-metacharacter '='-s look weird, since they're already used to separate param names and values. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13844820",
+            "date": "2013-12-10T23:36:23+0000",
+            "content": "I think that error message should include the param name (cursor) that couldn't be parsed.\n\nAgreed ... the current error text is basically just a placeholder, ideally it should be something like...\n\n\nUnable to parse cursor param: value must either be '*' or the cursorContinue value from a previous search: NOK\n\n\n\nAlso, maybe it would be useful to include a prefix that will (probably) never be used in unique ids, to visually identify the cursor as such: like always perpending '*'?\n\nHmmm, I'm not sure if that's really worth the added bytes & parsing. \n\nIf folks really felt like the param name should be \"searchAfter\" then i could certainly see the value in having some clear prefix, since the param name might lead folks to assuming they know what hte input should be; but with \"cursor\" i don't think we need to worry as much about people assuming they know what to put there, and with a clear error message instructing people how to get a valid cursor (from cursorContinue), that seems good enough. (right?)\n\nthe Base64-encoded text is used verbatim, including the trailing padding '=' characters - these could be stripped out for external use (since they're there just to make the string length divisible by four), and then added back before Base64-decoding. In a URL non-metacharacter '='-s look weird, since they're already used to separate param names and values.\n\nInteresting idea ... again: i'm not sure how i feel about the added overhead to the parsing just to shorten the totem \u2013 especially since clients will always need to safely url encode anyway since Base64 strings can also include \"+\"\n\nHowever....  \n\nIn the current patch, I used the base64 utility class Solr already had (used by BinaryField and a few other places).  But your suggestion reminds me that commons codec's Base64 class (jar already used by solr) supports a \"url safe\" variant of base64 (which looks like it's defined in RFC 4648?)...\n\nhttps://commons.apache.org/proper/commons-codec/javadocs/api-release/org/apache/commons/codec/binary/Base64.html#encodeBase64URLSafeString(byte[])\n\n...something to consider.\n\n\n\nOne other comment i got from a coworker offline was why I liked cursorContinue instead of nextCursor or cursorNext.  My thinking was that since 'cursor', (as a concept) is a noun, \"next cursor\" might suggest that it was a (different) cursor then the one currently in use.  I don't want people to think these strings are names of cursors, and they re-use the same name until they are done with it.  I want to make it clear that to continue fetching results from this cursor, you have to specify the new value.\n\nWould \"cursorAdvance\" convey that better then cursorContinue ? "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13844831",
+            "date": "2013-12-10T23:50:04+0000",
+            "content": "\nIn the current patch, I used the base64 utility class Solr already had (used by BinaryField and a few other places). But your suggestion reminds me that commons codec's Base64 class (jar already used by solr) supports a \"url safe\" variant of base64 (which looks like it's defined in RFC 4648?)...\n[https://commons.apache.org/proper/commons-codec/javadocs/api-release/org/apache/commons/codec/binary/Base64.html#encodeBase64URLSafeString(byte[])]\n\nI forgot to mention that the \"url safe\" variant was discussed on the issue where the Base64 utility class was introduced: SOLR-1116, and if I understand correctly, people thought the \"url safe\" variant wasn't necessary, since all modern browsers accept URLs with embedded standard Base64. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13844861",
+            "date": "2013-12-11T00:24:10+0000",
+            "content": "\nOne other comment i got from a coworker offline was why I liked cursorContinue instead of nextCursor or cursorNext. My thinking was that since 'cursor', (as a concept) is a noun, \"next cursor\" might suggest that it was a (different) cursor then the one currently in use. I don't want people to think these strings are names of cursors, and they re-use the same name until they are done with it. I want to make it clear that to continue fetching results from this cursor, you have to specify the new value.\n\nWould \"cursorAdvance\" convey that better then cursorContinue ?\n\nYou want to convey a (resumption) position in a result sequence.  A cursor is not itself a position; it's a movable pointer to a position.  The value of the cursor param is not the cursor itself; rather, it's the position from which to resume iterating over a result sequence.\n\nThe problem as I see it is that the cursor itself has to be anonymous, since the implementation stores no server-side state; passing in an opaque label thus is not possible.  So you're asking people to understand that they're moving a thing-that-can't-have-a-fixed-label, and that's cognitively dissonant.\n\nMaybe \"continuation\"/\"nextContinuation\" or \"continue\"/\"nextContinue\" or \"pos\"/\"nextPos\"?  (I don't love any of them.) "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13845588",
+            "date": "2013-12-11T18:03:40+0000",
+            "content": "Maybe \"continuation\"/\"nextContinuation\" or \"continue\"/\"nextContinue\" or \"pos\"/\"nextPos\"? (I don't love any of them.)\n\nOf all the ideas so far, i dislike cursor & cursorAdvance the least of all.\n\nBut i think you're on to something here...\n\nYou want to convey a (resumption) position in a result sequence. A cursor is not itself a position; it's a movable pointer to a position. The value of the cursor param is not the cursor itself; rather, it's the position from which to resume iterating over a result sequence.\n\nPerhaps the key here is to pick a param name that makes it clear it's not a \"cursor name\" is a \"position along the progression of a cursor\" ... things like cursorPosition, cursorPoint, and cursorValue seems like they could all easily suffer the same confusion as searchAfter .. but perhaps we could find a suitable \"attribute\" qualifier on cursor that is more clearly and obviously disjoint from something the user might think they can define on their own?\n\n\n\tcursorMark / nextCursorMark\n\tcursorPhase / nextCursorPhase\n\tcursorToken / nextCursorToken\n\tcursorPosToken / nextCursorPosToken\n\n\n\nAny of this sounding resoundingly better then the existing ideas to anyone?  I think my new favorite is cursorMark / nextCursorMark ... they seem suitably abstract that people won't try to presume they know what they mean. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-13845606",
+            "date": "2013-12-11T18:30:43+0000",
+            "content": "Nice work thus far Hoss!\n\nFWIW I dislike using the word \"token\" as it might be mistakenly associated with text analysis.  I suggest cursorKey. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13845616",
+            "date": "2013-12-11T18:38:24+0000",
+            "content": "FWIW I dislike using the word \"token\" as it might be mistakenly associated with text analysis.\n\nGreat point.\n\nI suggest cursorKey.\n\nI'm concerned that people might read that with the same implied assumptions that we've been worried about with \"cursor\" \u2013 that it's a \"cursor name\" or \"cursor identifier\" that tey can define on their own and/or should reuse in subsequent requests. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13845618",
+            "date": "2013-12-11T18:39:52+0000",
+            "content": "I think my new favorite is cursorMark / nextCursorMark\n\n+1\n\nI suggest cursorKey.\n\nI like \"mark\" better than \"key\", since in addition to conveying that it's a sign/symbol for something else (as \"key\" does), it also has a positional meaning.  And  it does both those things without inviting people to use unique ids in their place. "
+        },
+        {
+            "author": "Bill Bell",
+            "id": "comment-13845882",
+            "date": "2013-12-12T00:08:57+0000",
+            "content": "How does this work across slaves? Won't we need to have set a sticky session - or are you hashing the key for the slaves? "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13846473",
+            "date": "2013-12-12T17:26:24+0000",
+            "content": "How does this work across slaves? Won't we need to have set a sticky session - or are you hashing the key for the slaves?\n\nNope.  all of the information needed (the sort values to \"search after\") is encoded in the totem string. So in multi node setups (either simple replication or multi-replica SolrClouds) no request affinity is needed.\n\n\n\nFYI: I've posted a blog with some general discussion about the goals of this feature and some performance numbers based on the straw man implementation so far...\n\nhttp://searchhub.org/coming-soon-to-solr-efficient-cursor-based-iteration-of-large-result-sets/\n\n\n\nI'm going to move forward with one final straw man patch renaming everything to use the cursorMark / nextCursorMark convention discussed above, and then proceed with trying to throw out the straw man and integrate directly into SolrIndexSearcher using the PaginationCollector.\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13846932",
+            "date": "2013-12-12T23:50:55+0000",
+            "content": "Final strawman patch i plan to work on...\n\n\n\tSearchAfterTotem -> CursorMark\n\tDeepPagingTest -> CursorPagingTest\n\tTestDistribDeepPaging -> DistribCursorPagingTest\n\tsearchAfter -> cursorMark\n\tnextSearchAfter -> nextCursorMark\n\timproved javadocs\n\tCursorMark.toString -> CursorMark.getSerializedTotem\n\n\n\n...next up, throwing out DeepPagingComponent and hooking this logic directly into QueryComponent and SolrIdexSearcher (via  PaginationCollector) using the same tests. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13848064",
+            "date": "2013-12-13T23:35:22+0000",
+            "content": "Baby steps towards real solution.  This still has a DeepPagingComponent for doing setup & managing the sort values, but...\n\n\n\tGutted the vestigial remnants of SOLR-1726\n\treplaced CursorMark.getPagingFilter with CursorMark.getSearchAfterFieldDoc\n\tmade ResponseBuilder and QueryCommand keep track of a CursorMark\n\trefactored SolrIndexSearcher to add a buildTopDocsCollector helper\n\tmade buildTopDocsCollector aware of CursorMark.getSearchAfterFieldDoc\n\tadded test to ensure that the non-cachibility of the cursor query wouldn't affect the independent caching of the filter queries.\n\n\n "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13849681",
+            "date": "2013-12-16T20:18:15+0000",
+            "content": "(edit: fixed misspelled PaginationCollector -> PagingFieldCollector)\n\n One limitation i uncovered however is that MissingStringLastComparatorSource (which ironically is used by both sortMissingLast and sortMissingFirst) throws UsupOpEx for a large number of it's methods, which makes it impossible to use to filter out docs that are \"before\" the searchAfter totem. It should be fixable, but i've punted on this for now.\n\nI investigated this, and added an implementation for the only method that was needed (TermOrdValComparator_SML.compareDocToValues(int doc, Comparable docValue)).  The attached patch adds this implementation and uncomments the elements in schema-sorts.xml that Hoss commented out to get tests to pass, and assumes Hoss's most recent strawman patch has already been applied.  (I also tried converting the class to extend FieldComparator<BytesRef> instead of the current FieldComparator<Comparable>, but that causes TestDistributedGrouping to fail with a message about Integer not being castable to BytesRef - that's why I introduced an instanceof BytesRef check to convert the incoming value to BytesRef if necessary, via toString().) \n\nNOTE: this patch is not required by Hoss's latest (non-strawman) patch - when I uncomment the commented-out elements in schema-sorts.xml that triggered test failures in the strawman, all tests still pass, without this patch.  So I'm attaching the patch to this issue just for anybody who wants to try out the strawman implementation.\n\nI believe my patch is not needed in the latest non-strawman implementation because TermOrdValComparator_SML delegates to inner class AnyOrdComparator for per-segment sorting, and AnyOrdComparator has a functional implementation of compareDocToValues(); unlike the strawman implementation, the latest version invokes sorts on a per-segment basis, via PagingFieldCollector. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13849998",
+            "date": "2013-12-17T02:08:53+0000",
+            "content": "Small bits of progress (went down a bad fork in the road and got sidetracked with a bad idea)...\n\n\n\n\tre-enable missingLast test fields (thanks sarowe!)\n\trefactored (single node) next CursorMarker sort value extraction into SolrIndexSearcher\n\timproved tests based on things that occured to me as implementation changed\n\n\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13851150",
+            "date": "2013-12-18T00:20:57+0000",
+            "content": "DeepPagingComponent is dead, long live CursorMark!\n\nThis patch removes DeepPagingComponent completely, as all of the necessary functionality is now integrated nicely into various places of QueryComponent, ResponseBuilde, and SolrIndexSearcher.\n\nthere are still plenty of nocommits, but those are all mostly around test improvements and/or code paths that i want to give some more review before committing.\n\nI'm getting ready to go on vacation for a week+ so now is a really good time for people to take the patch for a spin and try out with their use cases (nudge, nudge) w/o needing to worry that i'll upload a new one as soon as they download it. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13852175",
+            "date": "2013-12-18T21:22:03+0000",
+            "content": "FYI: I've updated my previous blog with new graphs showing the improvements the current patch has over the (lazy) strawman...\n\nhttp://searchhub.org/2013/12/12/coming-soon-to-solr-efficient-cursor-based-iteration-of-large-result-sets/#update_2013_12_18 "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13854642",
+            "date": "2013-12-20T22:51:43+0000",
+            "content": "Hoss Man, I accidentally discovered that a blank cursorMark request param is ignored - is this intentional?  I ask because although CursorMark.parseSerializedTotem(\"\") throws an exception about the bad format of an empty totem, QueryComponent.prepare() ignores a blank cursorMark param:\n\n\nfinal String cursorStr = rb.req.getParams().get(CursorMark.CURSOR_MARK_PARAM,\"\");\nif (! StringUtils.isBlank(cursorStr) ) {\n  final CursorMark cursorMark = new CursorMark(rb.req.getSchema(),\n                                               rb.getSortSpec());\n  cursorMark.parseSerializedTotem(cursorStr);\n  rb.setCursorMark(cursorMark);\n}\n\n\n\nShouldn't this instead throw an exception when the param is present but has a blank value? Something like the following would allow parseSerializedTotem() to throw its exception for a blank cursorMark:\n\n\nfinal String cursorStr = rb.req.getParams().get(CursorMark.CURSOR_MARK_PARAM);\nif (null != cursorStr) {\n  final CursorMark cursorMark = new CursorMark(rb.req.getSchema(),\n                                               rb.getSortSpec());\n  cursorMark.parseSerializedTotem(cursorStr);\n  rb.setCursorMark(cursorMark);\n}\n\n\n "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13854732",
+            "date": "2013-12-21T01:19:58+0000",
+            "content": "Hoss Man, you have nocommits wondering what the value of start should be in returned results when using cursor functionality, e.g. from DistribCursorPagingTest.doSimpleTest():\n\n\n// assertStartAt(-1, results); // nocommit: what should start be? -1?\n\n\n\nWhat would be cool is if start could be the number of docs in previous pages.  PagingFieldCollector.collect() throws this info away now though. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13856498",
+            "date": "2013-12-25T00:29:54+0000",
+            "content": "I accidentally discovered that a blank cursorMark request param is ignored - is this intentional? I ask because although CursorMark.parseSerializedTotem(\"\") throws an exception about the bad format of an empty totem, QueryComponent.prepare() ignores a blank cursorMark param:\n\nYeah .. that was intentional.  My thinking was that from CursorMark's perspective, attempting to parse a null or blank string was not valid \u2013 but from QueryComponent's perspective, a null or blank string ment \"do not construct a CursorMark object at all\"\n\nthe basic motivation being that it didn't seem like it should be an error to have something like /select?q=foo&cursorMark=&... ... but i'm not adamant that it should work that way.\n\nIn fact, thinking about it more, and looking at how some other params (like start, rows, facet, etc...) deal with blank strings, i agree with you \u2013 it should be an error.\n\n\n\nWhat would be cool is if start could be the number of docs in previous pages.\nPagingFieldCollector.collect() throws this info away now though.\n\nYeah ... i was initially thinking that \"-1\" or some other marker value would be handy to help make it clear that they shouldn't infer any meaning from it when using a cursor \u2013 but then i realize that was probably more dangerous then just using \"0\" because at least then there was less risk of confusing off by 1 errors if they blindly use it in some context (but i forgot to remove those nocommit questions)\n\nif you can see an easy way to get the \"real\" number from PagingFieldCollector that might be handy too ... i'm not sure.\n\nI'm perfectly happy with a fixed value of 0 at the moment ... it could always be revisted in the future. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13859667",
+            "date": "2013-12-31T20:24:09+0000",
+            "content": "Patch with a few changes added onto Hoss's most recent patch.\n\n\nI accidentally discovered that a blank cursorMark request param is ignored - is this intentional? I ask because although CursorMark.parseSerializedTotem(\"\") throws an exception about the bad format of an empty totem, QueryComponent.prepare() ignores a blank cursorMark param:\nYeah .. that was intentional. My thinking was that from CursorMark's perspective, attempting to parse a null or blank string was not valid \u2013 but from QueryComponent's perspective, a null or blank string ment \"do not construct a CursorMark object at all\"\nthe basic motivation being that it didn't seem like it should be an error to have something like /select?q=foo&cursorMark=&... ... but i'm not adamant that it should work that way.\nIn fact, thinking about it more, and looking at how some other params (like start, rows, facet, etc...) deal with blank strings, i agree with you \u2013 it should be an error.\n\nI changed the behavior to make blank cursorMark params raise an error, and added a couple tests for it to CursorMarkTest.\n\nI fixed a few misspellings in comments, and removed a few unused imports.\n\nI added a new test TestCursorMarkWithoutUniqueKey.\n\nI substituted CURSOR_MARK_PARAM for \"cursorMark\", and CURSOR_MARK_START for \"*\" in CursorPagingTest. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13859803",
+            "date": "2014-01-01T00:34:18+0000",
+            "content": "More patch improvements..\n\n\tcleaned up the test nocommits related to the startAt value (for now it's just 0, sarowe opened LUCENE-5380 with his other idea, we can revist and change the cursor code/test later if/when that goes through)\n\tadded some comments regarding potential improvements via SOLR-5595\n\tcleaned up some nocommits that were acting as reminders of things i wanted to review later with fresh eyes\n\tconverted some nocommit asserts to clean user exceptions\n\tuser exception if attempting to combine cursor with timeAllowed (sarowe pointed this out to me in IRC: the nextCursorMark would make no sense)\n\tadded more tests for bad user input conditions\n\n\n\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13861009",
+            "date": "2014-01-03T00:31:33+0000",
+            "content": "Improvements in this patch...\n\n\n\tMoved cursor param constants to .commons.params.CursorMarkParams\n\tAdded QueryResponse.getNextCursorMark\n\tswitch cloud tests to use QueryResponse.getNextCursorMark\n\tfixed a small ordering inconsistency between the single core response and the cloud response\n\tfix TestCursorMarkWithoutUniqueKey's lifecycle so it plays nicely with multiple run\n\tadd a custom sorting field type into the tests, leveraging sarowe's work in SOLR-5354\n\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13862159",
+            "date": "2014-01-04T02:27:05+0000",
+            "content": "New in this patch...\n\n\n\tuser error if trying to use cursor with grouping\n\t\n\t\tI actualy thought i put this in a while ago, because i couldn't wrap my head arround what it should mean, in a perfect world, to use grouping with a cursor (let alone how to implement it) but reviewing the tests i realized it wasn't there yet.\n\t\n\t\n\tfixed the last remaining nocommit: sortDocSet\n\t\n\t\tworking through the code, i realized we could actually leverage the cached docSets in the useFilterForSortedQuery situation \u2013 so I refactored the method a bit to give it more context (so it could call the buildTopDocsCollector helper method i added), removed the restriction on useFilterCache for sorted doc set when a cursor is used, and randomized useFilterForSortedQuery in the cursor test configs\n\t\n\t\n\tadded simple test combining faceting w/cursor.  this was something i was pretty certain would work fine, but reviewing the clover coverage reports when running just the cursor tests, i realized that the getDocListAndSet paths in SolrIndexSearcher weren't being hit, so we needed a test to prove it.\n\n\n\nThere are probably still a lot more permutations of things that could be tested, but i'm felling really good about the state of this patch \u2013 i think it's ready to commit (to trunk) and let jenkins churn away at it.\n\ni'll plan on pushing to trunk on monday unless anyone has concerns. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13863427",
+            "date": "2014-01-06T21:16:15+0000",
+            "content": "Commit 1556036 from hossman@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1556036 ]\n\nSOLR-5463: new 'cursorMark' request param for deep paging of sorted result sets "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13863434",
+            "date": "2014-01-06T21:21:13+0000",
+            "content": "I just committed the latest patch to trunk...\nCommitted revision 1556036.\n\nSince this is a pretty big change, I'm going to let it soak for a few days and get hammered by jenkins a bit before attempting to backport. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13867274",
+            "date": "2014-01-09T23:25:15+0000",
+            "content": "I haven't seen any negative feedback or suspicious jenkins failures, so unless someone sees a problem i'll start backporting tomorrow. "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13867316",
+            "date": "2014-01-10T00:09:09+0000",
+            "content": "This is a great feature. I think this should work automatically with the CollapsingQParserPlugin so there's some grouping support. I'll do some testing on this to confirm. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13867928",
+            "date": "2014-01-10T15:48:02+0000",
+            "content": "I think this should work automatically with the CollapsingQParserPlugin so there's some grouping support. I'll do some testing on this to confirm.\n\nCool \u2013 thanks.\n\nI think what we have on trunk now is pretty stable, so I'll go ahead and backport to 4x, and if any tweaks are needed to play nice with CollapsingQParser (or at a minimum: tests to show how to use them in combination and what the results are) we should probably track those in a new issue...\n\ncool with you Joel Bernstein? "
+        },
+        {
+            "author": "Joel Bernstein",
+            "id": "comment-13867944",
+            "date": "2014-01-10T16:14:42+0000",
+            "content": "Sounds like a plan. I'll check in after testing. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13867992",
+            "date": "2014-01-10T16:57:15+0000",
+            "content": "Commit 1557192 from hossman@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1557192 ]\n\nSOLR-5463: move CHANGES to 4.7 for backporting "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13867994",
+            "date": "2014-01-10T16:59:42+0000",
+            "content": "Commit 1557196 from hossman@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1557196 ]\n\nSOLR-5463: new 'cursorMark' request param for deep paging of sorted result sets (merge r1556036 and r1557192) "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13867999",
+            "date": "2014-01-10T17:01:58+0000",
+            "content": "Backported to 4x w/o much complication (a small autoboxing situation caused the java6 compile to complain w/o an explicit cast)\n\nI'll get started on some new refguide content..... "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13868760",
+            "date": "2014-01-11T12:38:12+0000",
+            "content": "Commit 1557370 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1557370 ]\n\nSOLR-5463: disable codecs that don't support docvalues in these tests "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13869744",
+            "date": "2014-01-13T17:52:19+0000",
+            "content": "Patch adding a randomized faceting test to CursorPagingTest to validate that aggregating field value counts via a deep paging full walk arrives at the same results as faceting.  Also checks that facet results are the same with each page.  \n\nI'm running this test in a loop 100 times - once that finishes with no failures (none yet at ~75 iterations), I'll commit. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13869795",
+            "date": "2014-01-13T18:27:39+0000",
+            "content": "Commit 1557800 from Steve Rowe in branch 'dev/trunk'\n[ https://svn.apache.org/r1557800 ]\n\nSOLR-5463: added randomized faceting test to CursorPagingTest "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13869861",
+            "date": "2014-01-13T19:24:52+0000",
+            "content": "Commit 1557821 from Steve Rowe in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1557821 ]\n\nSOLR-5463: added randomized faceting test to CursorPagingTest (merged trunk r1557800) "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13874071",
+            "date": "2014-01-16T22:38:32+0000",
+            "content": "Commit 1558939 from hossman@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1558939 ]\n\nSOLR-5463: more details in case of spooky 'walk already seen' errors "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-13874094",
+            "date": "2014-01-16T22:47:21+0000",
+            "content": "Commit 1558945 from hossman@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1558945 ]\n\nSOLR-5463: more details in case of spooky 'walk already seen' errors (merge r1558939) "
+        },
+        {
+            "author": "jefferyyuan",
+            "id": "comment-13881919",
+            "date": "2014-01-25T15:13:19+0000",
+            "content": "This feature is great, and I am trying to use it.\nBut I found one issue, for the first query: I set start=0&rows=10&cursorMark=*, it returns the first 10 data, then I update cursorMark withe the nextCursorMark value returned in last response.\n\nThen the request failed with error: Cursor functionality requires start=0\nThis is caused by CursorMark constructor which checks the offset must be 0 when cursorMark is set.\n    if (0 != sortSpec.getOffset()) \n{\n      throw new SolrException(ErrorCode.BAD_REQUEST,\n                              \"Cursor functionality requires start=0\");\n    }\n\nDid I miss anything?\n\nThanks.. "
+        },
+        {
+            "author": "Steve Rowe",
+            "id": "comment-13881942",
+            "date": "2014-01-25T16:31:42+0000",
+            "content": "for the first query: I set start=0&rows=10&cursorMark=*, it returns the first 10 data, then I update cursorMark withe the nextCursorMark value returned in last response.\n\nOn the second request, what value did you give the start param? "
+        },
+        {
+            "author": "jefferyyuan",
+            "id": "comment-13882110",
+            "date": "2014-01-25T23:34:19+0000",
+            "content": "Thanks, Steve.\n\nI made a mistake in the second query: I set start to 10 as i usually do before. \n\nI changed start=0 in all subsequent queries, and update cursorMark accordingly, and it works well. \n\nBut we should always use start=0 when use cusrorMark feature.\nThis feature is great, and Thanks again. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-13882481",
+            "date": "2014-01-26T23:46:49+0000",
+            "content": "Nice work guys!\n\nSome further thoughts:\n\nWe should consider allowing non-zero \"start\" parameters with cursorMark.  The primary use case is when someone is skipping pages (perhaps trying to get to a different section of results, or trying to get much later in a time based search, or just viewing the long tail).\n\nFor example, a user at page 50 clicks on page 60.  It would be nice to support this by just specifying start=90 (i.e. 600-510) assuming 10 docs per page, along with the normal cursorMark (that would have started at page 51 / doc 510).  Currently, the prohibition on non-zero start parameters would mean that we would either have to abandon cursoring altogether, or we would have to actually retrieve 100 documents to continue it.\n\nThe other thought is around how to do reverse paging efficiently.  One way is to save previous cursorMarks on the client side and just return to them if one wants to page backwards.  The other potential way is to reverse the sort parameters and use the current cursorMark.  The only pitfall to this approach is that you don't get the current document you are on (because we \"searchAfter\").\n\n\n "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-13883114",
+            "date": "2014-01-27T18:59:02+0000",
+            "content": "Some further thoughts: ...\n\nYonik: no disagreement from me, but since what we've got so far has already been committed and backported to 4x, i think it would make sense to track your enhancement ideas in new issues for tracking purposes (unless you think you can help bang these out before 4.7). "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14010881",
+            "date": "2014-05-28T07:29:13+0000",
+            "content": "Inability to use this without sorting by an unique key (e.g. id) makes this feature useless. Same could be achieved previously with sorting by id and searching for docs where id is >/< than the last received. See how cursors do work in MongoDB, that's the right direction. "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14010883",
+            "date": "2014-05-28T07:30:58+0000",
+            "content": "http://docs.mongodb.org/manual/core/cursors/ "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14010888",
+            "date": "2014-05-28T07:43:58+0000",
+            "content": "Sorry for spamming, but can't edit my previous message. I just found that in mongo they also aren't isolated and could return duplicates, I was thinking they are. But sorting docs by id is not acceptable in 99% of use cases, especially in Solr, where it is more expected to get results sorted by relevance. "
+        },
+        {
+            "author": "Yonik Seeley",
+            "id": "comment-14011217",
+            "date": "2014-05-28T15:40:28+0000",
+            "content": "But sorting docs by id is not acceptable in 99% of use cases, especially in Solr, where it is more expected to get results sorted by relevance.\n\nIt's only a tiebreak by \"id\" that is needed.  So \"sort=score desc, id asc\" is fine. "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14011226",
+            "date": "2014-05-28T15:50:47+0000",
+            "content": "Oh, that's awesome, thanks for the tip. "
+        },
+        {
+            "author": "David Smiley",
+            "id": "comment-14011244",
+            "date": "2014-05-28T16:02:41+0000",
+            "content": "I think Solr could be more user-friendly here by auto-adding the \", id asc\" if it's not there. "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-14011384",
+            "date": "2014-05-28T17:55:43+0000",
+            "content": "I think Solr could be more user-friendly here by auto-adding the \", id asc\" if it's not there.\n\nThe reason the code currently throws an error was because i figured it was better to force the user to choose which tie breaker they wanted (asc vs desc) then to just magically pick one arbitrarily.\n\nIf folks think a magic default is a better i've got no serious objections \u2013 just open a new issue. "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14012084",
+            "date": "2014-05-29T05:26:41+0000",
+            "content": "If, as David mentioned, Solr will add it only if it is not there, this should keep the ability for users to manually specify another key and order when that is required (a rare case it seems). "
+        },
+        {
+            "author": "Alexander S.",
+            "id": "comment-14012449",
+            "date": "2014-05-29T15:28:48+0000",
+            "content": "I have another idea about cursors implementation. That's just an idea, I am not sure if that's possible to do.\n\nIs it possible to use cursors together with \"start\" and \"rows\" parameters? That would allow to use pagination and draw links for prev, next, 1, 2, 3, n+1 pages, as we can do now. So that instead of using cursorMark we'll use cursorName, which could be a static. So the request start:0, rows:10, cursorName:* will return first page of results and a static cursor name, which could then be used for all other pages (i.e. start:10, rows:10, cursorName:#\n{received_cursor_name}\n).\n\nDoes that make sense? "
+        }
+    ]
+}

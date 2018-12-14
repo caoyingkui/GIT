@@ -1,0 +1,104 @@
+{
+    "id": "LUCENE-5272",
+    "title": "OpenBitSet.ensureCapacity does not modify numBits",
+    "details": {
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [
+            "4.6",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "It's a simple bug, reproduced by this simple test:\n\n\n  public void testEnsureCapacity() {\n    OpenBitSet bits = new OpenBitSet(1);\n    bits.fastSet(0);\n    bits.ensureCapacity(5); // make room for more bits\n    bits.fastSet(2);\n  }\n\n\n\nThe problem is that numBits which is used only for assrets isn't modified by ensureCapacity and so the next fastSet trips the assert. I guess we should also fix ensureCapacityWords and test it too.\n\nI may not be able to fix this until Sunday though, so if anyone wants to fix it before (maybe it can make it into 4.5.1), feel free.",
+    "attachments": {
+        "LUCENE-5272.patch": "https://issues.apache.org/jira/secure/attachment/12607948/LUCENE-5272.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-10-11T05:00:25+0000",
+            "content": "After fixing the bug, I realized that the API of OBS is somewhat broken:\n\n\n\tsetBits lets you set a long[] bits, but doesn't modify neither numBits nor wlen.\n\t\n\t\tNothing uses this method, so I'll nuke it. There's a ctor for that, so I don't see the advantage.\n\t\n\t\n\n\n\n\n\tsetNumWords has the same issues\n\t\n\t\tNuke it too, one can call new OpenBitSet(other.getBits(), newNumWords).\n\t\n\t\n\n\n\n\n\tget and fastGet don't work the same. If you create OBS(3) and call get/fastGet(5) the result is different:\n\t\n\t\tfastGet trips the assertion\n\t\tget returns false\nI'm not sure if get is wrong since if OBS allows growing, it's technically correct to return false. But then, should it change numBits (because now the app effectively 'grew' the array)? If it doesn't, then stupid code like get(5); fastSet(5); fails because numBits isn't modified...\nI don't know if we should fix it because then get() becomes an API which modifies the OBS instance (which is unexpected).\n\t\n\t\n\n\n\nMaybe we should get rid of numBits in OBS entirely? If someone called ensureCapacity(5) and does set/fastSet(17), maybe it's ok if we sometimes succeed in both? set() will grow the bits if needed, fastSet will trip an AIOOBE which is OK I think .. if you want to use fastSet, make sure you call ensureCapacity before.\n\nIn the meanwhile, I've discovered I can grow a FixedBitSet very easily by allocating a new FBS instance, and FBS doesn't suffer from these inconsistencies, so maybe I'll just use it for now to make progress, but would still like to resolve the issues raised here.\n\nOne possible solution is to offer a convenient ctor to FBS, like FixedBitSet(FixedBitSet other, int numBits) which will arraycopy the bits from other. The only thing we add here is the FBS object allocation, vs OBS which only grows the internal array, but I think that's not critical. If we do that, then we can get rid of OBS entirely I think ... or remove all the fastXXX methods and make it more like GrowableBitSet. ",
+            "author": "Shai Erera",
+            "id": "comment-13792338"
+        },
+        {
+            "date": "2013-10-11T05:03:52+0000",
+            "content": "Progress thus far: fixes ensureCapacity(Words) to set numBits correctly and adds a testcase. If we choose to get rid of numBits entirely, then it can be even more simplified. ",
+            "author": "Shai Erera",
+            "id": "comment-13792342"
+        },
+        {
+            "date": "2013-10-13T12:46:47+0000",
+            "content": "I was about to post an updated patch when I realized that now OBS.length() is broken. It currently returns bits.length << 6, which is completely unrelated to neither wlen nor numBits. Bits.length() javadocs say: \"Returns the number of bits in this set\", what should we return?\n\n\n\tIf we want to adhere to the jdocs, we should return numBits, but then numBits cannot be an assertion-only member.\n\tIf we want to return wlen << 6, then we should nuke numBits because otherwise you will call length() to receive e.g 64 but when you will call fastSet(52) you may trip the assertion error.\n\tIf we return bits.length, then we can nuke both wlen and numBits.\n\n\n\nActually, OpenBitSetIterator is also broken, because it iterates up to wlen, again with no relation to numBits. And of course it's now unrelated to bits.length too, so e.g. if you call OBS.length() and compares that with the number of nextDoc() calls the iterator returns (say when all bits are 'set'), the numbers are not equal...\n\nWhy do we need these two fields? As far as I can tell, wlen is only < bits.length when someone shares a long[] but limit its size. Do we really care about this case? I can understand the reason to keep numBits because e.g. you want to adhere to Bits spec:\n\n\n\tReturn numBits from length()\n\tBits.get(int) document that you should not call it with out of bounds indexes\n\tIterator should iterate up to the last set/cleared bit\n\n\n\nBut it has to be a first-class member, not an assert-only one.\n\nAnother quirkiness, what should the app expect to happen if it calls obs.get(170) (and say bits.length=1)? It currently receives false and not e.g. AIOOBE. But this could falsly lead to calling fastSet(170) thinking that the bitset is at the right size. I'm not saying this is a super-duper usecase we should handle, since if an app calls fastSet, it should also call fastGet, but I think it will be good if we are consistent about when you get false and when you hit out-of-bounds.\n\nThe out-of-bounds here are also related to 'wlen', as the method checks if the bit is within bits.length range, not wlen range. This is another bug I think since if you share a bits[] which has say bit 170 set, but you limit it to 2 words, calling OBS.get(170) will false return true?\n\nI think this class could use some serious overhauling and re-thinking. I find it very confusing as it is written now. We should decide what are the contracts of each method, and then implement it as such.\n\nAnd though unrelated to the bugs reported in this issue, perhaps someone can explain why we need both the 'int' and 'long' method variants? Can't we have only the long indexes? ",
+            "author": "Shai Erera",
+            "id": "comment-13793637"
+        },
+        {
+            "date": "2013-10-13T13:31:44+0000",
+            "content": "\nI'm adding  a method to OpenBitSetIterator to support advanceToJustBefore for a new DocBlockIterator, see LUCENE-5092.\n\nBasically this does an advance followed by a prevSetBit, and when the advance is getting too far out, it is important to know precisely where the end of the bit set is.\n\nAlso I found that in order to be able to use prevSetBit from OBS I had to add this static method there:\n\n  public static int prevSetBitStatic(int index, long[] bits, int wlen) {\n  }\n\n\n\nwhich is ugly. It would be better to have the OBS as an  attribute in the OBSIterator so the existing prevSetBit method can be called directly.\n\nSo I am in favour of an overhaul, remove (deprecate?) everything that is not currently used, and make OBS an attribute in OBSIterator instead of the long[] and its length.\n\n\nFor the end of the bit set, bits.length seems to be the simplest thing that could possibly work, so it is worth at try.\n\nFor the 'int' and 'long' variants, maybe we can do without the 'int' variants now that 64 bit processors have become common.\n\nAnother candidate for a minor clean up is EliasFanoEncoder.numLongsForBits which is a long implementation of OBS.bits2words. ",
+            "author": "Paul Elschot",
+            "id": "comment-13793654"
+        },
+        {
+            "date": "2013-10-13T15:45:33+0000",
+            "content": "I don't think we need to deprecate anything as there's no way anyone relies on these methods and his app works (setNumWords, length etc.). I am also thinking of a new GrowableBitSet which relaxes all bounds checks and puts the responsibility on the app to call grow()/ensureCapacity(). This will also get rid of the duplicate methods (set/fastSet, get/fastSet etc.).\n\nUnfortunately we cannot modify OBS to relax bound checks because that's a serious backwards break. But perhaps we can completely deprecate it in favor of the new bitset. ",
+            "author": "Shai Erera",
+            "id": "comment-13793686"
+        },
+        {
+            "date": "2013-10-13T20:40:48+0000",
+            "content": "I didn't fix all the issues that I raised because I'm not sure what's the best course of action here. Clearly, no one relies on these buggy methods so maybe we should just fix ensureCapacity for now and worry about OBS's contract another day.\n\nIf there are no objections, and the patch also seems correct, I will commit those changes. ",
+            "author": "Shai Erera",
+            "id": "comment-13793775"
+        },
+        {
+            "date": "2013-10-14T21:04:28+0000",
+            "content": "Commit 1532093 from Shai Erera in branch 'dev/trunk'\n[ https://svn.apache.org/r1532093 ]\n\nLUCENE-5272: OpenBitSet.ensureCapacity does not modify numBits ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794483"
+        },
+        {
+            "date": "2013-10-14T21:10:37+0000",
+            "content": "Commit 1532099 from Shai Erera in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1532099 ]\n\nLUCENE-5272: OpenBitSet.ensureCapacity does not modify numBits ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794489"
+        },
+        {
+            "date": "2013-10-14T21:11:23+0000",
+            "content": "Committed to trunk and 4x. ",
+            "author": "Shai Erera",
+            "id": "comment-13794490"
+        },
+        {
+            "date": "2013-10-15T01:52:25+0000",
+            "content": "Commit 1532161 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1532161 ]\n\nLUCENE-5272: fix test bugs ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794777"
+        },
+        {
+            "date": "2013-10-15T01:52:52+0000",
+            "content": "Commit 1532162 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1532162 ]\n\nLUCENE-5272: fix test bugs ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13794779"
+        },
+        {
+            "date": "2013-10-15T12:56:04+0000",
+            "content": "Commit 1532321 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1532321 ]\n\nLUCENE-5272: fix more test bugs ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13795155"
+        },
+        {
+            "date": "2013-10-15T12:57:13+0000",
+            "content": "Commit 1532322 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1532322 ]\n\nLUCENE-5272: fix more test bugs ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13795157"
+        }
+    ]
+}

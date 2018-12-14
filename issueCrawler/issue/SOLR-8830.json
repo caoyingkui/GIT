@@ -1,0 +1,57 @@
+{
+    "id": "SOLR-8830",
+    "title": "client error messages should be consistent even when updates are internally routed to other nodes",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "As things stand today, clients sending documents to a SolrCloud cluster may or may not get a useful error message depending on whether the update goes directly to the appropriate leader, or if it gets routed internally.\n\nA trivial example of this is shown below, and can be reproduced using \"bin/solr -e cloud\" using 2 nodes, 1 shard, 2 replicas...\n\n\n$ curl -H 'Content-Type: application/json' --data-binary '[{\"id\":\"a\", \"foo_i\":\"bogus\"}]' 'http://localhost:7574/solr/gettingstarted/update?indent=true'\n{\n  \"responseHeader\":{\n    \"status\":400,\n    \"QTime\":49},\n  \"error\":{\n    \"metadata\":[\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"java.lang.NumberFormatException\",\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"org.apache.solr.common.SolrException\"],\n    \"msg\":\"Bad Request\\n\\n\\n\\nrequest: http://127.0.1.1:8983/solr/gettingstarted_shard1_replica2/update?update.chain=add-unknown-fields-to-the-schema&update.distrib=TOLEADER&distrib.from=http%3A%2F%2F127.0.1.1%3A7574%2Fsolr%2Fgettingstarted_shard1_replica1%2F&wt=javabin&version=2\",\n    \"code\":400}}\n$ curl -H 'Content-Type: application/json' --data-binary '[{\"id\":\"a\", \"foo_i\":\"bogus\"}]' 'http://localhost:8983/solr/gettingstarted/update?indent=true'\n{\n  \"responseHeader\":{\n    \"status\":400,\n    \"QTime\":9},\n  \"error\":{\n    \"metadata\":[\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"java.lang.NumberFormatException\"],\n    \"msg\":\"ERROR: [doc=a] Error adding field 'foo_i'='bogus' msg=For input string: \\\"bogus\\\"\",\n    \"code\":400}}\n\n\n\n...note that while the \"root-error-class\" of NumberFormatException is preserved in both cases, the actual message indicating the specific problem (field foo_i contains an invalid value bogus)  is lost in the case where the update was internally forwarded.\n\nEven if we never make the err msgs perfectly identical between those requests (because it might be useful to indicate what node/shard reported the error in case it's node specific) we should at least ensure some minimum consistency in the information returned \u2013 ie: always include the remote exception message as a suffix. of the Exception.getMessage().\n\nWe should likewise ensure that SolrExceptions thrown by SolrJ clients (HttpSolrClient, or CloudSolrClient, etc...) due to remote errors adequately propogate the msg text \u2013 especially when it's a 4xx error.",
+    "attachments": {
+        "SOLR-8830.patch": "https://issues.apache.org/jira/secure/attachment/12794666/SOLR-8830.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-03-10T22:14:53+0000",
+            "author": "Kevin Risden",
+            "content": "\nWe should likewise ensure that SolrExceptions thrown by SolrJ clients (HttpSolrClient, or CloudSolrClient, etc...) due to remote errors adequately propogate the msg text \u2013 especially when it's a 4xx error.\n\nThis is definitely currently not the case with HttpSolrClient and streams. 401 errors are swallowed and most other errors are probably wrong as well. I sent a message to the dev list about this yesterday here after discovering in SOLR-8213.  ",
+            "id": "comment-15190061"
+        },
+        {
+            "date": "2016-03-16T17:01:02+0000",
+            "author": "Jason Gerlowski",
+            "content": "Is this problem only limited to updates, or is this a problem that we see elsewhere, and /update is just the worst (most common, most frustrating) offender?  Just want to clarify the scope of the problem. ",
+            "id": "comment-15197679"
+        },
+        {
+            "date": "2016-03-21T11:55:47+0000",
+            "author": "Jason Gerlowski",
+            "content": "Short non-update here:\n\nSpent a little time looking into this yesterday.  I didn't get far, but I did learn a few things.  They might be of interest to others, but mainly I just want to jot them down here so I have some notes to come back to when I pick this up again tonight.  (This stuff is all probably common knowledge for those familiar with the update code).\n\nWhen an update request is received in DistributedUpdateProcessor (thanks again btw Hoss) by a non-leader, it is eventually forwarded via a call to SolrCmdDistributor.distribAdd().  Eventually, SolrCmdDistributor uses StreamingSolrClients to send requests to the other Solr nodes.  StreamingSolrClients keeps track of any errors in a List of SolrCmdDistributor.Error objects.  SolrCmdDistributor fetches these errors in its finish() method, which is invoked by DistributedUpdateProcessor.\n\nI saw some evidence that the leader isn't returning the right information (its response doesn't contain the message about \"bogus\" and \"foo_i\"), and that the code-path detailed above would handle things correctly if it had been given enough to work with.  I doubt my own work a bit there, so I'm going to double check that when I pick this up in a bit.\n\nAnyways, like I said, I haven't gotten far with this.  Just wanted to jot down a few notes for later, and maybe someone could correct any mistakes/misconceptions I had. ",
+            "id": "comment-15204077"
+        },
+        {
+            "date": "2016-03-22T01:36:17+0000",
+            "author": "Jason Gerlowski",
+            "content": "Might've been going down the wrong path before.  I realized that it's really the SolrClient that handles and passes along the remote-error, and a few tweaks to ConcurrentUpdateSolrClient go a long way to improving the usefulness of the error message in the example Hoss pointed out in the description.\n\nWith the attached patch, the response body when a request is sent to the non-leader now looks like:\n\n\n{\n  \"responseHeader\":{\n    \"status\":400,\n    \"QTime\":99},\n  \"error\":{\n    \"metadata\":[\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"org.apache.solr.common.SolrException\"],\n    \"msg\":\"Bad Request\\n\\n\\n\\nrequest: http://127.0.1.1:8983/solr/gettingstarted_shard2_replica2/update?update.chain=add-unknown-fields-to-the-schema&update.distrib=TOLEADER&distrib.from=http%3A%2F%2F127.0.1.1%3A7574%2Fsolr%2Fgettingstarted_shard2_replica1%2F&wt=javabin&version=2 Full Error {responseHeader={status=400,QTime=45},error={metadata={error-class=org.apache.solr.common.SolrException,root-error-class=java.lang.NumberFormatException},msg=ERROR: [doc=a] Error adding field 'foo_i'='bogus' msg=For input string: \\\"bogus\\\",code=400}}\",\n    \"code\":400}}\n\n\n\nThat said, I've got a few questions before this can really be moved forward:\n\n1.) Is this a reasonable error message?  There's a decent amount of duplication, which sucks.  But I could see an argument made that including the remote-error verbatim is the best thing we could do here. (Greatly reduces the chance anything is being dropped, gives users the most info to debug off of, etc.)  An alternate approach would involve parsing out the root-cause from any remote errors, but I'd guess that this would be brittle/error-prone, and would result in some cryptic/uninformative messages.  Anyone have thoughts/opinions?\n\n2.) Assuming we decide on the right way to tweak these messages, is this something we want to push into all SolrClient implementations, or only the ones used directly by the /update code?\n\n3.) The description and early comments laid out two options for where this JIRA could go.  We could improve the error messages.  Or we could find a way to make them consistent regardless of the node receiving the request.  This patch takes a stab at the first (easier) goal, but admittedly doesn't do anything to help with the second objective.  Do we really want to pursue the latter goal?  If the error-message is decent in either case, is it worth the effort to make them consistent.  (This isn't intended as a leading question; just trying to understand the issue).\n\nSorry for asking (maybe) obvious questions.  Just trying to make sure I'm putting my effort in the right things here.  Hope this patch is a step in the right direction though. ",
+            "id": "comment-15205593"
+        },
+        {
+            "date": "2016-04-01T14:24:53+0000",
+            "author": "Jason Gerlowski",
+            "content": "Can anyone give me a little guidance on where to direct my efforts on this JIRA?  I'd love to make some sort of improvement on the current behavior, and I've proposed a simple change in my comment above, but I'm looking for some feedback to see if I'm on the right track... ",
+            "id": "comment-15221754"
+        },
+        {
+            "date": "2016-04-01T14:41:05+0000",
+            "author": "Mark Miller",
+            "content": "1) I think it's reasonable. You arguments make sense to me.\n\n2) I think we should be sure errors are always propagated correctly when Solr is using an internal SolrJ client.\n\n3) I think this is a great start. We can open a new JIRA if we want to pursue this more. ",
+            "id": "comment-15221782"
+        }
+    ]
+}

@@ -1,0 +1,79 @@
+{
+    "id": "SOLR-7571",
+    "title": "Return metrics with update requests to allow clients to self-throttle",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "4.10.3",
+        "status": "Resolved",
+        "resolution": "Duplicate",
+        "priority": "Major"
+    },
+    "description": "I've assigned this to myself to keep track of it, anyone who wants please feel free to take this.\n\nI've recently seen a setup with 10 shards and 4 replicas. The SolrJ client (and post.jar for json files for that matter) firehose updates (150 separate threads in total) at Solr. Eventually, replicas (not leaders) go into recovery and the state cascades and eventually the entire cluster becomes unusable. SOLR-5850 delays the behavior, but it still occurs. There are no errors in the follower's logs this is leader-initiated-recovery because of a timeout.\n\nI think the root problem is that the client is just sending too many requests to the cluster, and ConcurrentUpdateSolrClient/Server (used by the leader to distribute update requests to all the followers) (this was observed in Solr 4.10.3+).  I see thread counts of 500+ when this happens.\n\nSo assuming that this is the root cause, the obvious \"cure\" is \"don't index that fast\". This is unsatisfactory since \"that fast\" is variable, the only recourse is to set that threshold low enough that the Solr cluster isn't being driven as fast is it can be.\n\nWe should provide some mechanism for having the client throttle itself. The number of outstanding update threads is one possibility. The client could then slow down sending updates to Solr. \n\nI'm not sure there's a good way to deal with this on the server. Once the timeout is encountered, you don't know whether the doc has actually been indexed on the follower (actually, in this case it is indexed, it just take a while). Ideally we'd just manage it all magically, but an alternative to let clients dynamically throttle themselves seems do-able.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-05-19T19:49:50+0000",
+            "author": "Erick Erickson",
+            "content": "Not entirely sure whether all there are related to firehosing updates at Solr or not, but they were all seen in the same environment. ",
+            "id": "comment-14551096"
+        },
+        {
+            "date": "2015-05-30T21:33:25+0000",
+            "author": "Vijay Sekhri",
+            "content": "Ideally if a system cannot handle a high rate, it should fails early on by letting the client know about the failure . In which case the client can mark those failures and retry and adjust the rate in an adaptive and real time way.\nInstead what happens currently is that the system does not report failure to the client if the rate is too high even though internally it could not handle the update to its replicas and therefore renders the whole cluster unstable. A fail fast approach with acknowledgement back to the client can really help a lot in this case. ",
+            "id": "comment-14566206"
+        },
+        {
+            "date": "2015-06-02T17:24:43+0000",
+            "author": "Otis Gospodnetic",
+            "content": "If you are going to be keeping track of any (new) metrics around this, in addition to possibly returning them to clients, please expose them via JMX, so monitoring tools can expose what is going on with the Solr cluster, too.  This can then trigger alert events and alerts events can trigger actions, such as reducing the indexing rate. ",
+            "id": "comment-14569459"
+        },
+        {
+            "date": "2015-06-02T23:59:58+0000",
+            "author": "Erick Erickson",
+            "content": "Otis:\n\nGood suggestion, thanks! In the scenario I was thinking about the metrics would come back in the result from each update, forcing the client to look to see whether it should self-throttle, which would kind of leave updating by posting files out in the cold.\n\nOn tricky bit here is that say the \"metric\" was the number of threads ConcurrentUpdateSolrClient had outstandng (on each leader). You'd have to return either the entire list each time (possibly 100s of leaders) or the max threads outstanding or.... Not quite sure how providing the info through JMX would deal with that, any ideas?\n\nWhat about failing if whatever metric chosen is exceeded? Let's say its' the number of outstanding threads CUSC has open. Then, instead of trying to open up yet another thread, fail with a \"SLOW_DOWN_PLEASE\" exception, the client would then, say, wait a little while and re-submit the request or some such. I'm not at all sure how that would play in a situation where you had 5 shards and only one of them hit this condition though. ",
+            "id": "comment-14570015"
+        },
+        {
+            "date": "2015-06-03T02:23:50+0000",
+            "author": "Otis Gospodnetic",
+            "content": "Erick Erickson - Not sure yet, would have to see which numbers you'd end up having, but I'm guessing you could construct MBean names in such a way that the name of the leader would be a part of its name (think about parsing, allowed vs. forbidden chars!) and the metric you want to return would be the MBean value.\n\nNow that I think about this, you should also probably think about how the size of Solr response would be affected by more info being added to every response and how much that would affect the client that has to process this.  Providing this via JMX, which does not stand between client and server on every request, and is checked independently of search requests, maaaay in some ways be better. ",
+            "id": "comment-14570150"
+        },
+        {
+            "date": "2015-06-14T15:33:50+0000",
+            "author": "Erick Erickson",
+            "content": "The symptom I saw was a bazillion outstanding threads on the leader, followed by the leader forcing the follower into leader-initiated-recovery even though the follower reported no errors, it was just slow. If SOLR-7344 allows to gracefully limit the number of outstanding threads on the leader that might impact this problem.\n\nI still think the metric isn't a bad idea. ",
+            "id": "comment-14585098"
+        },
+        {
+            "date": "2015-06-14T15:40:00+0000",
+            "author": "Erick Erickson",
+            "content": "Otis Gospodnetic\nbq: Providing this via JMX, which does not stand between client and server on every request, and is checked independently of search requests, maaaay in some ways be better\n\nIf we do it that way, how do you handle a many-shard situation? The client would have to ping  all the nodes they might care about it seems. I was thinking of a couple of optional params. This particular issue is that some node is running hot, I don't particularly care which. So all that's necessary to return with each request is the high water mark, thus adding only a single return value per metric.\n\nActually I'm thinking of some like this:\nmetrics=true|false, default to false. What we do now if false.\n\nmetrics.detail=true|false default false. Return only the highest value of each metric from any replica if false, otherwise return all the metrics from all the replicas.\n\nmetrics.which=comma-delimited-list. The list of things we want to return, the one I'm thinking of as a PoC is \"threadcount\". ",
+            "id": "comment-14585100"
+        },
+        {
+            "date": "2015-06-14T16:40:52+0000",
+            "author": "Yonik Seeley",
+            "content": "My general thought on this:  We have a synchronous update API, which would seem to make client side throttling unnecessary.... it's already in the networking stack.  They should automatically block when solr gets too far behind.  If there are fixes to be made, they should be in the server side so we can handle whatever load is thrown at us.  Also, it would be hard to enforce that all clients correctly throttle (think 3rd party clients).\n\nSOLR-7344 may be a big part of the solution here (or perhaps the entire solution). ",
+            "id": "comment-14585110"
+        },
+        {
+            "date": "2015-06-14T17:33:13+0000",
+            "author": "Erick Erickson",
+            "content": "Yonik Seeley\n\nYeah, returning metrics was a stop-gap at best, giving clients at least the opportunity to self-throttle which they don't have now. But architecturally it's definitely a hack. I really don't like solutions that require the client do \"do the right thing\", too many opportunities to fail.\n\nThat's why I linked SOLR-7344 in to this one. It would be a much better solution to have a way to throw updates (or requests in general I think) at Solr as fast as possible and have Solr just deal with it.\n\nThe situation I saw at a client's was ameliorated (but not eliminated, \"stuff\" popped out in other places) just by moving to a simple bounded thread pool as an experiment. The clients were still firehosing requests though so things were still backing up on Solr as you'd expect.\n\nSo I think I'll defer this until we see if SOLR-7344 fixes things up. ",
+            "id": "comment-14585138"
+        },
+        {
+            "date": "2016-01-20T22:05:33+0000",
+            "author": "Erick Erickson",
+            "content": "SOLR-7344 is a much better approach, Solr should survive ill-mannered clients. ",
+            "id": "comment-15109573"
+        }
+    ]
+}

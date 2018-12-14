@@ -1,0 +1,677 @@
+{
+    "id": "SOLR-7344",
+    "title": "Allow Jetty thread pool limits while still avoiding distributed deadlock.",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "",
+    "attachments": {
+        "SOLR-7344.patch": "https://issues.apache.org/jira/secure/attachment/12726969/SOLR-7344.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-04-13T23:49:54+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Here is a high-level design. I have a reasonably working patch against Solr 4.10.3 version. If there are no major objections to this proposal, I will prepare and submit a patch against the trunk.\n\n\n\tDefine two separate end-points for Solr - one to handle internal requests (i.e. communication between Solr servers) and other for external requests (i.e. communication between clients and servers). Each of the end-point would be backed by a dedicated thread-pool.\n\tDefine a property \u2018externalPort\u2019 in the solr.xml (under solrcloud configuration element) along with a similarly named Java system property. This property would define the port used by the external endpoint.\n\tMake appropriate changes in Solr such that,\n  --> This property is published as part of the clusterstate.json ZNODE (along with the current base_url property which is used for internal requests).\n  --> Change the solrj implementation to use this newly introduced property instead of base_url property (in the CloudSolrServer). If this newly introduced property is missing (e.g. new client connecting to old server), it will fall back to using the old property for backward compatibility.\n  --> We don't need to change any other code on the server side (since it is using base_url property anyways).\n\n\n\nIf all external requests are sent to the external endpoint, a distributed deadlock can not occur since only threads associated with external endpoint will be doing the scatter/gather. And no two scatter/gather requests will directly depend upon each other. In the worst case, we can get a socket timeout error during the gather phase if too many internal requests are sent to a specific solr server. But we can not run into deadlock scenarios.\n\nBut the same can not be said if external requests also land on the internal endpoint. In this case one or more internal threads may be doing scatter/gather and hence would depend upon each other (just like today). Hence there is a possibility of distributed deadlock in this case. To prevent this from happening we should also add validation to ensure that the external requests sent to the internal endpoint are rejected.\n\nThis can be implemented by tagging internal requests in Solr (via an additional request parameter or a header) and adding validation via a servlet filter to reject external requests sent to the internal endpoint. To check if a request is sent to an internal endpoint, we can use the ServletRequest#getLocalPort() method.\n\nOpen questions\n(1) For /admin/collections and /admin/cores APIs, we currently use information stored under live_nodes ZNODE. Each ZNODE under live_nodes is named as <host_name>:<port_number>_solr. The port number mentioned here corresponds to internal endpoint (used for solr server specific communication). What is the best way to add more information to it (e.g. external port value) ? may be as a content of the ZNODE?\nhttps://github.com/apache/lucene-solr/blob/817303840fce547a1557e330e93e5a8ac0618f34/solr/solrj/src/java/org/apache/solr/client/solrj/impl/CloudSolrServer.java#L550\n\n(2) What is your opinion on rejecting the external requests sent to internal endpoint? Any alternatives?  ",
+            "id": "comment-14493300"
+        },
+        {
+            "date": "2015-04-14T08:30:22+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Thanks for getting to this Hrishikesh, we had been meaning to do this ourselves. I personally would prefer the choice of pool to be configurable rather than enforced.\n\nAlso, I think the idea of external/internal should be generalized especially if we are thinking of changing the ZK information. In general, you have a set of named pools which can be configured, and each action in Solr (we could start with internal/external here, but this could be made more granular if needed, say, on a request type basis for example) could run off a pool name which is configurable. ",
+            "id": "comment-14493789"
+        },
+        {
+            "date": "2015-04-14T17:55:18+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Ramkumar Aiyengar I like your suggestion and it is not very difficult to incorporate in my earlier proposal. The main change would be as follows,\n\n\n\tInstead of defining 'externalPort' property, we can define an 'endpoint' element which would allow specifying details such as\n  --> port number\n  --> request type (either a URL suffix of the REST API or a wildcard e.g. '*' for all requests)\n  --> Anything else \n\tWe would publish the information about all configured pools as part of the ZNODE representing the given Solr server (under /live_nodes ZNODE)\n\tWe would change solrj to use the correct endpoint based on the request_type (may be a URL suffix?). If no endpoint is available, we can fallback on base_url value (i.e. the current behavior) to maintain backward compatibility.\n\n\n\nJust out of curiosity, can you please explain why someone would not want to define separate thread pools for internal and external requests? Also do you think if there would be use-cases which would require separate endpoints per request type?    ",
+            "id": "comment-14494486"
+        },
+        {
+            "date": "2015-04-14T19:52:19+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "No separate threadpools: For very small solr clouds, it might just be overkill or just sit there without being used at all (what if I had only one replica?)\n\nPer request type: I might want to dedicate separate amount of resources to say, indexing and searching, so that one doesn't starve out the other. In indexing spikes, you can currently visibly see search performance be affected on leaders..\n\nOn the ZK layout, I guess this would work.. Just that I am in two minds about if all this configuration should be in live nodes.. But happy to be convinced.. \n\nThe alternative would be for the endpoint could just have a port and a name. May be it could guarantee a \"default\" endpoint being always present. So live nodes just \"publishes\" information about its resources, and how its \"consumed\" is decoupled. SolrJ could just hard code the default name and allow people to configure the end point name to start things off \u2013 or this could be part of separate per-coll config which SolrJ reads (isn't there a clusterprops.json? I forget..) and that could store configuration for logically what each operation should use. Similarly indexing config for Solr could allow for an endpoint to be configured. ",
+            "id": "comment-14494749"
+        },
+        {
+            "date": "2015-04-14T20:49:37+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Ramkumar Aiyengar Thanks for the feedback. Yes this makes perfect sense. \n\nI think I have enough information/context to get started with the actual implementation. I suggested to keep this configuration under /live_nodes ZNODE since I don't see any other appropriate ZNODE. If you have any other ideas, please let me know. But I think we can get started with this and make changes if necessary. I will reply once I have a patch ready. ",
+            "id": "comment-14494849"
+        },
+        {
+            "date": "2015-04-21T19:29:47+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Here is a patch inline with our earlier discussion. ",
+            "id": "comment-14505578"
+        },
+        {
+            "date": "2015-04-21T20:10:20+0000",
+            "author": "Otis Gospodnetic",
+            "content": "Hrishikesh Gadre - didn't check the patch, but does that means that we will now be able to see request metrics (counts, latencies) for internal vs. external requests separately?  That would be awesome because current metrics don't make this distinction. ",
+            "id": "comment-14505658"
+        },
+        {
+            "date": "2015-04-21T20:52:36+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Otis Gospodnetic Yes it should be possible although the current patch does not include that. Let me take a look and update the patch accordingly. ",
+            "id": "comment-14505736"
+        },
+        {
+            "date": "2015-04-23T19:32:16+0000",
+            "author": "Mark Miller",
+            "content": "Patch looks great, thanks for taking this on!\n\nI do think we want to setup 2 thread pools out of the box. We should pick a new default internal port number for Solr - 8985 or something?\n\nSomething about storing data on those ephemeral live nodes does smell wrong initially, but I don't know that making new nodes is really any more useful, so perhaps that is the way to go. ",
+            "id": "comment-14509639"
+        },
+        {
+            "date": "2015-04-23T19:42:47+0000",
+            "author": "Yonik Seeley",
+            "content": "We should pick a new default internal port number for Solr - 8985 or something?\n\nOr a default of <external_port_number> + <standard_offset> ? ",
+            "id": "comment-14509659"
+        },
+        {
+            "date": "2015-04-23T19:50:53+0000",
+            "author": "Yonik Seeley",
+            "content": "Another approach at the high level would be to just use our single port.\nHave different thread pools internally that requests would be handled by depending on the request handler.  That would solve both distributed deadlock and limit the number of concurrent requests actually doing computation, without any need for an additional port.  ",
+            "id": "comment-14509673"
+        },
+        {
+            "date": "2015-04-23T20:19:47+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yonik Seeley Currently we use thread-per-request model (especially for queries). To implement your proposal, I think we would need to move away from it (e.g. based on servlet 3 spec). Otherwise it would be wasteful of resources. e.g. lets assume we define 2 thread-pools internally. Now when we get a request (internal or external), we would submit a task in one of the queues. But still we will have to wait for the result to come back so that we can reply to the client. This means there is still a chance for distributed deadlocks. (Note Datastax Search uses async model http://www.datastax.com/dev/blog/robust-and-scalable-distributed-queries).\n\nOn the other hand, having two different endpoints backed by dedicated thread-pools won't have this issue. Also the amount of code change is minimal. If you look at my patch, no changes are required in any part of the server side functionality. \n\nAny thoughts?\n\n\n ",
+            "id": "comment-14509714"
+        },
+        {
+            "date": "2015-04-23T20:40:27+0000",
+            "author": "Yonik Seeley",
+            "content": "This means there is still a chance for distributed deadlocks.\n\nNot if you keep the size of the jetty thread pool high and then reject top level requests when we go over some high water mark.\nActually, you wouldn't even need separate thread pools... just use a countdown latch to limit the number of threads executing at one time in any given category (i.e. separate latch for top level request and sub-request).\n\nI'm not against the current approach - just lamenting that it can't be done for us auto-magically by jetty based on URL or whatever.  I also wanted to point out there are options if we do want to stick with a single port.\n\nAlso, even with the 2-port approach, we'll need to keep the normal 8983 port with a high thread count as we do today, else we could still get into distributed deadlock due to request forwarding. ",
+            "id": "comment-14509745"
+        },
+        {
+            "date": "2015-04-23T20:59:24+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yonik Seeley Yes I think this can work. Although a minor point - typically every endpoint is associated with a thread-pool and an accept queue. Hence when all threads are busy, one or more outstanding requests can still stay in the accept queue without being rejected. In our case, this facility will probably be not available (since we would need to reject the request right away to free up the thread). I am not saying this is a deal-breaker, but just something I realized while thinking about this. \n\nAnyone else has any thoughts on this? Or should I take a crack at this alternate design? ",
+            "id": "comment-14509793"
+        },
+        {
+            "date": "2015-04-23T21:14:45+0000",
+            "author": "Yonik Seeley",
+            "content": "Although a minor point - typically every endpoint is associated with a thread-pool and an accept queue.\n\nRight. And I think that's important.  We probably don't want to return failures unless the server is truly overloaded, otherwise some form of blocking is desirable.\nSo we would have (for example):\n\n\tup to 16 sub-request threads executing at any one time.\n\tup to high-water-mark sub-requests blocking waiting for an execution slot to open (what should this be.... hundreds? thousands?)\n\tafter which point we return a 503 HTTP error\n\n\n\nAnd the same thing (but different numbers perhaps) for top-level requests.  I guess that is one benefit to this approach... we would have the ability to limit the number of top-level requests (w/o resorting to a 3rd port to deal with the request forwarding issue).\n\nBut the lack of an accept queue (or basically, the lack of getting that blocking behavior for free for sub-requests) is a downside... and it's not clear how well blocking after the fact (up to the high-water-mark) will work in practice. ",
+            "id": "comment-14509817"
+        },
+        {
+            "date": "2015-04-23T21:32:45+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Right, if you want to get all this logic in, aren't you at this point doing a part of Jetty's job? I get the motivation behind keeping a single port, but that perhaps is also solved by having some custom classes plugged into Jetty \u2013 which we should be free to do now. The Solr code from dispatch filter downwards should be worried with the application logic, with the container (or whatever network layer we are moving towards) taking care of the resource allocation. ",
+            "id": "comment-14509859"
+        },
+        {
+            "date": "2015-04-23T21:47:15+0000",
+            "author": "Yonik Seeley",
+            "content": "The Solr code from dispatch filter downwards should be worried with the application logic\n\nOur DispatchFilter is the bridge between network/container and application logic.  We may be able to move more application-only code out of the dispatch filter though.\n\nbut that perhaps is also solved by having some custom classes plugged into Jetty \u2013 which we should be free to do now.\nYep, good point.  We don't have to do anything in a servlet-generic way any more.\nWhether something is implemented in the dispatch filter or in another custom class plugged into Jetty should be determined by which is easier.  ",
+            "id": "comment-14509891"
+        },
+        {
+            "date": "2015-04-23T22:04:49+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "We may be able to move more application-only code out of the dispatch filter though.\n\n+1, with that, I agree SolrDispatchFilter is as good a place as custom Jetty classes. ",
+            "id": "comment-14509922"
+        },
+        {
+            "date": "2015-04-23T22:05:34+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yonik Seeley Ramkumar Aiyengar Yes that make sense. What do you guys think about exploring async servlet option as well (on similar lines as Datastax Search I mentioned earlier)? ",
+            "id": "comment-14509924"
+        },
+        {
+            "date": "2015-04-23T22:18:31+0000",
+            "author": "Mark Miller",
+            "content": "Also, even with the 2-port approach, we'll need to keep the normal 8983 port with a high thread count as we do today, else we could still get into distributed deadlock due to request forwarding.\n\nI think whatever approach we take should solve this for the forward case as well - whether that is 3 ports or an alternative approach. I really don't want to keep that high thread limit. ",
+            "id": "comment-14509945"
+        },
+        {
+            "date": "2015-04-23T22:47:09+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yonik Seeley FYI. Actually the forwarding request can be considered as a special type of scatter/gather query and hence would perfectly fit my earlier design. Please take a look at the following code\n\nhttps://github.com/apache/lucene-solr/blob/trunk/solr/core/src/java/org/apache/solr/servlet/SolrDispatchFilter.java#L711\n\nIt is using base_url property (similar to other server-side querying code). The original request would block on a thread in the external endpoint and the forwarded request would be executed on a thread belonging to internal thread-pool. So there is no chance of deadlock as such.  ",
+            "id": "comment-14510004"
+        },
+        {
+            "date": "2015-04-23T22:48:18+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "What do you guys think about exploring async servlet option as well (on similar lines as Datastax Search I mentioned earlier)?\n\nThat certainly would be great to try out, but I think it is somewhat orthogonal to this issue. Async or not, we are looking at some way to segregate resources.. May be we could look at one and then the other (in any order). ",
+            "id": "comment-14510005"
+        },
+        {
+            "date": "2015-04-23T22:51:29+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Ok. Let me take a look and I will reply with my findings ASAP. ",
+            "id": "comment-14510011"
+        },
+        {
+            "date": "2015-04-23T23:17:17+0000",
+            "author": "Yonik Seeley",
+            "content": "(regarding forwarded requests, where a request received by a node w/o a core in the target collection will forward to a node with a core in the target collection)\nThe original request would block on a thread in the external endpoint and the forwarded request would be executed on a thread belonging to internal thread-pool. So there is no chance of deadlock as such.\n\nThat essentially means that top-level requests could go to the \"internal\" request pool and we are back to square 1: threads from that request pool (the internal one now) depending on sub-requests that use the same pool.  That leads to distributed deadlock if the pool is limited.  It's easier to think about these things if you just take it to the extremes... think of pool sizes of 1. ",
+            "id": "comment-14510045"
+        },
+        {
+            "date": "2015-05-27T19:13:35+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yonik Seeley\n\nI have an alternate proposal similar to your earlier idea of having a logical partition of a jetty worker pool without requiring a separate endpoint. I believe this would also solve the problem of request forwarding.\n\nThe idea here is to implement a custom Servlet filter similar to  Jetty QoSFilter which would reserve a certain capacity of the worker thread-pool for internal and external requests. The advantages of this approach are as follows,\n\n\n\tWe will still get to use the thread-per-request model when the number of requests (of a specific type) are less than the capacity reserved for that request type. All the additional requests will be suspended until atleast one thread is available for processing.\n\tWe will not require extensive changes to the SolrDispatcherFilter code thereby reducing the possibility of introducing new bugs.\n\tSince this new filter needs to be added to the solr webapp, folks can opt out if they want (Please see the earlier comment from Ramkumar Aiyengar).\n\n\n\nNote even for this approach, we need to implement a way to identify an internal request (e.g. adding an extra request header/param). Now regarding the request forwarding, I have following change in mind. Let's assume that a client C has sent a request to node A for a collection/core hosted by node B. \n\n\n\tThe initial request from client C will be categorized as an \"external\" request.\n\tNode A will figure out that it does not host the requested collection/core. It will figure out the correct Solr server (node B in this case) and send another request to node B. Here we will ensure that this request is also categorized as an \"external\" request (i.e. not to add the request header/param even though its a server-server communication).\n\tNode B will process the \"forwarded\" request as if it were an \"external\" request and return results to node A.\n\tNode A will return results to client C.\n\n\n ",
+            "id": "comment-14561532"
+        },
+        {
+            "date": "2015-05-27T20:11:04+0000",
+            "author": "Yonik Seeley",
+            "content": "Note even for this approach, we need to implement a way to identify an internal request\n\nShard sub-requests will always have \"isShard=true\" param set.\n\nThe idea here is to implement a custom Servlet filter similar to Jetty QoSFilter\n\nLooks interesting. I wonder what the performance implications of using continuations are? ",
+            "id": "comment-14561627"
+        },
+        {
+            "date": "2015-05-27T23:00:19+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yonik Seeley\n\n>>I wonder what the performance implications of using continuations are?\n\nNote that the Jetty continuation API predates Servlet 3 specification. Hence to maintain backwards compatibility, latest version of Jetty implements continuation API using the Servlet 3 APIs under the hood. I could not find any recent reference suggesting bad performance of servlet 3 based implementation. There is one article (published in 2008) comparing the performance difference between thread-per-request model vs non-blocking IO (http://iobound.com/tag/jetty/). But given that the latest version of Jetty uses NIO by default, I am not sure how relevant this really is.\n\nAlso as I mentioned before we will still get to use the thread-per-request model when the number of requests (of a specific type) are less than the capacity reserved for that request type. All the additional requests will be buffered in a Queue until at-least one thread is available for processing. Logically this is as good as having two separate endpoints each associated with a dedicated thread-pool and an accept queue.\n\nAnyway I think we should do a performance testing with this change to be certain. Please let me know if there are any concerns with this proposal. Otherwise I will start implementing this approach. ",
+            "id": "comment-14561926"
+        },
+        {
+            "date": "2015-05-28T00:34:29+0000",
+            "author": "Yonik Seeley",
+            "content": "Otherwise I will start implementing this approach.\n\nSounds good. The person actually doing the work has the most say (or all the say) on what approach to try  ",
+            "id": "comment-14562079"
+        },
+        {
+            "date": "2015-06-09T00:42:02+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "OK. Here is the first cut implementation of this idea https://github.com/hgadre/servletrequest-scheduler\n\nThis is just the core logic for this approach. We still need to implement solr specific policy to use it. I am thinking to partition the worker pool such that we identify following types of requests,\n\n\n\tInternal_Querying\n\tInternal_Indexing\n\tExternal_Local (viz. requests sent by external clients such that a given collection is available on this server).\n\tExternal_Forwarded (viz. requests sent by external clients such that a given collection is not available on this server).\n\tAdmin requests \n\n\n\nI think the tricky part here is to identify the appropriate thread-pool size for each of the partition. Please take a look and let me know any feedback.\n ",
+            "id": "comment-14578132"
+        },
+        {
+            "date": "2015-06-09T10:46:29+0000",
+            "author": "Noble Paul",
+            "content": "can you post a patch as well , how do I know what to review\n ",
+            "id": "comment-14578697"
+        },
+        {
+            "date": "2015-06-09T14:17:54+0000",
+            "author": "Mark Miller",
+            "content": "how do I know what to review\n\nBy looking at the code of the first implementation cut at https://github.com/hgadre/servletrequest-scheduler. It's not a Lucene-Solr repo it's the code Hrishikesh is talking about in the comment above.\n\nIt obviously has not been integrated the project yet. ",
+            "id": "comment-14578955"
+        },
+        {
+            "date": "2015-06-11T15:28:56+0000",
+            "author": "Mark Miller",
+            "content": "Please take a look and let me know any feedback.\n\nThis looks great! I like this approach a lot. \n\nI think the tricky part here is to identify the appropriate thread-pool size for each of the partition.\n\nAs long as it's configurable, we can use simple benchmarks to get a start and tweak the defaults as more information comes back. ",
+            "id": "comment-14582080"
+        },
+        {
+            "date": "2015-06-11T16:33:39+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I like this approach too. \n\n\n An application can provide a custom \nUnknown macro: {@link RequestSchedulingPolicy} \n via a\n\n\tJava system property named 'requestPolicyClassName'. This policy\n\timplementation needs to provide the necessary configuration parameters\n\trequired by this filter viz.\n\t- A list of request types accepted by the application. (Note - this list must be\n\texhaustive i.e. it should cover all requests processed by the application).\n\n\n\nI don't think it is practical to require that the request type list be exhaustive because of the pace of Solr's development and custom components. A good default should be provided.\n\nMinor nit: typo in \"golbalProcessingTime\" in RequestSchedulerFilter. ",
+            "id": "comment-14582195"
+        },
+        {
+            "date": "2015-06-11T16:55:48+0000",
+            "author": "Hrishikesh Gadre",
+            "content": ">>I don't think it is practical to require that the request type list be exhaustive because of the pace of Solr's development and custom components. A good default should be provided.\n\nYes we need to define one request type which will map to all unidentified requests (like a wild card).\n\n>>Minor nit: typo in \"golbalProcessingTime\" in RequestSchedulerFilter.\n\nThanks  Let me fix this. ",
+            "id": "comment-14582216"
+        },
+        {
+            "date": "2015-06-12T21:20:26+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "I am running into a problem while writing a Solr specific policy using the above mentioned framework. I am trying to use the request parameters for identifying request types e.g. \n\n\tpresence of update.distrib parameter identifies internal_indexing request\n\tpresence of isShard parameter identifies internal_querying request\n\tAbsence of both these parameter identifies external request\n\n\n\nIt looks like for POST requests, these parameters are passed via the request body. The HttpServletRequest implementation reads the InputStream when we invoke method to retrieve these parameters. But the side effect of this invocation is that this information is not available to downstream filter chain (SolrDispatchFilter in our case) and it breaks the Solr functionality. Here is a relevant discussion thread on the internet,\nhttp://stackoverflow.com/questions/10210645/http-servlet-request-lose-params-from-post-body-after-read-it-once\n\nIs there any other reliable way to identify the request types (e.g. by interpreting the URL path)? The workaround suggested for this requires copying the InputStream into a byte array (in memory). I don't quite know if this is a good idea for Solr. \n\nAny suggestions/comments are welcome!  ",
+            "id": "comment-14584103"
+        },
+        {
+            "date": "2015-06-13T03:13:34+0000",
+            "author": "Noble Paul",
+            "content": "Is there any other reliable way to identify the request types\nWe need to ensure that these params are sent in the query string itself or add an http header for the same  ",
+            "id": "comment-14584414"
+        },
+        {
+            "date": "2015-06-13T17:53:59+0000",
+            "author": "Mark Miller",
+            "content": "by interpreting the URL path\n\nSolr is pretty configurable here unfortunately.\n\nI don't quite know if this is a good idea for Solr.\n\nYeah, we def don't want to do that.\n\nI had a similar issue to solve and I added a new method to HttpSolrClient:\n\n\n  /**\n   * Expert Method\n   * @param queryParams set of param keys to only send via the query string\n   * Note that the param will be sent as a query string if the key is part\n   * of this Set or the SolrRequest's query params.\n   * @see org.apache.solr.client.solrj.SolrRequest#getQueryParams\n   */\n  public void setQueryParams(Set<String> queryParams) {\n    this.queryParams = queryParams;\n  }\n\n\n\nBecause I needed to be able to easily read some params without reading the request, StreamingSolrClients does:\n\n\n      Set<String> queryParams = new HashSet<>(2);\n      queryParams.add(DistributedUpdateProcessor.DISTRIB_FROM);\n      queryParams.add(DistributingUpdateProcessorFactory.DISTRIB_UPDATE_PARAM);\n      client.setQueryParams(queryParams);\n\n\n\nYou may be able to work something into that. ",
+            "id": "comment-14584740"
+        },
+        {
+            "date": "2015-06-13T19:48:25+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "My main concern with this approach is that it would require adding this code every place we are making HTTP call and hence it is kind of fragile. A better alternative could be to pass a Request header for every HTTP request sent between Solr servers. Apache HTTP client has an option to configure default headers which would be added to each outgoing request. We will need to configure HttpClientUtil with an additional header somehow.\n\nClientPNames.DEFAULT_HEADERS='http.default-headers':  defines the request headers to be sent per default with each request. This parameter expects a value of type java.util.Collection containing Header objects.\n\nReference: http://hc.apache.org/httpcomponents-client-4.2.x/tutorial/html/httpagent.html \n\nThis will help us to identify internal vs external requests. Once we identify an internal request, can we use URI paths for further identification (querying vs indexing) ? I think the paths are hardcoded for internal traffic. Right?\n ",
+            "id": "comment-14584791"
+        },
+        {
+            "date": "2015-06-13T20:03:26+0000",
+            "author": "Mark Miller",
+            "content": "I don't know - all indexing and querying goes through htttpsolrclient, there is really only that and the forwarding code. I don't see why any other code would be POSTing those simple params. \n\nIf you could default the http client to have internal headers, that sounds interesting, but still fragile. I think both cases have the same issue of devs needing to understand something simple that they are likely to miss. ",
+            "id": "comment-14584796"
+        },
+        {
+            "date": "2015-06-13T20:06:28+0000",
+            "author": "Yonik Seeley",
+            "content": "My main concern with this approach is that it would require adding this code every place we are making HTTP call \n\nIt's probably not many - I think all distributed query sub-request are dispatched via a single method for example.\n\nI guess another approach would be to have SolrHttpClient always pull out certain parameters and put them on the URL, even for POST requests. ",
+            "id": "comment-14584798"
+        },
+        {
+            "date": "2015-06-13T21:30:24+0000",
+            "author": "Mark Miller",
+            "content": "I think the paths are hardcoded for internal traffic. Right?\n\nThe /update handler is hard coded in ConcurrentUpdateSolrServer. I don't think this is totally intentional currently - we allow much more expressive configuration. I don't think it's a bad idea to lock down a known /update handler, but I think we are still in fuzzy territory in terms of decisions on that. The query side should not be hardcoded, you can use shard.qt or something to change the internal handler that is hit.\n\nI guess another approach would be to have SolrHttpClient always pull out certain parameters and put them on the URL, even for POST requests.\n\nThese names are confusing, but that's the feature I mention above.\n\nI guess more interesting would be if we could move that  impl from HttpSolrClient to the Solr HttpClient  created by HttpClientUtil (currently returns an CloseableHttpClient impl). I don't know offhand how feasible that is though.\n\n(which is what I assume you meant by SolrHttpClient?) ",
+            "id": "comment-14584827"
+        },
+        {
+            "date": "2015-06-14T00:03:56+0000",
+            "author": "Hrishikesh Gadre",
+            "content": ">>It's probably not many - I think all distributed query sub-request are dispatched via a single method for example.\n\nYes that may be the case for querying. But what about replication/indexing? What about admin requests (if any)? There could be more functionality that I may be missing. Instead passing this parameter by default make more sense as the parameter itself is harmless and this will cover all possible functionalities. The parameter can be passed either via query string or a header.\n\n ",
+            "id": "comment-14584889"
+        },
+        {
+            "date": "2015-06-14T15:10:50+0000",
+            "author": "Mark Miller",
+            "content": "Yes that may be the case for querying. But what about replication/indexing? \n\nThese requests can already be internal / external and will require the same attention if you use headers. Perhaps I'm not understanding, but I'm not sure a default of internal / external gains you much - you still have to consider each call. We use SolrJ clients that are both user and internal based and HttpClients are in the same boat. How will that param default to the right value? Sure, you can always populate it by default - who cares if it's the wrong value?\n\nWhat about admin requests (if any)?\n\nAll admin requests should be easily identifiable by URL. The std Admin request handlers location are purposely hardcoded in SolrCloud mode. ",
+            "id": "comment-14585091"
+        },
+        {
+            "date": "2015-06-14T15:20:34+0000",
+            "author": "Mark Miller",
+            "content": "I think an approach that might force compliance much more effectively is change our HttpClientUtil methods that all HttpClients are created with to require an enum or something that specifies the overall request type: internal, external, admin, whatever. ",
+            "id": "comment-14585095"
+        },
+        {
+            "date": "2015-06-14T17:02:21+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "I think I didn't state my approach clearly. Sorry about that. Here is what I am thinking,\n\n\n\tDefine a static method in HttpClientUtil which allow us to add a \"default\" request header. This \"default\" header will be added to all HttpClients created in the JVM.\n\tInvoke this method in the SolrDispatcherFilter::init(...) to add a request header Solr-Request-Type => Internal. This will ensure that all HttpClients created in the Solr server JVM automatically send this header value for each request.\n\tThis will NOT affect the Solrj clients at all (unless someone invokes this new method).\n\n\n\nYour other approach of forcing compliance is more correct than what I am proposing. The only downside is that it is invasive (which is not bad if we all agree to it). I am fine with this approach as well.\n\nLet's finalize the approach so that I can resume the implementation. ",
+            "id": "comment-14585125"
+        },
+        {
+            "date": "2015-06-14T17:22:44+0000",
+            "author": "Mark Miller",
+            "content": "Invoke this method in the SolrDispatcherFilter::init(...) to add a request header Solr-Request-Type => Internal.\n\nAh, ok - right, I wasn't getting that. But the issue is still that it only works great with two request types - otherwise devs can still easily screw it up.\n\nThe only downside is that it is invasive\n\nI think that is the upside of it - if we are going to have multiple request types and every request should fit properly, seems we have to force the dev to think and pick whenever s/he adds HttpClient usage. ",
+            "id": "comment-14585131"
+        },
+        {
+            "date": "2015-06-14T17:33:43+0000",
+            "author": "Mark Miller",
+            "content": "So to sum up that proposal:\n\n\n\tUsing the headers for HttpClient is fine, but I think a default is really only solid with two request types. Not only do we have more than two to start, but we may want to add more later.\n\tWe deprecate all HttpClient methods in 5x that create a client and add new methods that force specifying an enum for request type.\n\tAdd the deprecated methods to forbidden API's in 5x? Remove them in 6x.\n\n\n\nAll our requests now and in the future get properly marked, we can assume request with no headers are just external user requests. ",
+            "id": "comment-14585139"
+        },
+        {
+            "date": "2015-06-14T18:22:17+0000",
+            "author": "Mark Miller",
+            "content": "To expand on my concern for new requests with the wrong type:\n\nI know in general, it's not the largest issue currently - if all HttpClients under SolrDispatchFilter have internal as a default and forwarding is minimal like it is now, perhaps a simple default in SolrDispatchFiter serves us well. I think the problem is that this is tricky stuff and will evolve over time and we don't have an easy way to ensure devs that don't understand this part of the system don't add code that is not compliant in the future and cause random deadlocks and/or other hard to debug or notice issues. This is a common occurrence (devs changing/adding code without knowing all the ramifications), so for tricky areas like this, I prefer sticking things right in the devs face with docs and forced params. ",
+            "id": "comment-14585174"
+        },
+        {
+            "date": "2015-06-14T18:27:32+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Yes I agree. Lets go with this approach! ",
+            "id": "comment-14585180"
+        },
+        {
+            "date": "2015-06-14T18:47:28+0000",
+            "author": "Yonik Seeley",
+            "content": "I don't think we should place much weight on internal enforcement.  Job #1 should be: what will actually work best for our existing system right now, by default, and be the least invasive to clients (without counting internal solr code as clients).  I see discussions of mechanisms for tagging requests, but I still don't have an understanding of if the overall problem will be solved or not.\n\nTo recap the problem:\n 1) We want to cap the number of certain types of requests executing concurrently for both flow control (see SOLR-7571) and to make more efficient use of resources.\n 2) Solr makes requests to itself in various scenarios\n\n\tdistributed sub-requests (currently only one)\n\tdistributed updates (forwards to leaders, distributed updates\n\tforwards of requests because the forwarder is not part of the target collection\n\tSolr Streaming API: potentially unlimited nesting of requests (solr calling itself)\n\n\n\nCan someone describe what the current proposal will actually look like (by default, including what queues would have what limits)?\n\nEdit: this issue is getting big enough, I had missed Hrishikesh's message on the proposed queue types.\n\nI think the tricky part here is to identify the appropriate thread-pool size for each of the partition. Please take a look and let me know any feedback.\nIndeed... it seems like this is what we need to be solving (what queues, what limits, what behavior over the limit).  Without that I can't even tell if we've solved the distributed-deadlock problem or not. ",
+            "id": "comment-14585190"
+        },
+        {
+            "date": "2015-06-14T19:03:36+0000",
+            "author": "Mark Miller",
+            "content": "Job #1 should be: what will actually work best for our existing system right now, by default, and be the least invasive to clients (without counting internal solr code as clients). \n\nNothing talked about makes things any more difficult for external clients, so I don't think that's a current concern.\n\nI see discussions of mechanisms for tagging requests, but I still don't have an understanding of if the overall problem will be solved or not.\n\nWe are talking about tagging requests because we talked about the meat of the problem above...\n\nThe linked to GitHub code and QosFilter type approach with queues and continuations will work as easily as multiple thread pools will work.\n\n\n ",
+            "id": "comment-14585198"
+        },
+        {
+            "date": "2015-06-14T19:04:16+0000",
+            "author": "Mark Miller",
+            "content": "I don't think we should place much weight on internal enforcement. \n\nI wish that was the case - we must work on a different project  ",
+            "id": "comment-14585199"
+        },
+        {
+            "date": "2015-06-14T19:09:20+0000",
+            "author": "Mark Miller",
+            "content": "(what queues, what limits, what behavior over the limit).\n\nIt should work with whatever limits - you should be able to specify whatever sizes and avoid deadlock. The default is not that important - something less than the current silly 10k?\n\nWe have a start for what queues.\n\nBehavior over the limit is to start rejecting requests.... ",
+            "id": "comment-14585204"
+        },
+        {
+            "date": "2015-06-14T19:14:54+0000",
+            "author": "Yonik Seeley",
+            "content": "Here's where I was coming from... I was trying to think about:\n\n\tdid this solve the distributed deadlock issue\n\tdid this address the need to limit concurrent requests without accidentally decreasing throughput for some request loads (think of the differences between high fanout and low fanout query request types for example).\n\tdid it make life harder for clients\n\n\n\nAll I could come up with at this point is, \"maybe not\" for #1 and \"I don't know\" for #2 and #3 ",
+            "id": "comment-14585209"
+        },
+        {
+            "date": "2015-06-14T19:27:46+0000",
+            "author": "Yonik Seeley",
+            "content": "It should work with whatever limits - you should be able to specify whatever sizes and avoid deadlock.\n\nBut what's the plan to make it work with whatever sizes?\n\nThe default is not that important \n\nI don't care about the tweaks (changing from 32 to 64 because they have a bigger box), I care about one queue size being an order of magnitude bigger than another queue size for some good reason, or which queue sizes need to be (essentially) unbounded to prevent distributed deadlock.  Defaults can make the difference between deadlock and no deadlock.\n\nBehavior over the limit is to start rejecting requests....\n\nOuch... I hope that's not true.  That would certainly be very invasive to clients.  Hopefully there's blocking behavior in there too, and requests are only rejected after too many of them are buffered? ",
+            "id": "comment-14585216"
+        },
+        {
+            "date": "2015-06-14T19:30:13+0000",
+            "author": "Mark Miller",
+            "content": "did this solve the distributed deadlock issue : \"maybe not\" \n\nYeah, but you are being obtuse about that. Where do you see the issue? From a high level, it certainly seems like this solve the issue. Hrishikesh explains and points to code above. Where is the hole? It looks like you can get the behavior we need - we will know shortly when the Solr policy is posted I think.\n\ndid this address the need to limit concurrent requests without accidentally decreasing throughput for some request loads (think of the differences between high fanout and low fanout query request types for example).\n\nUsers can still tweak things for individual use cases - we should have limits that work well for most cases - the default outstanding request limit should not be that low. No matter what it will be an improvement on the craziness you can get now with so many threads that get spun up so easily. This approach is a much better way to handle high load.\n\ndid it make life harder for clients\n\nLike I said, nothing so far affects external clients at all - a request that is not marked can easily be classified as external.\n\nIt sounds like you spot a specific issue(s), because a lot is fairly spelled out above in comments and code, but what is the issue(s)? ",
+            "id": "comment-14585217"
+        },
+        {
+            "date": "2015-06-14T19:31:21+0000",
+            "author": "Mark Miller",
+            "content": " Ouch... I hope that's not true. That would certainly be very invasive to clients. Hopefully there's blocking behavior in there too, and requests are only rejected after too many of them are buffered?\n\nWell, yes of course. It's the same as the multiple thread pool approach. You have a backlog queue that is so big (blocking) and once that overflows (server is overloaded) you start dropping. ",
+            "id": "comment-14585218"
+        },
+        {
+            "date": "2015-06-14T19:46:13+0000",
+            "author": "Mark Miller",
+            "content": "That is really one of the cooler parts about this approach.\n\nEach request type has it's own backlog queue - once we start draining those, we get to pick in what order and we can prioritize things like admin requests. ",
+            "id": "comment-14585225"
+        },
+        {
+            "date": "2015-06-14T19:46:54+0000",
+            "author": "Hrishikesh Gadre",
+            "content": ">>did this solve the distributed deadlock issue\n\nYes it would solve the distributed deadlock issue. Remember how deadlock can happen in the first place? \n\n\n\tAll worker threads are processing top level requests (either request forwarding or scatter-gather querying)\n\tDuring the request processing, they sent sub-requests and are waiting for the results of those requests.\n\tThese sub requests can not be processed since there are no threads available for processing.\n\n\n\nHow would this approach fix the problem? - By allowing top-level requests to consume only a (configurable) portion of thread pool. This ensures that a portion of thread pool is available for processing sub requests. This is as good as having two thread pools.\n\n>>did this address the need to limit concurrent requests without accidentally decreasing throughput for some request loads (think of the >>differences between high fanout and low fanout query request types for example).\n\nIt should. But this depends upon choosing the appropriate size for various request types.\n\n>>did it make life harder for clients\n\nThe clients are not at all aware of this change. So I don't think it would be a problem.  ",
+            "id": "comment-14585226"
+        },
+        {
+            "date": "2015-06-14T19:56:37+0000",
+            "author": "Hrishikesh Gadre",
+            "content": ">>Ouch... I hope that's not true. That would certainly be very invasive to clients. Hopefully there's blocking behavior in there too, and requests are only rejected after too many of them are buffered?\n\nThe current implementation is as follows,\n\n\n\tWhenever a request can not processed immediately, it is suspended and placed on an internal queue.\n\tWe associate a (configurable) timeout value with this request and attach a callback (using Servlet 3 AsyncListener).\n\tWhenever the timeout occurs, we attempt to reschedule request. If a thread is available for the corresponding request type, then the request goes through. Otherwise we send the HTTP 503 error.\n\n\n\nSo from client perspective it is still blocking (until a timeout happens on the server). At this point either it will get a valid response or an HTTP 503 error. Please take a look here for more details. ",
+            "id": "comment-14585227"
+        },
+        {
+            "date": "2015-06-14T19:57:01+0000",
+            "author": "Mark Miller",
+            "content": "FYI, here is the actual java code for the QoSFilter - really cool stuff: https://github.com/eclipse/jetty.project/blob/master/jetty-servlets/src/main/java/org/eclipse/jetty/servlets/QoSFilter.java ",
+            "id": "comment-14585228"
+        },
+        {
+            "date": "2015-06-14T20:00:18+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Since QoSFilter does not directly solve the deadlock issue, I suggest we use following code for reference/discussions.\nhttps://github.com/hgadre/servletrequest-scheduler/blob/master/src/main/java/org/apache/solr/scheduling/RequestSchedulerFilter.java ",
+            "id": "comment-14585230"
+        },
+        {
+            "date": "2015-06-14T20:14:29+0000",
+            "author": "Yonik Seeley",
+            "content": "Yeah, but you are being obtuse about that. Where do you see the issue? \n\nThe only thing I can figure is that I had an underlying assumption that you didn't.   I assumed that at least some queues would be (essentially) unbounded (like our 10K today) to solve all of the distributed deadlock problems.  But I didn't see a description of which ones would be unbounded.  Which ones you need to make unbounded also obviously affect the other goal - limit concurrent requests to make better use of resources.  Too many unknowns make it hard to figure out where the problems are.\n\nThe reasoning behind thinking that at least one queue would need to be unbounded is that the streaming API already has the ability to make unlimited recursive requests.  So it would seem that we either need at least one unbounded queue, or barring that, an unbounded number of limited queues (i.e. a request-depth number could be incremented by 1 for each level and a queue for that level created on demand). ",
+            "id": "comment-14585242"
+        },
+        {
+            "date": "2015-06-14T20:20:12+0000",
+            "author": "Mark Miller",
+            "content": "Since QoSFilter does not directly solve the deadlock issue\n\nMeh - I think anyone reading or following this issue should check out the QosFilter.java code. It's a much more solid foundational reference point due to it's documentation, origins with the Jetty team, and as it's not a new creation.\n\nI assumed that at least some queues would be (essentially) unbounded (like our 10K today) to solve all of the distributed deadlock problems. \n\nOkay, well that is something concrete  I don't want any unboundedness in this issue - it's been one of my primary goals since I started considering two thread pools.\n\nstreaming API already has the ability to make unlimited recursive requests. \n\nThe stuff Joel recently committed? ",
+            "id": "comment-14585247"
+        },
+        {
+            "date": "2015-06-14T20:28:06+0000",
+            "author": "Yonik Seeley",
+            "content": "\nThe current implementation is as follows,\n\n\tWhenever a request can not processed immediately, it is suspended and placed on an internal queue.\n\tWe associate a (configurable) timeout value with this request and attach a callback (using Servlet 3 AsyncListener).\n\tWhenever the timeout occurs, we attempt to reschedule request. If a thread is available for the corresponding request type, then the request goes through. Otherwise we send the HTTP 503 error.\n\n\n\nInteresting, thanks for that.\n\nAfter one request is finished, does something immediately try to pull another request from the queue? Or do we need to wait for that timeout to hit? ",
+            "id": "comment-14585255"
+        },
+        {
+            "date": "2015-06-14T20:30:24+0000",
+            "author": "Hrishikesh Gadre",
+            "content": ">>After one request is finished, does something immediately try to pull another request from the queue? Or do we need to wait for that timeout to hit?\n\nNo it will be pulled immediately. ",
+            "id": "comment-14585258"
+        },
+        {
+            "date": "2015-06-14T20:36:23+0000",
+            "author": "Mark Miller",
+            "content": "Streaming API\n\nIn any case, I still see no need for 10k limits, much better that by default these request fail instead of eating up 10k threads. Sure, you should be able to raise the limits to eat up whatever you want. But by default, we should really operate reasonably - if someone is doing enough recursive calls to use up 10k threads, by default I'd rather those querys end up being denied and the user has to consider what is going on. A default of just eating up all the resources is exactly what we are trying to get away from. ",
+            "id": "comment-14585261"
+        },
+        {
+            "date": "2015-06-14T20:48:52+0000",
+            "author": "Yonik Seeley",
+            "content": "The stuff Joel recently committed?\n\nYeah, in 5.1\n\nIn any case, I still see no need for 10k limits, much better that by default these request fail instead of eating up 10k threads.\n\nWe don't want 10K threads today... we have to have it (a high limit) or we'll get into distributed deadlock.  Eating up additional threads is better than distributed deadlock, and better than arbitrarily failing requests at some low level when the system still has resources it could use.\n\nJust because we have an unbounded pool doesn't mean that it will be used up under normal circumstances, it just means that we can't put a safe bound on it without risking distributed deadlock.  The real max will likely be some function of the queue sizes of any queues that can make a request to the unbounded queue along with the number of nodes in the system. ",
+            "id": "comment-14585266"
+        },
+        {
+            "date": "2015-06-14T20:57:21+0000",
+            "author": "Mark Miller",
+            "content": "We don't want 10K threads today... we have to have it (a high limit) or we'll get into distributed deadlock. \n\nYes, though these days, we have default connection timeouts and it should actually make progress (the timeouts are very long though).\n\nbetter than arbitrarily failing requests at some low level when the system still has resources it could use.\n\nI don't agree with that. I think if a user wants that fine, but that by default we should run within something comfortable like 500-3000 threads or something, and reject above that. I'd way rather Jetty was friendly with the system by default and we didn't have the thread storms we can see now. To me, that is the point of this issue - reasonable thread limits, reject stuff that breaks them, allow a user to configure limits as high as they want. That's just a much nicer system IMO.\n\nit just means that we can't put a safe bound on it without risking distributed deadlock.\n\nYou shouldn't deadlock with this approach - the request that can't get a thread for it's type will simply time out on the queue and we can deny the request and alert the user they are using above normal resources and if they want to up the limits fine, but by default we avoid creating shit loads of threads. ",
+            "id": "comment-14585270"
+        },
+        {
+            "date": "2015-06-14T21:26:07+0000",
+            "author": "Yonik Seeley",
+            "content": "You shouldn't deadlock with this approach - the request that can't get a thread for it's type will simply time out on the queue\n\nAh right, if everything now has timeouts, then at least things will fail at some point.\nBut I guess by that same logic we don't really even need separate queues any more to prevent distributed deadlock.  Of course we still want them.  And relying on timeouts to break distributed deadlocks would be a really inefficient proposition (i.e. should not be used on queues with a low limit, where limiting happens even when the system isn't overloaded).\n\nbetter than arbitrarily failing requests at some low level when the system still has resources it could use.\n\nI don't agree with that. I think if a user wants that fine, but that by default we should run within something comfortable like 500-300 threads or something, and reject above that.\n\n300-500 threads is a ton (and we could rightly consider the system to be overloaded beyond that point).  I guess I'd still call this the \"closer to unbounded\" queue if you disagree with the \"effectively unbounded\" thing.  An important point is that this queue should not be the same queue as one that would have a desirable lower limit.\n\nFor example, one could reasonably configure the Internal_Querying queue size to be something like 16 or 32 for better use of resources and higher throughput.  You would not want an intermediate request from the streaming API to be taking up one of those slots though, both due to (temporary) distributed deadlock and inefficient resource utilization. ",
+            "id": "comment-14585275"
+        },
+        {
+            "date": "2015-06-14T21:41:24+0000",
+            "author": "Yonik Seeley",
+            "content": "So does it seem like we need (at least) one more queue?\n\nPerhaps based on behavior:\n\n\tInternal_Long  // a long-running request that does not call back to Solr (prob good for streaming API endpoint)\n\tInternal_Recursive  // a request that may make other sub-requests to Solr (directly or indirectly) - can't effectively buffer due to recursion... needs a high number of threads\n\n ",
+            "id": "comment-14585280"
+        },
+        {
+            "date": "2015-06-14T22:00:15+0000",
+            "author": "Mark Miller",
+            "content": "300-500 threads is a ton \n\nI meant 300-5000. I'm not tied to any number. I don't think 300 threads max for an app is high at all. I'd be very happy if that was Solr's starting point.\n\nI guess I'd still call this the \"closer to unbounded\" queue if you disagree with the \"effectively unbounded\" thing.\n\nI think it's fuzzy. I know if a server won't use more than 1k threads by default I'm happy and otherwise I'm less happy. I know I'd also like to be able to configure a max of 25 or 50 threads. I'd want a default that wasn't crazy (like I think 10k is) but no so low as to stop normal load and use cases. Where is that number? I don't know. I do know it's not 10k.\n\nBut I guess by that same logic we don't really even need separate queues any more to prevent distributed deadlock.\n\nRight, we can have these types of timeouts anyway - but this is nicer.\n\nFor example, one could reasonably configure the Internal_Querying queue size to be something like 16 or 32 for better use of resources and higher throughput. \n\nYes, this is what I'm after - it would be great to be able to drop things way down and still get reasonable behavior. ",
+            "id": "comment-14585289"
+        },
+        {
+            "date": "2015-06-15T00:16:02+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Good discussion. I hope we are still on track with this design ? ",
+            "id": "comment-14585342"
+        },
+        {
+            "date": "2015-06-15T00:36:14+0000",
+            "author": "Yonik Seeley",
+            "content": "Good discussion. I hope we are still on track with this design ?\n\nThe general mechanism seems fine, yes.\n\nBut if this issue will also enable it by default, then the details still need to be nailed down.  What requests go to what queues, and which queues can be safely lowered to limit concurrency and increase throughput, and which queues need to be configured near upper bounds to work correctly.\n\nOr we could split it up and limit this JIRA issue to the mechanism and punt enabling with good defaults to another issue.\nedit: or enable but have high limits for all queues before we figure out what good defaults are (that should not be worse than the current scenario).  I just don't want to go backwards by committing something with bad defaults on a promise that we'll figure out the right thing later. ",
+            "id": "comment-14585348"
+        },
+        {
+            "date": "2015-06-15T01:14:41+0000",
+            "author": "Erick Erickson",
+            "content": "BTW, I have a test harness that drives my local machine wild that I'd be glad to test this patch (or whatever) with. ",
+            "id": "comment-14585357"
+        },
+        {
+            "date": "2015-06-15T11:01:55+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Yonik, I am curious as to why Streaming API has to have infinite recursion? Is it a necessity or a design choice to do this instead of having one federator issuing all requests? Having two levels (external, internal) is enough of a headache trying to come up with usage patterns and knowing what the optimal amount of parallelism is. I share Mark's concern that this patch or not, having the possibility of one query eating up all threads is scary.. ",
+            "id": "comment-14585781"
+        },
+        {
+            "date": "2015-06-15T14:02:55+0000",
+            "author": "Yonik Seeley",
+            "content": "Yonik, I am curious as to why Streaming API has to have infinite recursion?\n\nIt's not infinite, and it shouldn't even be high.  It's just that you don't know ahead of time what the upper bound will be because it's expressed in the request.\n\nEven 3 levels would mess us up if the majority of the traffic consisted of those types of requests and we didn't have this high-limit queue (it would essentially be back to the situation we have today with normal distributed search queries and one queue.  If the queue calls itself, it needs to have a high limit.) ",
+            "id": "comment-14586072"
+        },
+        {
+            "date": "2015-06-15T16:50:15+0000",
+            "author": "Mark Miller",
+            "content": "But if this issue will also enable it by default, then the details still need to be nailed down. \n\nOnce we have a patch I'm sure we can deal with the tuning. The key to me has been: The QosFilter shows that this approach is entirely possible and even desirable. It also suggests that this will be performant (benchmarks will be interesting). Cool. Now let's get the impl. We can work out the obvious details that will need to be worked out like we normally do with patch iterations. ",
+            "id": "comment-14586303"
+        },
+        {
+            "date": "2015-06-15T16:55:56+0000",
+            "author": "Mark Miller",
+            "content": "If the queue calls itself, it needs to have a high limit.\n\nNo, not necessarily. It's entirely acceptable for us to say, no, you are using over N threads, fail, Solr won't use over N threads by default. As we agreed, there is no distributed deadlock. All that is required is that the upper limit is configurable. ",
+            "id": "comment-14586310"
+        },
+        {
+            "date": "2015-06-15T17:02:31+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "The current implementation of distributed querying is to block the thread handling top-level request until all the sub requests are complete. Have we thought about using fork-join framework (along with servlet 3 api) for this? At high-level, the idea would be to start an async servlet context and submit a scatter-gather task to an internal thread-pool (defined in HttpShardHandlerFactory). The \"gather\" phase would merge the results and reply back to the client (i.e. it will complete the async request). Because the \"gather\" phase is executed after all the sub-requests are complete (either success/failure), it will not occupy the thread for while the sub-requests are in progress. I think this will ensure to avoid the deadlock scenarios as well. \n\nIf distributed querying is the main cause of deadlocks, I wonder if this will fix the problem more directly? ",
+            "id": "comment-14586314"
+        },
+        {
+            "date": "2015-06-15T17:04:43+0000",
+            "author": "Mark Miller",
+            "content": "Deadlocks are just as much a problem on the indexing side as the querying side. ",
+            "id": "comment-14586317"
+        },
+        {
+            "date": "2015-06-15T17:05:51+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "It's not infinite, and it shouldn't even be high. It's just that you don't know ahead of time what the upper bound will be because it's expressed in the request. Even 3 levels would mess us up if the majority of the traffic consisted of those types of requests ...\n\nRight, rather than having a solution which solves this issue for N levels (N > 2), I am curious if it's too restrictive to say that solutions should try to work with N = 2? From a user's perspective as well, it will be a lot easier to predictively allocate resources if we get to that place.. ",
+            "id": "comment-14586321"
+        },
+        {
+            "date": "2015-06-15T17:10:18+0000",
+            "author": "Yonik Seeley",
+            "content": "Dude (mark), you're just being obstinate now.  Relying on timeouts to break distributed deadlock is horrible and will cause random unrelated requests to also fail.  We need a separate queue with a high limit (or a higher limit) for types of requests that can cause another request to be fired off. ",
+            "id": "comment-14586324"
+        },
+        {
+            "date": "2015-06-15T17:15:54+0000",
+            "author": "Yonik Seeley",
+            "content": "Right, rather than having a solution which solves this issue for N levels (N > 2), I am curious if it's too restrictive to say that solutions should try to work with N = 2?\n\nI think that's antithetical to streaming (i.e. it requires a multi-step thing be done in batches). ",
+            "id": "comment-14586331"
+        },
+        {
+            "date": "2015-06-15T17:20:19+0000",
+            "author": "Yonik Seeley",
+            "content": "Hrishikesh - I think everyone agrees that the current queueing approach is fine.\nThe issue I'm talking about is what queues there should be and what the limits should be. ",
+            "id": "comment-14586337"
+        },
+        {
+            "date": "2015-06-15T17:26:29+0000",
+            "author": "Mark Miller",
+            "content": "Dude (mark), you're just being obstinate now. Relying on timeouts to break distributed deadlock is horrible and will cause random unrelated requests to also fail. \n\nI don't agree. The first time you try to do a streaming api query that requires enough recursion to use that many threads will fail and the user will realize what is happening. I think this is better behavior!\n\nI prefer that to just using unlimited threads. I can just as easily say you are being obstinate about having Solr just eat up as many threads as it can no matter what. Most of the devs I know hate that about Solr. I do to.\n\nWe need a separate queue with a high limit (or a higher limit) \n\nYes, the limit can be higher. It doesn't need to be that high by default. That is my point. We could decide that Solr should not spin up more than 300 threads by default and that part for the streaming API might fail with much recursive crap that requires lots of threads unless a user says specifically, yes what I'm doing requires ridiculous thread creation so I'll allow that. I'm saying that could be okay. You might not like it, but it's a perfectly acceptable path. I don't agree it should be some silly high number like what we do now. ",
+            "id": "comment-14586349"
+        },
+        {
+            "date": "2015-06-15T17:31:44+0000",
+            "author": "Mark Miller",
+            "content": "will cause random unrelated requests to also fail.\n\nAnd just using as many threads as it takes won't affect other requests... ",
+            "id": "comment-14586356"
+        },
+        {
+            "date": "2015-06-15T17:32:06+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "May be if the concern is that Streaming fails in an unpredictable manner, is there a way to restrict the amount of recursion possible? That way, the user will be forced to decide the amount of recursion and crank up the number of threads (or make both unbounded if they don't care). Then the defaults for both the number of threads and the number of levels of recursion can be low.. ",
+            "id": "comment-14586357"
+        },
+        {
+            "date": "2015-06-15T17:36:45+0000",
+            "author": "Yonik Seeley",
+            "content": "I don't agree. The first time you try to do a streaming api query that requires enough recursion to use that many threads will fail and the user will realize what is happening. I think this is better behavior!\n\nI'm not sure you understand.  If we have 2 queues, then 3 levels of requests is enough to get into trouble same as today.  All the threads come from the fact that you have a lot of top-level requests... same as distributed search today.  It's not from a single request of some run-away query or something.\n\nThat's why we need (a) a separate queue for those types of requests that we can configure with a higher limit.\nThe normal \"internal query\" pool we (or a user) may want to crank down to low numbers for good throughput but with a high buffering to handle spikes.  That must be a different queue than the queue that can be called recursively.\n\nBut it really feels like you're just picking things out to disagree with, so I'll stop now and use a veto later if necessary to prevent a bad default from being committed. ",
+            "id": "comment-14586370"
+        },
+        {
+            "date": "2015-06-15T17:37:09+0000",
+            "author": "Mark Miller",
+            "content": "May be if the concern is that Streaming fails in an unpredictable manner, \n\nWhat will probably happen in many cases is that the stupid query will fail early like it should before it eats up 20k threads and crashes your server. ",
+            "id": "comment-14586371"
+        },
+        {
+            "date": "2015-06-15T17:38:10+0000",
+            "author": "Mark Miller",
+            "content": ". That must be a different queue than the queue that can be called recursively.\n\nI never said this should not be a different queue or that it couldn't have a higher limit than the other queues. I'm not sure you read what I wrote. ",
+            "id": "comment-14586375"
+        },
+        {
+            "date": "2015-06-15T17:41:36+0000",
+            "author": "Mark Miller",
+            "content": "then 3 levels of requests is enough to get into trouble same as today. \n\nGood god, we just keep going over the same shit. It's not the same trouble as today! The stupid query will fairly quickly timeout because the final request will timeout on the queue! That timeout will makes very different than what you see today, or what you saw when we stupidly had infinite timeouts everywhere! ",
+            "id": "comment-14586381"
+        },
+        {
+            "date": "2015-06-15T18:04:58+0000",
+            "author": "Mark Miller",
+            "content": "veto later if necessary to prevent a bad default from being committed.\n\nWe will toil under your veto threat and see if you end up approving of the consensus defaults we eventually work out. Nice 'dude'. ",
+            "id": "comment-14586409"
+        },
+        {
+            "date": "2015-06-15T18:08:15+0000",
+            "author": "Yonik Seeley",
+            "content": "I was going to respond to your \"It's not the same trouble as today!\", but it's just another nit.  Instead of acknowledging how it fundamentally is the same issue, you find something a nit to disagree with to keep up the argument.  Too much argument for me... I'm done. ",
+            "id": "comment-14586416"
+        },
+        {
+            "date": "2015-06-15T18:14:11+0000",
+            "author": "Mark Miller",
+            "content": "Good! Perhaps we can get a patch before you veto it then.\n\nThe point is it is all nits! The strategy works, the numbers can be worked out, I don't agree they have to be so high, it's all pretty simple. You are good at making some of these issues very hard to get off the ground. ",
+            "id": "comment-14586424"
+        },
+        {
+            "date": "2015-10-17T16:26:43+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Yonik Seeley, Mark Miller and I got a chance to discuss this at Revolution. One approach we seemed to have consensus on (correct me guys if I am wrong) is:\n\n\n\tWe use a single, small, internal queue for non-streaming APIs.\n\tWe leave the limit high for streaming APIs and raise a new issue for (1) The ability to control the amount of nesting in Streaming APIs, and (2) To dynamically have N pools (Internal.1, Internal.2, ...., Internal.N), each with a small limit, where N is the amount of maximum nesting configured for Streaming APIs..\n\n ",
+            "id": "comment-14961970"
+        },
+        {
+            "date": "2016-01-20T21:58:59+0000",
+            "author": "Erick Erickson",
+            "content": "This seems to have stalled a bit, but I did want to add that the situation I saw at one point was not distributed deadlock. Rather the follower just got so overloaded that the request from the leader timed out. The leader then forced the follower into LIR.\n\nI think this situation is handled by this patch, just adding this in for completeness' sake. ",
+            "id": "comment-15109560"
+        },
+        {
+            "date": "2017-08-04T22:39:24+0000",
+            "author": "Varun Thacker",
+            "content": "Hi Hrishikesh,\n\nWould https://github.com/hgadre/servletrequest-scheduler/blob/master/src/main/java/org/apache/solr/scheduling/RequestSchedulerFilter.java be the best place to start looking at the current state of work ? ",
+            "id": "comment-16115053"
+        },
+        {
+            "date": "2017-08-04T23:04:27+0000",
+            "author": "Varun Thacker",
+            "content": "Hi Hrishikesh,\n\nOkay reading a bit more would this comment of yours accurately describe the current state of work?\n\nOK. Here is the first cut implementation of this idea https://github.com/hgadre/servletrequest-scheduler\nThis is just the core logic for this approach. We still need to implement solr specific policy to use it. I am thinking to partition the worker pool such that we identify following types of requests,\nInternal_Querying\nInternal_Indexing\nExternal_Local (viz. requests sent by external clients such that a given collection is available on this server).\nExternal_Forwarded (viz. requests sent by external clients such that a given collection is not available on this server).\nAdmin requests \nI think the tricky part here is to identify the appropriate thread-pool size for each of the partition. Please take a look and let me know any feedback.\n\nSo this Jira would add a filter , then SOLR-7683  and SOLR-7684 would actually make use of it? ",
+            "id": "comment-16115075"
+        },
+        {
+            "date": "2018-05-02T23:44:32+0000",
+            "author": "Mark Miller",
+            "content": "Is this deadlock even an issue anymore?\n\nWe are Jetty 9 now and it only offers NIO connectors (so long thread per request). AFAIK that means requests waiting on IO don't hold a thread. ",
+            "id": "comment-16461743"
+        },
+        {
+            "date": "2018-05-02T23:59:41+0000",
+            "author": "Mark Miller",
+            "content": "I guess maybe without Http2 multiplexing it would depend on the connection pool limitations. ",
+            "id": "comment-16461753"
+        },
+        {
+            "date": "2018-05-03T17:40:02+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Mark Miller\nIs this deadlock even an issue anymore?\n\nWe are Jetty 9 now and it only offers NIO connectors (so long thread per request). AFAIK that means requests waiting on IO don't hold a thread.\nIn order to fully utilize NIO connector capability, the application needs to use asynchronous servlet APIs (provided as part of Servlet 3 spec). Here is a good tutorial that you can take a look: https://docs.oracle.com/javaee/7/tutorial/servlets012.htm\n\nIs it possible for us to use this feature for SOLR? Sure, but it will take a major rewrite of core parts of SOLR cloud (e.g. distributed querying, replication, remote queries etc.) as these components synchronously wait for the results of RPC calls. The servlet-request scheduler proposed in this Jira (https://github.com/hgadre/servletrequest-scheduler)\u00a0internally uses servlet 3 async API to queue up the requests overflowing the thread-pool capacity, ensuring that distributed deadlocks are avoided without requiring any change in the SOLR cloud functionality.\n\n\u00a0 ",
+            "id": "comment-16462840"
+        },
+        {
+            "date": "2018-05-03T18:28:21+0000",
+            "author": "Erick Erickson",
+            "content": "Gotta ask the question, while admitting total ignorance of the scope:\n\nIf this much work is going on, is it time to consider ditching Jetty and replacing with Netty or whatever? ",
+            "id": "comment-16462897"
+        },
+        {
+            "date": "2018-05-03T18:49:35+0000",
+            "author": "Hrishikesh Gadre",
+            "content": "Erick Erickson\nIf this much work is going on, is it time to consider ditching Jetty and replacing with Netty or whatever?\n\u00a0\nNo. The synchronous RPCs is the root cause of the distributed deadlock issue and no matter what technology we use (Jetty, Netty, Tomcat) it will not go away until either we fix it or work around it.\u00a0 ",
+            "id": "comment-16462922"
+        },
+        {
+            "date": "2018-05-03T19:37:40+0000",
+            "author": "Mark Miller",
+            "content": "I don't know that we care about switching to Netty. Basically it's just a lower level project, in many ways that probably means more work to replace what we have. What do you think it offers that we can't get with Jetty? ",
+            "id": "comment-16462967"
+        },
+        {
+            "date": "2018-05-03T20:20:50+0000",
+            "author": "Erick Erickson",
+            "content": "Hey, man! I admitted total ignorance! I'm remembering discussions about how Jetty would eventually be replaced when we were initially going to no war file. I'll totally defer the question to people who know things about the details. ",
+            "id": "comment-16462998"
+        },
+        {
+            "date": "2018-05-03T20:36:54+0000",
+            "author": "Mark Miller",
+            "content": "Heh, it's a serious statement and question.\n\nWe do want to determine what the best underlying tech to use is for the long term and that was part of the motivation to move away from a WAR (but just part).\n\nIf people like or want Netty, it would be good to know why and get those discussions out of the way. Personally, I've never used Netty. From what I understand, it's a lower level project and it would be a lot of work to switch - so to even consider it, we would want powerful reasons.\n\nAFAIK, the Jetty team has done a ton of work in response to the popularity of frameworks like Netty to match most of there features. Perhaps not as light weight in some cases, but that is just because if you are building it for your app, you might be able to leave a lot out. I'm not very optimistic we could leave much out of what Jetty does for us. Instead, we would need to take a long time to stabilize.\n\nSo my thoughts have been to work towards supporting more advanced features available in Jetty over time. ",
+            "id": "comment-16463010"
+        },
+        {
+            "date": "2018-05-03T21:11:34+0000",
+            "author": "Mark Miller",
+            "content": "For this issue, I don't really think we need to deal with this anymore.\n\nI have not checked with the current Apache HttpClient and Jetty, but with Jetty HttpClient and Jetty and the NIO2 stuff it can do, even with very high pool limits, normal load uses way fewer threads. The thread per request model we still used a couple years ago was really what made things so ugly. Having smaller thread pools is way less interesting now and having more than one even less so.\n\nNow we should be able to set pretty high limits like we do now and instead implement a filter for throttling or load control. ",
+            "id": "comment-16463061"
+        },
+        {
+            "date": "2018-05-03T21:45:40+0000",
+            "author": "Mark Miller",
+            "content": "Even before, having multiple pools was probably the wrong idea. Instead we should have focused on internal thread reuse and optimization as well as tuning the thread pool the best we could to be less thread greedy, and then add a QOS type filter like the one I pointed too way above. ",
+            "id": "comment-16463102"
+        }
+    ]
+}

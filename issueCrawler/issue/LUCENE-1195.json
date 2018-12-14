@@ -1,0 +1,122 @@
+{
+    "id": "LUCENE-1195",
+    "title": "Performance improvement for TermInfosReader",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "2.4"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Currently we have a bottleneck for multi-term queries: the dictionary lookup is being done\ntwice for each term. The first time in Similarity.idf(), where searcher.docFreq() is called.\nThe second time when the posting list is opened (TermDocs or TermPositions).\n\nThe dictionary lookup is not cheap, that's why a significant performance improvement is\npossible here if we avoid the second lookup. An easy way to do this is to add a small LRU \ncache to TermInfosReader. \n\nI ran some performance experiments with an LRU cache size of 20, and an mid-size index of\n500,000 documents from wikipedia. Here are some test results:\n\n50,000 AND queries with 3 terms each:\nold:                  152 secs\nnew (with LRU cache): 112 secs (26% faster)\n\n50,000 OR queries with 3 terms each:\nold:                  175 secs\nnew (with LRU cache): 133 secs (24% faster)\n\nFor bigger indexes this patch will probably have less impact, for smaller once more.\n\nI will attach a patch soon.",
+    "attachments": {
+        "SafeThreadLocal.java": "https://issues.apache.org/jira/secure/attachment/12389898/SafeThreadLocal.java",
+        "lucene-1195.patch": "https://issues.apache.org/jira/secure/attachment/12376663/lucene-1195.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2008-02-27T00:55:11+0000",
+            "content": "Nice results!\nI assume this is on a non-optimized index?\nOne of the unexpected things I've seen in Solr is that enumerating over all the terms of a non-optimized index is a very significant component of the total time (including iterating over termdocs when necessary).  This was with terms with a relatively low df though. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12572747"
+        },
+        {
+            "date": "2008-02-27T01:03:18+0000",
+            "content": "Test details:\nThe index has 500,000 docs and 3191625 unique terms. To construct the queries \nI used terms with 1000<df<3000, the index has 3880 of them. I combined the \nterms randomly. Each query has at least one hit. The AND queries have 25 hits \non average, the OR queries 5641. \n\nThe LRU cache was pretty small with a size of just 20.\n\nThe index is unoptimized with 11 segments.\n\nThe searcher was warmed for the tests, thus benefiting from FS caching, which\nshould be a common scenario for indexes of such a medium size. ",
+            "author": "Michael Busch",
+            "id": "comment-12572750"
+        },
+        {
+            "date": "2008-02-27T01:13:34+0000",
+            "content": "Thinking about a common use in Solr: doing a query and faceting that query by a field... would blow out the cache (due to iterating over all the terms in a single field) if it's a global cache?  Is there a good way to prevent that from happening (perhaps just change lucene's existing single -entry thread local cache to a multi-entry thread local cache?) ",
+            "author": "Yonik Seeley",
+            "id": "comment-12572753"
+        },
+        {
+            "date": "2008-02-27T03:28:39+0000",
+            "content": "When faceting(iterating all terms), will each term be looked up twice in dictionary? ",
+            "author": "Eric",
+            "id": "comment-12572768"
+        },
+        {
+            "date": "2008-02-27T14:31:01+0000",
+            "content": "When faceting(iterating all terms), will each term be looked up twice in dictionary?\n\nNo, but consider the case of one thread iterating over all the terms in a field (due to faceting, a range query, prefix query, etc)  That would tend to destroy the cache for other threads doing simple queries unless a way could be found to bypass the cache during enumeration somehow, or make each cache thread specific.\n\n\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-12572913"
+        },
+        {
+            "date": "2008-02-27T19:31:30+0000",
+            "content": "Here is the simple patch. The cache is only used in TermInfosReader.get(Term).\n\nSo if for example a RangeQuery gets a TermEnum from the IndexReader, then\nenumerating the terms using the TermEnum will not replace the terms in the\ncache.\n\nThe LRUCache itself is not synchronized. It might happen that multiple \nthreads lookup the same term at the same time, then we might get an cache \nmiss. But I think such a situation should be very rare, and it's therefore\nbetter to avoid the synchronization overhead?\n\nI set the default cache size to 1024. A cache entry is a (Term, TermInfo)\ntuple. TermInfo needs 24 bytes, I think a Term approx. 20-30 bytes? So\nthe cache would need about 1024 * ~50 bytes = 50Kb plus a bit overhead\nfrom the LinkedHashMap. This is the memory requirement per index segment,\nso a non-optimized index with 20 segments would need about 1MB more memory\nwith this cache. I think this is acceptable? Otherwise we can also decrease\nthe cache size.\n\nAll core & contrib tests pass. ",
+            "author": "Michael Busch",
+            "id": "comment-12573039"
+        },
+        {
+            "date": "2008-02-27T19:42:25+0000",
+            "content": "The LRUCache itself is not synchronized. \n\nUnfortunately, it needs to be... no getting around it. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12573045"
+        },
+        {
+            "date": "2008-02-27T19:46:54+0000",
+            "content": "\nHere is the simple patch. The cache is only used in TermInfosReader.get(Term).\n\nSo if for example a RangeQuery gets a TermEnum from the IndexReader, then\nenumerating the terms using the TermEnum will not replace the terms in the\ncache.\n\nBut for each term, TermDocs.seek() will be called, and that will do a TermInfosReader.get(Term), replacing items in the cache.\nFor SegmentReader, seek(TermEnum) actually doesn't call TermInfosReader.get(Term), but any kind of multi-reader does. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12573049"
+        },
+        {
+            "date": "2008-02-27T21:03:24+0000",
+            "content": "\nUnfortunately, it needs to be... no getting around it.\n\nYou're right, and I'm stupid  \nActually what I meant was that the get() and put() methods don't need to\nbe synchronized if the underlying data structure, i. e.the LinkedHashMap,\nthat I'm using is thread-safe, otherwise it might return inconsistent\ndata. \nBut the LinkedHashMap is not, unless I decorate it with \nCollections.synchronizedMap(). Do you know what's faster? Using the\nsynchronized map or making get() and put() synchronized? Probably\nthere's not really a difference, because the decorator that \nCollections.synchronizedMap() returns just does essentially the same? ",
+            "author": "Michael Busch",
+            "id": "comment-12573065"
+        },
+        {
+            "date": "2008-02-27T21:26:53+0000",
+            "content": "There's higher level synchronization too (ensuring that two different threads don't generate the same cache entry at the same time), and I agree that should not be done in this case.\n\nJust use Collections.synchronizedMap(), it will be the same speed, more readable, and can be easily replaced later anyway. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12573073"
+        },
+        {
+            "date": "2008-05-21T08:37:33+0000",
+            "content": "Changes in the patch:\n\n\tthe used cache is thread-safe now\n\tadded a ThreadLocal to TermInfosReader, so that each thread has its own cache of size 1024 now\n\tSegmentTermEnum.scanTo() returns now the number of invocations of next(). TermInfosReader only\n  puts TermInfo objects into the cache if scanTo() has called next() more than once. Thus, if e. g.\n  a WildcardQuery or RangeQuery iterates over terms in order, only the first term will be put into\n  the cache. This is an addition to the ThreadLocal that prevents one thread from wiping out its\n  own cache with such a query. \n\tadded a new package org/apache/lucene/util/cache that has a SimpleMapCache (taken from LUCENE-831)\n  and the SimpleLRUCache that was part of the previous patch here. I decided to put the caches in\n  a separate package, because we can reuse them for different things like LUCENE-831 or e. g. after\n  deprecating Hits as LRU cache for recently loaded stored documents.\n\n\n\nI reran the same performance experiments and it turns out that the speedup is still the same and\nthe overhead of the ThreadLocal is in the noise. So I think this should be a good approach now?\n\nI also ran similar performance tests on a bigger index with about 4.3 million documents. The \nspeedup with 50k AND queries was, as expected, not as significant anymore. However, the speedup\nwas still about 7%. I haven't run the OR queries on the bigger index yet, but most likely the\nspeedup will not be very significant anymore.\n\nAll unit tests pass. ",
+            "author": "Michael Busch",
+            "id": "comment-12598587"
+        },
+        {
+            "date": "2008-05-23T02:18:49+0000",
+            "content": "In the previous patch was a silly thread-safety problem that I fixed now. \nSome threads in the TestIndexReaderReopen test occasionally hit \nerrors (I fixed the testcase to fail now whenever an error is hit).\n\nI made some other changes to the TermInfosReader. I'm not using\ntwo ThreadLocals anymore for the SegmentTermEnum and Cache,\nbut added a small inner class called ThreadResources which holds\nreferences to those two objects. I also minimized the amount of\nThreadLocal.get() calls by passing around the enumerator.\n\nFurthermore I got rid of the private scanEnum() method and inlined\nit into the get() method to fix the above mentioned thread-safety \nproblem. And I also realized that the cache itself does not have to\nbe thread-safe, because we put it into a ThreadLocal.\n\nI reran the same performance test that I ran for the first patch and\nthis version seems to be even faster: 107secs vs. 112secs with \nthe first patch (~30% improvement compared to trunk, 152secs).\n\nAll tests pass, including the improved\nTestIndexReaderReopen.testThreadSafety(), which I ran multiple\ntimes.\n\nOK I think this patch is ready now, I'm planning to commit it in a\nday or so. ",
+            "author": "Michael Busch",
+            "id": "comment-12599265"
+        },
+        {
+            "date": "2008-05-23T17:22:36+0000",
+            "content": "Committed. ",
+            "author": "Michael Busch",
+            "id": "comment-12599438"
+        },
+        {
+            "date": "2008-05-24T15:17:38+0000",
+            "content": "SegmentTermEnum.scanTo() returns now the number of invocations of next(). TermInfosReader only\nputs TermInfo objects into the cache if scanTo() has called next() more than once. Thus, if e. g.\na WildcardQuery or RangeQuery iterates over terms in order, only the first term will be put into\nthe cache. This is an addition to the ThreadLocal that prevents one thread from wiping out its\nown cache with such a query.\n\nHmmm, clever, and pretty much free.\n\nIt doesn't seem like it would eliminate something like a RangeQuery adding to the cache, but does reduce the amount of pollution.  Seems like about 1/64th of the terms would be added to the cache?  (every 128th term and the term following that... due to \"numScans > 1\" check).\n\nStill, it would take a range query covering 64K terms to completely wipe the cache, and as long as that range query is slow relative to the term lookups, I suppose it doesn't matter much if the cache gets wiped anyway.  A single additional hash lookup per term probably shouldn't slow the execution of something like a range query that much either.\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-12599606"
+        },
+        {
+            "date": "2008-09-11T03:12:10+0000",
+            "content": "A \"safe\" ThreadLocal that can be used for more deterministic memory usage.\n\nProbably a bit slower than the JDK ThreadLocal, due to the synchronization.\n\nOffers a \"purge()\" method to force the cleanup of stale entries.  Probably most useful in code like this:\n\n\tSomeLargeObject slo; // maybe a RAMDirectory?\n\ttry \n{\n\t\tslo = new SomeLargeObject(); // or other creation mechanism;\n\t}\n catch (OutOfMemoryException e) \n{\n\t\tSafeThreadLocal.purge();\n\t\t// now try again\n\t\tslo = new SomeLargeObject(); // or other creation mechanism;\n\t}\n\n ",
+            "author": "robert engels",
+            "id": "comment-12630076"
+        },
+        {
+            "date": "2008-09-11T05:16:28+0000",
+            "content": "Also, SafeThreadLocal can be trivially changed to reduce the synchronization times, by using a synchronized map - then only the access is sync'd.\n\nSince a ThreadLocal in Lucene is primarily read (after initial creation), a 1.5 lock designed for read often, write rarely would be best.\n ",
+            "author": "robert engels",
+            "id": "comment-12630091"
+        }
+    ]
+}

@@ -1,0 +1,55 @@
+{
+    "id": "LUCENE-2143",
+    "title": "Understand why NRT performance is affected by flush frequency",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "4.1"
+        ],
+        "affect_versions": "None",
+        "resolution": "Not A Problem",
+        "status": "Closed"
+    },
+    "description": "In LUCENE-2061 (perf tests for NRT), I test NRT performance by first\ngetting a baseline QPS with only searching, using enough threads to\nsaturate.\n\nThen, I pick an indexing rate (I used 100 docs/sec), and index docs at\nthat rate, and I also reopen a NRT reader at different frequencies\n(10/sec, 1/sec, every 5 seconds, etc.), and then again test QPS\n(saturated).\n\nI think this is a good approach for testing NRT \u2013 apps can see, as a\nfunction of \"freshness\" and at a fixed indexing rate, what the cost is\nto QPS.  You'd expect as index rate goes up, and freshness goes up,\nQPS will go down.\n\nBut I found something very strange: the low frequency reopen rates\noften caused a highish hit to QPS.  When I forced IW to flush every\n100 docs (= once per second), the performance was generally much\nbetter.\n\nI actually would've expected the reverse \u2013 flushing in batch ought to\nuse fewer resoruces.\n\nOne theory is something odd about my test env (based on OpenSolaris),\nso I'd like to retest on a more mainstream OS.\n\nI'm opening this issue to get to the bottom of it...",
+    "attachments": {
+        "SearchTest.java": "https://issues.apache.org/jira/secure/attachment/12427921/SearchTest.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-12-10T19:49:13+0000",
+            "content": "So why also, are you only picking one indexing rate?  Should you not also be varying this from low, all the way up to saturating the system with maximum indexing rate, to properly stress the system? ",
+            "author": "Jake Mannix",
+            "id": "comment-12788871"
+        },
+        {
+            "date": "2009-12-10T20:07:11+0000",
+            "content": "So why also, are you only picking one indexing rate? Should you not also be varying this from low, all the way up to saturating the system with maximum indexing rate, to properly stress the system?\n\nYes, you're right \u2013 we need to see the full curve in general, when\ntesting NRT.  I already did that in LUCENE-2061 (see the first 3\ntables), testing saturated QPS at 1/10/100/1000 DPS, and reopen rate\nof every 0.1/1.0/5.0/10.0/30.0 seconds, and update vs add case.\n\nIt's a 4d space that NRT tests should cover \u2013 freshness, QPS, DPS,\nadd vs update; you fix 3 of them and saturate the other, to get the\ncurve.  The big question is how much you have to pay (lower QPS/DPS)\nfor different levels of freshness.\n\nWhat was good about the tests in LUCENE-2061 is, as long as you flush\nonce per second, you don't pay much for freshness, even down to 10X\nreopens per second, at least at the 100 docs/sec indexing rate.  I\nthink for most NRT apps, 100 msec freshness is more than enough.\n\nI'm focused on the 100 docs/sec indexing rate, for this issue, because\nthat's able to reproduce this odd problem (though I imagine other\nDPS would as well). ",
+            "author": "Michael McCandless",
+            "id": "comment-12788883"
+        },
+        {
+            "date": "2009-12-14T13:16:32+0000",
+            "content": "So, good news / bad news...\n\nThe good news is I got a more mainstream test env (CentOS 5.4) online.\n\nThe bad news is the strange anomolies when testing NRT still occur,\nand, flushing every 100 docs does not work around them.\n\nBut then the good news is, I managed to isolate the problem to the\nhotspot compiler: somehow, it consistently compiles Lucene's search\ncode less efficiently (20-30% slower) depending on which test is being\nrun, which basically makes it impossible to really test performance\ntradeoffs of NRT.\n\nI've attached a simple SearchTest.java that shows the hotspot issue.\n\nRun it like this:\n\njava SearchTest /path/to/index <warmMethod>\n\n\n\nI'm testing against a 5M doc Wikipedia index.\n\nThe <warmMethod> can be:\n\n\n\t\"writer\": open a writer, indexes docs, then rollback\n\n\n\n\n\t\"nrt\": same as \"writer\", but periodically get an NRT reader\n\n\n\n\n\t\"reader\": just open an IndexReader N times, then close it\n\n\n\n\n\t\"searcher\": same as \"reader\", but do some searching against each\n    opened reader\n\n\n\n\n\t\"none\": do no warming\n\n\n\nAfter the warming, the test just runs a set of searches (TermQuery for\nterms 0, 1, 2 ... 9) 10 times, then prints the min time.\n\nI ran the tests on a 5M docs wikipedia index.\n\nOn nearly all JREs version I've tested, on OpenSolaris 2009.06 &\nCentOS 5.4, warming with NRT causes a \"permanent\" loss of search\nperformance of somewhere between 20-30%.  EG here's my results on\nOpenSolaris:\n\n\nnrt...\n  5718 msec\nsearcher...\n  4664 msec\nreader...\n  4771 msec\nwriter...\n  4785 msec\nnone...\n  4839 msec\n\n\n\nOn CentOS:\n\nnrt...\n  4550 msec\nsearcher...\n  3760 msec\nreader...\n  4730 msec\nwriter...\n  3780 msec\nnone...\n  3766 msec\n\n\n\n(In this case the \"reader\" warming also kicked hotspot into the slow\nmode... it seems to be intermittant because sometimes \"reader\" is\nfast)\n\nI run java as \"java -server -Xms1g -Xmx1g\"\n\nIt's very odd... I suspect something buggy in hotspot, but I'm not\nsure how to isolate it.  It seems to somehow kick itself into a state\nwhere it produces less optimal code for searching.  And we're not\ntalking about that many methods, on the hotspots for running\nTermQuery...\n\nI even printed out the assembly code (-XX:+PrintOptoAssembly) and it\nwas very strange \u2013 eg even IndexInput.readVInt was compiled\ndifferently, if you warmed with \"nrt\" vs the others.  I don't get it.\n\nI'm trying to find a workaround that makes hotspot more manageable so\nI can run real tests.... ",
+            "author": "Michael McCandless",
+            "id": "comment-12790137"
+        },
+        {
+            "date": "2012-09-11T16:50:29+0000",
+            "content": "This is a hotspot issue ... not much we can do about it. ",
+            "author": "Michael McCandless",
+            "id": "comment-13453167"
+        },
+        {
+            "date": "2013-05-10T10:33:18+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13653889"
+        }
+    ]
+}

@@ -1,0 +1,288 @@
+{
+    "id": "SOLR-8344",
+    "title": "Decide default when requested fields are both column and row stored.",
+    "details": {
+        "components": [],
+        "type": "New Feature",
+        "labels": "",
+        "fix_versions": [
+            "7.1",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "This issue was discussed in the comments at SOLR-8220. Splitting it out to a separate issue so that we can have a focused discussion on whether/how to do this.\n\nIf a given set of requested fields are all stored and have docValues (column stored), we can retrieve the values from either place.  What should the default be?",
+    "attachments": {
+        "SOLR-8344.patch": "https://issues.apache.org/jira/secure/attachment/12885730/SOLR-8344.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-12-01T14:53:25+0000",
+            "author": "Yonik Seeley",
+            "content": "But are you also arguing for always loading fields from docvalues even if they are stored?\n\nIf a client requests fl=a,b,c (and these three fields all have docvalues and are stored), it may be slower using docvalues if they are not cached yet.\nThe question then becomes.... why are they not cached?\n\n\tthis is a one-off query, the docValues are not normally used\n\t\n\t\tthis is a case we should not be optimizing too much for\n\t\n\t\n\tthis is going to be a very common query\n\t\n\t\tin this case, we should use docvalues anyway.... the average latency will drop as things get cached.\n\t\n\t\n\n\n\nIf we're requesting a large result set, it probably makes sense to use docvalues.... every cache miss brings in 4K of that column, so subsequent accesses will become less likely to miss (vs the same scenario in stored fields).  If the sort is by _docid_ then access will even be linear, meaning there will be few cache misses.  OS read-ahead being triggered will reduce that even further.\n\nIf the index is so massive that the docvalues for these three fields can't be cached for the random access case, then how will docvalues compare to stored values?\nWith a disk-seek-per-doc-access, this is going to be a slow system regardless, and very specialized (i.e. if one can't effectively cache these fields, then things like sorting/faceting on these fields will be slow as well).\n\nBased on what we know now, it feels like docValues is the right default.\nBenchmarking to verify our assumptions would be a good thing. ",
+            "id": "comment-15033802"
+        },
+        {
+            "date": "2015-12-01T15:00:22+0000",
+            "author": "Yonik Seeley",
+            "content": "Also highly related is what our schema defaults should be.\n\nFor example, the fields we add as docValue by default (say dynamic fields like *_i), should they also be row-stored (stored=\"true\") or not? ",
+            "id": "comment-15033823"
+        },
+        {
+            "date": "2015-12-01T17:05:41+0000",
+            "author": "Erick Erickson",
+            "content": "Moving my comment from SOLR-8220 here, didn't see this ticket before pasting my comment there:\n\nMy initial take would be something like add a new possibility to stored, something like stored=\"true|false|docvalues\".\n\nNo guessing involved then. stored=\"docvalues\" would NOT put anything in the fdt file for this field. We should probably error out if stored=\"docvalues\" and docValues=\"false\".\n\nIf it was important to get 2, not 1.999999999999 then there would need to be a stored=true variant of the field.\n\n**************Another take...\nShould we consider disallowing setting both? I.e. stored=\"true\" docValues=\"true\" throws an error...\n\nNow it's totally under the control of the user which path is chosen through the schema definition; we don't have to try to guess anything. No new syntax either. Maybe with a new \"best practice\" or something. There would be a learning curve for users around using only docValues=true for efficiency and not setting stored=true.\n\nThat said, I suspect that the break in back-compat is too expensive and I think stored=docvalues is better anyway.... ",
+            "id": "comment-15034076"
+        },
+        {
+            "date": "2015-12-01T17:07:40+0000",
+            "author": "Yonik Seeley",
+            "content": "Not quite sure what to do if the user defines both however, perhaps use the stored value?\nThat's what this issue is about.\n\nWhy are we trying to anticipate \"the right thing to do\"?\nThey are both \"right\" (semantically equivalent), so we're trying to figure out the best performing option.  That will change based on the request, and always (statically) choosing one over the other is never going to be optimal.\n\nExample: If a field is column-stored (docValued), one could chose to add it as stored so that it would be quicker to retrieve along with other non-docvalue fields (if you need to go to stored fields anyway, just get all the field values you can from there).  But when accessing that field alone, we'd still certainly want to use the column... it will be much faster. ",
+            "id": "comment-15034083"
+        },
+        {
+            "date": "2015-12-01T17:28:28+0000",
+            "author": "Erick Erickson",
+            "content": "Yeah, removed that all from 8220, thought about it more and saw this ticket...\n\nWe do want to keep in mind though that from a user perspective, inputting '2.178734872984723984729387\" as a float and getting  back \"2.17873477935791\" are not equivalent. So whatever we do needs to take that into account. If we use the stored=docvalues approach, then they'd need a copyField with stored=true field if it was important to them.\n\nThe other thing I like about the stored=docvalues approach, existing schemas/applications continue to work exactly as they do now. Upgrading is not surprising. Users can selectively take advantage of this new capability.\n\nI think it'd even work if a user changed an existing schema from stored=true to stored=docvalues and did not re-index. True, they'd be carrying around some useless data in the *.fdt files until it was merged away for updated docs, but as long as docValues=true was set in the original schema, it'd \"do the expected thing\".\n\nI suppose the same functionality could come from a new parameter on a <field> definition like fl_from_dv=true but aside from the awkward name, I think this is harder to wrap your head around.\n\nIf you were willing to pay the \"wasted disk space\" penalty though, a separate parameter on the <field> to control where the \"stored\" value came from would allow one to switch back and forth without re-indexing. But to be clear, I don't think this is a good idea; using the  stored=docvalues option forces a decision to be made up-front. ",
+            "id": "comment-15034126"
+        },
+        {
+            "date": "2015-12-01T17:58:52+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Erick Erickson As of now, users got the stored value directly, but the dv value by using field(). If we load stored fields also from docValues, do you think adding a function stored(), which would actually go and retrieve the row stored value, solve this usecase? ",
+            "id": "comment-15034206"
+        },
+        {
+            "date": "2015-12-01T18:18:37+0000",
+            "author": "Yonik Seeley",
+            "content": "We do want to keep in mind though that from a user perspective, inputting '2.178734872984723984729387\" as a float and getting back \"2.17873477935791\" \n\nRight.  Numeric values are already stored in binary form, so any truncation that may occur is already occurring (and should occur in an identical way for docvalues). ",
+            "id": "comment-15034256"
+        },
+        {
+            "date": "2015-12-01T18:40:33+0000",
+            "author": "Erick Erickson",
+            "content": "Ishan Chattopadhyaya I think it'd solve the use-case. and I'm +1 on adding stored().\n\nI'm also concerned with the upgrade case though. If someone takes their 5x schema and app (and I'm assuming all this is 6.0 at the earliest) and does nothing to their schema or app, I'd like them to see no change. If we require them to use stored() to pull the stored value explicitly, the app needs to change or the users will be surprised.\n\nWhich is why I kinda like the stored=docvalues option. It would mean that they get the same behavior they see now if they do nothing, but the option of doing things the new way without re-indexing.\n\nHmmm, I like also adding the stored() option. That would allow someone to take an existing schema/index/app, add stored=docvalues option (for fields that are already DV fields) and still get the raw stored value if they want.\n\nHmmmmm2. the more I think about it, the more I think that it's probably better to have something like a new option. Rather than stored=docvalues, something like defaultStoredReturn=docvalues|stored. That would allow an existing index with a DV field to have the maximum flexibility. Plus it would allow a single field definition to serve all the use cases. My original idea of stored=docvalues wouldn't put anything in the fdt files when indexing, so a stored() operation wouldn't work on a new index.\n\nHmmmmm3. Maybe I'm worrying too much about flexibility. We already have enough trouble explaining the nuances of stored/indexed/docValues. Adding defaultStoredReturn to the mix makes it really ugly. Just using stored=docvalues allows people to make a decision, and the back-compat story is simple. \"To take advantage of these efficiencies, you may have to reindex if you care about the edge case of floats/doubles/ints/longs (and maybe dates)\". ",
+            "id": "comment-15034324"
+        },
+        {
+            "date": "2015-12-01T19:04:44+0000",
+            "author": "Erick Erickson",
+            "content": "Damn, ya' learn something new every day. \n\nGolly, I need to think before I type. We get the transformed date back from the stored field.\n\nSo never mind the whole \"they may not get back what they put in\" discussion, it's misguided. ",
+            "id": "comment-15034370"
+        },
+        {
+            "date": "2015-12-01T19:50:43+0000",
+            "author": "Yonik Seeley",
+            "content": "I'm also concerned with the upgrade case though. If someone takes their 5x schema and app (and I'm assuming all this is 6.0 at the earliest) and does nothing to their schema or app, I'd like them to see no change.\n\nThe plan from SOLR-8220 was to use the schema version for back compat... meaning that if you have unstored docValues fields, they won't suddenly start appearing when you do fl=* ",
+            "id": "comment-15034467"
+        },
+        {
+            "date": "2016-03-22T03:23:55+0000",
+            "author": "Erick Erickson",
+            "content": "What is the status of this now that SOLR-8220 has been committed? Still under development? ",
+            "id": "comment-15205703"
+        },
+        {
+            "date": "2016-03-22T05:17:52+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Erick, I'll take a fresh look at this post 6.0 release, and attempt an initial patch, unless someone else wants to take it up. ",
+            "id": "comment-15205815"
+        },
+        {
+            "date": "2016-03-22T13:34:51+0000",
+            "author": "Yonik Seeley",
+            "content": "Related: in my testing, it seemed like retrieving docvalue fields that were unstored was much slower than the /export handler... and it wasn't the sorting part, this was sustained slowness, pointing to our retrieval code. ",
+            "id": "comment-15206354"
+        },
+        {
+            "date": "2016-07-20T03:06:05+0000",
+            "author": "Erick Erickson",
+            "content": "Is it possible to preferentially return DV when doing the first pass of a distributed search? IIRC, Yonik said at one point that we already get the sort values from the index (or perhaps we can pull them from DV fields). But I just verified that the logic in DocStreamer decompresses the doc pretty much no matter what. I've just verified this in 6.2. The test for whether all the fields are DV fields fails due to the presence of the \"score\" pseudo field.\n\nI added a hack patch to 6810 to illustrate one path that sidesteps decompression. \n\nAnyway, I was wondering if we could somehow detect that this was the first pass and return the DV fields all the time, although I do wonder if some obscure case where the sorted order of the multiValued DV fields would mess things up. ",
+            "id": "comment-15385236"
+        },
+        {
+            "date": "2016-07-20T04:47:12+0000",
+            "author": "David Smiley",
+            "content": "Is it possible to preferentially return DV when doing the first pass of a distributed search?\n\nYes with customizations.  I have a patch in https://issues.apache.org/jira/browse/SOLR-5478 which is used by one of my clients, and I have another deployed implementation in which a custom request handler extending SearchHandler rewrites the id field in fl to be field(id) in certain circumstances, and that didn't require patching Solr.  I'd love to see SOLR-5478 get finally put to bed.  Oh and I wrote tests.  Hmmm. ",
+            "id": "comment-15385318"
+        },
+        {
+            "date": "2017-06-05T13:41:15+0000",
+            "author": "David Smiley",
+            "content": "This issue (SOLR-8344) seems to be about a decision, not about actual code.  Linking to SOLR-5478 which contains a patch that actually does this.   ",
+            "id": "comment-16036947"
+        },
+        {
+            "date": "2017-09-01T12:41:51+0000",
+            "author": "Cao Manh Dat",
+            "content": "I think instead of find out the default solution. Why don't we do a quick estimation like this \n\ndvEstimate = estimateReadingTimeForDocValuesAsDefault(List<String> fields, int numDocs);\nstoredEstimate = estimateReadingTimeForStoredAsDefault(List<String> fields, int numDocs);\n\n\nBy comparing dvEstimate and storedEstimate we can choose to use dv or stored field here. ",
+            "id": "comment-16150447"
+        },
+        {
+            "date": "2017-09-07T03:35:04+0000",
+            "author": "Cao Manh Dat",
+            "content": "Here are my patch for this ticket. The work here is simple. I created a new class called RetrieveFieldsOptimizer, It takes input from docFetcher, returnFields and docList, then return storedFields and docValuesFields need to retrieve.\n\nThe optimization here is very simple ( we can do more optimization in the future if we want ). In case of field has both stored and docValues, we always use docValues unless the numDocs is small and exist a field need to be returned but only stored.\n\nTherefore in first pass ( with id and score fields only ) we will always use docValues to retrieve id field.\n\nHere are some benchmark result ( 3 shards, 1 replica each, SSD drive, 18000 docs, run 500 times and get average )\n\n\n\nQuery\nAVG QTime with optimizer\nAVG QTime without optimizer\n\n\nq=:&fl=title_str_dv_stored,id,revision_text_str_dv_stored&start=10000\n54\n172\n\n\nq=:&fl=title_str_dv_stored,id,revision_text_str_dv_stored&start=10\n2\n2\n\n\nq=:&fl=title_str_dv_stored,id,revision_text_str_dv_stored&rows=1000\n40\n64\n\n\nq=:&fl=title_str_dv_stored,id,revision_text_str_stored&start=10000\n53\n175\n\n\nq=:&fl=title_str_dv_stored,id,revision_text_str_stored&start=10\n2\n2\n\n\nq=:&fl=title_str_dv_stored,id,revision_text_str_stored&rows=1000\n56\n64\n\n\n\n ",
+            "id": "comment-16156395"
+        },
+        {
+            "date": "2017-09-07T05:35:19+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Interesting! Two questions:\nq=:&fl=TITLE_str,id,REVISION_TEXT_str&start=10000\nDid you mean \"rows=10000\" or are you actually changing start?\nWhat happens in your benchmark if at least one of the fields to return is a text field (or has docValues=false)? Does getting the stored content of one of the fields change your benchmark results? ",
+            "id": "comment-16156497"
+        },
+        {
+            "date": "2017-09-07T07:13:28+0000",
+            "author": "Cao Manh Dat",
+            "content": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe I changed start param. Therefore, in the first pass, every shard will send back 10010 ids back to the query master. Right now we will use stored field to retrieve doc ids, with this patch, we will use doc values field to retrieve doc ids ( which is significant faster ).\nIn case of less values to be retrieved ( case 2 ), the different is not much.\n\nWhat happens in your benchmark if at least one of the fields to return is a text field (or has docValues=false)? Does getting the stored content of one of the fields change your benchmark results?\n\nYeah, I'm about to testing that, we post result latter. But keep in mind that, in case of multi-value field, we can't use docValues because values are stored as sorted-set. ",
+            "id": "comment-16156597"
+        },
+        {
+            "date": "2017-09-07T16:05:47+0000",
+            "author": "David Smiley",
+            "content": "I don't think the number of documents is that pertinent since both strategies are O(docs) multiplied by other factors.  Remember that testing this is also complicated by the existence of the Solr document cache.  Why not have the strategy simply observe if it's possible at all to completely use docValues.  If it is, do it, if not, don't.  If the \"fl\" contains a wildcard, we may want to give up on using docValues altogether. ",
+            "id": "comment-16157141"
+        },
+        {
+            "date": "2017-09-07T16:17:23+0000",
+            "author": "Yonik Seeley",
+            "content": "Why not have the strategy simply observe if it's possible at all to completely use docValues.\n+1\n\nIf the \"fl\" contains a wildcard, we may want to give up on using docValues \nOr resolve wildcards first. ",
+            "id": "comment-16157156"
+        },
+        {
+            "date": "2017-09-07T23:38:14+0000",
+            "author": "Cao Manh Dat",
+            "content": "David Smiley \nI don't think the number of documents is that pertinent since both strategies are O(docs) multiplied by other factors. \nNo, It matter in case of \"fl\" contains a field which is stored only (let's call it field1) and \"rows\" is small. Because we already have to pay for seek cost for reading field1 therefore reading other fields from stored will be faster than reading from DV. I tested this result with Lucene (not Solr) so we don't have to worry about caching will affect the result here. ",
+            "id": "comment-16157864"
+        },
+        {
+            "date": "2017-09-08T03:05:11+0000",
+            "author": "David Smiley",
+            "content": "No, It matter in case of \"fl\" contains a field which is stored only (let's call it field1) and \"rows\" is small. \n\nWhich scenario is this in your benchmark above?  Or some other benchmark you allude to?\n\nBecause we already have to pay for seek cost for reading field1 therefore reading other fields from stored will be faster than reading from DV\n\nI understand that but don't see what that has to do with the number of documents.\n\nIn the event every field in \"fl\" has docValues, stored, single valued: will your patch use docValues data always?  If not, why not?  Maybe I should study your patch further but I was a bit confused.\n\nI would like to consider the relationship of this optimization on the document cache, if not in this patch then perhaps in a follow-up.  If in some request we realize we can avoid accessing the stored document and instead do only with docValues, we should avoid polluting the document cache as well, I think.  Maybe we will  Consider the first phase of distributed search that only wants the uniqueKey field.  \n\nIn your patch, this: if (doc.containsKey(fieldName)) doc.remove(fieldName); can be simplified to remove the needless condition ",
+            "id": "comment-16158059"
+        },
+        {
+            "date": "2017-09-08T03:46:34+0000",
+            "author": "Cao Manh Dat",
+            "content": "Which scenario is this in your benchmark above? Or some other benchmark you allude to?\nYeah, it belongs to another simple benchmark.\nI understand that but don't see what that has to do with the number of documents.\nHmm, I re-run the benchmark and you're right. They are almost the same.\nIn the event every field in \"fl\" has docValues, stored, single valued: will your patch use docValues data always\nYeah, It always use docValues.\nIf in some request we realize we can avoid accessing the stored document and instead do only with docValues, we should avoid polluting the document cache as well\nWith this patch, if we notice that we do not need stored field, so we will skip reading the document as well as caching. \nIn your patch, this: if (doc.containsKey(fieldName)) doc.remove(fieldName); can be simplified to remove the needless condition\nI don't know what you means, but if we remove this line, some tests will get failed ( TestPseudoReturnFields ) ",
+            "id": "comment-16158073"
+        },
+        {
+            "date": "2017-09-08T03:55:41+0000",
+            "author": "David Smiley",
+            "content": "I mean just call {{doc.remove(fieldName)}; no need to guard this with an \"if\".  If it's not there, doc.remove is harmless. ",
+            "id": "comment-16158082"
+        },
+        {
+            "date": "2017-09-08T03:56:47+0000",
+            "author": "Cao Manh Dat",
+            "content": "Ah yeah, you're right. ",
+            "id": "comment-16158083"
+        },
+        {
+            "date": "2017-09-08T04:13:52+0000",
+            "author": "Cao Manh Dat",
+            "content": "BTW I think that for this ticket, the current optimization is good enough ( we can remove numRows check before doing commit ). And we can always change the optimize method latter. ",
+            "id": "comment-16158097"
+        },
+        {
+            "date": "2017-09-08T04:14:16+0000",
+            "author": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe",
+            "content": "Because we already have to pay for seek cost for reading field1 therefore reading other fields from stored will be faster than reading from DV\nThat would be my guess. But then, wouldn't we prefer to use stored fields for all fields (if possible) if at least one of the fields needs to come from stored fields? In the patch, it looks like, if rows >= 100, then we try to get everything from DVs when possible, right? ",
+            "id": "comment-16158098"
+        },
+        {
+            "date": "2017-09-08T04:22:27+0000",
+            "author": "Cao Manh Dat",
+            "content": "Tom\u00e1s Fern\u00e1ndez L\u00f6bbe Yeah in my benchmark for Lucene, they will almost the same, so I would like to read from docValues, therefore docValues fields can be cached. ",
+            "id": "comment-16158102"
+        },
+        {
+            "date": "2017-09-08T12:40:10+0000",
+            "author": "David Smiley",
+            "content": "Please post a new patch so we can see before you commit it.  Furthermore, can you please include a simple summary of the approach in the javadoc of the optimizer.... something like (assuming this is accurate):  \n\nSometimes we could fetch a field value from either the stored document or docValues.  Such fields have both and are single-valued.  If choosing docValues allows us to avoid accessing the stored document altogether for all fields to be returned then we do it, otherwise we prefer the stored value when we have a choice.\n\nIMO An effective strategy and straight-forward to explain. ",
+            "id": "comment-16158560"
+        },
+        {
+            "date": "2017-09-08T12:48:32+0000",
+            "author": "Uwe Schindler",
+            "content": "I'd always use docValues for the ID field (if available) for the first pass of a cloud/distributed search. I had a customer with huge stored fields and the first pass of the distributed search got a major slowdown. Only workaround was to use single-pass, which had other problems (of course).\n\nSo I'd suggest to add the following special case: If first pass of distributed search AND id field has docvalues => also use docValues. ",
+            "id": "comment-16158575"
+        },
+        {
+            "date": "2017-09-08T13:01:41+0000",
+            "author": "David Smiley",
+            "content": "Uwe Schindler it isn't necessary to have a special condition for distributed search.  As long as the uniqueKey field has docValues, the algorithm I've been promoting here will choose it.  Can you see that from my proposed documentation comment above?  If not can you suggest improved wording? ",
+            "id": "comment-16158593"
+        },
+        {
+            "date": "2017-09-08T13:08:45+0000",
+            "author": "Yonik Seeley",
+            "content": "A related thing worth thinking about: what should the default be for our docValue fields in our schema templates / examples?\nIIRC, they are both stored and docValues=true currently, which was a conservative decision since we didn't know the impact of trying to use docValues only for stored fields.  That extra space may not be worth it in the average case though. ",
+            "id": "comment-16158607"
+        },
+        {
+            "date": "2017-09-08T13:43:58+0000",
+            "author": "Uwe Schindler",
+            "content": "For the Id field we figured out that it breaks some stuff if stored is missing. E.g., More like this breaks. IMHO this is a bug, because MLT should use the doc cache / searcher to get the MLT values including id. ",
+            "id": "comment-16158653"
+        },
+        {
+            "date": "2017-09-12T03:39:51+0000",
+            "author": "Cao Manh Dat",
+            "content": "IIRC, they are both stored and docValues=true currently, which was a conservative decision since we didn't know the impact of trying to use docValues only for stored fields. That extra space may not be worth it in the average case though.\n\nYeah, I think in case of single-value field, we should use docValues=true only. ",
+            "id": "comment-16162448"
+        },
+        {
+            "date": "2017-09-13T00:37:33+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch based on your hint David Smiley ",
+            "id": "comment-16163951"
+        },
+        {
+            "date": "2017-09-13T18:48:55+0000",
+            "author": "David Smiley",
+            "content": "\n\tSolrDocumentFetcher: minor: allStoreds variables & getter should simply be allStored (no trailing 's' which reads weird)\n\tRetrieveFieldsOptimizer.storedFields add comment saying \"null\" means all available\n\tRetrieveFieldsOptimizer.calcStoredFieldsForReturn: in the hasPatternMatching condition check: eagerly initialize storedFields to a new HashSet instead of lazy. If it turns out that no stored fields match, we don't want to act like we want all stored fields, which is what I think will happen with your logic.  To clarify calcStoredFieldsForReturn further, I suggest making storedFields final, and return null early for wantsAllFields.  (IMO final fields can help clarify non-trivial logic)\n\tRetrieveFieldsOptimizer.optimize:  couldn't the loop here be replaced with a dvFields.addAll(storedFields); storedFields.clear(); ?\n\tminor: It's debatable to me that RetrieveFieldsOptimizer is its own class.  It seems to me that a few static methods on DocsStreamer would be fine?  (package access for testing).  No big deal though.\n\tdo we really need to make this setting toggle-able with a new parameter?  I suppose you left this in for performance testing but I think it can be removed now.\n\tshould we consider the presence of useDocValuesAsStored=false in one of the fields that are both stored and docValues as a signal that we should not do this optimization?  I suppose so.\n\n\n\nI think I see an existing bug (not introduced here) in the logic you moved \u2013 calcDocValueFieldsForReturn.  If fl=foo*,dvField and dvField has useDocValuesAsStored=false then the code won't return dvField even though it's been explicitly mentioned.  I haven't tried this; I'm just reading the code carefully. ",
+            "id": "comment-16165102"
+        },
+        {
+            "date": "2017-09-18T03:59:53+0000",
+            "author": "Cao Manh Dat",
+            "content": "Thanks for your review, that's great. But\n\nminor: It's debatable to me that RetrieveFieldsOptimizer is its own class. It seems to me that a few static methods on DocsStreamer would be fine? (package access for testing). No big deal though.\nI think the purpose of the class is clear to me and this make the code look better\nshould we consider the presence of useDocValuesAsStored=false in one of the fields that are both stored and docValues as a signal that we should not do this optimization? I suppose so.\nI maybe misunderstanding but useDocValuesAsStored=true only relate to fl=* case and in that case, storedFields==null which is already skipped in the patch. ",
+            "id": "comment-16169554"
+        },
+        {
+            "date": "2017-09-18T04:15:07+0000",
+            "author": "Cao Manh Dat",
+            "content": "Updated patch for this ticket ( thanks David Smiley the patch looks much better ). I will run the test and do commit soon. ",
+            "id": "comment-16169563"
+        },
+        {
+            "date": "2017-09-18T23:03:06+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 40f78dd2740122e5fa18f2515effc9272fd2d902 in lucene-solr's branch refs/heads/master from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=40f78dd ]\n\nSOLR-8344: Decide default when requested fields are both column and row stored. ",
+            "id": "comment-16170873"
+        },
+        {
+            "date": "2017-09-18T23:04:59+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit d877ade945c5b143dcd063e2865ab65368710b92 in lucene-solr's branch refs/heads/branch_7x from Cao Manh Dat\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d877ade ]\n\nSOLR-8344: Decide default when requested fields are both column and row stored. ",
+            "id": "comment-16170876"
+        },
+        {
+            "date": "2017-09-18T23:13:41+0000",
+            "author": "Cao Manh Dat",
+            "content": "I think I see an existing bug (not introduced here) in the logic you moved \u2013 calcDocValueFieldsForReturn. If fl=foo*,dvField and dvField has useDocValuesAsStored=false then the code won't return dvField even though it's been explicitly mentioned. I haven't tried this; I'm just reading the code carefully.\n\nDavid Smiley This seems a bug to me, too. I will spin off this issue into another ticket. ",
+            "id": "comment-16170884"
+        },
+        {
+            "date": "2017-10-17T11:04:12+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Bulk close after 7.1.0 release ",
+            "id": "comment-16207439"
+        }
+    ]
+}

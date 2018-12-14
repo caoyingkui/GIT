@@ -1,0 +1,96 @@
+{
+    "id": "LUCENE-5222",
+    "title": "TestExpressionSorts fails sometimes when using expression returning score",
+    "details": {
+        "components": [],
+        "fix_versions": [
+            "4.6",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Bug",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "Jenkins picked this up.  Repeat with:\n\n\nant test  -Dtestcase=TestExpressionSorts -Dtests.method=testQueries -Dtests.seed=115AD00ED89D9F7B -Dtests.multiplier=3 -Dtests.slow=true -Dtests.locale=no_NO -Dtests.timezone=America/Nassau -Dtests.file.encoding=US-ASCII\n\n\n\nIt appears to have to do with scoring, as removing the score sort from the original sorts causes the tests to pass.  If you remove the possible discrepancy between doDocScores and docMaxScore params to searcher.search, then the test gets farther before failing.",
+    "attachments": {
+        "LUCENE-5222.patch": "https://issues.apache.org/jira/secure/attachment/12603852/LUCENE-5222.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-09-17T20:30:56+0000",
+            "content": "Note this only happens with the paging collector... searchAfter.\nIf u change the test to page the old fashioned way its fine.\n\nI suspect a bug in topfieldcollector.pagingfieldcollector. eg when there are multiple sorts and tiebreaks or something. I don't even think testsearchafter tests the case of multiple sorts this well. ",
+            "author": "Robert Muir",
+            "id": "comment-13769902"
+        },
+        {
+            "date": "2013-09-18T01:29:02+0000",
+            "content": "A couple things I found:\n\n\tscorer.score() in ScoreFunctionValues is sometimes returning NaN\n\tIf I add the last two boolean values explicitly as true (doDocScores and doMaxScore) to both search() and searchAfter() calls, the test succeeds\n\n ",
+            "author": "Ryan Ernst",
+            "id": "comment-13770289"
+        },
+        {
+            "date": "2013-09-18T14:13:47+0000",
+            "content": "Its not returning NaN, when you say 'doDocScores', indexsearcher confusingly fills a NaN.\n\nI think we have way too many booleans, optimizations, and specializations here... \n\nI dont think anyone tests this paging with multiple sorts... ill commit something to TestSearchAfter to try to break these collectors. ",
+            "author": "Robert Muir",
+            "id": "comment-13770799"
+        },
+        {
+            "date": "2013-09-18T14:46:10+0000",
+            "content": "\nIf I add the last two boolean values explicitly as true (doDocScores and doMaxScore) to both search() and searchAfter() calls, the test succeeds\n\nIndeed: I just tested this and it works (see patch below)\n\nAdditionally i noticed TestSearchAfter in core somehow \"hides the bug\" with this stuff in its test:\n\nif (sort == Sort.RELEVANCE) {\n         paged = searcher.searchAfter(lastBottom, query, filter, pageSize, sort, true, doMaxScore);\n\n\n\nSo there is a bug here in searchAfter/TopFieldCollector, and i'm also unhappy TestSearchAfter is not testing multiple sorts!\n\n\n\nIndex: src/test/org/apache/lucene/expressions/TestExpressionSorts.java\n===================================================================\n--- src/test/org/apache/lucene/expressions/TestExpressionSorts.java\t(revision 1524082)\n+++ src/test/org/apache/lucene/expressions/TestExpressionSorts.java\t(working copy)\n@@ -131,7 +131,10 @@\n \n   void assertQuery(Query query, Filter filter, Sort sort) throws Exception {\n     int size = _TestUtil.nextInt(random(), 1, searcher.getIndexReader().maxDoc()/5);\n-    TopDocs expected = searcher.search(query, filter, size, sort, random().nextBoolean(), random().nextBoolean());\n+    // consume randomness\n+    random().nextBoolean();\n+    random().nextBoolean();\n+    TopDocs expected = searcher.search(query, filter, size, sort, true, false);\n     \n     // make our actual sort, mutating original by replacing some of the \n     // sortfields with equivalent expressions\n@@ -152,12 +155,15 @@\n     }\n     \n     Sort mutatedSort = new Sort(mutated);\n-    TopDocs actual = searcher.search(query, filter, size, mutatedSort, random().nextBoolean(), random().nextBoolean());\n+    // consume randomness\n+    random().nextBoolean();\n+    random().nextBoolean();\n+    TopDocs actual = searcher.search(query, filter, size, mutatedSort, true, false);\n     CheckHits.checkEqual(query, expected.scoreDocs, actual.scoreDocs);\n     \n     if (size < actual.totalHits) {\n-      expected = searcher.searchAfter(expected.scoreDocs[size-1], query, filter, size, sort);\n-      actual = searcher.searchAfter(actual.scoreDocs[size-1], query, filter, size, mutatedSort);\n+      expected = searcher.searchAfter(expected.scoreDocs[size-1], query, filter, size, sort, true, false);\n+      actual = searcher.searchAfter(actual.scoreDocs[size-1], query, filter, size, mutatedSort, true, false);\n       CheckHits.checkEqual(query, expected.scoreDocs, actual.scoreDocs);\n     }\n   }\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13770831"
+        },
+        {
+            "date": "2013-09-18T15:11:08+0000",
+            "content": "One thing I just discovered: the seed causes newSearcher to pass an ExecutorService to IndexSearcher ... if I turn that off (keeping randomness consumption constant) then the test passes ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13770857"
+        },
+        {
+            "date": "2013-09-18T16:01:11+0000",
+            "content": "Ok, thats definitely the issue: the problem is that when using an Executor, IndexSearcher searches each segment and then merges the results with a FakeScorer.\n\nit has a special hack for this case where it actually ignores the boolean options you set, if the sort itself contains a relevance comparator:\n\n\ndoDocScores || sort.needsScores()\n\n\n\nThe current implementation is\n\n  /** Whether the relevance score is needed to sort documents. */\n  boolean needsScores() {\n    for (SortField sortField : fields) {\n      if (sortField.getType() == SortField.Type.SCORE) {\n        return true;\n      }\n    }\n    return false;\n  }\n\n\n\nSo in the case of the expression sortfield (or any other similar sortfield), the hack does not work of course, because its a CUSTOM sortfield.\n\nSo I think we should change this hack to call SortField.needsScores() ? This way if someone has a custom one, they can just return true here and all this works.\n\nI will make a stab at a patch. ",
+            "author": "Robert Muir",
+            "id": "comment-13770909"
+        },
+        {
+            "date": "2013-09-18T16:09:58+0000",
+            "content": "Here's a patch. Its a simple solution for now, I think we could optimize it more later? ",
+            "author": "Robert Muir",
+            "id": "comment-13770916"
+        },
+        {
+            "date": "2013-09-18T21:23:39+0000",
+            "content": "Commit 1524575 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1524575 ]\n\nLUCENE-5222: fix expression sort with executorService ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13771254"
+        },
+        {
+            "date": "2013-09-18T21:31:49+0000",
+            "content": "Commit 1524580 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1524580 ]\n\nLUCENE-5222: fix expression sort with executorService ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13771263"
+        },
+        {
+            "date": "2013-09-18T21:36:56+0000",
+            "content": "Thanks Ryan and Mike, I opened LUCENE-5226 to make this not always return true.\n\nI think we can do it relatively cleanly, I will try. (I just wanted to fix the bug first). ",
+            "author": "Robert Muir",
+            "id": "comment-13771271"
+        },
+        {
+            "date": "2013-09-19T16:37:33+0000",
+            "content": "Commit 1524779 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1524779 ]\n\nLUCENE-5222: add CHANGES entry ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13772013"
+        },
+        {
+            "date": "2013-09-19T16:38:02+0000",
+            "content": "Commit 1524780 from Robert Muir in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1524780 ]\n\nLUCENE-5222: add CHANGES entry ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13772014"
+        }
+    ]
+}

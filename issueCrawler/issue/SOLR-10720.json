@@ -1,0 +1,62 @@
+{
+    "id": "SOLR-10720",
+    "title": "Aggressive removal of a collection breaks cluster state",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.3",
+            "master (8.0)"
+        ],
+        "affect_versions": "6.5.1",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "We are periodically seeing tricky concurrency bug in SolrCloud that starts with `Could not fully remove collection: my_collection` exception:\n\n\n2017-05-17T14:47:50,153 - ERROR [OverseerThreadFactory-6-thread-5:SolrException@159] - {} - Collection: my_collection operation: delete failed:org.apache.solr.common.SolrException: Could not fully remove collection: my_collection\n        at org.apache.solr.cloud.DeleteCollectionCmd.call(DeleteCollectionCmd.java:106)\n        at org.apache.solr.cloud.OverseerCollectionMessageHandler.processMessage(OverseerCollectionMessageHandler.java:224)\n        at org.apache.solr.cloud.OverseerTaskProcessor$Runner.run(OverseerTaskProcessor.java:463)\n\n\n\nAfter that all operations with SolrCloud that involve reading cluster state fail with\n\n\norg.apache.solr.common.SolrException: Error loading config name for collection my_collection\n    at org.apache.solr.common.cloud.ZkStateReader.readConfigName(ZkStateReader.java:198)\n    at org.apache.solr.handler.admin.ClusterStatus.getClusterStatus(ClusterStatus.java:141)\n...\nCaused by: org.apache.zookeeper.KeeperException$NoNodeException: KeeperErrorCode = NoNode for /collections/my_collection\n...\n\n\n\nSee full stacktraces\n\nAs a result SolrCloud becomes completely broken. We are seeing this with 6.5.1 but I think we\u2019ve seen that with older versions too.\n\nFrom looking into the code it looks like it is a combination of two factors:\n\n\tForcefully removing collection's znode in finally block in DeleteCollectionCmd that was introduced in SOLR-5135. Note that this causes cached cluster state to be not in sync with the state in Zk, i.e. zkStateReader.getClusterState() still has collection in it (see the code here) whereas /collections/<collection_id> znode in Zk is already removed.\n\tReading cluster state operation not only returns cached version, but it is also reading collection's config name from /collections/<collection_id> znode, but this znode was forcefully removed. The code to read config name for every collection directly from Zk was introduced in SOLR-7636. Isn't there any performance implications of reading N znodes (1 per collection) on every getClusterStatus call?\n\n\n\nI'm not sure what the proper fix should be\n\n\tShould we just catch KeeperException$NoNodeException in getClusterStatus and treat such collection as removed? That looks easiest / less invasive fix.\n\tShould we stop reading config name from collection znode and get it from cache somehow?\n\tShould we not try to delete collection's data from Zk if delete operation failed?",
+    "attachments": {
+        "SOLR-10720.patch": "https://issues.apache.org/jira/secure/attachment/12911985/SOLR-10720.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-02-26T05:51:30+0000",
+            "content": "Thanks Alexey. This patch catches NoNodeException and omits the collection assuming it to be removed. I've been trying to reproduce this in tests but not getting anywhere. Since the description of the problem is clear and the patch is trivial, I'll commit this without a test. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16376417"
+        },
+        {
+            "date": "2018-02-26T05:52:51+0000",
+            "content": "Commit 6f2d99e574888227a29ea173e52f6ff6a19e23db in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6f2d99e ]\n\nSOLR-10720: Aggressive removal of a collection breaks cluster status API ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16376418"
+        },
+        {
+            "date": "2018-02-26T05:53:37+0000",
+            "content": "Commit a96ac1300fee9ce0390c1e20efce86895155770c in lucene-solr's branch refs/heads/branch_7x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a96ac13 ]\n\nSOLR-10720: Aggressive removal of a collection breaks cluster status API\n\n(cherry picked from commit 6f2d99e) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16376419"
+        },
+        {
+            "date": "2018-02-26T05:54:54+0000",
+            "content": "Thanks Alexey! ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16376420"
+        },
+        {
+            "date": "2018-07-10T20:13:35+0000",
+            "content": "\n} catch (SolrException e) {\n  if (e.getCause() instanceof KeeperException.NoNodeException)  {\n    // skip this collection because the collection's znode has been deleted\n    // which can happen during aggressive collection removal, see SOLR-10720\n  } else throw e;\n}\n\n\u00a0\n\nIn this code block should we force fetch the new zk state?\u00a0\n\nWe saw the same issue with Solr 7.2.1 and only a restart fixes the issue.\u00a0\n\nThere was one scenario when a create collection failed because of this error. I'm trying to capture logs when this happened but that's what motivated me to say we should refresh the zk state when we hit this error. ",
+            "author": "Varun Thacker",
+            "id": "comment-16539179"
+        },
+        {
+            "date": "2018-07-10T20:20:58+0000",
+            "content": "Okay so the user was\u00a0HttpClusterStateProvider / CloudSolrClient#withSolrUrl which is why when they hit this issue in Solr 7.2.1 create collections would also fail.\u00a0\n\nException in thread \"main\" java.lang.RuntimeException: Couldn't initialize a HttpClusterStateProvider (is/are the Solr server(s), [http://host:port/solr/], down?)\nat org.apache.solr.client.solrj.impl.CloudSolrClient$Builder.build(CloudSolrClient.java:1496)\n...\nCaused by: org.apache.solr.client.solrj.impl.HttpSolrClient$RemoteSolrException: Error from server at http://host:port/solr: Error loading config name for collection my_collection_name\nat org.apache.solr.client.solrj.impl.HttpSolrClient.executeMethod(HttpSolrClient.java:643)\nat org.apache.solr.client.solrj.impl.HttpSolrClient.request(HttpSolrClient.java:255)\nat org.apache.solr.client.solrj.impl.HttpSolrClient.request(HttpSolrClient.java:244)\nat org.apache.solr.client.solrj.SolrClient.request(SolrClient.java:1219)\nat org.apache.solr.client.solrj.impl.HttpClusterStateProvider.fetchLiveNodes(HttpClusterStateProvider.java:189)\nat org.apache.solr.client.solrj.impl.HttpClusterStateProvider.<init>(HttpClusterStateProvider.java:64)\nat org.apache.solr.client.solrj.impl.CloudSolrClient$Builder.build(CloudSolrClient.java:1494)\n\n ",
+            "author": "Varun Thacker",
+            "id": "comment-16539182"
+        }
+    ]
+}

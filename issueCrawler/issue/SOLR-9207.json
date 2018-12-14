@@ -1,0 +1,85 @@
+{
+    "id": "SOLR-9207",
+    "title": "PeerSync recovery fails if number of updates requested is high",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "affect_versions": "5.1,                                            6.0",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Minor"
+    },
+    "description": "PeerSync recovery fails if we request more than ~99K updates. \n\nIf update solrconfig to retain more tlogs to leverage https://issues.apache.org/jira/browse/SOLR-6359\n\nDuring out testing we found out that recovery using PeerSync fails if we ask for more than ~99K updates, with following error\n\n\n WARN  PeerSync [RecoveryThread] - PeerSync: core=hold_shard1 url=<shardUrl>\nexception talking to <leaderUrl>, failed\norg.apache.solr.client.solrj.impl.HttpSolrServer$RemoteSolrException: Expected mime type application/octet-stream but got application/xml. \n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<response>\n<lst name=\"error\"><str name=\"msg\">application/x-www-form-urlencoded content length (4761994 bytes) exceeds upload limit of 2048 KB</str><in\nt name=\"code\">400</int></lst>\n</response>\n\n\n\n\nWe arrived at ~99K with following match\n\n\tmax_version_number = Long.MAX_VALUE = 9223372036854775807\n\tbytes per version number =  20 (on the wire as POST request sends version number as string)\n\tadditional bytes for separator ,\n\tmax_versions_in_single_request = 2MB/21 = ~99864\n\n\n\nI could think of 2 ways to fix it\n1. Ask for about updates in chunks of 90K inside PeerSync.requestUpdates()\n\n2. Use application/octet-stream encoding",
+    "attachments": {
+        "SOLR-9207.patch": "https://issues.apache.org/jira/secure/attachment/12812828/SOLR-9207.patch",
+        "SOLR-9207.patch_updated": "https://issues.apache.org/jira/secure/attachment/12816235/SOLR-9207.patch_updated"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-06-23T15:43:39+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Pushkar. PeerSync doesn't stream so this is not surprising. Which solution have you implemented in the patch? A rough description would go a long way. Also, there are some unrelated changes in TSTLookup which don't belong here. A workaround would be to increase the default upload limit in Jetty. ",
+            "id": "comment-15346632"
+        },
+        {
+            "date": "2016-06-23T18:37:35+0000",
+            "author": "Pushkar Raste",
+            "content": "Here is high level description\n\nPeerSync currently computes versions the node recovery is missing and then sends all the version numbers to a replica to get corresponding updates. When a node under recovery is missing too many updates, the payload of getUpdates goes above 2MB and jetty would reject the request. Problem can be solved using one of the following technique\n\n\n\tIncreasing jetty payload limit pay solve this problem. We still would be sending a lot of data over the network, which might not be needed.\n\tStream versions to replica while asking for updates.\n\tRequest versions in chunks of about 90K versions at a time\n\tgzip versions , and unzip it on the other side.\n\tAsk for version using version ranges instead of sending individual versions.\n\n\n\nApproaches 1-3 require sending lot of data over the wire. \nApproach #3 also requires making multiple calls. Additionally #3 might not be feasible consider how current code works by submitting requests to shardHandler and calling handleResponse.\n#4 may work, but looks a little inelegant. \n\nHence I settle on approach #5 (suggested by Ramkumar). Here is how it works \n\n\tLet's say replica has version [1, 2, 3, 4, 5, 6] and leader has versions [1, 2, 3, 4, 5, 6, 10, -11, 12, 13, 15, 18]\n\tWhile recovery using PeerSync strategy, replica computes, that range it is missing is 10...18\n\tReplica now requests for versions by specifying range 10...18 instead of sending all the individual versions (namely 10,11,-11,12,13,15,18)\n\tI have made using version ranges for PeerSync configurable, by introducing following configuration section\n\n  <peerSync>\n    <str name=\"useRangeVersions\">${solr.peerSync.useRangeVersions:false}</str>\n  </peerSync>\n\n\n\tFurther I have it backwards compatible and a recovering node will use version ranges only if node it asks for updates can process version ranges\n\n ",
+            "id": "comment-15346944"
+        },
+        {
+            "date": "2016-07-04T16:32:34+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Pushkar! The patch looks good to me except that the testing is not adequate. The one test modified by the patch is RecoveryAfterSoftCommitTest which is designed to never trigger PeerSync at all. I think we should enable useRangeVersions by default and randomly set it to false during tests for good coverage. ",
+            "id": "comment-15361557"
+        },
+        {
+            "date": "2016-07-04T17:10:33+0000",
+            "author": "Pushkar Raste",
+            "content": "Thanks a lot Shalin.\nI will make the suggested change for randomized testing. ",
+            "id": "comment-15361608"
+        },
+        {
+            "date": "2016-07-05T17:47:38+0000",
+            "author": "Pushkar Raste",
+            "content": "Shalin Shekhar Mangar - Please check updated patch. ",
+            "id": "comment-15362859"
+        },
+        {
+            "date": "2016-07-06T20:08:42+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Changes:\n\n\tThe value for useRangeVersions being set in solrconfig.xml wasn't being read at all because it was written in solrconfig.xml with the element 'str' but it was being read as 'useRangeVersions'. I changed the element name in configuration to useRangeVersions to make it work.\n\tThe value for useRangeVersions should be in EditableSolrConfigAttributes.json so that it can be changed via the config API\n\tSimilarly, useRangeVersions should be returned in SolrConfig.toMap so that its value is returned by the config API\n\tSystem property set in SolrTestCase4J for useRangeVersions should be cleared in the tear down method\n\n\n\nI'll run precommit + tests and commit if there are no surprises. ",
+            "id": "comment-15364990"
+        },
+        {
+            "date": "2016-07-06T21:03:01+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 380c5a6b9727beabb8ccce04add7e8e7089aa798 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=380c5a6 ]\n\nSOLR-9207: PeerSync recovery failes if number of updates requested is high. A new useRangeVersions config option is introduced (defaults to true) to send version ranges instead of individual versions for peer sync. ",
+            "id": "comment-15365072"
+        },
+        {
+            "date": "2016-07-06T21:05:29+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit a942de68fc34602ad0640a2726fd3dd240352357 in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a942de6 ]\n\nSOLR-9207: PeerSync recovery failes if number of updates requested is high. A new useRangeVersions config option is introduced (defaults to true) to send version ranges instead of individual versions for peer sync.\n(cherry picked from commit 380c5a6) ",
+            "id": "comment-15365086"
+        },
+        {
+            "date": "2016-07-06T21:06:49+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Pushkar! ",
+            "id": "comment-15365088"
+        },
+        {
+            "date": "2016-08-26T13:59:11+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close resolved issues after 6.2.0 release. ",
+            "id": "comment-15438975"
+        }
+    ]
+}

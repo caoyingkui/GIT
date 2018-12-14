@@ -1,0 +1,296 @@
+{
+    "id": "SOLR-9506",
+    "title": "cache IndexFingerprint for each segment",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.3"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "The IndexFingerprint is cached per index searcher. it is quite useless during high throughput indexing. If the fingerprint is cached per segment it will make it vastly more efficient to compute the fingerprint",
+    "attachments": {
+        "SOLR-9506_POC.patch": "https://issues.apache.org/jira/secure/attachment/12830339/SOLR-9506_POC.patch",
+        "SOLR-9506.patch": "https://issues.apache.org/jira/secure/attachment/12831772/SOLR-9506.patch",
+        "SOLR-9506-combined-deletion-key.patch": "https://issues.apache.org/jira/secure/attachment/12839011/SOLR-9506-combined-deletion-key.patch",
+        "SOLR-9506_final.patch": "https://issues.apache.org/jira/secure/attachment/12834737/SOLR-9506_final.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-09-25T17:12:03+0000",
+            "author": "Pushkar Raste",
+            "content": "POC/Initial commit - https://github.com/praste/lucene-solr/commit/ca55daa9ea1eb23232173b50111b9068f1817c13\n\nThere are two issues we still need to solve. \n\n\tHow to compute versionsInHash from versionsInHash of individual segments. We can not use current versionsHash (unless we cache all the individual version numbers), as it is not additive.  Consider following scenario\nLeader segments, versions and versionsHash\nseg1 : \n versions: 100, 101, 102  \n  versionHash: hash(100) + hash(101) + hash(102)\nseg2: \n versions: 103, 104, 105\n  versionHash: hash(103) + hash(104) + hash(105) \n  Replica segments, versions and hash\nseg1: \n versions: 100, 101\n  versionHash: hash(100) + hash(101) \nseg2: \n versions: 102, 103, 104, 105\n  versionHash: hash(102) + hash(103) + hash(104) + hash(105)\n Leader and Replica are essentially in sync, however using current method there is no way to compute and ensure cumulative versionHash of leader and replica would match. \n Even if decide not to cache IndexFingerprint per segment but just to parallalize the computation, I think we still would run into issue mentioned above.\n\n\n\n\n\tI still need to figure out how to keep cache in   DefaultSolrCoreState, so that we can reuse IndexFingerprint of individual segments when a new Searcher is opened.\n\n ",
+            "id": "comment-15521130"
+        },
+        {
+            "date": "2016-09-26T14:42:33+0000",
+            "author": "Noble Paul",
+            "content": "Pushkar Raste I've attached a sample program which computes versionsHash for leader and replica using the above example ",
+            "id": "comment-15523257"
+        },
+        {
+            "date": "2016-09-26T16:12:36+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "We should keep in mind that previously written segments can change if there are deletes. Maybe we should recompute the per-segment fingerprints upon deletion in that segment. ",
+            "id": "comment-15523485"
+        },
+        {
+            "date": "2016-09-26T16:14:31+0000",
+            "author": "Noble Paul",
+            "content": "no. segments don't change. you mean fingerprints can change?\n ",
+            "id": "comment-15523490"
+        },
+        {
+            "date": "2016-09-26T16:42:50+0000",
+            "author": "Pushkar Raste",
+            "content": "I think what Ishan Chattopadhyaya is hinting at, is that if numDocs account only for live (active) docs, then once documents are deleted in a segment, numDocs in the cached fingerprint might be wrong. \n\nSurprising, following test cases passed with my POC\n1. PeerSyncTest\n2. PeerSyncReplicationTest\n3. SyncSliceTest\n\nIn the worst case, we can atleast parallalize fingerprint computation.  ",
+            "id": "comment-15523564"
+        },
+        {
+            "date": "2016-09-26T16:43:19+0000",
+            "author": "Pushkar Raste",
+            "content": "Adding Yonik Seeley in the loop ",
+            "id": "comment-15523566"
+        },
+        {
+            "date": "2016-09-26T17:09:41+0000",
+            "author": "Noble Paul",
+            "content": "the cumulative numDocs will be same anyway\n\nI guess it can be reproduced as follows\n\n\n\ttake a 2 replica shard\n\tindex and commit multiple times\n\tdelete one doc and commit\n\tbring down replica\n\toptimize leader\n\tbring up replica\n\n\n\nI guess this will lead to a full replication\n\n\n ",
+            "id": "comment-15523631"
+        },
+        {
+            "date": "2016-09-29T06:35:27+0000",
+            "author": "Noble Paul",
+            "content": "Few quick points\n\n\n  // Map is not concurrent, but since computeIfAbsent is idempotent, it should be alright for two threads to compute values for the same key.   \n  private final Map<LeafReaderContext, Map<Long, IndexFingerprint>> perSegmentFingerprintCache = new WeakHashMap<>();\n\n\n\nIt's idempotent, but the map has to be thread safe, javadocs say that threadsafety depends on the map implementation\nWe really don't need to keep a cache per version. The reason is, we only give one version number and only the latest segment will have to have to compute anything other than the full fingerprint. As soon as a new segment is added everything else other than the full fingerprint becomes useless. So, the solution is , if maxVersion is Long.MAX_VALUE, cache it, else recompute everytime. So, the cache should be\n\n\n  private final Map<LeafReaderContext, IndexFingerprint> perSegmentFingerprintCache = Collections.synchronizedMap(new WeakHashMap<>());\n\n\n ",
+            "id": "comment-15531954"
+        },
+        {
+            "date": "2016-09-29T11:42:47+0000",
+            "author": "Pushkar Raste",
+            "content": "Discussed with Noble Paul \nWe should cache fingerprint for a segment only if  maxVersion specified > max version in the segment ",
+            "id": "comment-15532555"
+        },
+        {
+            "date": "2016-10-05T12:04:08+0000",
+            "author": "Noble Paul",
+            "content": "https://github.com/apache/lucene-solr/pull/84 ",
+            "id": "comment-15548510"
+        },
+        {
+            "date": "2016-10-05T13:51:58+0000",
+            "author": "Yonik Seeley",
+            "content": "A few random points after browsing this issue...\n\nWe can not use current versionsHash (unless we cache all the individual version numbers), as it is not additive.\n\nThe current versionsHash is additive (it must be, because as you say segments may not line up between leader and replica, and document order may differ).  When caching per segment, keep this property by simply adding the segment fingerprints together.  Am I missing something here?\n\nprivate final Map<LeafReaderContext, ...\n\nLeafReaderContext objects are not reused between changed indexes, so it would not make an effective cache key.\nUse the core cache key, as FieldCache does.\n\nWe should keep in mind that previously written segments can change if there are deletes.\n\nRight... the core cache key does not change, even if there are deletes for the segment.\nOne way to handle this w/o recomputing everything is:\n1) compute the hash w/o regard to deleted docs\n2) compute the hash of deleted docs only\n3) subtract the two values to obtain your hash\n4) keep track of the numDocs in the segment as well... if that doesn't change, no need to recompute.  If it does change, then there were additional deletions.  Recompute the hash for the deleted docs.\n ",
+            "id": "comment-15548767"
+        },
+        {
+            "date": "2016-10-06T14:51:24+0000",
+            "author": "Pushkar Raste",
+            "content": "Updated patch, added a scenario in PeerSyncTest about replica missing an update.\nLooks like with don't need to remove live docs check if (liveDocs != null && !liveDocs.get(doc)) continue; ",
+            "id": "comment-15552125"
+        },
+        {
+            "date": "2016-10-07T20:17:50+0000",
+            "author": "Pushkar Raste",
+            "content": "I also found some weird behavior. If I use parallelStream to compute segment fingerprints in parallel. When I reduce it to the index fingerprint on the index searcher, test fails. Why should order of computation and reduction matter in this case? ",
+            "id": "comment-15556132"
+        },
+        {
+            "date": "2016-10-07T20:21:07+0000",
+            "author": "Pushkar Raste",
+            "content": "I computed hash w/o regard to deleted docs and cached it. All the tests are passing even without doing steps #2 and #3. I also verified that index fingerprint computed on entire index matches to that of fingerprint computed on from individual segments (even after deletions). ",
+            "id": "comment-15556139"
+        },
+        {
+            "date": "2016-10-18T14:15:19+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit bb907a2983b4a7eba8cb4d527a859f1b312bdc79 in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bb907a2 ]\n\n\n\tSOLR-9506: cache IndexFingerprint for each segment\n\n ",
+            "id": "comment-15585553"
+        },
+        {
+            "date": "2016-10-18T14:17:49+0000",
+            "author": "Noble Paul",
+            "content": "which test. I did not find? ",
+            "id": "comment-15585570"
+        },
+        {
+            "date": "2016-10-18T14:36:59+0000",
+            "author": "Pushkar Raste",
+            "content": "I did not upload the patch with parallelStream. In SolrIndexSearcher where we compute and cache per segment indexfingerprint try switching from stream() to parallelStream() and you will see PeerSyncTest fails.  ",
+            "id": "comment-15585612"
+        },
+        {
+            "date": "2016-10-18T14:46:04+0000",
+            "author": "Yonik Seeley",
+            "content": "Hmmm, why was this committed?\nSee my comments regarding deleted documents that were never addressed.  What was committed will now result in incorrect fingerprints being returned. ",
+            "id": "comment-15585635"
+        },
+        {
+            "date": "2016-10-18T14:59:39+0000",
+            "author": "Pushkar Raste",
+            "content": "I don't see why caching indexfingerprint per segment and using that later would be different than computing indexfingerprint on entire segment by going through one segment at time. \n\nI tried to come up with scenarios where caching solution would fail and original solution would not, but could not think of any.  ",
+            "id": "comment-15585677"
+        },
+        {
+            "date": "2016-10-18T15:01:33+0000",
+            "author": "Yonik Seeley",
+            "content": "\"Right... the core cache key does not change, even if there are deletes for the segment.\"\n\nSo the cache key ignores deleted documents, while the value being cached does not.  It's a fundamental mis-match. ",
+            "id": "comment-15585683"
+        },
+        {
+            "date": "2016-10-18T15:03:58+0000",
+            "author": "Pushkar Raste",
+            "content": "i.e. we really need fix IndexFingerprint computation, whether or not we cache. I will open a separate issue to fix it in that case. ",
+            "id": "comment-15585688"
+        },
+        {
+            "date": "2016-10-18T15:04:26+0000",
+            "author": "Keith Laban",
+            "content": "Are you implying that if you add a document. commit it, compute the index fingerprint and cache the segments. Then delete that document and commit that change, and compute the fingerprint again with the cached segment fingerprint, you will end up with the same index fingerprint? ",
+            "id": "comment-15585693"
+        },
+        {
+            "date": "2016-10-18T15:07:01+0000",
+            "author": "Yonik Seeley",
+            "content": "\nYep. ",
+            "id": "comment-15585700"
+        },
+        {
+            "date": "2016-10-18T15:10:44+0000",
+            "author": "Pushkar Raste",
+            "content": "I think what Yonik is implying is that, if for some reason, replica does not apply delete properly, index fingerprint would still checkout and that would be a problem.\n\nConsidering the issues with PeerSync, should add that option  recoverWithReplicationOnly ? For most of the setups I doubt if people would have hundreds of thousands of records in updateLog in which which almost no one is using PeerSync anyway ",
+            "id": "comment-15585707"
+        },
+        {
+            "date": "2016-10-18T15:11:18+0000",
+            "author": "Yonik Seeley",
+            "content": "Pretty simple to try out:\n\nbin/solr start -e techproducts\n\nhttp://localhost:8983/solr/techproducts/query?q=*:*\n  \"response\":{\"numFound\":32,\"start\":0,\"docs\":[\n\nhttp://localhost:8983/solr/techproducts/get?getFingerprint=9223372036854775807\n{\n  \"fingerprint\":{\n    \"maxVersionSpecified\":9223372036854775807,\n    \"maxVersionEncountered\":1548538118066405376,\n    \"maxInHash\":1548538118066405376,\n    \"versionsHash\":8803836617561505377,\n    \"numVersions\":32,\n    \"numDocs\":32,\n    \"maxDoc\":32}}\n\ncurl http://localhost:8983/solr/techproducts/update?commit=true -H \"Content-Type: text/xml\" -d '<delete><id>apple</id></delete>'\n\n# this shows that the delete is visibie\nhttp://localhost:8983/solr/techproducts/query?q=*:*\n  \"response\":{\"numFound\":31,\"start\":0,\"docs\":[\n\n#fingerprint returns the same thing\nhttp://localhost:8983/solr/techproducts/get?getFingerprint=9223372036854775807\n{\n  \"fingerprint\":{\n    \"maxVersionSpecified\":9223372036854775807,\n    \"maxVersionEncountered\":1548538118066405376,\n    \"maxInHash\":1548538118066405376,\n    \"versionsHash\":8803836617561505377,\n    \"numVersions\":32,\n    \"numDocs\":32,\n    \"maxDoc\":32}}\n\nbin/solr stop -all\nbin/solr start -e techproducts\n\n#after a restart, fingerprint returns something different\nhttp://localhost:8983/solr/techproducts/get?getFingerprint=9223372036854775807\n{\n  \"fingerprint\":{\n    \"maxVersionSpecified\":9223372036854775807,\n    \"maxVersionEncountered\":1548538118066405376,\n    \"maxInHash\":1548538118066405376,\n    \"versionsHash\":-1315083666674066080,\n    \"numVersions\":31,\n    \"numDocs\":31,\n    \"maxDoc\":32}}\n\n\n ",
+            "id": "comment-15585709"
+        },
+        {
+            "date": "2016-10-18T15:21:01+0000",
+            "author": "Pushkar Raste",
+            "content": "There is lot of confusion going on here. Would above test fail not fail, if we won't cache per segment indexfingerprint ?\nIf yes, them we should revert the commit, if not we should open a new issue to fix the indexfingerprint computation altogether.  ",
+            "id": "comment-15585736"
+        },
+        {
+            "date": "2016-10-18T15:29:09+0000",
+            "author": "Yonik Seeley",
+            "content": "\nNot sure I understand... are you suggesting a workaround in PeerSync (recoverWithReplicationOnly) to work around the correctness problem caused by this commit? ",
+            "id": "comment-15585756"
+        },
+        {
+            "date": "2016-10-18T15:30:12+0000",
+            "author": "Yonik Seeley",
+            "content": "\nThe above manual test only exhibited this bad behavior after the commit today. ",
+            "id": "comment-15585759"
+        },
+        {
+            "date": "2016-10-18T15:39:58+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 9aa764a54f50eca5a8ef805bdb29e4ad90fcce5e in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9aa764a ]\n\n\n\tSOLR-9506: cache IndexFingerprint for each segment\n\n ",
+            "id": "comment-15585781"
+        },
+        {
+            "date": "2016-10-18T15:46:15+0000",
+            "author": "Noble Paul",
+            "content": "If the above case fails, let's revert the commit and revisit the fingerprint computation ",
+            "id": "comment-15585801"
+        },
+        {
+            "date": "2016-10-18T16:32:08+0000",
+            "author": "Yonik Seeley",
+            "content": "Please do. ",
+            "id": "comment-15585918"
+        },
+        {
+            "date": "2016-10-18T19:24:42+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ffa5c4ba2c2d6fa6bb943a70196aad0058333fa2 in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ffa5c4b ]\n\nSOLR-9506: reverting the previous commit ",
+            "id": "comment-15586419"
+        },
+        {
+            "date": "2016-10-18T20:07:56+0000",
+            "author": "Keith Laban",
+            "content": "How expensive would it be to check numDocs (#4 in yoniks comment earlier). I think this would be the most straightforward and understandable approach. ",
+            "id": "comment-15586530"
+        },
+        {
+            "date": "2016-10-19T19:36:43+0000",
+            "author": "Pushkar Raste",
+            "content": "Noble Paul and Yonik Seeley I was able to put together test to show that current implementation is broken. \nI will update patch with the test and a fix by EOD today ",
+            "id": "comment-15589649"
+        },
+        {
+            "date": "2016-10-20T16:27:37+0000",
+            "author": "Pushkar Raste",
+            "content": "Patch with parallalized computation  ",
+            "id": "comment-15592277"
+        },
+        {
+            "date": "2016-10-21T19:46:56+0000",
+            "author": "Pushkar Raste",
+            "content": "Don't use patch for parallalized computation. Parallel streams in use a shared fork-join pool. A bad actor can create havoc. ",
+            "id": "comment-15596148"
+        },
+        {
+            "date": "2016-10-21T19:49:10+0000",
+            "author": "Pushkar Raste",
+            "content": "Removed maxVersionFingerprintCache from SolrIndexSearcher  ",
+            "id": "comment-15596155"
+        },
+        {
+            "date": "2016-10-23T04:38:40+0000",
+            "author": "David Smiley",
+            "content": "Parallel streams in use a shared fork-join pool. A bad actor can create havoc.\n\nInteresting.  FWIW I found this solution: http://stackoverflow.com/a/22269778/92186 \u2013 create a custom ForkPointPool that you execute within.  Definitely non-obvious. ",
+            "id": "comment-15599045"
+        },
+        {
+            "date": "2016-10-23T15:09:52+0000",
+            "author": "Pushkar Raste",
+            "content": "Yeah, I looked into it. I will try that approach, if I can get to it before Noble Paul applies the patch.  ",
+            "id": "comment-15599826"
+        },
+        {
+            "date": "2016-10-24T11:16:05+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 184b0f221559eaed5f273b1907e8af07bc95fec9 in lucene-solr's branch refs/heads/master from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=184b0f2 ]\n\nSOLR-9506: cache IndexFingerprint for each segment ",
+            "id": "comment-15601675"
+        },
+        {
+            "date": "2016-10-24T12:22:49+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 265d425b00181dd384fa963e46dc35b92b7e02c0 in lucene-solr's branch refs/heads/branch_6x from Noble Paul\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=265d425 ]\n\nSOLR-9506: cache IndexFingerprint for each segment ",
+            "id": "comment-15601820"
+        },
+        {
+            "date": "2016-11-15T17:53:46+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "While working on SOLR-5944, I realized that the current per segment caching logic works fine for deleted documents (due to comparison of numDocs in a segment for the criterion of cache hit/miss). However, if a segment has docValues updates, the same logic is insufficient. It is my understanding that changing the key for caching from reader().getCoreCacheKey() to reader().getCombinedCoreAndDeletesKey() would work here, since the docValues updates are internally handled using deletion queue and hence the \"combined\" core and deletes key would work here. Attaching a patch for the same. ",
+            "id": "comment-15667788"
+        },
+        {
+            "date": "2016-11-15T17:56:34+0000",
+            "author": "Noble Paul",
+            "content": "Ishan , i guess this is already fixed in 6.3. so, we may need to open another ticket ",
+            "id": "comment-15667795"
+        },
+        {
+            "date": "2016-11-15T17:58:30+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "I see.. I saw it was unresolved, and I thought it didn't make it into 6.3 yet. I'll see if it made it into 6.3, and open a new ticket if that's the case. ",
+            "id": "comment-15667801"
+        },
+        {
+            "date": "2016-11-15T19:02:47+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Can we resolve this issue, since it seems it was released as part of 6.3.0? (I will open another issue for the issue I wrote about two comments before Added SOLR-9777). ",
+            "id": "comment-15667956"
+        }
+    ]
+}

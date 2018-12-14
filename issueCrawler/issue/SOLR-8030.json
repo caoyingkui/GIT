@@ -1,0 +1,239 @@
+{
+    "id": "SOLR-8030",
+    "title": "Transaction log does not store the update chain (or req params?) used for updates",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "5.3",
+        "status": "Open",
+        "resolution": "Unresolved",
+        "priority": "Major"
+    },
+    "description": "Transaction Log does not store the update chain, or any other details from the original update request such as the request params, used during updates.\n\nTherefore tLog uses the default update chain, and a synthetic request, during log replay.\n\nIf we implement custom update logic with multiple distinct update chains that use custom processors after DistributedUpdateProcessor, or if the default chain uses processors whose behavior depends on other request params, then log replay may be incorrect.\n\nPotentially problematic scenerios (need test cases):\n\n\n\tDBQ where the main query string uses local param variables that refer to other request params\n\tcustom Update chain set as default=\"true\" using something like StatelessScriptUpdateProcessorFactory after DUP where the script depends on request params.\n\tmultiple named update chains with diff processors configured after DUP and specific requests sent to diff chains \u2013 ex: ParseDateProcessor w/ custom formats configured after DUP in some special chains, but not in the default chain",
+    "attachments": {
+        "SOLR-8030.patch": "https://issues.apache.org/jira/secure/attachment/12764093/SOLR-8030.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-09-10T14:13:17+0000",
+            "author": "Mark Miller",
+            "content": "But aren't the docs in the tlog stored post update chain anyway?  ",
+            "id": "comment-14738795"
+        },
+        {
+            "date": "2015-09-10T14:18:21+0000",
+            "author": "Ludovic Boutros",
+            "content": "Not for delete by query for instance, it seems. ",
+            "id": "comment-14738802"
+        },
+        {
+            "date": "2015-09-10T14:23:46+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Interesting.. Is there a test / steps to reproduce? ",
+            "id": "comment-14738813"
+        },
+        {
+            "date": "2015-09-10T14:25:20+0000",
+            "author": "Ludovic Boutros",
+            "content": "Seems to be here:\n\nTransactionLog.java\n  public long writeDeleteByQuery(DeleteUpdateCommand cmd, int flags) {\n    LogCodec codec = new LogCodec(resolver);\n    try {\n      checkWriteHeader(codec, null);\n\n      MemOutputStream out = new MemOutputStream(new byte[20 + (cmd.query.length())]);\n      codec.init(out);\n      codec.writeTag(JavaBinCodec.ARR, 3);\n      codec.writeInt(UpdateLog.DELETE_BY_QUERY | flags);  // should just take one byte\n      codec.writeLong(cmd.getVersion());\n      codec.writeStr(cmd.query);\n\n      synchronized (this) {\n        long pos = fos.size();   // if we had flushed, this should be equal to channel.position()\n        out.writeAll(fos);\n        endRecord(pos);\n        // fos.flushBuffer();  // flush later\n        return pos;\n      }\n      } catch (IOException e) {\n        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);\n      }\n\n  }\n\n ",
+            "id": "comment-14738819"
+        },
+        {
+            "date": "2015-09-10T14:47:38+0000",
+            "author": "Ludovic Boutros",
+            "content": "Ishan Chattopadhyaya,\n\nyou could create an update processor which forbid deleteByQuery updates.\nThen put it in the default update chain.\nYou can create another update chain without this processor.\nAdd some documents and delete them with queries with the update chain allowing this operation.\nNext, play with the famous Monkey \n\nPerhaps, are there easier ways to reproduce ?\n\nI can try do reproduce this, I like the Monkey .\n ",
+            "id": "comment-14738859"
+        },
+        {
+            "date": "2015-09-15T22:39:27+0000",
+            "author": "Hoss Man",
+            "content": "But aren't the docs in the tlog stored post update chain anyway?\n\nI'm pretty sure it's more complicated then that \u2013 i suspect any processor that is configured to run after the DistributedUpdateProcessor is at risk here in the event of tlog replay. ",
+            "id": "comment-14746403"
+        },
+        {
+            "date": "2015-09-16T10:40:40+0000",
+            "author": "Ludovic Boutros",
+            "content": "I think Chris Hostetter (Unused) is right.\nIt seems that log entries are added at the end of the update processor chain and replayed from the beginning of the default processor chain.\nThe replayed commands are local commands, so I think that pre-distributed processors are bypassed, but the other processors seem to be used. \n\nWhy the log replay does not use the RunUpdateProcessor directly, instead of the full update chain ?  ",
+            "id": "comment-14747282"
+        },
+        {
+            "date": "2015-09-16T13:38:05+0000",
+            "author": "Mark Miller",
+            "content": "Why the log replay does not use the RunUpdateProcessor directly, instead of the full update chain ?\n\nSeems like maybe it should - I don't think we want to run things through the chain twice. ",
+            "id": "comment-14768937"
+        },
+        {
+            "date": "2015-09-16T16:16:34+0000",
+            "author": "Hoss Man",
+            "content": "It seems that log entries are added at the end of the update processor chain and replayed from the beginning of the default processor chain.\n\nWhy the log replay does not use the RunUpdateProcessor directly, instead of the full update chain ? \n\nUnless i'm remembering incorrectly, replaying directly to RunUpdateProcessor would also be a mistake \u2013 isn't DistributedUpdateProcessor (on the leader) what is currently writting to the tlog? ... in order to ensure consistent processors, the replay should be resumed by DistributedUpdateProcessor of the same chain\n\ni thought was already how it worked (DistributedUpdateProcessor handling log replay) ... i thought this bug was just pointing out that the default chain was always used for the replay, not whatever chain was involved in the original command? (if not then the problem is bigger then initially discussed) ",
+            "id": "comment-14790640"
+        },
+        {
+            "date": "2015-09-16T16:52:42+0000",
+            "author": "Ludovic Boutros",
+            "content": "True, this bug is initialy pointing out that the default chain was always used for the replay.\nBut it seems to be more complicated like you said.\n\nThe DistributedUpdateProcessor seems to buffer updates  in the tLog while in inactive state.\nSo you're right, only replaying to RunUpdateProcessor would be a mistake.\n\nBut the DirectupdateHandler2 seems to add updates  in the tLog while in active state.\nAnd replaying from the beginning of the default update chain seems to be a mistake as well.\n ",
+            "id": "comment-14790722"
+        },
+        {
+            "date": "2015-09-19T15:36:12+0000",
+            "author": "Ludovic Boutros",
+            "content": "I managed to reproduce the two different problems in a test.\n\n\n\tProcessors can be applied multiple times because of log replay\n\tDefault update chain is the only chain used during log replay\n\n ",
+            "id": "comment-14877185"
+        },
+        {
+            "date": "2015-09-19T15:41:42+0000",
+            "author": "Ludovic Boutros",
+            "content": "I don't know if there is an easier way to test this. ",
+            "id": "comment-14877186"
+        },
+        {
+            "date": "2015-09-21T08:12:34+0000",
+            "author": "Ludovic Boutros",
+            "content": "I will update the test in order to control pre-distributed processors (buffered updates during recovery).\nI will also rename the processor which locks the replay with a more explicit name.\n\nI propose to add one or two flags to the command status to be able to detect already processed update commands (before and after distribution).\nThey should be set in the RunUpdateProcessor and in the DistributedUpdateProcessor.\n\nFor buffered updates, the replay should start processing update from the DistributedUpdateProcessor.\nFor the other updates, the replay should only use the RunUpdateProcessor.\n\nFor the update chain, I think the name could be stored in the tlog and reused during replay (With perhaps the last chain cached to prevent the search in the update chain map...).\n ",
+            "id": "comment-14900359"
+        },
+        {
+            "date": "2015-09-24T17:35:33+0000",
+            "author": "Ludovic Boutros",
+            "content": "Update of the test.\n\nI have a problem with this test, it creates inconsistent replicas (On my mac).\n\nThis prevents the real update chain testing. ",
+            "id": "comment-14906706"
+        },
+        {
+            "date": "2015-09-24T17:38:53+0000",
+            "author": "Ludovic Boutros",
+            "content": "Is it related to this SOLR-8085 ? ",
+            "id": "comment-14906713"
+        },
+        {
+            "date": "2015-09-25T14:13:58+0000",
+            "author": "Ludovic Boutros",
+            "content": "Ok, I have found my problem with the test. It needs an FS directory.\nThis patch is a simplified test for this issue. ",
+            "id": "comment-14908072"
+        },
+        {
+            "date": "2015-09-28T17:36:35+0000",
+            "author": "Ludovic Boutros",
+            "content": "I'm trying to fix this issue. \nBut it seems to be even more complicated.\n\nI have added the update chain name to the transaction log for the following operations:\nadd, delete, deleteByQuery\n\nThe 'finish' call can be done on each update chain used during the log replay.\n\nBut, actually commits are ignored and a final commit is fired at the end.\nBut if the update logic of the chain does something during the commit it will be ignored and it seems to be tricky to improve this.\n\nThe (de)serialization of the commands are done with element positions,\nso, it's not really easy to add new elements to the transaction log. These positions must be updated in multiple places. Perhaps it should use at least some constant values...\n\nAnother thing, it seems that PeerSync uses the same (de)serialization, and is affected by the same issue. The bad thing is that the code is duplicated. It will have to take the update chain in account too. ",
+            "id": "comment-14933642"
+        },
+        {
+            "date": "2015-09-28T20:36:04+0000",
+            "author": "Ludovic Boutros",
+            "content": "The update chain to use in case of log replay or peersync should be: \n\nDistributedUpdateProcessor => RunUpdateProcessor\n\nThe DistributedUpdateProcessor is needed in case of version update.\nThe update chain should be kept in order to be able to call the finish() method at the end of log replay or peer sync.\n\nThis patch contains updated tests: TestRecovery and PeerSyncTest which check the (bad) usage of default route. It cannot be called anymore.  \n\nIt contains a fix as well. ",
+            "id": "comment-14933934"
+        },
+        {
+            "date": "2016-03-21T13:22:54+0000",
+            "author": "David Smiley",
+            "content": "Thanks for your tireless effors on this Ludovic Boutros; I'd like to pursue getting your patch committed, or some variant of it.  There's definitely a bug today in that PeerSync is grabbing the default URP chain.  I ran into this bug.  Your patch does the right thing here \u2013 DistributedURP + RunURP.  What I don't understand is why you feel that the UpdateLog should keep track of the original URP chain used.  I'd like to have URPs run exactly once for any document (notwithstanding Distrib & RunUpdate which are special). ",
+            "id": "comment-15204169"
+        },
+        {
+            "date": "2016-03-21T13:54:15+0000",
+            "author": "David Smiley",
+            "content": "I suppose one argument against any change here is that the the current behavior allows one to subclass Solr's default processors for whatever custom purpose and also to perform some logic that only happens during PeerSync (detectable by looking at the \"flags\" in the command to check for UpdateCommand.PEER_SYNC bit).  If we change to hard-code DistributedURP & RunURP we lose that ability.  I haven't had the need for such customizations, granted, but I'm now less confident a change is needed.  If we wind up making no changes, then somehow we should make it clearer (docs) that you shouldn't be setting default=\"true\" on your URP chain unless you understand what you're doing, since most likely the user should simply name the chain and use the update.chain param.  I had thought of these paths as equivalent but I learned the hard way that they are different.   It's an insidious problem because it only bites you in failure situations (when PeerSync is used). ",
+            "id": "comment-15204209"
+        },
+        {
+            "date": "2016-03-24T22:04:15+0000",
+            "author": "Ludovic Boutros",
+            "content": "I learned it the hard way too David Smiley. I'll try to take some times on this next WE. Thx. ",
+            "id": "comment-15211031"
+        },
+        {
+            "date": "2016-03-25T19:00:48+0000",
+            "author": "David Smiley",
+            "content": "After resolving this issue in a big search app last week, I actually did need to configure the URP chain for the UpdateLog separate from the \"normal\" document URP.  The details why aren't that important, and if I had absolutely no way of customizing the chain for the UpdateLog replay, I could have found other means to achieve my aims, at least for this app.  So I think there's no change in Solr needed here aside from clearer docs.  Alternatively, to make this less of a gotcha, Solr could perhaps look up a chain by a special name, such as _updateLogReplay_ which would be defaulted to be Distributed URP + RunURP if not found. ",
+            "id": "comment-15212255"
+        },
+        {
+            "date": "2016-03-31T16:27:06+0000",
+            "author": "David Smiley",
+            "content": "I'm still experiencing a problem and then I more carefully read the earlier comments here by Hoss etc.  I originally just thought the docs were added to the UpdateLog in DirectUpdateHandler2 (which makes sense to me) but now I see that DistributedURP has code paths to add to the UpdateLog too.  That's very confusing to me \u2013 that we do it in two places; the code in DistributedURP is very confusing too.  And with custom URPs & URP chains, I'm sure there are gotchas like this (issue) waiting to surprise you.  Given DistributedURP adds the doc to the log, I can understand the desire to record the URP chain, since we need to know where to continue from on replay.  Perhaps DistributedURP's design could be changed to not write to the UpdateLog?  That would add some sanity to being able to reason about things more easily and, I think, simplify the code.  But DistributedURP is writing to the UpdateLog now for some reason.  Mark Miller (or someone else familiar with the design) can you please comment?\n\nAs a practical matter right now given these issues, I think I'm going to have to have just one URP chain, and ensure each of the URPs can deal with the possibility of a doc flowing through twice. ",
+            "id": "comment-15220137"
+        },
+        {
+            "date": "2016-04-01T07:35:38+0000",
+            "author": "Ludovic Boutros",
+            "content": "David Smiley, if I remember the process correctly, (I checked this a long time ago now ), there are two different cases :\n\n\tthe first one is the \"normal\" case, the URP chain is used and the DirectUpdateHandler adds the documents to the UpdateLog.\n\tthe second one is used during recovery when updates must be buffered and the URP chain is not used before buffering documents to the UpdateLog. And the buffering is done by the DistributedURP.\n\n\n\nThat's why you will find two different places where documents are added to the UpdateLog and that's why two different URP chain should be put in the UpdateLog (see my old comment on that subject). ",
+            "id": "comment-15221309"
+        },
+        {
+            "date": "2016-04-01T15:15:46+0000",
+            "author": "David Smiley",
+            "content": "Thanks Ludovic.  Yesterday on IRC #solr-dev Shalin Shekhar Mangar described this to me in more detail.  At least with this understanding, I can tweak my update chain configuration accordingly.  I added a healthy dose of comments to the config & URP code I have, and some safety checks.\n\nIMO, separately from this issue, I claim this aspect of SolrCloud would be better off if DistributedURP didn't write to the UpdateLog.  It complicates things quite a bit that it does, both the code readability/maintainability and trying to reason about when URPs run.  Instead I think the DistributedURP should block during recovery or perhaps return an informative error (or first then second).  Adding URP chain metadata to the UpdateLog as the title suggests is more technical debt & complexity, even if it seems to fix URPs to always run exactly once.  I think fixing technical debt is a challenge for open-source... it's harder than adding another band-aid but we're better off in the long run.  That's how it was when I set out to add BC dates to Solr when I discovered our date handling code was using obsolete date APIs.  Band aids, in the short term, are less work. ",
+            "id": "comment-15221824"
+        },
+        {
+            "date": "2016-12-20T17:53:00+0000",
+            "author": "Erick Erickson",
+            "content": "There's another variant on this theme FWIW. With a ParseDateFieldUpdateProcessorFactory in the chain (after DistributedUpdateProcessorFactory), and indexing a date like 2001-09-09T11:12:23 (not no 'Z') fails on tlog replay. ",
+            "id": "comment-15764805"
+        },
+        {
+            "date": "2016-12-20T18:05:41+0000",
+            "author": "David Smiley",
+            "content": "Yeah.  In general, put URPs before DistributedURP; only do after if you need/have to do otherwise, you know what you are doing, and furthermore actually test tlog replay somehow. ",
+            "id": "comment-15764834"
+        },
+        {
+            "date": "2017-01-03T17:26:19+0000",
+            "author": "Hoss Man",
+            "content": "FWIW: I have not looked into this issue in depth, nor have i had time to really read & think about the patch posted  \u2013 but based on some recent discussion about this issue and SOLR-9883 it occured to me that the problem is almost cerainly broader then just keeping track of the chain name \u2013 it's also potentially all the request params from the original request.\n\nSo i've updated the summary & description accordingly. ",
+            "id": "comment-15795594"
+        },
+        {
+            "date": "2017-01-04T08:25:24+0000",
+            "author": "Ludovic Boutros",
+            "content": "Thank you Hoss Man.\n\nThe point is that for main operations, the Document Update Processors do not have access to the Solr request.\nThe parameters are stored in the commands (add, delete, commit).\nI don't know if for merging and rollback operations the parameters could also be stored in the command.\n\nThis way we do would not have to worry about request parameters.\n\nI agree with David Smiley that the log replay is too complicated.\nBut I do not agree with David Smiley that this should not be fixed because of very specific use cases.\n\nI think the log replay must be symetric by default.\nThis is the natural behavior of all database systems that I can think of.\nIf you need something else you can always check the REPLAY flag in your processor.\n\nCurrently, your index can be easily corrupted because your update processor logic is not applied during log replay. ",
+            "id": "comment-15797577"
+        },
+        {
+            "date": "2017-01-04T17:22:08+0000",
+            "author": "Hoss Man",
+            "content": "The point is that for main operations, the Document Update Processors do not have access to the Solr request.\n\nI'm not sure what you mean by that \u2013 during normal update processing the SolrQueryRequest is available to UpdateProcessorFactories as part of the getInstance(...) call as well as to the UpdateProcessors themselves via UpdateCommand.getReq() and some factories/processors (like StatelessScriptUpdateProcessorFactory in my example) access the request to get the request params and make conditional choices based on those values \u2013 but unless i'm completely missing something, things like the request params are not written to the tlog when the UpdateCommands are written to the tlog.\n\nhence: the scope of the problem goes beyond just keeping a record of the update chain needed for each command in the tlog, it's a matter of tracking ALL the relevant variables (chain, req params, etc...)\n\nBut I do not agree with David Smiley that this should not be fixed because of very specific use cases.\n\nI suspect you missunderstood david \u2013 either that or i did \u2013 i don't think he's of the opinion that this shouldn't be fixed, my understanding of his comments is that: \n\n\the agrees the entire situation is bad, and should fixed in some way\n\the would rather look a the big picture and \"rip the bandaid off\" with whatever sort of invasive fix is needed then add more band-aids on top of the code we already have\n\tuntil such time as we have a \"good\" fix, the workaround is to encourage people to only use chains/updates that will work in spite of this bug.\n\n\n\ni would agree with those three sentiments, even if they aren't what he actually ment  ",
+            "id": "comment-15798787"
+        },
+        {
+            "date": "2017-01-04T19:31:03+0000",
+            "author": "David Smiley",
+            "content": "You've read me correctly Hoss Man   \n\nI have no idea how controversial ripping this mode of the updateLog out of Solr would be.  To be clear, I propose that the UpdateLog only get written to by DirectUpdateHandler, and thus we can better reason about it.  I've been following Cao Manh Dat 's progress in SOLR-9835 and the complexities of PeerSync were too much to deal with so he totally punted on it for now.  Was that related to the fact that the updateLog can be in a buffering mode written to by DistributedURP?  Not sure. ",
+            "id": "comment-15799127"
+        },
+        {
+            "date": "2017-01-04T19:48:52+0000",
+            "author": "Yonik Seeley",
+            "content": "I have no idea how controversial ripping this mode of the updateLog out of Solr would be.\n\nI've never liked the idea of putting custom processors after the DistributedURP.  To me, the latter was mostly an implementation detail.\n\nI propose that the UpdateLog only get written to by DirectUpdateHandler, and thus we can better reason about it. \n\nI'd put it slightly differently... the user should not care about that implementation detail (if the tlog is written in the processor or the handler, or some combination), and thus we should be free to do either. ",
+            "id": "comment-15799165"
+        },
+        {
+            "date": "2017-01-05T12:16:28+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Based on my reading of LUCENE-7302, I think we should try to leverage this in future and have the update log additions closer to the IW (i.e. from DUH2, rather than URPs). ",
+            "id": "comment-15801211"
+        },
+        {
+            "date": "2017-01-05T12:56:18+0000",
+            "author": "Ludovic Boutros",
+            "content": "Thank you Hoss Man for the clarification. And you are right on the request parameters as well, I did not check the abstract class.\n\nSorry David Smiley for the misunderstanding  ",
+            "id": "comment-15801285"
+        },
+        {
+            "date": "2018-05-25T18:10:14+0000",
+            "author": "Shawn Heisey",
+            "content": "We have a use case on the solr-user mailing list that is going to require the fix for this issue.  I've explained the reason that post-processors aren't recommended, and they replied with what I think is a coherent reason that they need post-processors.\n\nThey use Atomic Updates extensively and their custom update processors must operate on the full document, not the partial document available before DistributedUpdateProcessor runs.\n\nCan an agreement be reached about how to fix this issue? ",
+            "id": "comment-16491102"
+        },
+        {
+            "date": "2018-05-25T18:16:56+0000",
+            "author": "Shawn Heisey",
+            "content": "I was thinking that if we could move Atomic Update processing out of DistributedUpdateProcessor into its own processor, we could cover almost every situation that requires a post-processor.  But there may be a complication to doing that \u2013 the core that runs pre-processors (is that a valid term?) may be for the wrong shard, and possibly for the wrong collection, so accessing the original document that's being updated could be a problem. ",
+            "id": "comment-16491116"
+        }
+    ]
+}

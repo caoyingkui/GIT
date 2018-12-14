@@ -1,0 +1,102 @@
+{
+    "id": "LUCENE-2335",
+    "title": "optimization: when sorting by field, if index has one segment and field values are not needed, do not load String[] into field cache",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "Spinoff from java-dev thread \"Sorting with little memory: A suggestion\", started by Toke Eskildsen.\n\nWhen sorting by SortField.STRING we currently ask FieldCache for a StringIndex on that field.\n\nThis can consumes tons of RAM, when the values are mostly unique (eg a title field), as it populates both int[] ords as well as String[] values.\n\nBut, if the index is only one segment, and the search sets fillFields=false, we don't need the String[] values, just the int[] ords.  If the app needs to show the fields it can pull them (for the 1 page) from stored fields.\n\nThis can be a potent optimization \u2013 alot of RAM saved \u2013 for optimized indexes.\n\nWhen fixing this we must take care to share the int[] ords if some queries do fillFields=true and some =false... ie, FieldCache will be called twice and it should share the int[] ords across those invocations.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-03-19T23:00:58+0000",
+            "content": "If anyone wants to take this, feel free!  I won't be able to (for a long time at least!). ",
+            "author": "Michael McCandless",
+            "id": "comment-12847638"
+        },
+        {
+            "date": "2010-03-19T23:30:04+0000",
+            "content": "This is also useful for MultiReader (or equivalent if we get rid of it).\nBefore we went per-segment searching, I always meant to do an optimization that would skip the String[] part of StringIndex when it wasn't needed.  Of course, now it is needed for per-segment string sorting... but ord-only can still be useful. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12847647"
+        },
+        {
+            "date": "2010-03-19T23:34:57+0000",
+            "content": "I obviously have a share in this and would like to give the inner workings a go (I've made a proof of concept at http://github.com/tokee/lucene that I'll use as base). However, I am not all that familiar with the finer details of the Lucene code base, so I'll proably need help for integrating the code.\n\nIf I read the Lucene code correctly, the actual Strings need only be resolved for the requested X documents (using FieldComparator.value). If this is true, there is no need for stored fields: We can get the Strings from the indexed fields instead, as we keep track of the ordinals for the Terms. ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12847650"
+        },
+        {
+            "date": "2010-03-20T08:04:54+0000",
+            "content": "If this is true, there is no need for stored fields: We can get the Strings from the indexed fields instead, as we keep track of the ordinals for the Terms.\n\nMeaning, after we're done collecting hits for this segment, you'd make a 2nd pass to resolve the ord -> value for all docs that made the cut?  This may be slowish?  Or would you somehow try to do it only at the end, ie for only docs that made the cut across all segments?\n\nWe'd probably want to change the API, somehow, bulk-load the ords, so that we'd make single forward sweep (ie, visit the ords in order). ",
+            "author": "Michael McCandless",
+            "id": "comment-12847744"
+        },
+        {
+            "date": "2010-03-20T11:34:54+0000",
+            "content": "The sort-first-then-resolve-Strings is what I did in the proof of concept. The speed is that of TermsInfoReader, where it delivers a Term from a given position. If this is too slow for multiple segments, the segment-spanning ordered ordinals-approach could be tried.\n\nAs for deprecating stored fields, then I guess there's the issue of spatial locality. Wouldn't moving the bytes into the inverted term index bloat it in a way that makes all searches slower?\n\nThere's an issue of having multiple terms in the same field for a given document, which also ties into facets. It takes some more logic to handle this, but I think it can be done without excessive memory or processing load: Basically we make two passes, where the first pass determines the optimal packed structure and the second pass fills in the ordinals. This would give us a memory overhead of\n\n#docs + #references_to_terms + #terms ints\n\n\nfor very fast facet structure building with support for collator sorted terms in the facet result. This is basically what we're already doing at Statsbiblioteket - the only real difference is whether the Strings are pulled from the Terms index or from an external structure.\n\nSaving RAM, this could be be done using PackedInts\n\n#docs*log2(#references_to_terms) + #references_to_terms*log2(#terms) + #terms*log2(#terms) bits\n\n\nbut I am afraid that access time would suffer. A hybrid\n\n#docs*32 + #references_to_terms*32 + #terms*log2(#terms) bits\n\n\nwould be just as fast for building as the non-packed version and a wee bit slower for the final fetching of the terms.\n\nOf course, just as with fillFields=true searches, the calculated Terms must be extracted at the end. For faceting, this can be quite a load.\n\nThe facet-supporting structure is not as simple as the sorting-optimized one. I realize that supporting facets from the start might be quite a large jump. However, if API-breaks are requires, I guess it would be best to do it as few times as possible? ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12847766"
+        },
+        {
+            "date": "2010-03-22T21:55:23+0000",
+            "content": "The sort-first-then-resolve-Strings is what I did in the proof of concept. The speed is that of TermsInfoReader, where it delivers a Term from a given position. If this is too slow for multiple segments, the segment-spanning ordered ordinals-approach could be tried.\n\nI fear both approaches are too slow.  (This is why we have the\nper-docXfield String values RAM resident now).\n\nAs for deprecating stored fields, then I guess there's the issue of spatial locality. Wouldn't moving the bytes into the inverted term index bloat it in a way that makes all searches slower?\n\nWe're not planning on deprecating stored fields?\n\nThere's an issue of having multiple terms in the same field for a given document, which also ties into facets.\n\nFor sorting it must be a single term right?\n\nAlso, for facets, you have to visit all docs, aggregating, not just\nthe final top N in the queue?\n\nFacets are fun to discuss... but let's keep this issue focused on how\nto optimize the single-segment sorting case with fillFields=false. ",
+            "author": "Michael McCandless",
+            "id": "comment-12848380"
+        },
+        {
+            "date": "2010-03-23T07:10:57+0000",
+            "content": "I can see that I messed up reading your previous answer, regarding stored fields. Let's just forget is as to not confuse the issue further.\n\nAs for facets, they are equivalent to sorting in the aspect that resolving the actual Strings can be delayed until the very end. I'll try and contain myself on the facet subject and focus on sorting though.\n\nI have used some time tinkering with the problem of spanning multiple segments and it seems to me that the generation of a \"global\" list of sorted ordinals should be feasible without too much overhead. Basically we want to preserve sequential access as much as possible, so merging sorted ordinals from segments will benefit from a read-ahead cache. By letting the reader deliver ordinals by an iterater, it is free to implement such a cache when necessary. I envision the signature to be something like\n\nIterator<OrdinalTerm> getOrdinalTerms(\n      String persistenceKey, Comparator<Object> comparator, String field,\n      boolean collectDocIDs) throws IOException;\n\n\nwhere OrdinalTerm contains ordinal, Term and docID.\n\nThe beauty of all this is that the mapping is from docID->sortedOrdinal index (which it has to be for fast comparison), so keeping the possibility of resolving the Strings after the sort (fillFields=true) is free in terms of storage space and processing time.\n\nI hope to have a patch out soon for SegmentReader so that it is possible to perform a sorted search \"the Lucene way\" rather than the hack I use in my proof of concept. However, vacation starts friday... ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12848589"
+        },
+        {
+            "date": "2010-03-23T09:11:05+0000",
+            "content": "I have used some time tinkering with the problem of spanning multiple segments and it seems to me that the generation of a \"global\" list of sorted ordinals should be feasible without too much overhead.\n\nIf you can this it'll be super-awesome   The holy grail of \"sort by String\"...\n\nAs for facets, they are equivalent to sorting in the aspect that resolving the actual Strings can be delayed until the very end.\n\nAhh OK.\n\nI hope to have a patch out soon for SegmentReader so that it is possible to perform a sorted search \"the Lucene way\" rather than the hack I use in my proof of concept.\n\nOK I'm looking forward to it!\n\nHowever, vacation starts friday...\n\nHave a good vacation  ",
+            "author": "Michael McCandless",
+            "id": "comment-12848628"
+        },
+        {
+            "date": "2010-03-26T09:43:33+0000",
+            "content": "Just a little status on development.\n\nThe SegmentReader has been modified to implement the getOrdinalTerms stated above and it works as expected (no surprise, as this is just a refactoring and cleanup of the code from the proof of concept). I'm moving on to DirectoryReader. When that is done, I'll make a preliminary patch. For easy experimentation, I could try and make the new Sort(new SortField(\"myfield\", new Locale(\"da\"))); use the new code.\n\nSorting 10M terms still takes about 6 minutes on my machine. I've profiled the code and about 40% of the time is spend on requesting terms (with a cache of 20000 terms, locale da, using a conventional harddisk). There's room for optimization by smarter caching of terms and of course using a faster Collator than Java's default. Using simple String.compareTo, which leads to nearly sequential access to terms, takes 44 seconds for the 10M terms. The key to real improvement seems to be a better exploitation of the observation that \"Unicode order is fairly aligned to most Locale-based orders\". It is already working somewhat as dumb in-memory merge-sort of the 10M Strings takes about 10 minutes. I'll save that for later though.\n\nNow, for merges there is some decisions to make. The primary one being how to handle terms that are the same for different segments. For the first take, I'll avoid merging such terms and thus allow the iterator to deliver the same term more than once for {{DirectoryReader}}s, but with different ordinals. This should work fine for direct building of a docID->sortedOrdinalIndex map, usable for sorting, which is the primary use-case.\n\nIf the structure is to be used for faceting, the terms instances needs to be collapsed. Luckily the logic for doing so resides at the code that used the iterator, rather than internally in the readers. Using Exposed for memory-efficient faceting should still be feasible with the general code. If the order of the tags in the facet is not significant, the Unicode-order-comparator can be used, making it very fast (1-2 minutes / 10M unique terms) to build the structure for a given field. ...But I digress and will try and get back on track with the real code. ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12850055"
+        },
+        {
+            "date": "2010-03-26T15:15:00+0000",
+            "content": "The exposed DirectoryReader is now implemented and the timing does not look horrible. Stepping through ordered terms for a DirectoryReader to build the structure needed for sorting is a bit faster than the sum of sorting the individual segments. That's not quite good enough, but there is still room for a clever read-ahead cache to make iteration more sequential at the SegmentReader-level.\n\nTo give a ball-park figure: Something like 1 minute / 1 million terms for segment-level sorting, which is re-used for non-changed segments on re-open. Then something like half that time for directory-level merging, which must be done fully at re-open.\n\nThere's no easy to use plug-in replacement yet (and it seems hard to do anyway, as the sorter gets the readers one at a time) and the code at github is in shambles, so no patch either. Sorry. I expect to get back to hacking in a week. ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12850174"
+        },
+        {
+            "date": "2010-04-06T10:41:17+0000",
+            "content": "I've mis-read Michael McCandless intention with this issue and have been working under a broader scope. A new issue has been opened at https://issues.apache.org/jira/browse/LUCENE-2369 where I will continue that work.\n\nLUCENE-2335 could be implemented by extending LUCENE-2369 to take null as a comparator. For single-segments this should be on par with a dedicated implementation and for multi-segments the merging of the ordinals should be fairly efficient. The big downside is that this would be a hard decision, meaning that multi-segment sorted search without locale would always have the start-up overhead.\n\nI guess the better choice would be to recommend using LUCENE-2335 for non-locale based sorted searches only if increased startup-time is acceptable. ",
+            "author": "Toke Eskildsen",
+            "id": "comment-12853847"
+        },
+        {
+            "date": "2013-07-23T18:44:23+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 ",
+            "author": "Steve Rowe",
+            "id": "comment-13716933"
+        },
+        {
+            "date": "2014-04-16T12:54:34+0000",
+            "content": "Move issue to Lucene 4.9. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13970805"
+        }
+    ]
+}

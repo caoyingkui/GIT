@@ -1,0 +1,67 @@
+{
+    "id": "SOLR-6204",
+    "title": "FreeBSD does not break out of ServerSocketChannel.accept()",
+    "details": {
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "This may be the reason why tests behave as crazy as they do on FreeBSD (lucene jenkins). Here's the story.\n\nI looked at Solr logs and saw this:\n\n  2> 1012153 T10 oejut.QueuedThreadPool.doStop WARN 4 threads could not be stopped\n\n\njust before failures related to \"socket/ port already bound\" in SSLMigrationTest. QueuedThreadPool in jetty attempts to wait for pool threads, then terminates them (and waits again). This wait time is configurable, alas broken in Solr's code in JettySolrRunner:\n\n\n  private void init(String solrHome, String context, int port, boolean stopAtShutdown) {\n...\n      if (threadPool != null) {\n        threadPool.setMaxThreads(10000);\n        threadPool.setMaxIdleTimeMs(5000);\n        threadPool.setMaxStopTimeMs(30000);\n      }\n\n\n\nThe threadPool variable here is always null because it gets assigned after jetty starts and the configuration block is executed before it. the threadPool != null condition is never true and the code that configures those timeouts is dead.\n\nThat's not a biggie, I fixed it. The problem remains, however \u2013 even with a long wait time, the threads in accept() call are not interrupted. I wrote a small test class:\n\n\nimport java.net.InetSocketAddress;\nimport java.nio.channels.ServerSocketChannel;\n\npublic class Foo {\n  public static void main(String[] args) throws Exception {\n    final ServerSocketChannel ssc = ServerSocketChannel.open();\n    ssc.configureBlocking(true);\n    ssc.socket().setReuseAddress(true);\n    ssc.socket().bind(new InetSocketAddress(0), 20);\n    System.out.println(\"Port: \" + ssc.socket().getLocalPort());\n\n    Thread t = new Thread() {\n      @Override\n      public void run() {\n        try {\n          System.out.println(\"Thread accept();\");\n          ssc.accept().close();\n          System.out.println(\"Done?\");\n        } catch (Exception e) {\n          System.out.println(\"Thread ex: \" + e);\n        }\n      }\n    };\n    t.start();\n\n    Thread.sleep(2000);\n    t.interrupt();\n    Thread.sleep(1000);\n    System.out.println(t.getState());\n  }\n}\n\n\n\nIf you run it on Windows, for example, here's the expected result:\n\nPort: 666\nThread accept();\nThread ex: java.nio.channels.ClosedByInterruptException\nTERMINATED\n\n\nMakes sense. On FreeBSD though, the result is:\n\nPort: 32596\nThread accept();\nRUNNABLE\n\n\nInterestingly, the thread IS terminated after ctrl-c is pressed...\n\nI think this is a showstopper since it violates the contract of accept(), which states:\n\nClosedByInterruptException - If another thread interrupts the current thread while the accept operation is in progress, thereby closing the channel and setting the current thread's interrupt status",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-14044049",
+            "date": "2014-06-25T21:14:28+0000",
+            "content": "It's kind of funny. Even if you close everything:\n\nssc.socket().close();\nssc.close();\n\n\njps still shows that zombie thread inside accept. It's clearly Chuck Norris type of method.\n\n\"Thread-0\" prio=5 tid=0x0000000801174000 nid=0x8010a8800 runnable [0x00007ffffe5e7000]\n   java.lang.Thread.State: RUNNABLE\n        at sun.nio.ch.ServerSocketChannelImpl.accept0(Native Method)\n        at sun.nio.ch.ServerSocketChannelImpl.accept(ServerSocketChannelImpl.java:241)\n        - locked <0x000000087515fbd8> (a java.lang.Object)\n        at Foo$1.run(Foo.java:34)\n\n "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-14044529",
+            "date": "2014-06-26T09:57:15+0000",
+            "content": "Seems like this isn't even implemented in the FreeBSD port. Accept tries to get the blocked thread's ID and then signal it, as in:\n\nclass NativeThread {\n\n    // Returns an opaque token representing the native thread underlying the\n    // invoking Java thread.  On systems that do not require signalling, this\n    // method always returns -1.\n    //\n    static native long current();\n\n    // Signals the given native thread so as to release it from a blocking I/O\n    // operation.  On systems that do not require signalling, this method has\n    // no effect.\n    //\n    static native void signal(long nt);\n\n\nbut from what I see in the port, it's compiled to the default noop:\n\nJNIEXPORT jlong JNICALL\nJava_sun_nio_ch_NativeThread_current(JNIEnv *env, jclass cl)\n{\n#ifdef __linux__\n    return (long)pthread_self();\n#else\n    return -1;\n#endif\n}\n\nJNIEXPORT void JNICALL\nJava_sun_nio_ch_NativeThread_signal(JNIEnv *env, jclass cl, jlong thread)\n{\n#ifdef __linux__\n    if (pthread_kill((pthread_t)thread, INTERRUPT_SIGNAL))\n        JNU_ThrowIOExceptionWithLastError(env, \"Thread signal failed\");\n#endif\n}\n\n "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-14045586",
+            "date": "2014-06-27T06:08:39+0000",
+            "content": "I was asked by FreeBSD developer Jung-uk Kim to try this patch:\nhttps://svn.redports.org/jkim/java/openjdk7/files/patch-src-solaris-native-sun-nio-ch-NativeThread.c\n\nbut I have no experience with compiling/ deploying FreeBSD ports. Uwe Schindler can we do it on a live instance vm without breaking too much (is there a compile/ stage/ deploy separation)? "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-14045886",
+            "date": "2014-06-27T12:13:28+0000",
+            "content": "Hi Dawid,\n\nI can patch the ports directory and run \"make install\" afterwards. So this is no issue at all. It will replace the default java7 on the machine. If it does not work, I can revert (will do a tar cvf on the port's build dir before and run make install on the old version). For quick test: Is there a way to reproduce with ANT command line?\n\nIf this patch proves to fix the issue, it should be included in the port by the maintainer, so we get it automatically after upgrading.\n\nYou have to wait until tomorrow, because I am on business trip in Switzerland... "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-14045888",
+            "date": "2014-06-27T12:14:20+0000",
+            "content": "The question on the patch: It patches the \"solaris\" part... Why? "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-14045901",
+            "date": "2014-06-27T12:30:27+0000",
+            "content": "No problem, Uwe. Thanks. \n\n> The question on the patch: It patches the \"solaris\" part... Why?\n\nBecause this particular file is part of BSD's compilation tree \u2013 it takes sources from openjdk's Solaris variant. I didn't dig deeply on this. I would also try to confirm what's happening to the \"dying\" threads on jenkins \u2013 the socket hang is one issue, the killed threads are another \u2013 so you don't have to update immediately. I'm waiting for another job to hang to then diagnose debug logs. "
+        },
+        {
+            "author": "Dawid Weiss",
+            "id": "comment-14047487",
+            "date": "2014-06-30T09:21:28+0000",
+            "content": "Fixed in FreeBSD's ports. Uwe installed it on jenkins. "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-14047509",
+            "date": "2014-06-30T09:59:36+0000",
+            "content": "Yeah, seems to work! It is already of FreeBSD's ports infrastructure. If you are affected by this problem: portsnap fetch; portsnap update; make deinstall; make install "
+        }
+    ]
+}

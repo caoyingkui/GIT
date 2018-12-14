@@ -1,0 +1,114 @@
+{
+    "id": "SOLR-4413",
+    "title": "SolrCore#getIndexDir() contract change between 3.6 and 4.1",
+    "details": {
+        "affect_versions": "4.0,                                            4.1",
+        "status": "Closed",
+        "fix_versions": [
+            "4.2",
+            "6.0"
+        ],
+        "components": [],
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "In SVN 1420992, SolrCore#getIndexDir() changed it's implementation from a version that would reflect the value of the index property in index.properties to one that does not. \n\nIn 3.6, SolrCore#getIndexDir() was:\n\npublic String getIndexDir() {\n  synchronized (searcherLock) {\n    if (_searcher == null)\t  \t\n      return dataDir + \"index/\";\n    SolrIndexSearcher searcher = _searcher.get();\n    return searcher.getIndexDir() == null ? dataDir + \"index/\" : searcher.getIndexDir();\n}\n\n\n\nIn 3.6, SolrIndexSearcher would be passed the value of SolrCore#getNewIndexDir() \u2013 which reads index.properties \u2013 in its constructor and return it when SolrIndexSearcher#getIndexDir() was called.\n\nIn 4.1, SolrCore#getIndexDir() is:\n\n  public String getIndexDir() {  \n    return dataDir + \"index/\";\n  }\n\n\n\nClients of SolrCore#getIndexDir() that were expecting the previous behavior are likely to have issues. E.g.:\n\n--In CoreAdminHandler#handleUnloadAction(SolrQueryRequest, SolrQueryResponse) if the deleteIndex flag is set to true, it calls core.getDirectoryFactory().remove(core.getIndexDir()). If a value other than index/ is set in index.properties, the wrong directory will be deleted.\n\n--In CoreAdminHandler#getIndexSize(SolrCore), the existence of SolrCore#getIndexDir() is checked before SolrCore#getNewIndexDir(). If a value other than index/ is set in index.properties, this will return the size of the wrong directory.",
+    "attachments": {
+        "SOLR-4413.patch": "https://issues.apache.org/jira/secure/attachment/12569077/SOLR-4413.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Mark Miller",
+            "id": "comment-13574650",
+            "date": "2013-02-08T17:31:50+0000",
+            "content": "AFAICT this changed when I finished making Directory first class. You can't so easily get the index dir from the searcher (which got it from the fs directory). I'll see what we can do to improve it for 4.2. "
+        },
+        {
+            "author": "Gregg Donovan",
+            "id": "comment-13577092",
+            "date": "2013-02-12T22:10:28+0000",
+            "content": "This patch is the full set of changes we needed to make the index.properties edit + core reload reindexing mechanism that we used in 3.6 work in 4.1.\n\nIn addition to the changes to SolrCore#getIndexDir(), we needed to check for a change of directory when the new SolrCore decided to either inherit a DirectoryFactory, DeletionPolicy, or UpdateHandler from the previous core or reuse the previous core's Directory for a searcher. In each case, the state from the previous core would cause problems when inherited by the new core.\n\nThe test suite passes with the full set of changes, but I'm not sure they should all be grouped in one JIRA or not. Mark \u2013 please let me know if you think they should be broken out. If not, perhaps we should change the title of this ticket? "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13577129",
+            "date": "2013-02-12T22:48:02+0000",
+            "content": "In each case, the state from the previous core would cause problems when inherited by the new core.\n\nCould you elaborate on these problems? "
+        },
+        {
+            "author": "Gregg Donovan",
+            "id": "comment-13577200",
+            "date": "2013-02-13T00:10:41+0000",
+            "content": "Could you elaborate on these problems?\n\nSolrDeletionPolicy\nIn Solr 4.1, a core reload sets the new deletion policy to be the previous core's IndexDeletionPolicyWrapper:\n\n     SolrCore core = new SolrCore(getName(), getDataDir(), config,\n         schema, coreDescriptor, updateHandler, prev);\n     core.solrDelPolicy = this.solrDelPolicy;\n     return core;\n\n\n\nThis would cause problems when trying to get the commit points because the commits from the previous directory would be inherited. In our case, we would start with an empty index at index/. Then, after a reindex, we would have a new index at index-<timestamp>/ at generation 2 (we do one incremental after a reindex before swapping it in). When the ReplicationHandler tried to find the commits for generation 2 during replication, it couldn't find them. core.getDeletionPolicy().getCommits() would yield the map for index/, not index-<timestamp>/.\n\n\nDirectory\nSolr 4.1 has an optimization to use the IndexWriter from the previous SolrCore to create a new DirectoryReader:\n\n      // use the (old) writer to open the first searcher\n      RefCounted<IndexWriter> iwRef = null;\n      if (prev != null) {\n        iwRef = prev.getUpdateHandler().getSolrCoreState().getIndexWriter(null);\n        if (iwRef != null) {\n          final IndexWriter iw = iwRef.get();\n          newReaderCreator = new Callable<DirectoryReader>() {\n            @Override\n            public DirectoryReader call() throws Exception {\n              return DirectoryReader.open(iw, true);\n            }\n          };\n        }\n      }\n\n\nIn our case, the old core refers to index/ and the core being created is at index-<timestamp>/, so the DirectoryReader from the old core points to a directory that is no longer in use. After doing the index.properties update and core reload, the newly created SolrIndexSearcher would still point to index/. It would take an empty commit to get a new reader pointed at index-<timestamp>/.\n\n\nUpdateHandler\nThe UpdateHandler has a reference to the SolrCoreState/DefaultSolrCoreState which has a reference to the SolrIndexWriter. So, when we inherited the UpdateHandler from index/ after the reload pointed to index-<timestamp>/, commits would still go to index/.\n\nIt's unfortunate to lose all of the stats in DirectUpdateHandler2, but maybe it makes sense to reset them anyway when the Directory changes?\n\nDirectoryFactory\nI should clarify: the reason for not inheriting DirectoryFactory from the previous core was not actually related to state. Rather, the current logic in 4.1 for whether to inherit the DirectoryFactory is:\n\n      if (updateHandler == null) {\n        initDirectoryFactory();\n        solrCoreState = new DefaultSolrCoreState(getDirectoryFactory());\n      } else {\n        solrCoreState = updateHandler.getSolrCoreState();\n        directoryFactory = solrCoreState.getDirectoryFactory();\n        this.isReloaded = true;\n      }\n\n\n\nI removed inheriting of the DirectoryFactory of the previous core because SolrCore#getNewIndexDir() uses this.directoryFactory to read index.properties and getNewIndexDir() was needed to determine whether the new core was using the same directory as the previous core. Perhaps this can be solved by creating a private version of SolrCore#getNewIndexDir that takes a DirectoryFactory as an argument? On second look I don't think I see state in DirectoryFactory that should cause problems when a new directory is used.\n "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13577267",
+            "date": "2013-02-13T01:43:02+0000",
+            "content": "Thanks Gregg - not sure how soon I can get to this stuff, but I'll certainly try to help you address all of this for 4.2. "
+        },
+        {
+            "author": "Gregg Donovan",
+            "id": "comment-13577272",
+            "date": "2013-02-13T01:47:05+0000",
+            "content": "Thanks, Mark \u2013 much appreciated.  "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13579800",
+            "date": "2013-02-16T14:51:07+0000",
+            "content": "The UpdateHandler has a reference to the SolrCoreState/DefaultSolrCoreState which has a reference to the SolrIndexWriter. So, when we inherited the UpdateHandler from index/ after the reload pointed to index-<timestamp>/, commits would still go to index/.\n\nThat seems strange - we handle that in replication by starting up a new writer when we switch indexes. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13579801",
+            "date": "2013-02-16T14:53:22+0000",
+            "content": "Can you try this patch and see how close it gets you? We may have to go back and forth once or twice. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13580105",
+            "date": "2013-02-17T02:41:45+0000",
+            "content": "Actually, I think you probably need that patch + SOLR-4417 "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13580302",
+            "date": "2013-02-17T22:16:16+0000",
+            "content": "[trunk commit] Mark Robert Miller\nhttp://svn.apache.org/viewvc?view=revision&revision=1447089\n\nSOLR-4413: Fix SolrCore#getIndexDir() to return the current index directory.\n\nSOLR-4469: A new IndexWriter must be opened on SolrCore reload when the index directory has changed and the previous SolrCore's state should not be  propagated. "
+        },
+        {
+            "author": "Commit Tag Bot",
+            "id": "comment-13580307",
+            "date": "2013-02-17T22:22:11+0000",
+            "content": "[branch_4x commit] Mark Robert Miller\nhttp://svn.apache.org/viewvc?view=revision&revision=1447090\n\nSOLR-4413: Fix SolrCore#getIndexDir() to return the current index directory.\n\nSOLR-4469: A new IndexWriter must be opened on SolrCore reload when the index directory has changed and the previous SolrCore's state should not be  propagated. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-13580313",
+            "date": "2013-02-17T22:37:35+0000",
+            "content": "I opened SOLR-4469 for part of this. Everything is in now. Let me know where you run into problems. "
+        },
+        {
+            "author": "Amit Nithian",
+            "id": "comment-13583042",
+            "date": "2013-02-21T09:27:01+0000",
+            "content": "Is there a way to get this into a minor release of 4.1 (4.1.1 or something). I think this is impacting the replication handler because if you have your index currently located in an index.<timestamp> directory, a full download will inadvertently always happen because none of the local files will exist since it's thinking the index dir is \"index/\". "
+        },
+        {
+            "author": "Shawn Heisey",
+            "id": "comment-13583779",
+            "date": "2013-02-22T01:14:17+0000",
+            "content": "Amit, as I am not a Lucene/Solr committer, I cannot give you an authoritative answer, but I can offer my best guess.  I do not think there will be a 4.1.1 release.  There is already a pledge by one committer to get 4.2 released in the next 2-3 weeks.  It takes almost as much developer effort for a point release as a new minor version, so the effort usually goes towards the new minor version. "
+        },
+        {
+            "author": "Uwe Schindler",
+            "id": "comment-13654174",
+            "date": "2013-05-10T10:34:17+0000",
+            "content": "Closed after release. "
+        }
+    ]
+}

@@ -1,0 +1,117 @@
+{
+    "id": "LUCENE-3786",
+    "title": "Create SearcherTaxoManager",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "modules/facet"
+        ],
+        "type": "New Feature",
+        "fix_versions": [
+            "4.3",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "If an application wants to use an IndexSearcher and TaxonomyReader in a SearcherManager-like fashion, it cannot use a separate SearcherManager, and say a TaxonomyReaderManager, because the IndexSearcher and TaxoReader instances need to be in sync. That is, the IS-TR pair must match, or otherwise the category ordinals that are encoded in the search index might not match the ones in the taxonomy index.\n\nThis can happen if someone reopens the IndexSearcher's IndexReader, but does not refresh the TaxonomyReader, and the category ordinals that exist in the reopened IndexReader are not yet visible to the TaxonomyReader instance.\n\nI'd like to create a SearcherTaxoManager (which is a ReferenceManager) which manages an IndexSearcher and TaxonomyReader pair. Then an application will call:\n\nSearcherTaxoPair pair = manager.acquire();\ntry {\n  IndexSearcher searcher = pair.searcher;\n  TaxonomyReader taxoReader = pair.taxoReader;\n  // do something with them\n} finally {\n  manager.release(pair);\n  pair = null;\n}",
+    "attachments": {
+        "LUCENE-3786-3x-nocommit.patch": "https://issues.apache.org/jira/secure/attachment/12577697/LUCENE-3786-3x-nocommit.patch",
+        "LUCENE-3786.patch": "https://issues.apache.org/jira/secure/attachment/12577627/LUCENE-3786.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-03-07T06:18:58+0000",
+            "content": "Removing 3.6 Fix version. If I'll make it by the release, I'll put it back. ",
+            "author": "Shai Erera",
+            "id": "comment-13224022"
+        },
+        {
+            "date": "2013-04-08T21:25:03+0000",
+            "content": "Patch w/ test. ",
+            "author": "Michael McCandless",
+            "id": "comment-13625842"
+        },
+        {
+            "date": "2013-04-09T03:52:18+0000",
+            "content": "I actually started working on that a long time ago and had a patch which I never posted because it wasn't ready. Back then I was thinking of how can the search and taxonomy indexes be synced. I.e. in your patch, opening a pair on a Directory assumes that the pair is \"valid\", which may not be the case at all. For instance, when you commit such pair, you need to first commit IW, and only then TW. That way, TW always contains ordinals that are >= than what IW knows about, in which case they are \"valid\". So if the commit to TW succeeds and the commit to IW fails, you potentially don't end up in an inconsistent state. However, if an app makes a mistake and commits them in a different order, the pair may not be valid. I'm willing to live with a documentation that says \"you should commit the pair like so...\".\n\nBut, if the app's commit logic is fine, yet it opened IW and TW with OpenMode.CREATE, then the taxonomy will include ordinals that may be completely unrelated to what IW stores, right? For that reason, I created (in the un-posted patch) a taxonomy timestamp class (which we can treat as version or something similar) which is written to both TW's and IW's commitData, and the manager checks for that at initialization to ensure the two actually match.\n\nThe taxonomy writer records an index.epoch property on the internal IW commitData, which keeps track of how many times it has been recreated (opened w/ OpenMode.CREATE, or replaceTaxonomy). TaxoReader uses that on openIfChanged, returning a new instance if it is the case. I think I had issues recording that in the IW commitData as well, because you need to first commit IW, but the epoch on TW commitData is unknown until it is committed... and pulling it from DirTaxoWriter's member is dangerous because in between you might get a replaceTaxo call which increments the epoch.\n\nIt's not that simple to keep these two in sync, so I put it aside until I have time to get back to it. Thanks for re-initiating!\n\nWhat do you think about this? This recreate thing is delicate. Since apps can call IW.deleteAll() as well as TW.replaceTaxonomy, I wish that we give a solution that works in all cases, rather than say this manager doesn't work if these methods were called.\n\nI think that we also need an object that manages IW and TW pair, so that a faceted search app calls commit() on it, and it handles the delicate commit order + whatever metadata we need to commit to make these two in sync. I wonder if it should be this manager? Then it can always take IW and TW pair, and offer both the acquire/release logic as well as commit.\n\nAbout the patch:\n\n\n\tWhy does the test uses newFSDirectory? I didn't read through, but can't it work with RAMDirectory too?\n\tManager.decRef()-- I think you should searcher.reader.incRef() if taxoReader.decRef() failed?\n\tIt's odd that acquire() throws IOE ... I realize it's because the decRef call in tryIncRef. I don't know if it's critical, but if it is, you may want to throw RuntimeEx?\n\n ",
+            "author": "Shai Erera",
+            "id": "comment-13626190"
+        },
+        {
+            "date": "2013-04-09T03:56:06+0000",
+            "content": "Here's the patch I ended up with when working on this on top of 3.x (don't remember if it was 3.5 or 3.6). This is not intended for commit, but you many want to look at the manager and its validation logic. Not sure how much of it is still relevant, except the recreate scenario. ",
+            "author": "Shai Erera",
+            "id": "comment-13626191"
+        },
+        {
+            "date": "2013-04-09T12:09:23+0000",
+            "content": "OK I discussed these tricky issues with Shai ... with the non-NRT case\n(app commits and then calls .maybeRefresh) there are some big\nchallenges.\n\nFirst off, the app must always commit IW first then TW.  But second\noff, even if it does that, there is at least this multi-threaded case\nwhere .maybeRefresh can screw up:\n\n\n\tThread 1 (indexer) commits IW1\n\tThread 1 (indexer) commits TW1\n\tThread 2 (indexer) commits IW2\n\tThread 3 (searcher) maybeRefresh opens IW2\n\tThread 3 (searcher) maybeRefresh opens TW1\n\tThread 1 (indexer) commits TW2\n\n\n\nThat will then lead to confusing AIOOBEs during facet counting...\n\nNet/net I think there's too much hair around supporting the non-NRT\ncase, and I think for starters we should just support NRT, ie you must\npass IW and TW to STM's ctor.  Then STM is agnostic to what commits\nare being done ... commit is only for durability purposes.\n\nWe must still document that you cannot do IW.deleteAll /\nTW.replaceTaxonomy (I'll add it).\n\nWhy does the test uses newFSDirectory?\n\nJust because it's using the LineFileDocs, which have biggish docs in\nthem.  Add in -Dtests.nightly, -Dtests.multiplier=3, and it could\nmaybe be we are pushing the 512 MB RAM limit...\n\nManager.decRef()-- I think you should searcher.reader.incRef() if taxoReader.decRef() failed?\n\nHmm this isn't so simple: that decRef could have closed the reader.  I\nsuppose I could do a \"best effort\" tryIncRef so that if the app\nsomehow catches the exception and retries the decRef we don't\nprematurely close the reader ...\n\nIt's odd that acquire() throws IOE ... I realize it's because the decRef call in tryIncRef. I don't know if it's critical, but if it is, you may want to throw RuntimeEx?\n\nI think it's OK to add IOE to the signature? ",
+            "author": "Michael McCandless",
+            "id": "comment-13626519"
+        },
+        {
+            "date": "2013-04-09T12:57:31+0000",
+            "content": "I think it's OK to add IOE to the signature?\n\nOk.\n\nthat decRef could have closed the reader\n\nHmm ... if we assume that this TR/IR pair is managed only by that manager, then an IOE thrown from decRef could only be caused by closing the reader, right?\nSo if you successfully IR.decRef() but fail to TR.decRef(), it means that IR is closed already right? Therefore there's no point to even tryIncRef?\n\nJust because it's using the LineFileDocs\n\nAhh ok. As I said, I didn't read the test through. I will review the patch after you post a new version. ",
+            "author": "Shai Erera",
+            "id": "comment-13626543"
+        },
+        {
+            "date": "2013-04-09T20:33:59+0000",
+            "content": "New patch, just handling the NRT case. ",
+            "author": "Michael McCandless",
+            "id": "comment-13627064"
+        },
+        {
+            "date": "2013-04-09T20:34:33+0000",
+            "content": "\nthat decRef could have closed the reader\n\nHmm ... if we assume that this TR/IR pair is managed only by that manager, then an IOE thrown from decRef could only be caused by closing the reader, right?\nSo if you successfully IR.decRef() but fail to TR.decRef(), it means that IR is closed already right? Therefore there's no point to even tryIncRef?\n\nYou're right ... so I just left the two decRefs in the patch ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13627065"
+        },
+        {
+            "date": "2013-04-10T03:47:24+0000",
+            "content": "Few comments:\n\n\n\tThis assert in the test assertEquals(1, results.size()); is kinda moot because we always return a FacetResult, even if empty. Perhaps you can assert that if the acquired reader.maxDoc is > 0, the returned FacetResult.rootNode has at least one child with count that is at least 1?\n\n\n\n\n\tMaybe change the end of the test to a single-line IOUtils.close()?\n\n\n\n\n\tYou wrote previously that the test uses LineFileDocs, but I don't see it. It seems it only adds facets to documents? If so, can it go back to newDirectory()?\n\n\n\n\n\tIt's good that you identify replaceTaxonomy, makes the code safer.\n\n\n\n\n\tTR.getTaxoEpoch: maybe instead of adding it to TR you can use the one on DTW (make it public, @lucene.internal)? It's odd that it documents that this epoch is returned only for an NRT TR, because the epoch is recorded on the taxo index commit data, so conceptually there's no reason why it shouldn't always return it. Yet, since this epoch is used internally, between TW and TR, I prefer not to expose it too much. Hmmm, but then you may hit a false positive where the returned TR is valid, yet just in between the checks the app called replaceTaxo. But I think that's ok since it means the check will fail on the next refresh attempt. Really, if ever DTW.epoch changes, we should fail.\n\n\n\n\n\tI don't know how important it is, but perhaps given the short discussion we had above, it would be good to add a 1-liner to decRef why the method seems unprotected, but in reality it's the best we can do?\n\n\n\n\n\tIn refreshIfNeeded, I understand this code newReader.decRef() is equivalent to closing newReader (if epoch has changed). But after I received a question yesterday from a someone who did not understand why we don't call close(), perhaps we should, for clarity?\n\n\n\nOtherwise this looks great! When I worked on it in the past, DTR wasn't NRT and the sync was a nightmare. Making it NRT really simplified this manager! ",
+            "author": "Shai Erera",
+            "id": "comment-13627435"
+        },
+        {
+            "date": "2013-04-10T13:59:58+0000",
+            "content": "Thanks for all the feedback Shai, I incorporated it all except for\nthis one:\n\nTR.getTaxoEpoch: maybe instead of adding it to TR you can use the one on DTW (make it public, @lucene.internal)? It's odd that it documents that this epoch is returned only for an NRT TR, because the epoch is recorded on the taxo index commit data, so conceptually there's no reason why it shouldn't always return it. Yet, since this epoch is used internally, between TW and TR, I prefer not to expose it too much. Hmmm, but then you may hit a false positive where the returned TR is valid, yet just in between the checks the app called replaceTaxo. But I think that's ok since it means the check will fail on the next refresh attempt. Really, if ever DTW.epoch changes, we should fail.\n\nI don't like that cutting over to DTW would open up the thread hazard\nthat we fail to catch the replace ... admittedly it'd be rare but why\nopen it up?  The added Expert/@lucene.internal method seems minor ...\n\nWhen I worked on it in the past, DTR wasn't NRT and the sync was a nightmare. Making it NRT really simplified this manager!\n\nThank you for doing all the hard work first (making DTR NRT)  ",
+            "author": "Michael McCandless",
+            "id": "comment-13627805"
+        },
+        {
+            "date": "2013-04-10T14:14:11+0000",
+            "content": "I reviewed again, and now that you switch to calling close() instead of decRef(), I think the close() should be done via IOUtils.close, to avoid a potential close failure (newReader.close()) and leave behind a dangling TR?\n\nAlso test() also has these 5 close() statements which can be folded into one IOUtils. But that's just style.\n\nI don't like that cutting over to DTW would open up the thread hazard that we fail to catch the replace\n\nWhat I meant is that if instead of checking epoch on TR you check on DTW, you won't (I think!) get into that hazard. That is: (1) reopen TR (2) check if DTW.epoch is different than the one the manager was created with. The only false positive in this case is that the TR might be valid (i.e. in between 1 and 2 a replaceTaxo was called), but I think that's ok to throw the exception, since on the next refresh you'll fail anyway?\n\nAnyway, I don't have any strong feelings about it. It is indeed safer to put it on TR and let TR provide evidence \"for itself\". If you want to keep it, can you make getEpoch public on both DTW and DTR, to be consistent. ",
+            "author": "Shai Erera",
+            "id": "comment-13627824"
+        },
+        {
+            "date": "2013-04-10T14:25:15+0000",
+            "content": "I reviewed again, and now that you switch to calling close() instead of decRef(), I think the close() should be done via IOUtils.close, to avoid a potential close failure (newReader.close()) and leave behind a dangling TR?\n\nGood, I'll fix that.\n\nAlso test() also has these 5 close() statements which can be folded into one IOUtils. But that's just style.\n\nWoops, I missed that one ... I'll fix.\n\nWhat I meant is that if instead of checking epoch on TR you check on DTW, you won't (I think!) get into that hazard. \n\nAhh, right, as long as I check taxoWriter after the reopen: good!  I'll fix to just use DTW... ",
+            "author": "Michael McCandless",
+            "id": "comment-13627833"
+        },
+        {
+            "date": "2013-04-10T14:25:58+0000",
+            "content": "New patch w/ last round of changes ... thanks Shai! ",
+            "author": "Michael McCandless",
+            "id": "comment-13627834"
+        },
+        {
+            "date": "2013-04-10T15:14:38+0000",
+            "content": "Looks good, +1. Thanks for doing the work Mike! ",
+            "author": "Shai Erera",
+            "id": "comment-13627888"
+        },
+        {
+            "date": "2013-05-10T10:32:41+0000",
+            "content": "Closed after release. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13653692"
+        }
+    ]
+}

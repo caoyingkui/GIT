@@ -1,0 +1,133 @@
+{
+    "id": "LUCENE-1063",
+    "title": "Token re-use API breaks back compatibility in certain TokenStream chains",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "modules/analysis"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "2.3"
+        ],
+        "affect_versions": "2.3",
+        "resolution": "Invalid",
+        "status": "Closed"
+    },
+    "description": "In scrutinizing the new Token re-use API during this thread:\n\n  http://www.gossamer-threads.com/lists/lucene/java-dev/54708\n\nI realized we now have a non-back-compatibility when mixing re-use and\nnon-re-use TokenStreams.\n\nThe new \"reuse\" next(Token) API actually allows two different aspects\nof re-use:\n\n  1) \"Backwards re-use\": the subsequent call to next(Token) is allowed\n     to change all aspects of the provided Token, meaning the caller\n     must do all persisting of Token that it needs before calling\n     next(Token) again.\n\n  2) \"Forwards re-use\": the caller is allowed to modify the returned\n     Token however it wants.  Eg the LowerCaseFilter is allowed to\n     downcase the characters in-place in the char[] termBuffer.\n\nThe forwards re-use case can break backwards compatibility now.  EG:\nif a TokenStream X providing only the \"non-reuse\" next() API is\nfollowed by a TokenFilter Y using the \"reuse\" next(Token) API to pull\nthe tokens, then the default implementation in TokenStream.java for\nnext(Token) will kick in.\n\nThat default implementation just returns the provided \"private copy\"\nToken returned by next().  But, because of 2) above, this is not\nlegal: if the TokenFilter Y modifies the char[] termBuffer (say), that\nis actually modifying the cached copy being potentially stored by X.\n\nI think the opposite case is handled correctly.\n\nA simple way to fix this is to make a full copy of the Token in the\nnext(Token) call in TokenStream, just like we do in the next() method\nin TokenStream.  The downside is this is a small performance hit.  However\nthat hit only happens at the boundary between a non-reuse and a re-use\ntokenizer.",
+    "attachments": {
+        "LUCENE-1063.patch": "https://issues.apache.org/jira/secure/attachment/12369905/LUCENE-1063.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2007-11-20T16:37:39+0000",
+            "content": "In ''code words\":\n\n// Filter F is calling TokenStream ts:\nF.next(Token result) {\n    Token t = ts.next(result);\n    t.setSomething();\n    return t;\n}\n\n\n\nProblem as described: ts expects the token it returns to not be altered because it somehow intends to rely on its content when servicing the following call to next([]). In other words, it assumes that callers to next([]) would only consume, but not alter, the returned token. \n\nSeems that such an expectation by ts would be problematic no matter if ts.next() or ts.next(Token) are used.\n\nI mean, even if we removed next(Token) but kept Token.termBuffer(), that char array could be modified, and some TokenSteam implementation could still be broken because it assumes (following similar logic) that it can reuse its private copy of the char array... right?\n\n\nA simple way to fix this is to make a full copy of the Token in the next(Token) call in TokenStream, just like we do in the next() method in TokenStream.  The downside is this is a small performance hit.  However that hit only happens at the boundary between a non-reuse and a re-use\ntokenizer.\n\nTokenStream already does this, right? (or do you mean in the class TokenStream or in all implementations of TokenStream?) ",
+            "author": "Doron Cohen",
+            "id": "comment-12543939"
+        },
+        {
+            "date": "2007-11-20T18:31:31+0000",
+            "content": "\n\n// Filter F is calling TokenStream ts:\nF.next(Token result) {\n    Token t = ts.next(result);\n    t.setSomething();\n    return t;\n}\n\n\nProblem as described: ts expects the token it returns to not be altered because it somehow intends to rely on its content when servicing the following call to next([]). In other words, it assumes that callers to next([]) would only consume, but not alter, the returned token.\n\nAnd, ts only defined \"non-reuse\" next(), thus it is the default\nimplemenation in TokenStream.next(Token) that is actually invoked,\nwhich in turn invokes ts.next() and directly returns the result.\n\n\nSeems that such an expectation by ts would be problematic no matter if ts.next() or ts.next(Token) are used.\n\nI mean, even if we removed next(Token) but kept Token.termBuffer(), that char array could be modified, and some TokenSteam implementation could still be broken because it assumes (following similar logic) that it can reuse its private copy of the char array... right?\n\nI don't think it's problematic for ts to expect this?  This is the\n\"contract\" that you are supposed to follow for this API, spelled out\nin the javadocs.\n\nWhen you call \"non-reuse\" ts.next() you expect to get a private copy\nthat you can hold onto indefinitely and it will never be modified,\nand, you accept that you must never modify this token yourself.\n\nWhereas when you call \"reuse\" ts.next(Token) you accept that you must\nfully consume the returned Token before you next call next(Token),\nand, that you are free to alter this token.\n\nI think that contract is well defined & consistent?\n\n\nTokenStream already does this, right? (or do you mean in the class TokenStream or in all implementations of TokenStream?)\nI'm talking about TokenStream's default implementation of next(Token).\nIt's not copying now, but it needs to in order to properly meet the\ncontract of this API (ie, allow caller to modify the returned token).\nThe default implementation of TokenStream.next() does already copy. ",
+            "author": "Michael McCandless",
+            "id": "comment-12543991"
+        },
+        {
+            "date": "2007-11-20T18:47:01+0000",
+            "content": "Could we make this a little more concrete by creating a simple test case that fails? ",
+            "author": "Yonik Seeley",
+            "id": "comment-12544005"
+        },
+        {
+            "date": "2007-11-20T19:50:15+0000",
+            "content": "Attached patch w/ unit test showing the issue, plus the fix.\n\nThe fix was actually simpler than I thought: we don't have to make a\nnew Token(); instead we just have to copy over the fields to the Token\nthat was passed in.  So the performance hit is less that I thought\nit'd be (copy instead of new/GC).\n\nI also strengthened the javadocs on the reuse & non-reuse APIs.\n\nAll tests pass. ",
+            "author": "Michael McCandless",
+            "id": "comment-12544028"
+        },
+        {
+            "date": "2007-11-20T20:04:34+0000",
+            "content": "Looking at the test, this would not have worked before token-reuse either.... I don't yet see how we are breaking backward compatibility.\nCallers of next() could change the Token, so caching your own copy that you already passed on to someone else was never valid. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12544034"
+        },
+        {
+            "date": "2007-11-20T20:25:53+0000",
+            "content": "Yes, that's what I meant - it is the addition of Token.termBuffer() \nthat allowed this to happen - in 2.2 (apart from payloads) only \nimmutable String could be obtained from the Token. ",
+            "author": "Doron Cohen",
+            "id": "comment-12544045"
+        },
+        {
+            "date": "2007-11-20T20:30:48+0000",
+            "content": "> it is the addition of Token.termBuffer() that allowed this to happen \n\nBut old filters won't use the termBuffer.\nand even with old style Tokens w/o Token reuse, one could always change what string the token pointed at. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12544048"
+        },
+        {
+            "date": "2007-11-20T20:44:42+0000",
+            "content": "\nLooking at the test, this would not have worked before token-reuse either.... I don't yet see how we are breaking backward compatibility.\nCallers of next() could change the Token, so caching your own copy that you already passed on to someone else was never valid.\n\nYou're right: before token reuse a filter could change the String\ntermText (and other fields) and mess up a cached copy held by a\nTokenStream earlier in the chain.\n\nBut, our core filters now use the reuse API (for better performance),\nso if you are using a TokenStream that does caching followed by one of\nthese core filters we will now mess up the cached copy, right?\n\nOh, duh: I just checked 2.2 and in fact the LowerCaseFilter,\nPorterStemFilter, ISOLatin1AccentFilter all directly alter termText\nrather than making a new token.\n\nSo actually this issue is pre-existing!\n\nAnd then I guess we are not breaking backwards compatibility by\nfurther propagating it.\n\nBut I think this is still a bug?\n\nHmm, I guess the semantics of the next() API is and has been to allow\nyou to arbitrarily modify the token after you receive it (\"forwards\nreuse\") but not re-use the token on the next call to next (\"backwards\nreuse\").  If we take that approach then the bug is in those\nTokenStreams that cache tokens without \"protecting\" their private copy\nwhen next() is called? ",
+            "author": "Michael McCandless",
+            "id": "comment-12544054"
+        },
+        {
+            "date": "2007-11-20T20:52:40+0000",
+            "content": "\nand even with old style Tokens w/o Token reuse, one could always change what string the token pointed at.\n\n...right... termText is now private but it used to be package protected. \n\nPatch looks good for (default) TokenStream,\nthough it is a shame there is no magic way to know if Token was changed and is copying really required.\n\nBut is this good enough also for non default TokenStreams which imlpement next(Token)? \nmm.. I checked next(Token res) implementations of CharTokenizer, KeywordTokenizer and StandardTokenizer and non of them checks res for null.\nAm I missing something trivial? ",
+            "author": "Doron Cohen",
+            "id": "comment-12544059"
+        },
+        {
+            "date": "2007-11-20T20:56:37+0000",
+            "content": "\nI checked next(Token res) implementations of CharTokenizer, KeywordTokenizer and StandardTokenizer and non of them checks res for null.\nI think you should not pass null into this method?  (Ie you should use\nnext() instead).  I can clarify this in the javadocs... ",
+            "author": "Michael McCandless",
+            "id": "comment-12544063"
+        },
+        {
+            "date": "2007-11-20T21:25:21+0000",
+            "content": "Oh, I was locked on that calling next(null) means do-not-reuse but guess since we have the original next() this is not required. ",
+            "author": "Doron Cohen",
+            "id": "comment-12544075"
+        },
+        {
+            "date": "2007-11-20T21:40:32+0000",
+            "content": "In the past, the semantics were simple... Tokenizer generated tokens, and token filters modified them.  I don't think it was a bug that filters modify instead of create new tokens.  No one cached tokens and expected them to be unchanged because they could be modified by a downstream filter.\n\n> TokenStreams that cache tokens without \"protecting\" their private copy when next() is called?\n\nThat would be a bug in the filter (both in the past and now). ",
+            "author": "Yonik Seeley",
+            "id": "comment-12544077"
+        },
+        {
+            "date": "2007-11-20T22:02:20+0000",
+            "content": "\nThat would be a bug in the filter (both in the past and now).\n\nCachingTokenFilter actually does this (caching references to the tokens).\nI think it should put a cloned copy into the cache.\n\nOh and actually I just noticed that Payload doesn't implement Cloneable!\nSo Token.clone() doesn't create a copy of the Payload, which I think it \nshould? I will fix this with Lucene-1062. ",
+            "author": "Michael Busch",
+            "id": "comment-12544088"
+        },
+        {
+            "date": "2007-11-20T22:04:45+0000",
+            "content": "\nI think it should put a cloned copy into the cache.\n\nOr, we could add a boolean to the ctr of CachingTokenFilter\nthat specifies whether or not to clone the Tokens. So if a\nuser knows that it is safe to simply cache the references\nthey can disable the cloning for performance reasons. ",
+            "author": "Michael Busch",
+            "id": "comment-12544091"
+        },
+        {
+            "date": "2007-11-20T22:07:35+0000",
+            "content": "\n> TokenStreams that cache tokens without \"protecting\" their private copy when next() is called?\n\nThat would be a bug in the filter (both in the past and now).\n\nI think it is okay to relax this to only protect in Toknizers (where Tokens are created), and not worry about TokenFilters.\n\nTokenFilters always take a TokenStream at construction and always call its next(Token), which eventually calls a Tokenizer.next(Token) \u2013 which is protecyed \u2013 and so the TokenFilter can rely on that protection.    Right? ",
+            "author": "Doron Cohen",
+            "id": "comment-12544093"
+        },
+        {
+            "date": "2007-11-20T22:26:33+0000",
+            "content": "> CachingTokenFilter actually does this (caching references to the tokens).\n\nIt's a bug to depend on the fact that the tokens you return won't change.\n\nIf one is supposed to be able to use CachingTokenFilter anywhere in a filter chain and then be able to replay the tokens exactly as CachingTokenFilter first saw them (which is what I would guess the use to be), then it is a bug and didn't work properly before token reuse either. ",
+            "author": "Yonik Seeley",
+            "id": "comment-12544098"
+        },
+        {
+            "date": "2007-11-20T22:41:19+0000",
+            "content": "OK it sounds like this was a false alarm on my part \u2013 sorry!\n\nThe semantics of next() have always allowed the caller to arbitrarily\nmodify the returned token (\"forward reuse\").\n\nSo I don't think we need to change anything. ",
+            "author": "Michael McCandless",
+            "id": "comment-12544103"
+        },
+        {
+            "date": "2007-11-21T07:03:17+0000",
+            "content": "\nSo I don't think we need to change anything.\n sounds good to me. \n\n looking close at TokenStream it is interesting that next() and next(Token) as written will loop forever. So if a subclass just implements say next() by calling (super's) next(new Token()) it is an infinite loop. However anything like this would be buggy anyhow because no meaningful token is created this way. To summarize there's no action item here. (I thought about modifying the javadoc NOTE to: subclasses must create the next Token by overriding at least one of next() or next(Token), but I am not convinced it is any clearer.) ",
+            "author": "Doron Cohen",
+            "id": "comment-12544175"
+        }
+    ]
+}

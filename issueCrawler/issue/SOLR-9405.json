@@ -1,0 +1,111 @@
+{
+    "id": "SOLR-9405",
+    "title": "ConcurrentModificationException in ZkStateReader.getStateWatchers",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "affect_versions": "6.1",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Jenkins found this: http://jenkins.thetaphi.de/job/Lucene-Solr-6.x-Linux/1432/\n\n\nStack Trace:\njava.util.ConcurrentModificationException\n        at __randomizedtesting.SeedInfo.seed([FA459DF725097EFF:A77E52876204E1C1]:0)\n        at java.util.HashMap$HashIterator.nextNode(java.base@9-ea/HashMap.java:1489)\n        at java.util.HashMap$KeyIterator.next(java.base@9-ea/HashMap.java:1513)\n        at java.util.AbstractCollection.addAll(java.base@9-ea/AbstractCollection.java:351)\n        at java.util.HashSet.<init>(java.base@9-ea/HashSet.java:119)\n        at org.apache.solr.common.cloud.ZkStateReader.getStateWatchers(ZkStateReader.java:1279)\n        at org.apache.solr.common.cloud.TestCollectionStateWatchers.testSimpleCollectionWatch(TestCollectionStateWatchers.java:116)",
+    "attachments": {
+        "SOLR-9405.patch": "https://issues.apache.org/jira/secure/attachment/12823215/SOLR-9405.patch",
+        "SOLR_9405_no_compute.patch": "https://issues.apache.org/jira/secure/attachment/12823896/SOLR_9405_no_compute.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-08-11T02:06:49+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "FYI Alan Woodward ",
+            "id": "comment-15416374"
+        },
+        {
+            "date": "2016-08-11T11:38:59+0000",
+            "author": "Alan Woodward",
+            "content": "Patch fixing the issue, and also dealing with a race in the test. ",
+            "id": "comment-15417066"
+        },
+        {
+            "date": "2016-08-11T14:58:11+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Alan. I am not sure how CollectionWatch#stateWatchers is thread-safe. Is it because all access to it is inside of ConcurrentHashMap#compute? The javadocs for compute only say that the entire method invocation is performed atomically. That doesn't necessarily mean that it is synchronized.\n\nWhat about access to the size() method? We access it independently in the canBeRemoved() method. Is that likely to cause a problem? ",
+            "id": "comment-15417371"
+        },
+        {
+            "date": "2016-08-11T15:37:02+0000",
+            "author": "Alan Woodward",
+            "content": "That doesn't necessarily mean that it is synchronized\n\nHm, I disagree here - if something is performed atomically, it necessarily implies that it's synchronized, doesn't it?  And the actual JVM implementation certainly uses synchronized blocks under the hood.\n\ncanBeRemoved() is also only ever called from inside a compute() method call, so we should be thread-safe here as well.\n\nIf we want to be totally safe, though, it should be possible to add a lock Object to CollectionWatch and synchronize on that inside the compute() blocks each time - I'll try it out. ",
+            "id": "comment-15417453"
+        },
+        {
+            "date": "2016-08-11T18:05:05+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Hm, I disagree here - if something is performed atomically, it necessarily implies that it's synchronized, doesn't it?\n\nA method which calls compare and set is atomic but doesn't necessarily synchronize.\n\nAnd the actual JVM implementation certainly uses synchronized blocks under the hood.\n\nI'm not very familiar with the new collection methods such as compute and that is why I asked if this is really synchronized. All I am saying is that the Javadocs don't explicitly say that it is synchronized and therefore we should be vary of relying on such behaviour. It is possible that my understanding is wrong but I'd still like to understand why if you can help. If you are confident that the current code is correct, a code comment on stateWatchers stating why and how it must be used in future would be nice to have. ",
+            "id": "comment-15417688"
+        },
+        {
+            "date": "2016-08-12T01:40:19+0000",
+            "author": "Edward Ribeiro",
+            "content": "Hi guys, I guess this patch doesn't solve the issue at hand. \n\nTL;DR: the solution is to declare stateWatchers as stateWatchers = ConcurrentHashMap.newKeySet();  at L#150. That is, no need to modify getStateWatchers.\n\nPlease, let me explain.\n\nFirst, the error is happening here:\n\n  /* package-private for testing */\n 1. Set<CollectionStateWatcher> getStateWatchers(String collection) {\n 2.   CollectionWatch watch = collectionWatches.get(collection);\n 3.   if (watch == null)\n 4.     return null;\n 5.   return new HashSet<>(watch.stateWatchers);\n 6. }\n\n\n\nThat is, ZkStateReader.getStateWatchers is creating a new HashSet instance by providing a new collection: CollectionWatch#stateWatchers. As we can see in ZkStateReader, watch#stateWatchers is also a HashSet.\n\n\nOkay, If we look into HashSet/AbstractCollection source code, we see that the constructor seen at line 5 (ABOVE)  basically calls the addAll method passing the collection provided via the constructor. Then addAll basically loops on collection provided including the elements one by one in the new collection. See in the stack trace provided in this issue:\n\n\nat java.util.HashMap$KeyIterator.next(java.base@9-ea/HashMap.java:1513) // RUNNING THE FOR-EACH LOOP\nat java.util.AbstractCollection.addAll(java.base@9-ea/AbstractCollection.java:351)  // DELEGATES TO ADDALL\nat java.util.HashSet.<init>(java.base@9-ea/HashSet.java:119)  // THE CONSTRUCTOR\n\n\n\nIn a nutshell, what is happening is that while we are populating the new HashSet instance at line 5 of ZkStateReader a new Thread changes stateWatchers concurrently. This throws the ConcurrentModificationException\n\nThe proposed patch doesn't solve the issue because even if collectionWatches.compute is atomic, none of the Sets in use in ZkStateReader is thread-safe.\n\nI wrote a test program to demonstrate my speculation: https://gist.github.com/eribeiro/4141df2d02c62d7370101bc4349cd8c4\n\nFinally, sorry if I misunderstood the problem, and let me know if what I wrote made any sense.  \n\nCheers! ",
+            "id": "comment-15418238"
+        },
+        {
+            "date": "2016-08-12T06:45:25+0000",
+            "author": "Alan Woodward",
+            "content": "Thanks Edward, that makes sense.\n\nI'm about to be away from a keyboard for two weeks - Shalin if you want to take this one in the meantime, feel free, otherwise I'll get to it when I'm back. ",
+            "id": "comment-15418427"
+        },
+        {
+            "date": "2016-08-12T10:16:32+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Edward. Yes that's what I was going for. We need to make the stateWatchers thread-safe either by wrapping with synchronizedMap or by using a set backed by ConcurrentHashMap. I'll put up a patch.\n\nHave fun, Alan! ",
+            "id": "comment-15418628"
+        },
+        {
+            "date": "2016-08-12T12:03:08+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Patch which changes the stateWatcher to a set backed by ConcurrentHashMap. It also includes the race condition fix that Alan had supplied for the TestCollectionStateWatchers in his last patch. I'll commit shortly. ",
+            "id": "comment-15418736"
+        },
+        {
+            "date": "2016-08-12T12:07:08+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit f82c3b1206011776c55867fb2b5027b824f99812 in lucene-solr's branch refs/heads/master from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f82c3b1 ]\n\nSOLR-9405: ConcurrentModificationException in ZkStateReader.getStateWatchers ",
+            "id": "comment-15418739"
+        },
+        {
+            "date": "2016-08-12T12:10:51+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 42254c2d9b0e93a96e280b44b2fcbd4b9b6693af in lucene-solr's branch refs/heads/branch_6x from Shalin Shekhar Mangar\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=42254c2 ]\n\nSOLR-9405: ConcurrentModificationException in ZkStateReader.getStateWatchers\n(cherry picked from commit f82c3b1) ",
+            "id": "comment-15418744"
+        },
+        {
+            "date": "2016-08-12T12:24:30+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Alan and Edward. I folded Alan's changes to use compute in getStateWatchers into the patch/commit. ",
+            "id": "comment-15418754"
+        },
+        {
+            "date": "2016-08-16T13:59:28+0000",
+            "author": "David Smiley",
+            "content": "Not sure if it's related to this issue, but when I beast test TestCollectionStateWatchers, I get \"ZkTestServer Watch limit violations\".\nant beast -Dtestcase=TestCollectionStateWatchers -Dbeast.iters=100  It only took a few minutes.\n\nSeparately from that, I find the use of ConcurrentHashMap.compute() in this class very odd... definitely not the intended purpose of this method \u2013 even the return value isn't used.  I think it's a nifty method/feature, it's just that I don't see why ZkTestServer is calling it the way it's calling it versus simply calling get().  Attached is a patch showing something simpler.  My beast test failed with and without this patch. ",
+            "id": "comment-15422754"
+        },
+        {
+            "date": "2016-08-26T13:59:30+0000",
+            "author": "Michael McCandless",
+            "content": "Bulk close resolved issues after 6.2.0 release. ",
+            "id": "comment-15438993"
+        }
+    ]
+}

@@ -1,0 +1,93 @@
+{
+    "id": "LUCENE-2948",
+    "title": "Make var gap terms index a partial prefix trie",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "None",
+        "resolution": "Won't Fix",
+        "status": "Closed"
+    },
+    "description": "Var gap stores (in an FST) the indexed terms (every 32nd term, by\ndefault), minus their non-distinguishing suffixes.\n\nHowever, often times the resulting FST is \"close\" to a prefix trie in\nsome portion of the terms space.\n\nBy allowing some nodes of the FST to store all outgoing edges,\nincluding ones that do not lead to an indexed term, and by recording\nthat this node is then \"authoritative\" as to what terms exist in the\nterms dict from that prefix, we can get some important benefits:\n\n\n\tIt becomes possible to know that a certain term prefix cannot\n    exist in the terms index, which means we can save a disk seek in\n    some cases (like PK lookup, docFreq, etc.)\n\n\n\n\n\tWe can query for the next possible prefix in the index, allowing\n    some MTQs (eg FuzzyQuery) to save disk seeks.\n\n\n\nBasically, the terms index is able to answer questions that previously\nrequired seeking/scanning in the terms dict file.",
+    "attachments": {
+        "LUCENE-2948.patch": "https://issues.apache.org/jira/secure/attachment/12472556/LUCENE-2948.patch",
+        "Results.png": "https://issues.apache.org/jira/secure/attachment/12472883/Results.png",
+        "LUCENE-2948_automaton.patch": "https://issues.apache.org/jira/secure/attachment/12472590/LUCENE-2948_automaton.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2011-03-03T16:51:11+0000",
+            "content": "Initial patch.  This is a checkpoint of work-in-progress \u2013 all tests pass, but there are zillions of nocommits to be resolved... ",
+            "author": "Michael McCandless",
+            "id": "comment-13002065"
+        },
+        {
+            "date": "2011-03-03T17:27:50+0000",
+            "content": "New patch \u2013 changes nextPossiblePrefix to return a SeekStatus. ",
+            "author": "Michael McCandless",
+            "id": "comment-13002087"
+        },
+        {
+            "date": "2011-03-03T19:16:41+0000",
+            "content": "Nice work Mike, i think I found a bug with nextPossiblePrefix though?\n\nI attached my modifications to try to use this with Automaton. (just the automaton parts):\n\nI'm also somehow triggering BlockReader's assert about crossing over index terms with other tests...\n\nI \"think\" i could see the problem here... is it that nextPossiblePrefix(BytesRef prefix) means it wants me to truly pass in a prefix? obviously a consumer doesn't know which portion of his term is/isnt a prefix!\n\nSo we would have to expose that , or alternatively change the semantics to nextPossiblePrefix(BytesRef term)? In other words, in this situation of 1[\\u0000]234567891 it would simply return true, because it knows 1* exists rather than forwarding me to s? Maybe this is what was intended all along and its just an off by one?\n\n\n    [junit] NOTE: reproduce with: ant test -Dtestcase=TestFuzzyQuery -Dtestmethod=testTokenLengthOpt -Dtests.seed=4471452442745287654:-2341611255635429887 -Dtests.codec=Standard\n\n// NOTE: this index has two terms: \"12345678911\" and \"segment\"\n\n    [junit] ------------- Standard Output ---------------\n    [junit] candidate: [\\u0000]1234567891\n    [junit] not found, goto: 1\n    [junit] candidate: 1[\\u0000]234567891\n    [junit] not found, goto: s <--- this is the problem, because \"12345678911\" exists\n    [junit] candidate: s1234567891\n    [junit] found!\n    [junit] candidate: t1234567891\n    [junit] found!\n\n ",
+            "author": "Robert Muir",
+            "id": "comment-13002150"
+        },
+        {
+            "date": "2011-03-04T22:14:51+0000",
+            "content": "New patch, fixes the bug Robert found (thanks!) and a few more.... adds a new test case. ",
+            "author": "Michael McCandless",
+            "id": "comment-13002845"
+        },
+        {
+            "date": "2011-03-05T20:21:54+0000",
+            "content": "I reviewed the (second) patch. It seems all right, even if the logic of keeping those paths is a bit complex at first (but I think I got it). I've been thinking about the questions stated in the comments \u2013 would it be possible to create a \"better\" pruning/ path keeping method. I honestly don't think it is possible if you add terms incrementally to the FST because some of the information required to keep or prune states is not available until the very end. \n\nOne method I was thinking of was to determine \"deep\" subtrees of states with an approximately equal size (and prune them entirely, or at least part of them). These \"deep\" subtrees (or precalculated frozen states if you want to think of them this way) can be computed by sorting reversed input sequences and calculating their LCP (longest common prefix) table \u2013 then the shared prefixes are actually suffixes of the input sequences... You can then linearly scan such a reversed table and you'd know immediately how large a given subtree of suffixes is. One problem is that this is exact only in state representation of the FST (in the edge/LAST representation an input suffix can be integrated with a longer suffix, as you recall).\n\nSince we're using edge-based representation I don't think the above idea helps much. Also, it would require sorting the reversed terms and calculating an LCP table... this may be even more costly than what is mentioned in the code comment \u2013 use two passes, build an FSA  first, determine nodes to prune and then build the final FST. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13003038"
+        },
+        {
+            "date": "2011-03-07T23:27:48+0000",
+            "content": "Thanks Dawid.\n\nIt really is hairy \u2013 I wish we could find a way to simplify it.\nPruning as-you-go, backwards on compiling a now \"finished\" tail is\njust really hard to think about!\n\nI've been thinking about the questions stated in the comments \u2013 would it be possible to create a \"better\" pruning/ path keeping method. I honestly don't think it is possible if you add terms incrementally to the FST because some of the information required to keep or prune states is not available until the very end.\n\nYeah I do too.  We'd need a more global view on how best to \"spend\"\nthe allowed budget.\n\nFor some cases (dense PKs) it takes very little budget to have a full\nprefix trie, and you get good speedups for this case.  But for other\ncases (eg, GUIDs as your PKs) it's the polar opposite.\n\nOne method I was thinking of was to determine \"deep\" subtrees of states with an approximately equal size (and prune them entirely, or at least part of them). These \"deep\" subtrees (or precalculated frozen states if you want to think of them this way) can be computed by sorting reversed input sequences and calculating their LCP (longest common prefix) table \u2013 then the shared prefixes are actually suffixes of the input sequences... You can then linearly scan such a reversed table and you'd know immediately how large a given subtree of suffixes is. One problem is that this is exact only in state representation of the FST (in the edge/LAST representation an input suffix can be integrated with a longer suffix, as you recall).\n\nPhew!  So this means for any given suffix you'd know how many terms\nend with it?  But how would we then use this info to better pick index\nnodes?\n\nSince we're using edge-based representation I don't think the above idea helps much. Also, it would require sorting the reversed terms and calculating an LCP table... this may be even more costly than what is mentioned in the code comment \u2013 use two passes, build an FSA first, determine nodes to prune and then build the final FST.\n\nYeah I fear it would be costly... ",
+            "author": "Michael McCandless",
+            "id": "comment-13003685"
+        },
+        {
+            "date": "2011-03-08T00:34:30+0000",
+            "content": "I ran perf test w/ latest patch, and also fixed luceneutil to track stddev of the measures:\n\n\n\n\nTask\nQPS base\nStdDev base\nQPS bushy\nStdDev bushy\nPct diff\n\n\nFuzzy1\n32.41\n1.29\n21.68\n0.65\n37%-28%\n\n\nFuzzy2\n21.59\n0.79\n14.54\n0.41\n36%-28%\n\n\nRespell\n29.52\n0.95\n28.70\n1.07\n9%-4%\n\n\nIntNRQ\n9.16\n1.10\n9.03\n1.04\n22%-24%\n\n\nWildcard\n53.88\n3.10\n53.25\n2.96\n11%-10%\n\n\nPrefix3\n31.75\n2.73\n31.41\n2.47\n16%-16%\n\n\nSloppyPhrase\n6.28\n0.26\n6.24\n0.31\n9%-8%\n\n\nAndHighHigh\n10.81\n0.40\n10.80\n0.36\n6%-7%\n\n\nPhrase\n6.79\n0.42\n6.80\n0.41\n11%-13%\n\n\nAndHighMed\n47.27\n1.37\n47.34\n1.10\n4%-5%\n\n\nSpanNear\n7.72\n0.43\n7.78\n0.34\n8%-11%\n\n\nTerm\n34.21\n3.12\n35.36\n3.04\n13%-23%\n\n\nOrHighHigh\n12.16\n1.18\n12.60\n1.15\n14%-25%\n\n\nOrHighMed\n15.20\n1.44\n15.76\n1.43\n13%-24%\n\n\nPKLookup\n39.59\n1.08\n56.36\n2.07\n33%-51%\n\n\n\n\n\nThe range on the %tg gain/loss takes the best/worst ends of +/1 one stddev.\n\nUnfortunately, the patch slows down fuzzy queries, I think because the cost of checking for the next possible prefix exceeds any savings.  Though, this is a hot test; it's possible we'd see gains w/ a cold test since we are doing less seeking.\n\nBut for PK lookup the gains are sizable.  But note that this only applies to PK values that are \"tight\", eg sequential IDs, not to GUIDs, and only then on a relatively \"fresh\" index (ie after many updates in randomish order the PKs will be randomly distributed and the gains will be gone).\n\nI think for now we should not expose the nextPossiblePrefix (or at least not use it from ATE)? ",
+            "author": "Michael McCandless",
+            "id": "comment-13003723"
+        },
+        {
+            "date": "2011-03-08T00:39:09+0000",
+            "content": "Graph showing perf results. ",
+            "author": "Michael McCandless",
+            "id": "comment-13003726"
+        },
+        {
+            "date": "2011-03-08T00:41:43+0000",
+            "content": "Here's a graphical rendition of the above table:\n\n\n\nIt's sorted in the same order (leftmost = biggest slowdown), and the error bars show std dev. ",
+            "author": "Michael McCandless",
+            "id": "comment-13003728"
+        },
+        {
+            "date": "2011-03-08T08:32:46+0000",
+            "content": "Nice visualization! \n\n> Phew! So this means for any given suffix you'd know how many terms\n> end with it? But how would we then use this info to better pick index\n> nodes?\n\nSuch an inverted array would allow you to precalculate which FSA states have a dense subtree and which don't and freeze them even before you'd start constructing the full FSA. But I agree that even without trying this seems like a costly solution.\n\nWith respect to the speed differences table above \u2013 I believe there is going to be no perfect method for all kinds of queries, so it's a tradeoff. What one could do is try to determine the distribution (bushiness factor of trienfication?  of input terms and then build separate automata for specific kinds of queries... But then they'd consume more RAM, so another tradeoff kicks in. ",
+            "author": "Dawid Weiss",
+            "id": "comment-13003858"
+        },
+        {
+            "date": "2012-03-20T15:19:30+0000",
+            "content": "I think BlockTree terms dict accomplished the same thing. ",
+            "author": "Michael McCandless",
+            "id": "comment-13233476"
+        }
+    ]
+}

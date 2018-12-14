@@ -1,0 +1,399 @@
+{
+    "id": "SOLR-5681",
+    "title": "Make the OverseerCollectionProcessor multi-threaded",
+    "details": {
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ],
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "Right now, the OverseerCollectionProcessor is single threaded i.e submitting anything long running would have it block processing of other mutually exclusive tasks.\nWhen OCP tasks become optionally async (SOLR-5477), it'd be good to have truly non-blocking behavior by multi-threading the OCP itself.\n\nFor example, a ShardSplit call on Collection1 would block the thread and thereby, not processing a create collection task (which would stay queued in zk) though both the tasks are mutually exclusive.\n\nHere are a few of the challenges:\n\n\tMutual exclusivity: Only let mutually exclusive tasks run in parallel. An easy way to handle that is to only let 1 task per collection run at a time.\n\tZK Distributed Queue to feed tasks: The OCP consumes tasks from a queue. The task from the workQueue is only removed on completion so that in case of a failure, the new Overseer can re-consume the same task and retry. A queue is not the right data structure in the first place to look ahead i.e. get the 2nd task from the queue when the 1st one is in process. Also, deleting tasks which are not at the head of a queue is not really an 'intuitive' thing.\n\n\n\nProposed solutions for task management:\n\n\tTask funnel and peekAfter(): The parent thread is responsible for getting and passing the request to a new thread (or one from the pool). The parent method uses a peekAfter(last element) instead of a peek(). The peekAfter returns the task after the 'last element'. Maintain this request information and use it for deleting/cleaning up the workQueue.\n\tAnother (almost duplicate) queue: While offering tasks to workQueue, also offer them to a new queue (call it volatileWorkQueue?). The difference is, as soon as a task from this is picked up for processing by the thread, it's removed from the queue. At the end, the cleanup is done from the workQueue.",
+    "attachments": {
+        "SOLR-5681-2.patch": "https://issues.apache.org/jira/secure/attachment/12644596/SOLR-5681-2.patch",
+        "SOLR-5681.patch": "https://issues.apache.org/jira/secure/attachment/12641035/SOLR-5681.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13887178",
+            "date": "2014-01-30T22:26:00+0000",
+            "content": "Async Collection API calls. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13959383",
+            "date": "2014-04-03T22:56:29+0000",
+            "content": "Here's another approach:\nFollow approach#2 with the following changes. When a request comes in, move it to the runningMap. Right now it just get's put into the runningMap without being removed from the work queue.\nOn completion, move the task from the running to the failed/completed map. In case of an Overseer failure, whenever a new Overseer comes up, make sure that all tasks from the running queue are moved back to the submitted queue. Also that they move in 'practically' the same order. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13962713",
+            "date": "2014-04-08T08:44:47+0000",
+            "content": "Although we call the stuff a queue in ZK , ZK internally has no queue. You can just read or delete an item from anywhere. Keep an in memory list of tasks getting processed . Read a few items in batch (from the head of course) decide what can be run now w/o interfering with other running tasks and pass it over to a thread. When the tasks are completed , remove them from the in memory list and delete from the zk directly using delete() command instead of queue.remove()   "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13964796",
+            "date": "2014-04-09T23:18:29+0000",
+            "content": "It's supposed to work in the following cases:\n\n\tCalls are async\n\tOnly one call per collection would be processed at a given time (keeping the mutual exclusion logic simple for now).\n\n\n\nI'll also buffer top-X submitted tasks from the zk queue in memory and use an internal, in-memory tracking for the purpose of processing the parallel tasks.\n\nHere's the flow that I'm working on now:\n\n\tRead top-X tasks from the zk queue (as opposed to a single task now)\n\tProcess tasks, spawn thread/pass task to ThreadPoolExecutor in case it's an ASYNC request, else process inline(still debating). Synchronize on the tasks buffer and internal maps. Remove when done.\n\tDelete the task from zk directly (not using typical queue mechanism).\n\t+ Store more information about the completed ASYNC task in the zk map entry.\n\n "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13975449",
+            "date": "2014-04-21T07:16:09+0000",
+            "content": "First patch. I've ignored OverseerCollectionProcessorTest (still figuring out the changes required to mock the multi threaded OverseerCollectionProcessor).\nAlso, have another patch almost ready but that doesn't pass the tests quite as well so will upload it when I fix the stuff.\nHere's what can be expected in the next (few) patches:\n\n\tConfigurable ThreadPool size.\n\tFix hard-coded logic (where-ever that's the case).\n\tMocked out multi-threaded OCP test.\n\tTests for :\n\t\n\t\tStarting a long running task and having a shorter task triggered after that (with an expectation of seeing that complete before the other one).\n\t\tTest to validate that only mutually exclusive tasks run in parallel (sync  + async combined).\n\t\n\t\n\n "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13979580",
+            "date": "2014-04-24T11:26:17+0000",
+            "content": " workQueue.peekTopN(10);  If a task is being processed , this will always return immediately with one item and the loop would continue without a pause , hogging CPU/ZK-traffic. You will need to ensure that the call returns if the available items in the queue are different from the ones being processed. \n "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13979852",
+            "date": "2014-04-24T15:42:29+0000",
+            "content": "Another patch with a few things fixed, got rid off a bit of the hard coded logic and a multi threading probable race-condition.\nAlso, the main thread loop now continues if there's nothing new in the work-queue. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13982843",
+            "date": "2014-04-28T08:49:15+0000",
+            "content": "Added a test for running parallel tasks (multiple collection creation and split). Seems like there's some issue fetching new tasks from the queue.\nWorking on resolving the issue. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13984241",
+            "date": "2014-04-29T12:29:14+0000",
+            "content": "FIxed OCPTest error\n\npeekTopN() still does not take care of the problem I reported earlier "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13985162",
+            "date": "2014-04-30T04:47:44+0000",
+            "content": "Updated patch, though it has some failing tests. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13985320",
+            "date": "2014-04-30T09:36:28+0000",
+            "content": "Another one. Still has some issues with:\n\n\tRemoval of tasks from work queue.\n\tFailed tasks.\n\n\n\nWorking on the above two. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13985353",
+            "date": "2014-04-30T10:24:38+0000",
+            "content": "A little more cleanup. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13985380",
+            "date": "2014-04-30T11:28:49+0000",
+            "content": "Patch with all but 1 test passing. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13991606",
+            "date": "2014-05-07T06:55:45+0000",
+            "content": "More test. Working on adding more tests and fixing some issues found while adding another test. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13991773",
+            "date": "2014-05-07T12:15:11+0000",
+            "content": "I see a fundamental problem with the implementation\n\nWhen 'async' param is not passed, the main thread is blocked. This means if I accidently fire a long running task w/o the async param , the OCP is locked up till it is completed.\n\nThe solution would be to have all tasks be run in the threadpool and the purpose of async param should be to just choose whether to wait or not  till the operation completes "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13993259",
+            "date": "2014-05-08T23:51:03+0000",
+            "content": "Changes to make it completely non-blocking. The only reason why a task would not be processed now is if there's another one mid-way for the same collection. I have some tests which fail intermittently, working on fixing those. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13993860",
+            "date": "2014-05-09T19:37:15+0000",
+            "content": "Made the completedTasks map a ConcurrentHashMap to handle the multi-threaded puts. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13994896",
+            "date": "2014-05-12T07:42:00+0000",
+            "content": "Updated patch. Handles the following:\n\n\tAll tasks are attempted to be processed in parallel. The only restriction is the collection name i.e. At any point in time, only one task per collection can be processed.\n\tRestarts: Task-id is noted and until that taskId, an attempt is made at figuring out if the task was already completed i.e. present in the completed/failed zk map.\n\n\n\nIt would be good if someone looked at it too.\n\nHas a few failing tests due to the last change. Working on fixing that. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13994904",
+            "date": "2014-05-12T07:48:46+0000",
+            "content": "Patch with a small change. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13995857",
+            "date": "2014-05-13T00:17:05+0000",
+            "content": "A restructured patch. The MultiThreadedOverseerCollectionProcessor now pretty much controls everything when it comes to the execution of tasks.\nThe meaty processMessage now is a part of the inner class. Need to fix the existing OCPTest for that now. Everything else passes fine.\nAlso, here's the motivation behind moving everything to the inner class. The shardHandler is not really thread safe and sharing the same shardHandler is not possible in parallel. I'm now passing the zkController from the Overseer to the OCP, using it in the inner class to get a new shardHandler for every new task that comes in. I've added a todo in there for using something like a shardHandler pool or something for that.\nI'm manually testing this stuff it seems to be working. Need to evaluate on the backwards compat for OCP.processMessage() which was protected until now. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13996066",
+            "date": "2014-05-13T05:29:42+0000",
+            "content": "Another patch. This fixes an NPE issue from the DistributedQueue that was screwing up the OverseerTest.\nNeed to fix OCPTest and OverseerStatusTest. Rest everything passes. Manual testing passes for everything I've tested so far i.e. Multiple parallel collection creation, shard splits, deletions.\n\nAlso, will add cleaning up of processedZKTasks in the next patch. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13996082",
+            "date": "2014-05-13T05:39:23+0000",
+            "content": "Cleaning up processedZKTasks in OCP. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13996113",
+            "date": "2014-05-13T06:10:02+0000",
+            "content": "Fixed the OVERSEERSTATUS (Stats) Test. Made that good for multi-threaded code.\n\nOnly need to fix OverseerCollectionProcessorTest (substitute processMessage?). "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13996239",
+            "date": "2014-05-13T10:07:34+0000",
+            "content": "Another patch, with a different approach.\nThis one involves creating a new shardHandler more often. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13996399",
+            "date": "2014-05-13T13:48:37+0000",
+            "content": "The failing tests are fixed "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13997335",
+            "date": "2014-05-14T06:52:20+0000",
+            "content": "Thanks Noble.\n\nIt would be good to get more eyes on this. Considering it touches important parts of the mechanics of Collection API processing, the more the better and the sooner the better too. I'd want to close this soon else it might soon turn into something that's very tough to maintain.  "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13997611",
+            "date": "2014-05-14T14:50:51+0000",
+            "content": "Anshum Gupta please put up a patch for the trunk where all tests are passing , so that others can take a look "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13997923",
+            "date": "2014-05-14T19:27:02+0000",
+            "content": "This patch is cleaned up and passes tests. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-13998005",
+            "date": "2014-05-14T20:45:09+0000",
+            "content": "Some comments on the latest patch:\n\n\n\tThe new createCollection method in CollectionAdminRequest is not required. In fact we should clean up the existing methods which hard code \u201cimplicit\u201d router. I opened SOLR-6073 for it.\n\tThere are some unrelated changes in CollectionHandler.handleRequestStatus()\n\tThe added synchronisation in CoreAdminHandler.addTask is required. In fact it is a bug with the async work you did earlier and it should be fixed in trunk/branch_4x asap. We\u2019re probably late for it to make into 4.8.1 but we should still try for it.\n\tThe DistributedMap.size() method needlessly fetches all children. It can be implemented more efficiently using:\nStat stat = new Stat();\nzookeeper.getData(dir, null, stat, true);\nstat.getNumChildren();\n\tThe \u2018excludeList\u2019 param in DistributedQueue.peekTopN should be named \u2018excludeSet\u2019.\n\tDistributedQueue.peekTopN has the following code. It checks for topN.isEmpty but it should actually check for orderedChildren.isEmpty instead. Otherwise the method will return null even if children were found in the second pass after waiting.\n\nif (waitedEnough) {\n          if (topN.isEmpty()) return null;\n        }\n\n\n\tDistributedQueue.peekTopN has the following. Here the counter should be incremented only after topN.add(queueEvent) otherwise it either returns less nodes than requested and available or it waits more than required. For example, suppose children are (1,2,3,4,5), n=2 and excludeList=(1,2) then an extra await is invoked or if excludeList=(1,3) then only 2 is returned. In fact I think we should remove counter and just use topN.size() in the if condition. Also, is there any chance that headNode may be null?\n\nfor (String headNode : orderedChildren.values()) {\n          if (headNode != null && counter++ < n) {\n            try {\n              String id = dir + \"/\" + headNode;\n              if (excludeList != null && excludeList.contains(id)) continue;\n              QueueEvent queueEvent = new QueueEvent(id,\n                  zookeeper.getData(dir + \"/\" + headNode, null, null, true), null);\n              topN.add(queueEvent);\n            } catch (KeeperException.NoNodeException e) {\n              // Another client removed the node first, try next\n            }\n          } else {\n            if (topN.size() >= 1) {\n              return topN;\n            }\n          }\n        }\n        if (topN.size() >= 1) {\n          return topN;\n        } else {\n          childWatcher.await(wait == Long.MAX_VALUE ? DEFAULT_TIMEOUT : wait);\n          waitedEnough = wait != Long.MAX_VALUE;\n          continue;\n        }\n\n\n\tThe DistributedQueue.peekTopN method catches and swallows the InterruptedException. We should just declare that it throws InterruptedException and let the caller deal with it.\n\tRemove the e.printStackTrace() calls in DistributedQueue.getLastElementId()\n\tDo not swallow InterruptedException in DistributedQueue.getLastElementId()\n\toverseerCollectionProcessor.shutdown(); in Overseer.close() is not required because that is done by ccThread.close() already\n\tThere are formatting errors in success, error, time and storeFailureDetails methods in Overseer.Stats\n\tIf the  maxParallelThreads is supposed to be a constant then it should renamed accordingly as MAX_PARALLEL_THREADS.\n\tThe maxParallelThreads=10 is not actually used while creating the ThreadPoolExecutor. Instead it is initialised with 5-100 threads!\n\tUse this.processedZKTasks = Collections.synchronizedSet(new HashSet<String>()); to remove the unchecked cast warning in OCP constructor.\n\tInstead of passing a shardHandler to OCP constructor, why not just pass a shardHandlerFactory?\n\tRemove the e.printStackTrace in catch clauses in OCP.run()\n\tDo not swallow InterruptedException in OCP.run()\n\tIn OCP.cleanupWorkQueue, the synchronization on a ConcurrentHashMap is not required\n\tWhat is the reason behind cleaning work queue twice and sleeping for 20ms in this code:\n\n        cleanUpWorkQueue();\n\n        while(runningTasks.size() > maxParallelThreads) {\n          Thread.sleep(20);\n        }\n\n        cleanUpWorkQueue();\n\n\n\n\tThere are unrelated changes in OCP.prioritizeOverseerNodes\n\tThere are formatting problems in run(), checkExclusivity and cleanUpWorkQueue methods in OCP.\n\tWe should check for asyncId != null in if (completedMap.contains(asyncId) || failureMap.contains(asyncId)) to avoid two unnecessary calls to ZK.\n\tKeeperException.NodeExistsException thrown from markTaskAsRunning is ignored - Why would that happen? If it happens, why is it okay to ignore it? Shouldn\u2019t we fail loudly or log a warning?\n\n "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13998246",
+            "date": "2014-05-14T23:02:16+0000",
+            "content": "Thanks for looking at that Shalin. I've addressed everything but #6 and #7 (working on it right now). Everything other than that is either in the patch or explained below (or both).\n\nThere are some unrelated changes in CollectionHandler.handleRequestStatus()\nThey are related. The request status message flow earlier assumed that the same request would never be in the workQueue and completed/failed Map. It changes with this. The entry from workQueue is only removed by the parent thread in a batched manner. The entry in the completed/failed map however is made by the task thread. We now need to check for the task in completed/failed map before we look up the running map/workQueue. So the change.\n\nThe added synchronisation in CoreAdminHandler.addTask is required.\nSOLR-6075 created and put up a patch there. Was wanting to commit it but I have trouble logging in. Will wait for my password to be reset or will hope someone commits it.\n\nDistributedQueue.peekTopN has the following code. It checks for topN.isEmpty but it should actually check for orderedChildren.isEmpty instead.\nIf ordered children aren\u2019t empty but topN is, we want to return null. So the check.\n\nAlso, is there any chance that headNode may be null?\nI looked at the existing code and it does not assume that headNode would never be null. That\u2019s the reason I added it here too.\n\nRemove the e.printStackTrace() calls in DistributedQueue.getLastElementId()\nSeems like you\u2019ve been looking at the older patch. This method was renamed to getTailId() and the issues you mention already addressed.\n\nInstead of passing a shardHandler to OCP constructor, why not just pass a shardHandlerFactory?\nRequired deeper changes to the mock etc. We could move to that later but I think for now, this makes sense.\n\nIn OCP.cleanupWorkQueue, the synchronization on a ConcurrentHashMap is not required\nIt\u2019s required as it\u2019s a read-process-update issue. We iterate on the key set of the map and then in the end clear it while someone else might add to it. We don\u2019t want to clear a completed task which was never removed from the zk workQueue.\n\nWhat is the reason behind cleaning work queue twice and sleeping for 20ms in this code:\nTo maintain concurrency limits and clean-up from zk after tasks complete. I\u2019ve made it a little better by adding a waited bool in that loop and only call cleanUp for the second time when the waited is set.\n\nThere are unrelated changes in OCP.prioritizeOverseerNodes\nMerge issue.. at least it seems like it.\n\nKeeperException.NodeExistsException thrown from markTaskAsRunning is ignored\nThis should never happen. It\u2019s just that DistributedMap.put throws that exception so we need to catch it. I\u2019ve added a log.error for that and also commented saying that should never happen. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13998341",
+            "date": "2014-05-15T00:57:18+0000",
+            "content": "Addressing #6.\n\nI realized I had already handled #7 in the last patch. "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13998539",
+            "date": "2014-05-15T07:37:14+0000",
+            "content": "There are unrelated changes in OCP.prioritizeOverseerNodes\n\nI made those changes. I would commit it to trunk anyway because this logging was unnecessary. you can remove it "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13998546",
+            "date": "2014-05-15T07:45:07+0000",
+            "content": "OCP.\n\n\tmarkTaskAsRunning()make all those synchronized collection objects final\n\twhy is there a private variable sharHandlerOCP. We should consistently create a new object all the time and not keep any shardHandler\n\n\n\n\nDistributedQueue.peekTopN()\n\n\tI don\u2019t think that method needs to catch InterruptedException\n\tthe second param is a Set don\u2019t call it a List\n\tDistributedQueue.peekTopN returning List and null both is not required. Always return a non null List . No need to do null checks unnecessarily\n\n "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13998573",
+            "date": "2014-05-15T08:22:06+0000",
+            "content": "Noble Paul Thanks for taking a look at it, but seems like you looked at an older patch.\nDistributedQueue.peekTopN issues are already fixed in the latest patch. I'll make changes to never return a null from peekTopN.\n\nI'll also change markTaskAsRunning objects final.\nshardHandlerOCP is also already removed in the last patch. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13998636",
+            "date": "2014-05-15T09:53:00+0000",
+            "content": "Patch that makes a few vars final (tracking related).\nAlso, completedTasks is no longer a synchronizedHashMap but the synchronization is self-managed. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13998650",
+            "date": "2014-05-15T10:20:12+0000",
+            "content": "Made 'stale' in OCP a local variable and documented the use of the variable in the code. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-13998679",
+            "date": "2014-05-15T11:19:02+0000",
+            "content": "Thanks Anshum. Comments on the your last patch:\n\n\n\tThe processedZKTasks, runningTasks and collectionWip are wrapped with Collections.synchronizedSet and yet they are again synchronised before usage. One of the two synchronisation should be removed.\n\tMultiThreadedOverseerCollectionProcessor.updateStats has a todo about removing the synchronisation which is correct. That synchronisation is not required here.\n\tMultiThreadedOverseerCollectionProcessor is just a Runnable and not really multi-threaded by itself. We should rename it something more suitable to e.g. CollectionActionRunner or OverseerCollectionProcessorThread or maybe just Runner.\n\tAny exception thrown during processMessage inside MultiThreadedOverseerCollectionProcessor is never logged. In fact if an exception is thrown by processMessage, the \u201cresponse\u201d will be null and it will cause NPE at head.setBytes(SolrResponse.serializable(response)); We should log such exceptions at the very minimum.\n\tThere is a behaviour change between the earlier OCP and the multi-threaded one. If a processMessage results in an exception, the previous OCP will not remove the queue entry and continue to retry the task but the multi threaded OCP will mark the task as complete and remove it from the queue.\n\tThe stats collection in MultiThreadedOverseerCollectionProcessor.run is not correct, the right way to time the operation is to use timerContext.stop() in a finally block right after processMessage\n\tThere\u2019s an empty catch (KeeperException e) block in MultiThreadedOverseerCollectionProcessor.run()\n\tWrong code formatting in OCP.close()\n\tOCP.close() should use a shutDown(), awaitTermination(), shutdownNow() call pattern. The shutdown method by itself will not interrupt tasks in progress.\n\tThere are still unrelated changes in OCP.prioritizeOverseerNodes\n\n\n\nI'l still reviewing the changes. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-13998700",
+            "date": "2014-05-15T11:47:25+0000",
+            "content": "More comments:\n\n\tDistributedQueue.peekTopN should count stats in the same way as peek() does by using \u201cpeekN_wait_forever\u201d and \u201cpeekN_wait_\u201d + wait.\n\tDistributedQueue.peekTopN is still not correct. Suppose orderedChildren returns 0 nodes, the childWatcher.await will be called, thread will wait and immediately return 0 results even if children were available. So there was no point in waiting at all if we were going to return 0 results.\n\tThe same thing happens later in DQ.peekTopN after the loop. There\u2019s no point in calling await if we\u2019re going to return null anyway.\n\nchildWatcher.await(wait == Long.MAX_VALUE ? DEFAULT_TIMEOUT : wait);\n          waitedEnough = wait != Long.MAX_VALUE;\n          if (waitedEnough) {\n            return null;\n          }\n\n\n\tThe DQ.getTailId (renamed from getLastElementId) still has an empty catch block for KeeperException.\n\tWe should probably add unit test for the DQ.peekTopN method.\n\n "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13998712",
+            "date": "2014-05-15T12:07:48+0000",
+            "content": "minor changes\n\n\tuse wait/notify instead of Thread.sleep() in overseer main thread\n\tchanged some variable names\n\n "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-13998842",
+            "date": "2014-05-15T15:25:36+0000",
+            "content": "Shalin Shekhar Mangar your comments are taken care of in distributed queue "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13999227",
+            "date": "2014-05-15T20:37:32+0000",
+            "content": "Patch that addresses all of the things you had recommended. Here's a summary of the changes:\n\n\tSynchronized variables are fixed. They are explicitly handled now.\n\tRenamed the inner class to Runner.\n\tFailed task behavior switched back to what it should be like i.e. the OCP retries.\n\tStats handling fixed.\n\tClose is now handled gracefully. Also, there's a call to OCP.close in the finally block for the main OCP thread run().\n\tThe threadpool is no longer created in the constructor but in the run method.\n\n "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13999323",
+            "date": "2014-05-15T22:25:07+0000",
+            "content": "Added a new test that tests that a short running task (OVERSEERSTATUS) fired after a long running SHARDSPLIT returns before the completion of the latter.\n\nAlso, moved the invokeCollectionApi() from OverseerStatus test to the parent AbstractFullDistribZkTestBase test as that method is useful for other tests too. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13999472",
+            "date": "2014-05-16T00:46:32+0000",
+            "content": "Another patch, integrates the patch for SOLR-6075. Will remove this before committing once that goes into trunk. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-13999911",
+            "date": "2014-05-16T15:56:53+0000",
+            "content": "I would like to move ahead with committing this patch if I don't receive any feedback soon. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14001496",
+            "date": "2014-05-19T08:36:25+0000",
+            "content": "Thanks Anshum.\n\n\n\tThe new createCollection method in CollectionAdminRequest is not required. In fact we should clean up the existing methods which hard code \u201cimplicit\u201d router. I opened SOLR-6073 for it.\nThis patch still has the new createCollection method in CollectionAdminRequest. Please remove that.\n\tAnother patch, integrates the patch for SOLR-6075. Will remove this before committing once that goes into trunk.\nOkay.\n\tLet's remove this DEBUG instance. I see this in a lot of other tests but I cannot find where this instance is set to true. It's a bug in the other tests too and we should fix them. I opened SOLR-6090\n\nprivate static final boolean DEBUG = false;\n\n\n\tShould we rename processedZkTasks to runningZkTasks? They are 'processed' by the main OCP thread but they are still 'running' so it may give a wrong impression to someone reading the code.\n\tLet's document the purpose of each of the sets/maps we've introduced such as completedTasks, processedZkTasks, runningTasks, collectionWip as a code comment.\n\tI think we should use use the return value of collectionWip.add(collectionName) as a fail-safe and throw an exception if it ever returns false.\n\tThe OCP.Runner must call either markTaskComplete or resetTaskWithException upon exit otherwise we'll have items in queue which will never be processed and we'll never know why. It is not enough to call resetTaskWithException upon a KeeperException or InterruptedException only.\n\tSimilar to above, we should have debug level logging on items in our various data structures before cleanUpWorkQueue, after cleanUpWorkQueue, before the peekTopN call and the items returned by the peekTopN method. Also we should log the item skipped by 'checkExclusivity' in debug level. Without this logging, it'd be almost impossible to debug problems in production.\n\tIf the maxParallelThreads is supposed to be a constant then it should renamed accordingly as MAX_PARALLEL_THREADS\nLet's make it a constant.\n\tWe can improve MultiThreadedOCPTest.testTaskExclusivity by sending a shard split for shard1_0 as the third collection action.\n\tThere are still formatting problems in Overseer.Stats.success, error, time methods.\n\tZkStateReader has a new MAX_COLL_PROCESSOR_THREADS instance variable which is never used.\n\n "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14001583",
+            "date": "2014-05-19T11:01:42+0000",
+            "content": "This patch still has the new createCollection method in CollectionAdminRequest. Please remove that.\nDone.\n\n\nprivate static final boolean DEBUG = false;\n\n\nRemoved\n\nShould we rename processedZkTasks to runningZkTasks? \nDone.\n\nLet's document the purpose of each of the sets/maps we've introduced such as completedTasks, processedZkTasks, runningTasks, collectionWip as a code comment.\nDone\n\nI think we should use use the return value of collectionWip.add(collectionName) as a fail-safe and throw an exception if it ever returns false.\nThere's no uncaught exception or an exit point where this might not be reset. It would only not be reset in case the Overseer itself goes down but then there's nothing that stops a new Overseer from picking up a task that has not completely processed by an older Overseer. I don't think we need to check for that. Also, the only thread that adds/checks is the main thread.\n\nwe should have debug level logging on items in our various data structures\nDone.\n\nWe can improve MultiThreadedOCPTest.testTaskExclusivity by sending a shard split for shard1_0 as the third collection action\nFiring async calls doesn't guarantee the order of task execution. Sending SPLIT for shard1, followed by one for shard1_0 might lead to a failed test if split for shard1_0 get's picked up before splitting shard1.\n\nThere are still formatting problems in Overseer.Stats.success, error, time methods\nWeird as I don't see any in my IDE. Hopefully this patch has it right.\n\nI\u2019m fixing to get maxParallelThreads come from cluster props i.e. configurable. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14002109",
+            "date": "2014-05-19T18:15:35+0000",
+            "content": "A patch with fix for a potential NPE in a log.debug message.\n\nAlso added a check for successful completion of split shard tasks. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14002404",
+            "date": "2014-05-19T21:14:05+0000",
+            "content": "Firing async calls doesn't guarantee the order of task execution. Sending SPLIT for shard1, followed by one for shard1_0 might lead to a failed test if split for shard1_0 get's picked up before splitting shard1.\n\nAh, of course, you're right. How silly of me \n\nThanks for adding all the logging.\n\nThe OCP.Runner must call either markTaskComplete or resetTaskWithException upon exit otherwise we'll have items in queue which will never be processed and we'll never know why. It is not enough to call resetTaskWithException upon a KeeperException or InterruptedException only.\n\nThis is still not addressed.\n\nI\u2019m fixing to get maxParallelThreads come from cluster props i.e. configurable.\n\nThis is still pending.\n\nOne thing that I didn't notice earlier. We shouldn't be cleaning up in OCP.run before we execute the prioritizeOverseerNode() method. All OCP operations must be done after the prioritize call. "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14002454",
+            "date": "2014-05-19T21:44:47+0000",
+            "content": "A patch that handles all of that. I'm running the tests and the precommit.\nIf everything passes, I'd want to commit this.\n\nIt is not enough to call resetTaskWithException upon a KeeperException or InterruptedException only.\nThough I\u2019m half inclined towards adding a catch all exception clause (or an equivalent), I\u2019ll put it in there to be safe.\n\nmaxParallelThreads come from cluster props i.e. configurable\nI\u2019ll continue working on this but I don\u2019t think this should block us from getting this in. It required a bit of tweaking around in the mocks so I\u2019ll vote for committing it and adding this after the commit.\nI\u2019ve removed the variables for now though.\n\nWe shouldn't be cleaning up in OCP.run before we execute the prioritizeOverseerNode() method. All OCP operations must be done after the prioritize call.\nWe are not. We just read the last element. "
+        },
+        {
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-14002463",
+            "date": "2014-05-19T21:53:51+0000",
+            "content": "Yeah, making maxParallelThreads configurable isn't required. Just make it a constant for now.\n\nWe just read the last element.\nI misunderstood that. Thanks for clearing it up!\n\nI think this is good to go! My +1 "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14002514",
+            "date": "2014-05-19T22:40:42+0000",
+            "content": "Commit 1596089 from Anshum Gupta in branch 'dev/trunk'\n[ https://svn.apache.org/r1596089 ]\n\nSOLR-5681: Make the OverseerCollectionProcessor multi-threaded "
+        },
+        {
+            "author": "Noble Paul",
+            "id": "comment-14003425",
+            "date": "2014-05-20T15:19:09+0000",
+            "content": "The REQUESTSTATUS would not tell me what was the output of the run? \nSo, I miss that when async is used? "
+        },
+        {
+            "author": "Anshum Gupta",
+            "id": "comment-14003518",
+            "date": "2014-05-20T15:59:22+0000",
+            "content": "I had created SOLR-5886 for that.\nWill take that one up soon. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14003888",
+            "date": "2014-05-20T19:48:22+0000",
+            "content": "Commit 1596379 from Anshum Gupta in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1596379 ]\n\nSOLR-5681: Make the OverseerCollectionProcessor multi-threaded, merge from trunk (r1596089) "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007431",
+            "date": "2014-05-23T17:37:08+0000",
+            "content": "Commit 1597137 from Anshum Gupta in branch 'dev/trunk'\n[ https://svn.apache.org/r1597137 ]\n\nSOLR-5681: Add synchronization while printing tracking maps to a fix jenkins failure "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007437",
+            "date": "2014-05-23T17:40:37+0000",
+            "content": "Commit 1597140 from Anshum Gupta in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1597140 ]\n\nSOLR-5681: Add synchronization while printing tracking maps to a fix jenkins failure (Merge from trunk) "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007525",
+            "date": "2014-05-23T18:33:56+0000",
+            "content": "Commit 1597146 from Anshum Gupta in branch 'dev/trunk'\n[ https://svn.apache.org/r1597146 ]\n\nSOLR-5681: Fixing CHANGES.txt entry "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007533",
+            "date": "2014-05-23T18:39:31+0000",
+            "content": "Commit 1597150 from Anshum Gupta in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1597150 ]\n\nSOLR-5681: Fixing CHANGES.txt entry "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007549",
+            "date": "2014-05-23T19:05:09+0000",
+            "content": "Commit 1597160 from Anshum Gupta in branch 'dev/trunk'\n[ https://svn.apache.org/r1597160 ]\n\nSOLR-5681: Fixing CHANGES.txt entry, moving it into the Optimizations section "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-14007553",
+            "date": "2014-05-23T19:06:13+0000",
+            "content": "Commit 1597161 from Anshum Gupta in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1597161 ]\n\nSOLR-5681: Fixing CHANGES.txt entry, moving it into the Optimizations section "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-15109773",
+            "date": "2016-01-21T00:03:22+0000",
+            "content": "Hmm...did this mess with error handling for the collections API somehow? Anshum Gupta.\n\nWe throw errors like:\n throw new SolrException(ErrorCode.BAD_REQUEST, \"collection already exists: \" + collectionName);\nand\n throw new SolrException(ErrorCode.BAD_REQUEST, \"No config set found to associate with the collection.\");\nand other such things in OverseerCollectionMessageHandler.\n\nBut now all this code runs in an executor, and the errors are simply logged in another thread. The client always get's, the response timed out.\n\nI'll file a new bug issue, but just looking for where it was introduced. We need some collections api error testing I think. "
+        },
+        {
+            "author": "Mark Miller",
+            "id": "comment-15109834",
+            "date": "2016-01-21T00:52:05+0000",
+            "content": "Scratch that, off in the weeds. "
+        }
+    ]
+}

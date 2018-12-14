@@ -1,0 +1,142 @@
+{
+    "id": "LUCENE-2104",
+    "title": "IndexWriter.unlock does does nothing if NativeFSLockFactory is used",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "components": [
+            "core/store"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "2.9.3",
+            "3.0.2",
+            "3.1",
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "2.9,                                            2.9.1,                                            3.0",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "If NativeFSLockFactory is used, IndexWriter.unlock will return, silently doing nothing. The reason is that NativeFSLockFactory's makeLock always creates a new NativeFSLock. NativeFSLock's release first checks if its lock is not null. However, only if obtain() is called, that lock is not null. So release actually does nothing, and so IndexWriter.unlock does not delete the lock, or fail w/ exception.\nThis is only a problem in NativeFSLock, and not in other Lock implementations, at least as I was able to see.\n\nNeed to think first how to reproduce in a test, and then fix it. I'll work on it.",
+    "attachments": {
+        "LUCENE-2104.patch": "https://issues.apache.org/jira/secure/attachment/12427589/LUCENE-2104.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-12-09T13:02:20+0000",
+            "content": "I think that if I move those lines (in NativeFSLock.release()):\n\n      if (!path.delete())\n        throw new LockReleaseFailedException(\"failed to delete \" + path);\n\n\nto outside the if(lockExists()) section, this should work? Because then the new NativeFSLock will attempt to release an lock that's held by someone else, and fail. If the lock exists for some reason, but nobody is holding it, that line should succeed.\n\nIn order to test it, I think I'll need to spawn two processes, which is trickier. Let me know what you think about the fix in the meantime. ",
+            "author": "Shai Erera",
+            "id": "comment-12788077"
+        },
+        {
+            "date": "2009-12-10T08:06:11+0000",
+            "content": "Patch includes a test in TestLockFactory and fix in NativeFSLock. ",
+            "author": "Shai Erera",
+            "id": "comment-12788581"
+        },
+        {
+            "date": "2009-12-10T08:53:02+0000",
+            "content": "In general, there is no problem with NativeFSLock at all, because the removal of the lock file is just a \"cleanup\", which is not needed (not deleting the lock file would produce no problem - we only delete it to be interoperable with SimpleFSLockFactory). The existence of a lock file is no indice for a locked directory, only if a lock is \"on the file\". The JVM normally automatically removes lock files on exit.\n\nRemoving the lock file to \"unlock\" is also a no-op, because even if the lock file is removed, the lock still exists (unix delete on last close semantics). The unlock method in IndexWriter is just for SimpleFSLockFactory and is of no use for any other lock factory. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12788599"
+        },
+        {
+            "date": "2009-12-10T09:16:09+0000",
+            "content": "Uwe, the problem is that unlock does nothing when NativeFSLock is used. So I open an IndexWriter and receive a LockObtainFailedException, and then call unlock because I'm sure no one else holds the lock, I expect to be able to open the writer after unlock returns. With NativeFSLock, I cannot fail to obtain the lock if it's there but nobody uses it, so if I hit the exception, I shouldn't be allowed to call unlock.\n\nIf you use SimpleFSLockFactory and call IndexWriter.unlock(), but SimpleFSLock.release() fails, you hit an exception. With NativeFSLock it's not the same, simply because NativeFSLockFactory.makeLock creates a new instance with a 'lock = null', and therefore calling release() is always a no-op.\n\nI think the symmetry is broken and that's what the issue and patch attempt to fix. ",
+            "author": "Shai Erera",
+            "id": "comment-12788611"
+        },
+        {
+            "date": "2009-12-10T09:26:47+0000",
+            "content": "The problem with NativeFSLock is that you cannot release the lock if you are not owning the lock. It is the same like with synchronized() blocks, you can only unlock, if you own the lock.\n\nIf you use NativeFSLock you should never-ever try to forcefully unlock! If there is a lock, then the dir is used and it would be the badest thing you could do, to forcefully unlock. The O/S will take care of lock removal on JVM exit.\n\nI just repeat: IndexWriter.unlock() is only a last resort to forcefully remove a lock file from SimpleFSLockFactory because the cleanup does not work. And I want to repeat: Removing the lock file does not remove the lock. You test e.g. fails on windows even with you patch, because Windows forcefully keeps the lock and does not allow to remove the lock file until it is explicitely unlocked.\n\nWhat you patch does on UNIX is, that it removes the lock file and therefore all references in filesystem to the lock. If another index writer then tries to lock again, it works, because the new file has another inode number and is a different lock file. What you are tryng to do is completely broken. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12788616"
+        },
+        {
+            "date": "2009-12-10T09:30:59+0000",
+            "content": "The fix would be to add a javadocs comment to IW.unlock, that this method only works and is a hack just for SimpleFSLockFactory. The existence of a lock file in native fs lock is not the presence of a lock. The file is just a helper, to have a lock \"namespace\". Even if the file exists, the lock may not be obtained. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12788620"
+        },
+        {
+            "date": "2009-12-10T12:12:26+0000",
+            "content": "Thanks for the info Uwe. I know the unlock is to be used as a last resort, and if you know no one else has a reference to the lock. The fact that on Windows this fails is perfect, that's exactly what I want - for unlock() to fail if someone keeps a reference to the lock. On Unix - I didn't realize that's what happens, so that's indeed broken.\n\nI'm not sure that the fix is just javadocs ... perhaps the fix should be to add an unlock() method to Lock and impl it in SimpleFSLock by calling release(), but on NativeFSLock to first obtain the lock and if that succeeds, release it. That way, the obtain would fail and we can throw an exception. Also, we can keep release() and impl in NativeFSLock to first obtain if it does not hold the lock.\n\nAlso, what you say about IndexWriter.unlock() should be used if SimpleFSLockFactory is used, and only then, is not: (1) documented anywhere and (2) reasonable. What if I implement a Lock over a DB (I think someone even posted something about that a while ago). I should still be able to call unlock().\n\nThe thing is, IMO unlock() should throw an exception if it failed, and currently it does so in SimpleFSLock but not for NativeFSLock. The symmetry is broken, and I see no reason why it shouldn't fail for NativeFSLock, so the application knows about it. Notice that NativeFSLock fails to thrown an exception only because makeLock creates a new instance with the 'lock' member being null. It gives a false impression that the unlock succeeded, and for the wrong reason. ",
+            "author": "Shai Erera",
+            "id": "comment-12788697"
+        },
+        {
+            "date": "2009-12-13T11:26:11+0000",
+            "content": "Seems like two things are being discussed here:\n\n\n\tShould IW.unlock be able to forcefully release a still-in-use\n    lock?  For SimpleFSLockFactory we have no choice but to allow\n    this, since it's unable to tell if the lock is \"really\" still\n    held.  But since NativeFSLockFactory can tell, I don't think we\n    should remove a still-in-use lock?  Seems like we leave the choice\n    to the LF, eg for someone's external LF, it should decide if\n    forceful removal is allowed.\n\n\n\n\n\tIf forceful removal is not allowed, should we throw an exception\n    noting that you failed to forcefully remove the lock?  Seems like\n    we should?  Ie, somehow, NativeFSLockFactory should try to acquire\n    the lock, and if it was already locked, should throw an exception\n    saying you cannot release it?\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12789873"
+        },
+        {
+            "date": "2009-12-13T11:34:48+0000",
+            "content": "+1 on exception.\n\nThe problem: NativeFSLockFactory is never possible to get the lock and release it. This is only allowed for the code, that holds the lock (its the same like with a sysnchonized mutex using j.l.concurrent.ReentrantLock, only code that holds the lock can free it). So it is impossible to remove a lock, held by another process but it may be possible to release if it is created in the same JVM instance (for this to work, the factory needs a map of all generated locks). ",
+            "author": "Uwe Schindler",
+            "id": "comment-12789876"
+        },
+        {
+            "date": "2009-12-13T13:51:30+0000",
+            "content": "Thanks for the comments. I proposed this above:\n\nperhaps the fix should be to add an unlock() method to Lock and impl it in SimpleFSLock by calling release(), but on NativeFSLock to first obtain the lock and if that succeeds, release it. That way, the obtain would fail and we can throw an exception. Also, we can keep release() and impl in NativeFSLock to first obtain if it does not hold the lock.\n\nI vote for the second option (i.e. not adding another API, but use what's there and include a \"first obtain then release\" logic in an 'else' part in NativeFSLock). ",
+            "author": "Shai Erera",
+            "id": "comment-12789894"
+        },
+        {
+            "date": "2009-12-14T13:12:46+0000",
+            "content": "Changed NativeFSLock.release() to first obtain and then release the lock, if it's not held. That way, if obtain fails, LockReleaseFailedException is thrown, to indicate that. ",
+            "author": "Shai Erera",
+            "id": "comment-12790135"
+        },
+        {
+            "date": "2009-12-16T07:21:43+0000",
+            "content": "How do we proceed with this? Can someone (Uwe/Mike?) plz review the latest patch I added? ",
+            "author": "Shai Erera",
+            "id": "comment-12791242"
+        },
+        {
+            "date": "2009-12-16T07:30:06+0000",
+            "content": "For me the latest patch looks good as it no longer enforces to unlock (which is not possible with NativeFSLock) and throws Exception. The message should not include other processs, as the test verifies that it also fails in the same process, if the file is locked. Something like \"Cannot forcefully unlock a NativeFSLock which is held by another indexer component.\". ",
+            "author": "Uwe Schindler",
+            "id": "comment-12791244"
+        },
+        {
+            "date": "2009-12-16T08:34:31+0000",
+            "content": "Changed the sentence and updated CHANGES. ",
+            "author": "Shai Erera",
+            "id": "comment-12791267"
+        },
+        {
+            "date": "2009-12-16T10:26:50+0000",
+            "content": "Patch looks good!  Thanks Shai. ",
+            "author": "Michael McCandless",
+            "id": "comment-12791303"
+        },
+        {
+            "date": "2009-12-16T12:03:31+0000",
+            "content": "Committed revision 891205 with the \"== false\" check changed to \"!\"\n\nThanks Shai! ",
+            "author": "Uwe Schindler",
+            "id": "comment-12791340"
+        },
+        {
+            "date": "2010-05-25T16:12:30+0000",
+            "content": "Should I backport? ",
+            "author": "Uwe Schindler",
+            "id": "comment-12871223"
+        },
+        {
+            "date": "2010-05-25T16:36:38+0000",
+            "content": "Should I backport?\n\nNo \u2013 it was already fixed on 3x (I just marked it as such in the issue), probably because we branched 3x off after this was committed. ",
+            "author": "Michael McCandless",
+            "id": "comment-12871235"
+        },
+        {
+            "date": "2010-05-30T14:39:09+0000",
+            "content": "backport ",
+            "author": "Michael McCandless",
+            "id": "comment-12873438"
+        }
+    ]
+}

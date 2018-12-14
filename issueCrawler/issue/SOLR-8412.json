@@ -1,0 +1,63 @@
+{
+    "id": "SOLR-8412",
+    "title": "SchemaManager should synchronize on performOperations method",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "resolution": "Not A Problem",
+        "priority": "Minor"
+    },
+    "description": "Currently SchemaManager synchronizes on schema.getSchemaUpdateLock() . We should synzhronize on performOperations instead. \n\nThe net affect will be the same but the code will be more clear. schema.getSchemaUpdateLock() is used when you want to edit a schema and add one field at a time. But the way SchemaManager works is that it does bulk operations i.e performs all operations and then persists the final schema . If there were two concurrent operations that took place, the later operation will retry by fetching the latest schema .",
+    "attachments": {
+        "SOLR-8412.patch": "https://issues.apache.org/jira/secure/attachment/12777431/SOLR-8412.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-12-14T08:29:07+0000",
+            "author": "Varun Thacker",
+            "content": "Patch which does 3 things\n\n\n\tsynchronizes on performOperations instead of schema.getSchemaUpdateLock()\n\tMakes additional check of managed-schema being mutable\n\tLogging improvements\n\n ",
+            "id": "comment-15055623"
+        },
+        {
+            "date": "2015-12-14T20:37:17+0000",
+            "author": "Varun Thacker",
+            "content": "I realized that waitForOtherReplicasToUpdate was using the timeout variable timeout VS while (System.nanoTime() < endTime) in doOperations\n\nIn this patch waitForOtherReplicasToUpdate also uses endTime and if updateTimeoutSecs is not specified a 60s timeout is picked. \n\nTestBulkSchemaConcurrent is failing right now which I need to look deeper as to why. TestBulkSchemaConcurrent#testAdd would always fail before the changes were made to waitForOtherReplicasToUpdate ",
+            "id": "comment-15056674"
+        },
+        {
+            "date": "2015-12-16T12:28:27+0000",
+            "author": "Varun Thacker",
+            "content": "Patch which fixes a nanosecond conversion bug as well.\n\nThere is still a timing issue here. testAddFieldAndDocument fails sometimes complaining \"myNewField\" not defined.  ",
+            "id": "comment-15059919"
+        },
+        {
+            "date": "2015-12-18T17:45:54+0000",
+            "author": "Yonik Seeley",
+            "content": "We should synzhronize on performOperations instead. The net affect will be the same but the code will be more clear.\n\nChanging complex synchronization causes warning bells to go off.\nAre you sure that the net effect is the same?  I'm not familiar with this part of the code, so hopefully someone else who is can chime in... but at first blush it definitely doesn't look safe.\nThis patch changes the locking from using schemaUpdateLock (which is shared among multiple objects) to using either schemaUpdateLock or the current objects monitor.  It's certainly not simpler or clearer to try and figure out if things are still thread safe.\n\nReviewing the existing code some, I see this:\n\n\tSchemaManager.performOperations() calls doOperations() protected by schemaUpdateLock\n\tthis performs a list of operations on the latest ManagedIndexSchema object, which may be created fresh, but will be passed the same schemaUpdateLock\n\tthese operations can call things like addFields()\n\n\n\nAddSchemaFieldsUpdateProcessor has this:\n\n        // Need to hold the lock during the entire attempt to ensure that\n        // the schema on the request is the latest\n        synchronized (oldSchema.getSchemaUpdateLock()) {\n          try {\n            IndexSchema newSchema = oldSchema.addFields(newFields);\n\n\nBut with the patch, we're locking on a different object, so what the comment asserts it is trying to do may be broken?\nActually, it's not at all clear to me why even in the current code, we don't need to grab the latest schema again after we lock the update lock.\n\nMoving on, to addFields(), it looks like it can (with the patch) now be called on the same object with two different locks held.  Or even on different objects it's not clear if it's now safe.\n\nBottom line: the synchronization in the current code is complex enough that I don't know if the proposed simplifications are safe or not.  If you could add some explanation around that, it would be great. ",
+            "id": "comment-15064306"
+        },
+        {
+            "date": "2015-12-18T19:42:04+0000",
+            "author": "Varun Thacker",
+            "content": "Hi Yonik,\n\n\nReviewing the existing code some, I see this:\n\n\tSchemaManager.performOperations() calls doOperations() protected by schemaUpdateLock\n\tthis performs a list of operations on the latest ManagedIndexSchema object, which may be created fresh, but will be   passed the same schemaUpdateLock\n\tthese operations can call things like addFields()\n\n\n\nYes this is what my current understand is as well. \n\nHere is what I additionally gathered. The motivation behind AddSchemaFieldsUpdateProcessor and SchemaManager are different. AddSchemaFieldsUpdateProcessor adds one field at a time. So the locking there is fine.\n\nIn SchemaManager we allow bulk operations and want to either perform all the operations or none. \nNow in cloud mode - \nSchemaManager#performOperations calls SchemaManager#doOperation which grabs the latest schema from Zk and performs all the operations on it. Once that it done it finally tries to save the managed-schema file by calling ZkController.persistConfigResourceToZooKeeper . ZkController.persistConfigResourceToZooKeeper will fail if the zkVersion provided is stale . In that case SchemaManager keeps retrying by fetching the latest schema from ZK and retrying the entire bulk operation . It does that till success or timeout .\nThus I feel we don't need any synchronization at all here. Either the current {[schema.getSchemaUpdateLock()}} or the synchronization on SchemaManager#performOperations in the new patch. ZkController.persistConfigResourceToZooKeeper takes care of it.\n\nNow in standalone mode synchronizing on either the current way or the with making SchemaManager#performOperations synchronized has the same effect?\n\nBottom line: the synchronization in the current code is complex enough that I don't know if the proposed simplifications are safe or not. If you could add some explanation around that, it would be great.\n\nPoint taken. On the simplification part here is why I felt the patch simplifies things - When I first looked at the code I was confused as to how can we take a lock on a schema object and then fetch the latest schema from ZK and do operations on that . But later I understood the reasoning . So maybe the patch simplifies that aspect?\n\nOn the correctness part , does my explanation here help? Or you still think this is not the right way to go? If thats the case I could add comments there to make the code easier to read and fix the remaining issues I found in another patch? ",
+            "id": "comment-15064604"
+        },
+        {
+            "date": "2016-02-08T20:02:24+0000",
+            "author": "Noble Paul",
+            "content": "Changing complex synchronization causes warning bells to go off.\n\nIt's a bit complex because of the history of the APIs. It works differently for standalone and cloud. For cloud, it expects the listeners to do the trick. In standalone mode , there is no 'listener' . So, the in memory schema object is updated after persisting the new schema. In Cloud mode no synchronization is necessary. It is designed to work in a multithreaded mode or even on multiple nodes. OTOH , in the standalone mode the synchronization should be on the lock of the managedIndexSchema because that operation happens from multiple places . So, the current synchronization is fine. No need to change ",
+            "id": "comment-15137574"
+        },
+        {
+            "date": "2016-02-08T20:06:37+0000",
+            "author": "Varun Thacker",
+            "content": "Thanks Noble for confirming. Closing this Jira out. \n\nHowever I'll create a follow up Jira for the timeout bug in SchemaManager that I found while working on this patch ",
+            "id": "comment-15137586"
+        }
+    ]
+}

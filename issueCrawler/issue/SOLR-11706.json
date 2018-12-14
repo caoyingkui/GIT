@@ -1,0 +1,77 @@
+{
+    "id": "SOLR-11706",
+    "title": "JSON FacetModule can't compute stats (min,max,etc...) on multivalued fields",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "Facet Module"
+        ],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "While trying to write some tests demonstrating equivalences between the StatsComponent and the JSON FacetModule i discovered that the FacetModules stat functions (min, max, etc...) don't seem to work on multivalued fields.\n\nBased on the stack traces, i gather the problem is because the FacetModule seems to rely exclusively on using the \"Function\" parsers to get a value source \u2013 apparently w/o any other method of accumulating numeric stats from multivalued (numeric) DocValues?",
+    "attachments": {
+        "SOLR-11706.patch": "https://issues.apache.org/jira/secure/attachment/12899904/SOLR-11706.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-11-29T21:49:24+0000",
+            "content": "Trivial steps to reproduce...\n\n\nbin/solr -e techproducts\n...\ncurl -H 'Content-Type: application/json' --data-binary '[{\"id\":\"x\",\"foo_is\":42,\"foo_is\":666},{\"id\":\"y\",\"foo_is\":55}'] 'http://localhost:8983/solr/techproducts/update?commit=true'\n...\n\n\n\nNote that stats.field has no problems with foo_is...\n\ncurl 'http://localhost:8983/solr/techproducts/query?&stats=true&stats.field=foo_is&q=*:*&rows=0&omitHeader=true'\n{\n  \"response\":{\"numFound\":34,\"start\":0,\"docs\":[]\n  },\n  \"stats\":{\n    \"stats_fields\":{\n      \"foo_is\":{\n        \"min\":42.0,\n        \"max\":666.0,\n        \"count\":3,\n        \"missing\":32,\n        \"sum\":763.0,\n        \"sumOfSquares\":448345.0,\n        \"mean\":254.33333333333334,\n        \"stddev\":356.5730406709589}}}}\n\n\n\nBut the JSON FacetModule can't compute similar stats...\n\ncurl http://localhost:8983/solr/techproducts/query -d 'q=*:*&rows=0&omitHeader=true&json.facet=\n{ min:\"min(foo_is)\", max:\"max(foo_is)\", sum:\"sum(foo_is)\",\n  // count and missing not supported, see SOLR-11695\n  sumOfSquares:\"sumsq(foo_is)\", mean:\"avg(foo_is)\", stddev:\"stddev(foo_is)\"\n}'\n{\n  \"error\":{\n    \"metadata\":[\n      \"error-class\",\"org.apache.solr.common.SolrException\",\n      \"root-error-class\",\"org.apache.solr.common.SolrException\"],\n    \"msg\":\"can not use FieldCache on multivalued field: foo_is\",\n    \"code\":400}}\n\n\n\nstack trace from logs...\n\n\nERROR - 2017-11-29 21:40:30.417; [   x:techproducts] org.apache.solr.common.SolrException; org.apache.solr.common.SolrException: can not use FieldCache on multivalued field: foo_is\n        at org.apache.solr.schema.SchemaField.checkFieldCacheSource(SchemaField.java:190)\n        at org.apache.solr.schema.IntPointField.getValueSource(IntPointField.java:149)\n        at org.apache.solr.search.FunctionQParser.parseValueSource(FunctionQParser.java:384)\n        at org.apache.solr.search.FunctionQParser.parseValueSource(FunctionQParser.java:237)\n        at org.apache.solr.search.ValueSourceParser$86.parse(ValueSourceParser.java:977)\n        at org.apache.solr.search.FunctionQParser.parseAgg(FunctionQParser.java:421)\n        at org.apache.solr.search.facet.FacetParser.parseStringStat(FacetRequest.java:429)\n        at org.apache.solr.search.facet.FacetParser.parseStringFacetOrStat(FacetRequest.java:422)\n        at org.apache.solr.search.facet.FacetParser.parseFacetOrStat(FacetRequest.java:352)\n        at org.apache.solr.search.facet.FacetParser.parseSubs(FacetRequest.java:332)\n        at org.apache.solr.search.facet.FacetTopParser.parse(FacetRequest.java:601)\n        at org.apache.solr.search.facet.FacetTopParser.parse(FacetRequest.java:590)\n        at org.apache.solr.search.facet.FacetModule.prepare(FacetModule.java:102)\n        at org.apache.solr.handler.component.SearchHandler.handleRequestBody(SearchHandler.java:269)\n        at org.apache.solr.handler.RequestHandlerBase.handleRequest(RequestHandlerBase.java:177)\n        at org.apache.solr.core.SolrCore.execute(SolrCore.java:2484)\n \n\n\n\n\n(some other testing suggests that this problem exists regardless of whether TrieInt or IntPoint fields are used ... i didn't explicitly test float/long/double/etc... but based on a quick glance at the code i don't see any reason why they wouldn't all be equally affected) ",
+            "author": "Hoss Man",
+            "id": "comment-16271585"
+        },
+        {
+            "date": "2017-11-29T22:44:49+0000",
+            "content": "Perhaps a bug at the user level, but more of a \"not implemented yet\" at the development level.\n\nBased on the stack traces, i gather the problem is because the FacetModule seems to rely exclusively on using the \"Function\" parsers to get a value source \u2013 apparently w/o any other method of accumulating numeric stats from multivalued (numeric) DocValues?\n\nThat was the original reason.  As part of SOLR-11317 I added a bit of a hacky way to support a function or a bare field name (w/o trying to make the field name into a value source).\nmin/max parsers currently use this:\n\n    addParser(\"agg_min\", new ValueSourceParser() {\n      @Override\n      public ValueSource parse(FunctionQParser fp) throws SyntaxError {\n        return new MinMaxAgg(\"min\", fp.parseValueSource(FunctionQParser.FLAG_DEFAULT | FunctionQParser.FLAG_USE_FIELDNAME_SOURCE));\n      }\n    });\n\n\n\nNow in MinMaxAgg, we deal with fields separately from functions and throw an exception for a multivalued field since there is no implementation yet:\n\n      if (sf.multiValued() || sf.getType().multiValuedFieldCache()) {\n        vs = null;\n        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, \"min/max aggregations can't be used on multi-valued field \" + field);\n\n\n\nWe could either:\n\n\tuse the same strategy for all the stats (fine if we only care about multi-valued fields and not multi-valued functions)\n\tfix ValueSource so that it can be truly multi-valued and use that\n\n ",
+            "author": "Yonik Seeley",
+            "id": "comment-16271695"
+        },
+        {
+            "date": "2017-11-29T23:41:35+0000",
+            "content": "Perhaps a bug at the user level, but more of a \"not implemented yet\" at the development level.\n\nWell ... presumably, in the absence of any official documentation (yet), you would understand if people trusted that the things you wrote on your own website would be accurate since you created JSON Faceting \u2013 and you've explicitly said:\n\nNumeric aggregation functions such as avg can be on any numeric field, or on another function of multiple numeric fields.\n\nThere's a pretty big difference between \"any numeric field\" and \"any single valued numeric field\"\n\n...even taking into account that was written in 2015 (maybe?) before things like IntPointField existed \u2013 it doesn't seem to work with any multivalued trie fields either.\n\nNow in MinMaxAgg, we deal with fields separately from functions....\n\nI'm not really following what your point about MinMaxAgg is.  IIUC you're saying: \"None of the numeric aggs work with multivalued fields, but min & max don't work for a diff reason (and fail with a slightly diff error message) then things like 'sum'\" ?\n\nuse the same strategy for all the stats (fine if we only care about multi-valued fields and not multi-valued functions)\n\nI'm not really sure what it would mean to \"care about ... multi-valued functions\" \u2013 AFAIK we've never had any multivalued functions? .. are you just hypothosising that maybe someday we could?\n\n\n\n\nFWIW: The attached patch includes some trivial additions to TestJsonFacets to demonstrate some of the diff types of failures that can happen when runing to use min or sum on multivalued fields, as well as some suick and dirty attempts to generalize StatsComponentTest to show equivilences with json.facet (i originally hoped to flesh the StatsComponentTest changes out so the whole testcase demonstrated this across the board, but ran into this problem so quickly only one test method has been updated) ",
+            "author": "Hoss Man",
+            "id": "comment-16271804"
+        },
+        {
+            "date": "2017-11-30T03:07:55+0000",
+            "content": "I was just trying to point out that it's a \"yeah, that's not implemented yet\" rather than \"what the heck is wrong... I'll dig into it\" situation.\n\nWell ... presumably, in the absence of any official documentation (yet)\n\nHere's what we have so far:\nhttps://builds.apache.org/view/L/view/Lucene/job/Solr-reference-guide-master/javadoc/json-facet-api.html#AggregationFunctions\n\nI'm not really following what your point about MinMaxAgg is.\n\nIf one goes about implementing support for avg(multivalued_field), then the first issue one will run up against is that the function parser will fail because of the generic value source check for single valued fields.  min() and max() have already gotten around this issue, and I was pointing out how other stats could do the same thing.\n\nI'm not really sure what it would mean to \"care about ... multi-valued functions\" \u2013 AFAIK we've never had any multivalued functions? .. are you just hypothosising that maybe someday we could?\n\nYes, IMO we already need them.  There are multiple ways to handle multi-valued fields and we don't support that well anywhere. ",
+            "author": "Yonik Seeley",
+            "id": "comment-16272091"
+        },
+        {
+            "date": "2017-11-30T17:26:28+0000",
+            "content": "... I was pointing out how other stats could do the same thing.\n\nOh, oh ... i'm sorry, i understand now:  Some of the ground work has already been laid in MinMax, and similar work could be done in other aggs.  Got it. ",
+            "author": "Hoss Man",
+            "id": "comment-16272999"
+        },
+        {
+            "date": "2017-12-05T04:38:44+0000",
+            "content": "I just want to point out that \"multi-valued functions\" in fact exist \u2013 org.apache.lucene.queries.function.valuesource.MultiValueSource.  I'm not a fan \u2013 the API feels awkward to me, but there it is.  We pretty much only use it today for some legacy-ish spatial stuff.  I'd prefer this interface and some of the related methods on FunctionValues that take arrays be deprecated out of Lucene. ",
+            "author": "David Smiley",
+            "id": "comment-16278002"
+        },
+        {
+            "date": "2017-12-05T12:50:14+0000",
+            "content": "I'd prefer this interface and some of the related methods on FunctionValues that take arrays be deprecated out of Lucene.\nYeah, I agree. I've always tried to avoid building on the array based methods because it felt like we needed something better for multiValued fields & functions. ",
+            "author": "Yonik Seeley",
+            "id": "comment-16278490"
+        },
+        {
+            "date": "2017-12-12T19:03:07+0000",
+            "content": "Commit 53f2d4aa3aa171d5f37284eba9ca56d987729796 in lucene-solr's branch refs/heads/branch_7x from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=53f2d4a ]\n\nBeef up testing of json.facet 'refine:simple' when dealing with 'Long Tail' terms\n\nIn an attempt to get more familiar with json.facet refinement, I set out to try and refactor/generalize/clone\nsome of the existing facet.pivot refinement tests to assert that json.facet could produce the same results.\nThis test is a baby step towards doing that: Cloning DistributedFacetPivotLongTailTest into\nDistributedFacetSimpleRefinementLongTailTest (with shared index building code).\n\nAlong the way, I learned that the core logic of 'refine:simple' is actually quite different then how facet.field\n& facet.pivot work (see discussion in SOLR-11733), so they do NOT produce the same results in many \"Long Tail\"\nSitautions.  As a result, many of the logic/assertions inDistributedFacetSimpleRefinementLongTailTest are very\ndiffernet then their counter parts in DistributedFacetPivotLongTailTest, with detailed explanations in comments.\n\nHopefully this test will prove useful down the road to anyone who might want to compare/contrast facet.pivot\nwith json.facet, and to prevent regressions in 'refine:simple' if/when we add more complex refinement\napproaches in the future.\n\nThere are also a few TODOs in the test related to some other small discrepencies between json.facet and\nstats.field that I opened along the way, indicating where the tests should be modified once those issues are\naddressed in json.facet...\n\n\n\tSOLR-11706: support for multivalued numeric fields in stats\n\tSOLR-11695: support for 'missing()' & 'num_vals()' (aka: 'count' from stats.field) numeric stats\n\tSOLR-11725: switch from 'uncorrected stddev' to 'corrected stddev'\n\n\n\n(cherry picked from commit 2990c88a927213177483b61fe8e6971df04fc3ed) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16288084"
+        },
+        {
+            "date": "2017-12-12T19:03:20+0000",
+            "content": "Commit 2990c88a927213177483b61fe8e6971df04fc3ed in lucene-solr's branch refs/heads/master from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2990c88 ]\n\nBeef up testing of json.facet 'refine:simple' when dealing with 'Long Tail' terms\n\nIn an attempt to get more familiar with json.facet refinement, I set out to try and refactor/generalize/clone\nsome of the existing facet.pivot refinement tests to assert that json.facet could produce the same results.\nThis test is a baby step towards doing that: Cloning DistributedFacetPivotLongTailTest into\nDistributedFacetSimpleRefinementLongTailTest (with shared index building code).\n\nAlong the way, I learned that the core logic of 'refine:simple' is actually quite different then how facet.field\n& facet.pivot work (see discussion in SOLR-11733), so they do NOT produce the same results in many \"Long Tail\"\nSitautions.  As a result, many of the logic/assertions inDistributedFacetSimpleRefinementLongTailTest are very\ndiffernet then their counter parts in DistributedFacetPivotLongTailTest, with detailed explanations in comments.\n\nHopefully this test will prove useful down the road to anyone who might want to compare/contrast facet.pivot\nwith json.facet, and to prevent regressions in 'refine:simple' if/when we add more complex refinement\napproaches in the future.\n\nThere are also a few TODOs in the test related to some other small discrepencies between json.facet and\nstats.field that I opened along the way, indicating where the tests should be modified once those issues are\naddressed in json.facet...\n\n\n\tSOLR-11706: support for multivalued numeric fields in stats\n\tSOLR-11695: support for 'missing()' & 'num_vals()' (aka: 'count' from stats.field) numeric stats\n\tSOLR-11725: switch from 'uncorrected stddev' to 'corrected stddev'\n\n ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16288088"
+        }
+    ]
+}

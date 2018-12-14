@@ -1,0 +1,143 @@
+{
+    "id": "SOLR-11069",
+    "title": "CDCR bootstrapping can get into an infinite loop when a core is reloaded",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "CDCR"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "6.6.1",
+            "6.7",
+            "7.0",
+            "7.1",
+            "master (8.0)"
+        ],
+        "affect_versions": "6.2,                                            6.3,                                            6.4,                                            6.5,                                            6.6,                                            7.0",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "LASTPROCESSEDVERSION (a.b.v. LPV) action for CDCR breaks down due to poorly initialised and maintained buffer log for either source or target cluster core nodes.\n\nIf buffer is enabled for cores of either source or target cluster, it return -1, irrespective of number of entries in tlog read by the leader node of each shard of respective collection of respective cluster. Once disabled, it starts telling us the correct LPV for each core.\n\nDue to the same flawed behavior, Update Log Synchroniser may doesn't work properly as expected, i.e. provides incorrect seek to the non-leader nodes to advance at. I am not sure whether this is an intended behavior for sync but it surely doesn't feel right.",
+    "attachments": {
+        "SOLR-11069.patch": "https://issues.apache.org/jira/secure/attachment/12881641/SOLR-11069.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-07-13T16:56:23+0000",
+            "content": "Shalin Shekhar Mangar Renaud Delbru Any comments? ",
+            "author": "Erick Erickson",
+            "id": "comment-16085994"
+        },
+        {
+            "date": "2017-07-14T09:20:45+0000",
+            "content": "So when we enable buffering in CDCR, buffertoggle gets initialised via newLogReader() where ::\n\n return new CdcrLogReader(new ArrayList(logs), tlog);\n\n\n\n    private CdcrLogReader(List<TransactionLog> tlogs, TransactionLog tlog) {\n      this.tlogs = new LinkedBlockingDeque<>();\n      this.tlogs.addAll(tlogs);\n      if (tlog != null) this.tlogs.push(tlog); // ensure that the tlog being written is pushed\n\n      // Register the pointer in the parent UpdateLog\n      pointer = new CdcrLogPointer();\n      logPointers.put(this, pointer);\n\n      // If the reader is initialised while the updates log is empty, do nothing\n      if ((currentTlog = this.tlogs.peekLast()) != null) {\n        tlogReader = currentTlog.getReader(0);\n        pointer.set(currentTlog.tlogFile);\n        numRecordsReadInCurrentTlog = 0;\n        log.debug(\"Init new tlog reader for {} - tlogReader = {}\", currentTlog.tlogFile, tlogReader);\n      }\n    }\n\n\nlastVersion and nextToLastVersion initialised as -1 and never changed / modified / updated ever. The recent logs are added into tlogs and current tlog is maintained though.\n\nNow LPV is calculated as: CdcrRequestHandler::handleLastProcessedVersionAction\n\n    for (CdcrReplicatorState state : replicatorManager.getReplicatorStates()) {\n      long version = Long.MAX_VALUE;\n      if (state.getLogReader() != null) {\n        version = state.getLogReader().getLastVersion();\n      }\n      lastProcessedVersion = Math.min(lastProcessedVersion, version);\n    }\n\n    // next check the log reader of the buffer\n    CdcrUpdateLog.CdcrLogReader bufferLogReader = ((CdcrUpdateLog) core.getUpdateHandler().getUpdateLog()).getBufferToggle();\n    if (bufferLogReader != null) {\n      lastProcessedVersion = Math.min(lastProcessedVersion, bufferLogReader.getLastVersion());\n    }\n\n\nbufferLogReader.getLastVersion() is calculated -1 and LPV outputs -1. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16087076"
+        },
+        {
+            "date": "2017-07-14T09:34:33+0000",
+            "content": "Regarding updateLogSynchronizer ::\n\nEverytime we call DISABLEBUFFER or ENABLEBUFFER, CdcrBufferManager::stateUpdate gets invoked::\n\n@Override\n  public synchronized void stateUpdate() {\n    CdcrUpdateLog ulog = (CdcrUpdateLog) core.getUpdateHandler().getUpdateLog();\n    // If I am not the leader, I should always buffer my updates\n    if (!leaderStateManager.amILeader()) {\n      ulog.enableBuffer();\n      return;\n    }\n    // If I am the leader, I should buffer my updates only if buffer is enabled\n    else if (bufferStateManager.getState().equals(CdcrParams.BufferState.ENABLED)) {\n      ulog.enableBuffer();\n      return;\n    }\n    // otherwise, disable the buffer\n    ulog.disableBuffer();\n  }\n\n\n\nThe non-leader nodes are by-defaulted are always buffer enabled ::\n\nif (!leaderStateManager.amILeader()) {\n      ulog.enableBuffer();\n      return;\n    }\n\n\nthough LPV always calculated on leader but it has serious drawbacks explained later:\n\nin CdcrUpdateLogSynchronizer:: run :: if buffering is enabled ::\n\n// if we received -1, it means that the log reader on the leader has not yet started to read log entries\n        // do nothing\n        if (lastVersion == -1) {\n          return;\n        }\n        try {\n          CdcrUpdateLog ulog = (CdcrUpdateLog) core.getUpdateHandler().getUpdateLog();\n          if (ulog.isBuffering()) {\n            log.debug(\"Advancing replica buffering tlog reader to {} @ {}:{}\", lastVersion, collection, shardId);\n            ulog.getBufferToggle().seek(lastVersion);\n          }\n        }\n\n\nIt always returns on lastVersion == -1 and look at the comment if we received -1, it means that the log reader on the leader has not yet started to read log entries, that's misleading.\n\nAs the lastVersion is not +ve, the seek for the corresponding non-leader nodes are never set to appropriate LPV. \n\nNow if the leader goes down, and some non-leader becomes the leader himself, the LPV is not set properly resulting in improper sync and I have no idea how the impact will be in that case. \n\nAlso, as for non-leader nodes buffer is always on, if in the future it becomes the leader itself, even if we have disabled buffer for the source collection cluster, the status and its action will be buffer enabled. Again, not sure of the impact, need to look closely. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16087100"
+        },
+        {
+            "date": "2017-07-14T17:38:11+0000",
+            "content": "Continuing with how LPV was never tested robust:\n\nThe only bit where the LPV mentioned in the tests is in CdcrRequestHandlerTest\n\n    // replication never started, lastProcessedVersion should be -1 for both shards\n    rsp = invokeCdcrAction(shardToLeaderJetty.get(SOURCE_COLLECTION).get(SHARD1), CdcrParams.CdcrAction.LASTPROCESSEDVERSION);\n    long lastVersion = (Long) rsp.get(CdcrParams.LAST_PROCESSED_VERSION);\n    assertEquals(-1l, lastVersion);\n\n    rsp = invokeCdcrAction(shardToLeaderJetty.get(SOURCE_COLLECTION).get(SHARD2), CdcrParams.CdcrAction.LASTPROCESSEDVERSION);\n    lastVersion = (Long) rsp.get(CdcrParams.LAST_PROCESSED_VERSION);\n    assertEquals(-1l, lastVersion);\n\n\n\nLPV > -1 or what LPV value (which should > 1 atleast) can be when leader reads some entries from tlogs is never tested anywhere or at least I cannot find it. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16087665"
+        },
+        {
+            "date": "2017-07-14T21:11:41+0000",
+            "content": "I just saw a case where restarting the source cluster triggered bootstrap. Since LASTPROCESSEDVERSION was -1 the source ended up bootstrapping the target. Disabling buffer on source makes the pointer move correctly. ",
+            "author": "Varun Thacker",
+            "id": "comment-16088075"
+        },
+        {
+            "date": "2017-07-14T21:19:44+0000",
+            "content": "\nI just saw a case where restarting the source cluster triggered bootstrap.\nWhen leader of shard of source collection goes down and non-leader is selected, it triggers bootstrap due to above stated reason, LPV set to -1. ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16088095"
+        },
+        {
+            "date": "2017-08-13T05:19:18+0000",
+            "content": "I'm dithering back and forth about this. I suspect that we're conflating a couple of issues. There's definitely a problem with bootstrapping (I'll attach a patch in a minute). It may well be that the LASTPROCESSEDVERSION is not actually a problem, at least in some testing (with the attached patch) the fact that it is -1 when buffering is enabled seems to be OK.\n\nI propose we use the patch as a starting point to see if this LASTPROCESSEDVERSION is a problem or not.\n\n1> when buffering is enabled, tlogs will accrue forever according to the original intent. From Renaud:\n\nThe original goal of the buffer on cdcr is to indeed keep indefinitely the tlogs until the buffer is deactivated (https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=62687462#CrossDataCenterReplication(CDCR)-TheBufferElement). This was useful for example during maintenance operations, to ensure that the source cluster will keep all the tlogs until the target clsuter is properly initialised. In this scenario, one will activate the buffer on the source. The source will start to store all the tlogs (and does not purge them). Once the target cluster is initialised, and has register a tlog pointer on the source, one can deactivate the buffer on the source and the tlog will start to be purged once they are read by the target cluster.\n\nBut additionally he had this to say:\nRegarding the issue about LPV = -1, I am a bit surprised as this sentinel value should be used only when the source cluster does not have any log pointers, i.e., no target cluster were configured and initialised with this source cluster. In this case it indicates that there is no registered log reader, and that we should not remove any tlogs if buffer is enabled (as we have to wait for the target to register a log reader and log pointer). \n\nAnd enabling buffering definitely causes LASTPROCESSEDVERSION to return -1. However, with the patch LPV immediately goes back to a reasonable value as soon as buffering is disabled, the tlogs get cleaned up etc. without bootstrapping. So I do wonder if the -1 value is just overloaded in this case to also mean \"don't purge tlogs\".\n\nWe need to unentangle a couple of things. I'll attach a patch in a few minutes that might help. ",
+            "author": "Erick Erickson",
+            "id": "comment-16124804"
+        },
+        {
+            "date": "2017-08-13T05:26:49+0000",
+            "content": "figuring out the LPV issue is hard because bootstrapping had a problem. At the end of the process, the core is reloaded. However, that means that the code that checks on the state of the replication returns a \"notfound\", which causes another bootstrap command to be sent.\n\nSo this patch moves the relevant objects to (Default)SolrCoreState where they're preserved around core reloads. With this patch (PoC) I can get bootstrapping to occur, enable/disable buffering, bring the target up and down etc. The fact that LPV is -1 when buffering is enabled doesn't seem to be a problem.\n\nSo if others can give this a whirl and see if their testing is OK with it then maybe the LPV issue is not an issue.\n\nMostly I'm throwing this out for others to consider. What do people think about putting the additional objects in SolrCoreState? Putting the objects there was quick, I'm interested in seeing if my results work for others. If so we can decide whether this is the right way to go.\n\nHaven't run precommit, haven't run the full test suite. Did run CdcrBootstrapTest. Also, the CDCR docs need to be updated. ",
+            "author": "Erick Erickson",
+            "id": "comment-16124809"
+        },
+        {
+            "date": "2017-08-14T12:07:33+0000",
+            "content": "Thank you Erick for clarifying the root cause. I see LPV may very well not be the issue we are facing here, pardon my limited testing for this.\n\nThree things I tested on limited schedule to see issues are addressed with Erick's patch on branch_6x:\n\n1. Restart source and target clusters at different intervals, see if bootstrap is happening.\n2. On 2x2 source and target collection - clusters, shut down one node / leader to get the other nodes / follower as leader, see if bootstrap is happening.\n3. Observe behaviour of source and target tlogs across all cores in both source and target collections.\n\n1. Restart source and target clusters, see if bootstrap is happening.\n\nNo bootstrap except the obvious, when's required. The combinations I tested:\n1. CDCR stop, buffer enable, index X documents and then CDCR on, multiple restarts\n2. CDCR stop, buffer disable, index X documents and then CDCR on, multiple restarts\n3. CDCR stop, buffer enable,  index X documents and then CDCR on, buffer enable, multiple restarts\n4. CDCR stop, buffer disable,  index X documents and then CDCR on, buffer disable, multiple restarts\n5. Above 4 steps one after another on singly created source and target collections - clusters.\n\nThe expected behavior is observed, bootstrap when CDCR on.\n\n2.  On 2x2 source and target collection - clusters, shut down one node / leader to get the other nodes / follower as leader, see if bootstrap is happening.\n\nNo bootstrap except the obvious, when's required. The combinations I tested:\n1. CDCR stop, buffer enable, index X documents and then CDCR on, shut down the leader node\n2. CDCR stop, buffer disable, index X documents and then CDCR on, shut down the leader node\n3. CDCR stop, buffer enable,  index X documents and then CDCR on, buffer enable, shut down the leader node\n4. CDCR stop, buffer disable,  index X documents and then CDCR on, buffer disable, shut down the leader node\n5. Above 4 steps one after another on singly created source and target collections - clusters.\n\nThe expected behavior is observed, bootstrap when CDCR on. COLLECTIONCHECKPOINT and LASTPROCESSESVERSION are transferred / referred to corresponding new leader elected successfully. \n\n3. Observe behaviour of source and target tlogs across all cores in both source and target collections.\n\nThis was peculiar and as stated by Erick on an offline discussion, I had the same observations;\na) When buffer enable, all the tlogs are maintained forever on disk.\nb) Once we disable, when no indexing is taking place, it remains as it is.\nc) When a single document is indexed after that, the old tlogs gets purged, it doesn't maintain 10 tlogs ONLY as expected, but more which gradually decreases as we index along.\nd) There are times only 1-2 tlogs will be present in each core of source collections, as observed by Erick too, when we stop indexing all together or index slowly. Not sure of the reason, didn't had a chance to look into, but I speculate there is no need to maintain 10 or N definite number but to keep a tab on the last processed tlog version, it can be 2nd, 10th or ith, depends ?! ",
+            "author": "Amrit Sarkar",
+            "id": "comment-16125589"
+        },
+        {
+            "date": "2017-08-14T19:11:10+0000",
+            "content": "Thanks for testing! So net-net is that with this patch, with the exception of the tlog purging being a little confusing, the patch seems to fix CDCR?\n\nOn a relatively brief inspection of the code the 10 tlog bit is unimportant. The loop in CdcrUpdateLog.addOldLog removes old logs if and only if there's nothing pointing to it. In fact I don't really see the reason for even testing it, assuming that the \"if (!this.hasLogPointer(log)) {\"\nline preserves tlogs necessary for CDCR.\n\nI'm not sure we need to fix the fact that tlogs aren't getting purged quite the way we'd expect on this ticket, perhaps raise another one? Especially if this behavior is also present on 6.1, which I believe it is. CDCR is pretty broken with the infinite bootstrapping, but just a little confusing with the tlog retention. ",
+            "author": "Erick Erickson",
+            "id": "comment-16126249"
+        },
+        {
+            "date": "2017-08-15T01:04:42+0000",
+            "content": "This one against master. \n\nFixes precommit and has documentation changes.\n\nAll tests pass.\n\nI need to go over the doc changes again, but this is what it's looking like at this point. The major changes are an admonition about buffering and some explanation about what it's for. ",
+            "author": "Erick Erickson",
+            "id": "comment-16126693"
+        },
+        {
+            "date": "2017-08-15T18:50:32+0000",
+            "content": "Just asciidoc changes, somehow a bunch of my edits yesterday got lost. ",
+            "author": "Erick Erickson",
+            "id": "comment-16127702"
+        },
+        {
+            "date": "2017-08-16T12:29:40+0000",
+            "content": "Looks good to me, Erick! Thanks for fixing this. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16128716"
+        },
+        {
+            "date": "2017-08-16T23:03:33+0000",
+            "content": "Commit ac97931c7e5800b2e314545f54c4d524eb69b73b in lucene-solr's branch refs/heads/master from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ac97931 ]\n\nSOLR-11069: CDCR bootstrapping can get into an infinite loop when a core is reloaded ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16129578"
+        },
+        {
+            "date": "2017-08-16T23:09:30+0000",
+            "content": "Commit a850749ab32e57d0bd96a8517798febeaad9dec1 in lucene-solr's branch refs/heads/branch_7x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a850749 ]\n\nSOLR-11069: CDCR bootstrapping can get into an infinite loop when a core is reloaded\n\n(cherry picked from commit ac97931) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16129591"
+        },
+        {
+            "date": "2017-08-16T23:29:25+0000",
+            "content": "Commit 34139f7deb698611046263503272267179c0d315 in lucene-solr's branch refs/heads/branch_7_0 from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=34139f7 ]\n\nSOLR-11069: CDCR bootstrapping can get into an infinite loop when a core is reloaded\n\n(cherry picked from commit ac97931c7e5800b2e314545f54c4d524eb69b73b) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16129614"
+        },
+        {
+            "date": "2017-08-17T02:11:07+0000",
+            "content": "Commit e2477ecce2503f7c4f69ac1966c49691a3c977b8 in lucene-solr's branch refs/heads/branch_6x from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e2477ec ]\n\nSOLR-11069: CDCR bootstrapping can get into an infinite loop when a core is reloaded\n\n(cherry picked from commit ac97931c7e5800b2e314545f54c4d524eb69b73b) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16129767"
+        },
+        {
+            "date": "2017-08-17T02:24:24+0000",
+            "content": "Commit c7f9fcea4b4455c921987e4447b68cdbe046e2f6 in lucene-solr's branch refs/heads/branch_6_6 from Erick Erickson\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c7f9fce ]\n\nSOLR-11069: CDCR bootstrapping can get into an infinite loop when a core is reloaded\n\n(cherry picked from commit ac97931c7e5800b2e314545f54c4d524eb69b73b) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16129772"
+        },
+        {
+            "date": "2017-10-17T11:04:14+0000",
+            "content": "Bulk close after 7.1.0 release ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16207442"
+        }
+    ]
+}

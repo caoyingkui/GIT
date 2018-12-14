@@ -1,0 +1,115 @@
+{
+    "id": "SOLR-12121",
+    "title": "JWT Authentication plugin",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "Authentication"
+        ],
+        "type": "New Feature",
+        "fix_versions": [
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "A new Authentication plugin that will accept a Json Web Token (JWT) in the Authorization header and validate it by checking the cryptographic signature. The plugin will not perform\u00a0the authentication itself but assert that the user was authenticated by the service that issued the JWT token.\n\nJWT defined a number of standard claims, and user principal can be fetched from the sub\u00a0(subject) claim and passed on to Solr.\u00a0The plugin will always check the exp\u00a0(expiry) claim and\u00a0optionally enforce checks on the iss (issuer) and aud\u00a0(audience) claims.\n\nThe first version of the plugin will only support RSA signing keys and will support fetching the public key of the issuer through a\u00a0Json Web Key (JWK) file, either from a https URL or\u00a0from local file.",
+    "attachments": {
+        "image-2018-08-27-13-04-04-183.png": "https://issues.apache.org/jira/secure/attachment/12937257/image-2018-08-27-13-04-04-183.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-03-23T16:37:58+0000",
+            "content": "First version is ready for review in Github PR #343\n\nStill some TODO and NOCOMMIT. Lacks some end-to-end tests etc.\n\nSee sample RefGuide page here ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16411674"
+        },
+        {
+            "date": "2018-08-06T15:17:23+0000",
+            "content": "Soon to continue on this issue. Appreciate feedback of any kind on the work done so far! ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16570345"
+        },
+        {
+            "date": "2018-08-09T01:01:31+0000",
+            "content": "Move issue from deprecated 'In  Progress' back to 'Open' ",
+            "author": "Gavin",
+            "id": "comment-16574123"
+        },
+        {
+            "date": "2018-08-22T08:29:20+0000",
+            "content": "We want this plugin to handle inter-node requests when the request is initiated from a user, so the extra information in the token is conveyed to the other Solr nodes. Fine, we make our plugin implement HttpClientBuilderPlugin and implement logic to do so.\n\nBut if the request originates from Solr itself, such as scheduled jobs, Overseer tasks etc, then we don't have a valid JWT token and would like inter-node communication to be secured with PKI. Reading the code in CoreContainer#setupHttpClientForAuthPlugin it seems impossible to combine the two, if you want to handle some you have to handle all. Is that right, Noble Paul?\u00a0Suggestions on how to achieve this? ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16588547"
+        },
+        {
+            "date": "2018-08-22T09:30:22+0000",
+            "content": "It should be possible\n\n\u00a0\n\n\tImplement your own AuthenticationPlugin that implements\u00a0HttpClientBuilderPlugin\n\tWhen your plugin is initialized , it can accept CoreContainer as a constructor arg\n\tUse CoreContainer.getPkiAuthenticationPlugin() to get hold of the default PKI instance. Keep in mind that it is initialized anyway but it doesn't register an interceptor yet\n\tYour plugin should get a callback for every internode requests made if you register the interceptor in the getHttpClientBuilder(SolrHttpClientBuilder builder) method\n\tcheck the request if it contains your authentication headers. if not, it is a solr initiated request.\n\t\n\t\tIf your authentication is present, just set your own headers , else\n\t\tInvoke PKIAuthenticationPlugin.setHeader() . (Please note that it is a package private method, so you will need to have your class in the same package)\n\t\n\t\n\n ",
+            "author": "Noble Paul",
+            "id": "comment-16588622"
+        },
+        {
+            "date": "2018-08-22T14:02:28+0000",
+            "content": "Thanks Noble!\u00a0I was able to do steps 1-4, and have an interceptor that gets passed the HttpRequest and HttpContext objects.\n\nNow I'm trying to wrap my head around the cleanest way to\u00a0do step 5 in your list. I.e. how to get that initial Authorization\u00a0header to survive\u00a0all the hoops until the HttpShardHandler creates new clients and threads to distribute the request to all the shards.\n\nAs far as I can understand, headers are not copied across when new requests are made, only requestParams are. So the interceptor would not see any headers on all the sub shard requests. I don't think it would be correct to blindly copy all headers either. Storing the header on ThreadLocal would not work since sub requests are done in another threadPool. I could wrap\u00a0the HttpServletRequest object and add a custom requestParam in the queryString but I don't want it to look as if this was a user added parameter which would then get logged in solr log etc.\n\nA promising approach I think is to explicitly store the token/header\u00a0as a custom HttpServletRequest\u00a0attribute, e.g. \"solr.headersToAdd\" and then once the SolrRequest is created, copy that attribute over to a new List<Header>\u00a0property, which then the SolrClients will add as part of request(). Or am I complicating things here? ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16588890"
+        },
+        {
+            "date": "2018-08-22T15:54:23+0000",
+            "content": "You could create a custom Principal Object which may carry this extra data ",
+            "author": "Noble Paul",
+            "id": "comment-16589057"
+        },
+        {
+            "date": "2018-08-23T14:04:06+0000",
+            "content": "So the next question then is whether and how the Principal will be passed on from the original HttpServletRequest\u00a0so that it can be picked up from the process(HttpRequest request, HttpContext context) callback in the interceptor, in a different thread? ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16590261"
+        },
+        {
+            "date": "2018-08-24T22:24:39+0000",
+            "content": "I got it working with a custom Principal object carrying the token. But I had to \"help\" the Principal object jump from the original external request over to all the inter-node request objects, so that it could be picked up by the interceptor. Here are some code fragments of what I did:\n\nJWTAuthPlugin#authenticate():\n\nHttpServletRequestWrapper wrapper = new HttpServletRequestWrapper(request) {\n  @Override\n  public Principal getUserPrincipal() {\n    return authResponse.getPrincipal(); // Custom JWTPrincipal carrying the token and claims\n  }\n};\n\nHttpShardHandler#submit():\n\nThis is the code called by each handler to spawn a distributed request\n\n// If request has a Principal (authenticated user), extract it for passing on to the new shard request\nSolrRequestInfo requestInfo = SolrRequestInfo.getRequestInfo();\nfinal Principal userPrincipal = requestInfo == null ? null : requestInfo.getReq().getUserPrincipal();\n\nSolrRequest:\n\nSolrRequest is the base class of QueryRequest and did not have a userPrincipal member since this is a SolrJ request usually constructed on the client side and thus there would be no authenticated user. But when this object is used for sub requests based on an original user request, it makes sense to store the Principal here. In this case Principal can be any sub class carrying arbitrary data about the user, which can be picked up by AuthPlugin's HttpClient interceptor to set a request header or similar.\n\n// This user principal is typically used by Auth plugins during distributed/sharded search\nprivate Principal userPrincipal;\n\npublic void setUserPrincipal(Principal userPrincipal) {\n  this.userPrincipal = userPrincipal;\n}\n\npublic Principal getUserPrincipal() {\n  return userPrincipal;\n}\n\n\nCallable executed by\u00a0completionService in new threads:\n\nHttpShardHandler's submit() creates one Callable per shard and then sends them to completion service to execute in a new thread pool. We pick up the Principal object from the (final) userPrincipal variable populated above, and set the principal on the new QueryRequest (sub class of SolrRequest) object.\n\nCallable<ShardResponse> task = () -> {\n...\n  QueryRequest req = makeQueryRequest(sreq, params, shard);\n  req.setMethod(SolrRequest.METHOD.POST);\n  req.setUserPrincipal(userPrincipal); // New line to set original principal on request object\n\nHttpSolrClient#request():\n\nIn the request() method of the HttpSolrClient, we pick up userPrincipal from the incoming SolrRequest and send it to executeMethod()\n\npublic NamedList<Object> request(final SolrRequest request, final ResponseParser processor, String collection)\n...\n  return executeMethod(method, request.getUserPrincipal(), processor, isV2ApiRequest(request));\n\n\nHttpSolrClient#executeMethod:\n\nIn executeMethod we now put Principal object on the\u00a0HttpContext, which is part of the execute() call\n\nprotected NamedList<Object> executeMethod(HttpRequestBase method, Principal userPrincipal, final ResponseParser processor, final boolean isV2Api) throws SolrServerException {\n...\n  // Execute the method.\n  HttpClientContext httpClientRequestContext = HttpClientUtil.createNewHttpClientRequestContext();\n  if (userPrincipal != null) {\n    // Normally the context contains a static userToken to enable reuse resources.\n    // However, if a personal Principal object exists, we use that instead, also as a means\n    // to transfer authentication information to Auth plugins that wish to intercept the request later\n    httpClientRequestContext.setUserToken(userPrincipal);\n  }\n  final HttpResponse response = httpClient.execute(method, httpClientRequestContext);\n\n\nJWTAuthPlugin#getHttpClientBuilder:\n\nBack in our auth plugin we register an interceptor that eventually picks up the execute call from above. It lifts the httpContext, and if it contains a JWTPrincipal, then it can read the token from there, and set the Authorization header. If there is no JWTPrincipal, we delegate to PKI plugin and let it do its thing.\n\n@Override\npublic SolrHttpClientBuilder getHttpClientBuilder(SolrHttpClientBuilder builder) {\n  // Register interceptor for inter-node requests, that delegates to PKI if JWTPrincipal is not found on http context\n  HttpClientUtil.addRequestInterceptor(interceptor);\n  return builder;\n}\n\n// The interceptor class that adds correct header or delegates to PKI\nprivate class PkiDelegationInterceptor implements HttpRequestInterceptor {\n  @Override\n  public void process(HttpRequest request, HttpContext context) throws HttpException, IOException {\n    if (context instanceof HttpClientContext) {\n      HttpClientContext httpClientContext = (HttpClientContext) context;\n      if (httpClientContext.getUserToken() instanceof JWTPrincipal) {\n        JWTPrincipal jwtPrincipal = (JWTPrincipal) httpClientContext.getUserToken();\n        request.setHeader(HttpHeaders.AUTHORIZATION, \"Bearer \" + jwtPrincipal.token);\n        log.debug(\"Set JWT header on inter-node request\");\n        return;\n      }\n    }\n\n    if (coreContainer.getPkiAuthenticationPlugin() != null) {\n      log.debug(\"Inter-node request delegated from JWTAuthPlugin to PKIAuthenticationPlugin\");\n      coreContainer.getPkiAuthenticationPlugin().setHeader(request);\n    } else {\n      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, \n          \"JWTAuthPlugin wants to delegate inter-node request to PKI, but PKI plugin was not initialized\");\n    }\n  }\n}\n\n\nWell, it works, I have a passing integration test on a 2-node 2-shard cluster. Other things to note:\n\n\tAdmin requests such as create collection etc will always fallback to PKI; that's fine, I don't have a requirement for end-user auth on such inter-node reqs\n\tHave not yet tested this with distributed Update -\u00a0I believe we need a similar Principal transfer in DistributedUpdateProcessor\n\tI think we could be smarter with the PKI thing and interceptors. What if PKI always registered its interceptor, but the very first thing it would do is to ask the registered AuthPlugin whether it wants to attempt handling inter-node requests, and then call some new API on the plugin to allow it to do so, and only if the other plugin gave up, PKI would set its header. This would lead to cleaner code in plugins, and if PKI later changes its interceptor, we won't need to change a bunch of other plugins as well. Pseudo code:\n\nif (coreContainer.getAuthenticationPlugin() instanceof HttpClientBuilderPlugin) {\n  if (!coreContainer.getAuthenticationPlugin().interceptRequest(request, context)) {\n    // add our header\n  }\n} // else do nothing  \n\n\n\n\n\n\u00a0Other request flows\u00a0we should check? ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16592255"
+        },
+        {
+            "date": "2018-08-27T11:05:17+0000",
+            "content": "Attaching a sequence diagram to visualise the whole flow. New code to move Principal object around is highlighted\u00a0with yellow note boxes:\n\n ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16593487"
+        },
+        {
+            "date": "2018-08-28T19:26:39+0000",
+            "content": "Pushed new commits to PR\n\n\tTranfer of Principal object as explained above\n\tAlso transfer Principal for update requests (SolrCmdDistributor)\n\tIntegration tests (currently using plain HTTP requests, not SolrJ)\n\n\n\n\u00a0 ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16595489"
+        },
+        {
+            "date": "2018-09-04T08:33:11+0000",
+            "content": "Hi Jan H\u00f8ydahl, if it is possible can you make the necessary modification to jira/http2 branch (for Http2SolrClient). Sorry, I should do that my self, but the timeline for master 8.0 is kinda close. Thanks! ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16602758"
+        },
+        {
+            "date": "2018-09-04T09:38:36+0000",
+            "content": "Cao Manh Dat I think\u00a0the easiest is to tackle this on-demand, i.e. if http2 lands on master first, then this issue needs to adjust, or if this lands first then the http2 feature needs to adjust. I have a goal of landing this on master during September... ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16602826"
+        },
+        {
+            "date": "2018-09-05T22:03:21+0000",
+            "content": "Pushed new commits to PR:\n\n\tSupport for well-known opened-connect config endpoint\n\t\n\t\tThis will configure jwkUrl\u00a0automatically and also set iss from the config\n\t\n\t\n\tSupport for clientId\u00a0config, which will automatically set aud config to require cliendId as audience\n\tSupport for scope\u00a0config, with a list of valid scopes. If access token does not contain any of them, the request fails\n\tUse camelCase for param names, as for BasicAuth, e.g. blockUnknown instead of block_unknown\n\tValidate config and fail if unknown params given\n\tEnable config-edit API, using set-property\u00a0\n\tProvide an introspection spec\n\tUpdate refGuide\n\tCleaned up tests\n\n\n\nSo far I'm documenting that there is no\u00a0support for setting JWT header from SolrJ, and no support for using bin/solr with a JWT auth enabled cluster. I'll tackle that in followup issues. ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16604997"
+        },
+        {
+            "date": "2018-10-04T21:40:23+0000",
+            "content": "Spun off the Principal transfer logic to new issue\u00a0SOLR-12799 and marked that issue as a requirement to be committed before this one. ",
+            "author": "Jan H\u00f8ydahl",
+            "id": "comment-16638903"
+        }
+    ]
+}

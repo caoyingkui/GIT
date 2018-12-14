@@ -1,0 +1,76 @@
+{
+    "id": "SOLR-9470",
+    "title": "Deadlocked threads in recovery",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [],
+        "affect_versions": "6.2",
+        "status": "Closed",
+        "resolution": "Duplicate",
+        "priority": "Major"
+    },
+    "description": "Background: Booted up a cluster and replicas were in recovery. All replicas recovered minus one, and it was hanging on HTTP requests. Issued shutdown and solr would not shut down. Examined with JStack and found a deadlock had occurred. The relevant thread information is attached. Some information has been redacted as well (some custom URPs, IPs) from the stack traces.",
+    "attachments": {
+        "solr-deadlock.txt": "https://issues.apache.org/jira/secure/attachment/12826849/solr-deadlock.txt",
+        "solr-deadlock-2-r.txt": "https://issues.apache.org/jira/secure/attachment/12829921/solr-deadlock-2-r.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-09-09T16:52:54+0000",
+            "author": "Michael Braun",
+            "content": "Dug more into this and only two threads are actually part of the core deadlock - \n\n\"recoveryExecutor-3-thread-1-processing-n:x.x.x.166:8983_solr x:mycollection_shard1_replica2 s:shard1 c:mycollection r:core_node97\":\n\n\t- parking to wait for  <0x00007fc1b0a97250> (a java.util.concurrent.locks.ReentrantLock$FairSync)\n\tat java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)\n\tat java.util.concurrent.locks.AbstractQueuedSynchronizer.parkAndCheckInterrupt(AbstractQueuedSynchronizer.java:836)\n\tat java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireQueued(AbstractQueuedSynchronizer.java:870)\n\tat java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire(AbstractQueuedSynchronizer.java:1199)\n\tat java.util.concurrent.locks.ReentrantLock$FairSync.lock(ReentrantLock.java:224)\n\tat java.util.concurrent.locks.ReentrantLock.lock(ReentrantLock.java:285)\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1804)\n\tat org.apache.solr.handler.IndexFetcher.openNewSearcherAndUpdateCommitPoint(IndexFetcher.java:746)\n\tat org.apache.solr.handler.IndexFetcher.fetchLatestIndex(IndexFetcher.java:523)\n\tat org.apache.solr.handler.IndexFetcher.fetchLatestIndex(IndexFetcher.java:254)\n\tat org.apache.solr.handler.ReplicationHandler.doFetch(ReplicationHandler.java:397)\n\n\n\nIt first acquires the iwLock ( 0x00007fc1b0a96fe0) by this mechanism:\norg.apache.solr.update.DefaultSolrCoreState.newIndexWriter(DefaultSolrCoreState.java 210)\norg.apache.solr.update.DirectUpdateHandler2.newIndexWriter(DirectUpdateHandler2.java 698)\norg.apache.solr.handler.IndexFetcher.fetchLatestIndex(IndexFetcher.java 520)\n\n\nThen as you see from the stacktrace above, it's waiting on the openSearcherLock, which is held by the thread below:\n\n\"qtp1879034789-189\":\n\nat sun.misc.Unsafe.park(Native Method)\n\t- parking to wait for  <0x00007fc1b0a96fe0> (a java.util.concurrent.locks.ReentrantReadWriteLock$NonfairSync)\n\tat java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:215)\n\tat java.util.concurrent.locks.AbstractQueuedSynchronizer.doAcquireSharedNanos(AbstractQueuedSynchronizer.java:1037)\n\tat java.util.concurrent.locks.AbstractQueuedSynchronizer.tryAcquireSharedNanos(AbstractQueuedSynchronizer.java:1328)\n\tat java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock.tryLock(ReentrantReadWriteLock.java:871)\n\tat org.apache.solr.update.DefaultSolrCoreState.lock(DefaultSolrCoreState.java:159)\n\tat org.apache.solr.update.DefaultSolrCoreState.getIndexWriter(DefaultSolrCoreState.java:104)\n\tat org.apache.solr.core.SolrCore.openNewSearcher(SolrCore.java:1601)\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1806)\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1552)\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1487)\n\tat org.apache.solr.request.SolrQueryRequestBase.getSearcher(SolrQueryRequestBase.java:115)\n\tat org.apache.solr.handler.admin.LukeRequestHandler.handleRequestBody(LukeRequestHandler.java:130)\n\tat org.apache.solr.handler.RequestHandlerBase.handleRequest(RequestHandlerBase.java:154)\n\n\n\nIt's already holding the openSearchLock (0x00007fc1b0a97250) and wants the iwLock. It gets the openSearchLock by this mechanism:\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1804) is where it does the actual lock of openSearcher.lock, called by....\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1552)\n\tat org.apache.solr.core.SolrCore.getSearcher(SolrCore.java:1487)\n\tat org.apache.solr.request.SolrQueryRequestBase.getSearcher(SolrQueryRequestBase.java:115)\n\tat org.apache.solr.handler.admin.LukeRequestHandler.handleRequestBody(LukeRequestHandler.java:130) ",
+            "id": "comment-15477568"
+        },
+        {
+            "date": "2016-09-12T04:35:00+0000",
+            "author": "David Smiley",
+            "content": "Nice analysis \u2013 a lock ordering problem.  I don't have a lot of familiarity with this internal aspect of Solr, but I have more faith in the code path of SolrCore.getSearcher() to get locks in the right order (as it's hammered all the time) than that of IndexFetcher/Replication.  That getSearcher first obtains the openSearcher lock and then the indexWriter lock makes sense to me.   \n\nI don't follow something you said:  You explained how IndexFetcher (line 520) grabs the iwLock by calling DefaultSolrCoreState.newIndexWriter(DefaultSolrCoreState.java 210).  I see this. However, that method promptly releases the lock.  Granted during all this I think openSearcher should be held and it doesn't seem to be but despite that, the stack trace, to me, doesn't show that to be a problem in this instance.  I do see that the iwLock is held (by cross-referencing the memory reference with that of another thread awaiting it)... but it's not evident to me where exactly iwLock is acquired such that it isn't released at the time IndexFetcher line 523 is reached. ",
+            "id": "comment-15483039"
+        },
+        {
+            "date": "2016-09-12T17:58:36+0000",
+            "author": "Michael Braun",
+            "content": "David Smiley you're right - will dig deeper and figure out where it's actually being acquired. ",
+            "id": "comment-15484798"
+        },
+        {
+            "date": "2016-09-22T19:43:09+0000",
+            "author": "Michael Braun",
+            "content": "Replicated again - redacted thread dumps attached for relevant threads. Also confirmed we see some of the same lines that were shown in the relevant SOLR-9278 deadlock ticket, where the index files can't be deleted, as shown below:\n\n\n09-22 17:24:42.317  - we started the process\n\n09-22 17:25:43.716 org.apache.solr.handler.IndexFetcher (recoveryExecutor-3-thread-1-processing-n:x.x.x.75:8983_solr x:collection_shard1_replica1 s:shard1 c:collection) [s:shard1] IndexFetcher unable to cleanup unused lucene index files so we must do a full copy instead globalRequestId: \n09-22 17:25:43.716 org.apache.solr.handler.IndexFetcher (recoveryExecutor-3-thread-1-processing-n:x.x.x.75:8983_solr x:collection_shard1_replica1 s:shard1 c:collection) [s:shard1] IndexFetcher slept for 30000ms for unused lucene index files \nto be delete-able globalRequestId: \nINFO  09-22 17:25:43.864 org.apache.solr.update.DefaultSolrCoreState (recoveryExecutor-3-thread-1-processing-n:x.x.x.75:8983_solr x:collection_shard1_replica1 s:shard1 c:collection) [s:shard1] Rollback old IndexWriter... core=collection_shard1_replica1\n globalRequestId: \n \n\n\nI'm hoping that the patch in SOLR-9278 is valid and would fix the problem? ",
+            "id": "comment-15514291"
+        },
+        {
+            "date": "2016-09-29T18:46:47+0000",
+            "author": "Michael Braun",
+            "content": "We are now running with the patch in SOLR-9278 and have not yet run into the issue again. Is someone able to take a look at the patch included in that ticket?  ",
+            "id": "comment-15533669"
+        },
+        {
+            "date": "2016-09-30T13:30:39+0000",
+            "author": "Kevin Risden",
+            "content": "Closing as duplicate of SOLR-9278 ",
+            "id": "comment-15536008"
+        },
+        {
+            "date": "2016-10-06T15:47:06+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit ce22c2697c1342fd670e3bac460a53aef90d1d80 in lucene-solr's branch refs/heads/master from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ce22c26 ]\n\nSOLR-9470: Index replication interactions with IndexWriter can cause deadlock. ",
+            "id": "comment-15552291"
+        },
+        {
+            "date": "2016-10-06T15:47:51+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 82440f307a211d8f05fe729ec1361bcd1abd0e4e in lucene-solr's branch refs/heads/branch_6x from markrmiller\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=82440f3 ]\n\nSOLR-9470: Index replication interactions with IndexWriter can cause deadlock. ",
+            "id": "comment-15552293"
+        },
+        {
+            "date": "2016-10-06T15:52:03+0000",
+            "author": "Mark Miller",
+            "content": "Tagged this with the dupe issue. I'll flip it. ",
+            "id": "comment-15552304"
+        }
+    ]
+}

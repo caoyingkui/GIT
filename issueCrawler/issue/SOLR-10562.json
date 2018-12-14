@@ -1,0 +1,50 @@
+{
+    "id": "SOLR-10562",
+    "title": "TestSolrCLIRunExample failures indicating documents just indexed are not all searchable.",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "6.6,                                            7.0",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I've been beating the heck out of some test cases for fear that\nSOLR-10007 really messed things up and I can get a pretty regular test\nfailure for TestSolrCLIRunExample.testInteractiveSolrCloudExample, but\nit doesn't make sense.\n\nSo I went back to a revision before SOLR-10007 and it still fails.\nBut the failure is \"impossible\". I put a bunch of log.error messages\nin and, for experimental purposes a for loop in the test. Here's the\nlines that fail in the original:\n\nfor (idx = 0; idx < 10; ++idx) {\n construct a SolrInputDoc and then:\n  cloudClient.add(SolrInputDoc);\n}\n\ncloudClient.commit();\n\nQueryResponse qr = cloudClient.query(new SolrQuery(\"str_s:a\"));\nif (qr.getResults().getNumFound() != numDocs) {\n  fail(\"Expected \"+numDocs+\" to be found in the \"+collectionName+\n      \" collection but only found \"+qr.getResults().getNumFound());\n}\n\n\n\nIf I put the above (not the commit, just the query and the test) in a\nloop and check the query 10 times with a 1 second sleep if the numDocs\n!= getNumFound(). Quite regularly I'll see a message in the log file\nthat getNumFound() != numDocs, but after a few loops getNumFound() ==\nnumDocs and the test succeeds.\n\ncloudClient is what you'd expect:\ncloudClient = getCloudSolrClient(executor.solrCloudCluster.getZkServer().getZkAddress());\n\nSo unless I'm hallucinating, any tests that rely on\ncloudClient.commit() insuring that all docs sent to the cluster are\nsearchable will potentially fail on occasion.\n\nI looked over the JIRAs briefly and don't see any mentions, of a\nsimilar problem, but I may have missed it.\n\nThe logging I'm writing from the update handler seems to show it to be doing the right thing. Just late.\n\nI'll attach some data along with a \"patch\" which generates the logging information. I also attempted to submit a single batch rather than 10 individual docs and that fails too.",
+    "attachments": {
+        "runcli_12.log": "https://issues.apache.org/jira/secure/attachment/12864821/runcli_12.log",
+        "1_1.res": "https://issues.apache.org/jira/secure/attachment/12864817/1_1.res",
+        "1_2.res": "https://issues.apache.org/jira/secure/attachment/12864818/1_2.res",
+        "2_1.res": "https://issues.apache.org/jira/secure/attachment/12864819/2_1.res",
+        "debug.patch": "https://issues.apache.org/jira/secure/attachment/12864822/debug.patch",
+        "2_2.res": "https://issues.apache.org/jira/secure/attachment/12864820/2_2.res"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-04-24T19:58:10+0000",
+            "content": "BTW, assigned to myself so I don't lose track of it, but I probably won't work on it for a while so please feel free to take it.\n\nAnyway, the *.res files come from runcli_12.log and show the sequence in updatehandler for the respective cores.\n\nruncli_12.log shows (look for EOE) is the entire log, you can see that the commit is called (and returned from) before the query is made. We even look like we're waiting for the searcher to open. It looks like every shard has its commit called before we issue the query. So I'm pretty baffled.\n\nI do wonder how many of our sporadic test failures are a result of this problem, certainly anything that fails because of unexpected document counts is suspicious.\n\nYou can work around this by the logic I put in to test where we loop for, say, 10 seconds or until the doc counts are what we expect, but that's yucky.\n\nThe patch is on trunk but against sha 1b81dcde (the one before SOLR-10007) ",
+            "author": "Erick Erickson",
+            "id": "comment-15981778"
+        },
+        {
+            "date": "2017-04-24T22:55:22+0000",
+            "content": "This broke my mental model of SolrCloud and all the Jepsen tests that I did, so I had to dig deeper.\n\nThe reason we see this behavior in this test is because SolrCLI updates the autoSoftCommit settings using the Config API when running Solr in cloud mode. The Config API internally reloads all the replicas belonging to the collection asynchronously. This reload then interacts in a weird way in the test log that Erick attached.\n\nHere is the sequence of events on testCloudExamplePrompt_shard1_replica2\n\n\tT24126 Doc0 is added to IW\n\tT24388 Core is being reloaded \u2013 this closes the old IW and opens a new one thereby committing doc0 to disk\n\t\n\t\tOther docs keep getting added to IW's buffer (remember IW is shared between old and new core, reload is still in progress, so all requests are going to old core)\n\t\tT24445 Indexing finishes, client calls hard commit on old core!\n\t\tT24693 new reloaded core opens Searcher@59ceb956 using the IW \u2013 this should have all the data \u2013 note that hard commit is still in progress\n\t\tT24703 Searcher@59ceb956 is registered with new core\n\t\tNew core is fully loaded and active \u2013 will take part in all future requests\n\t\n\t\n\tOld core opens searcher Searcher@6e0502e7 which goes to disk directly bypassing IW buffer\n\t\n\t\tT24766 Searcher@6e0502e7 is registered with old core\n\t\tT24767 commit finishes, and old core is closed because this commit request was the last one holding the old core's reference!\n\t\n\t\n\tAll search requests keep going to testCloudExamplePrompt_shard1_replica2 which has a reloaded core with old data (i.e. 1 doc only)\n\n\n\nFinally a search request hits a different replica testCloudExamplePrompt_shard1_replica1 and gets the latest count of the documents.\n\nTL;DR\nIndexing during reloads can cause apparent data loss \u2013 the data exists on disk but may not be searchable if a commit operation starts before the core reload completes due to configuration changes. In such a state, an RTG will show the latest data and any subsequent commits will make the data visible to searchers. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-15982059"
+        },
+        {
+            "date": "2017-04-24T23:11:12+0000",
+            "content": "Nice sleuthing Shalin Shekhar Mangar! I can make this happen pretty reliably so if you want me to beat it up let me know. I'm not sure I'll be able to find time to work on the code though.\n\nMark Miller This may be behind a number of the intermittent test failures, we'll see if Shalin comes up with a solution.\n ",
+            "author": "Erick Erickson",
+            "id": "comment-15982084"
+        },
+        {
+            "date": "2017-07-08T01:47:07+0000",
+            "content": "I've update the summary of this issue to specifically address the observable situation noted in the issue description, and opened a new SOLR-11035 to address the root cause (rather then convoluting the history/descrption of this jira directly) ",
+            "author": "Hoss Man",
+            "id": "comment-16078894"
+        }
+    ]
+}

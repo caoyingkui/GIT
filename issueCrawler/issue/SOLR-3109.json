@@ -1,0 +1,154 @@
+{
+    "id": "SOLR-3109",
+    "title": "group=true requests result in numerous redundant shard requests",
+    "details": {
+        "affect_versions": "3.5,                                            4.0-ALPHA",
+        "status": "Closed",
+        "fix_versions": [
+            "3.6",
+            "4.0-ALPHA"
+        ],
+        "components": [
+            "search"
+        ],
+        "type": "Bug",
+        "priority": "Critical",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "During the second phase of a group query, the collator sends a query to each of the shards.  The purpose of this query is for shards to respond with the doc ids that match the set of group ids returned from the first phase.  The problem is that it sends this second query to each shard multiple times.  Specifically, in an environment with n shards, each shard will be hit with an identical query n times during the second phase of query processing, resulting in O(n 2) performance where n is the number of shards.\n\nI have traced this bug down to a single line in TopGroupsShardRequestFactory.java, and I am attaching a patch.",
+    "attachments": {
+        "SOLR-3109-lucene_solr_3_5.patch": "https://issues.apache.org/jira/secure/attachment/12514023/SOLR-3109-lucene_solr_3_5.patch",
+        "SOLR-3109.patch": "https://issues.apache.org/jira/secure/attachment/12513763/SOLR-3109.patch",
+        "SOLR-3109-Backport-of-grouping-performace-fix-to-3.x.patch": "https://issues.apache.org/jira/secure/attachment/12514008/SOLR-3109-Backport-of-grouping-performace-fix-to-3.x.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Russell Black",
+            "id": "comment-13203303",
+            "date": "2012-02-08T05:59:32+0000",
+            "content": "The patch changes this line of code in TopGroupsShardRequestFactory.java:\n\nsreq.actualShards = new String[] {shard};\n\n\nbecomes \n\nsreq.shards = new String[] {shard};\n\n\n\nTo see why this was a problem, look at SearchHandler.java line 249:\n\nsreq.actualShards = sreq.shards // sets actualShards to null\nif (sreq.actualShards==ShardRequest.ALL_SHARDS ) { //ALL_SHARDS is null\n  sreq.actualShards = rb.shards; // every shard!\n}\n\n\n\nThis sets actualShards to null, which means send the request to every shard. "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13203353",
+            "date": "2012-02-08T08:09:54+0000",
+            "content": "That doesn't look good... Thanks for bringing this up! "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13203990",
+            "date": "2012-02-08T21:14:12+0000",
+            "content": "I noticed that the distributed test failed with this patch. After some digging I found out that the TopGroupsShardResponseProcessor can't really deal with multiple ShardRequests... I've updated the patch so that only one ShardRequest is created by the TopGroupsShardRequestFactory. Test passes now and I don't see any redundant real http requests being generated. \n\nRussell can you confirm this as well? "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13204065",
+            "date": "2012-02-08T22:34:39+0000",
+            "content": "Martijn, I also noticed that TopGroupsShardResponseProcessor can't deal with multiple ShardRequests (although it looks like it wouldn't be to hard to add this ability).  At any rate, your approach of returning a single ShardRequest containing all relevant shards sounds like the right one.  I went one step further and refactored TopGroupsShardRequestFactory.java because there was significant code duplication in the class's two primary methods.  \n\nIn my testing I also discovered a closely related problem.  The bug is in the data structure used to map search groups to the shards which contain them.  ResponseBuilder.searchGroupToShard assumes that a given search group only resides on one shard.  I could not find this assumption documented anywhere, nor can I find a reason such a restriction need be imposed.  This structure is populated by SearchGroupShardResponseProcessor.  There is a race condition there, wherein the last shard to report a search group will be assumed to be the only shard containing the search group.  This data structure is used in TopGroupsShardRequestFactory.createRequestForSpecificShards() to know which shards to query.  This means you can get a different set of shards to query depending on shard query order.  \n\nI have changed the structure to allow a search group to be present in multiple shards.  \n\nPatch to follow.   "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13204362",
+            "date": "2012-02-09T08:38:22+0000",
+            "content": "Thanks for the refactoring!\n\n\nThe bug is in the data structure used to map search groups to the shards which contain them. ResponseBuilder.searchGroupToShard assumes that a given search group only resides on one shard. I could not find this assumption documented anywhere, nor can I find a reason such a restriction need be imposed.\nThere is no such restriction. A search group can reside on more than one shard. I wonder why this issue didn't result in test failure / bugs from the beginning. I guess b/c of the redundant requests all shards were queried and this way the end result was still correct. At least the latest patch I added should have resulted in a test failure but it didn't. Can you share how you did this testing? This can then be added to the TestDistributedGrouping test class. "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13204533",
+            "date": "2012-02-09T14:01:53+0000",
+            "content": "The current TestDistributedGrouping test case is constructed in such a way that each record has a unique value for it's search group field (i1), so that there is never more than one record in any given search group.  This style of indexing conforms to the restriction discussed earlier.  This is likely the reason there were no test failures.   "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13204612",
+            "date": "2012-02-09T16:12:08+0000",
+            "content": "Yes, that might be the reason. The TestDistributedGrouping needs to be changed, so that a search group contains multiple records. "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13204653",
+            "date": "2012-02-09T17:04:27+0000",
+            "content": "In TestDistributedGrouping you wrote the following comment:\n\n\n // In order to validate this we need to make sure that during indexing that all documents of one group only occur on the same shard\n\n\n\nI wanted to understand the reason for that comment before making any changes to the test case.  (Assuming you wanted me to update the test case \u2013 if not, I'll leave the test case in your hands) "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13204737",
+            "date": "2012-02-09T18:55:20+0000",
+            "content": "No worries  I didn't want to move this work to anyone. Just wanted to say that the test needs to be updated.\n\nI put that comment b/c in the following three lines group.ngroups and group.truncate features are tested. These features only work properly if documents belonging to a group reside in the same shard. If documents belonging to a group do occur in more than one shard then the results are very likely incorrect.\n\nTomorrow I will update the test case and get this patch committed. If you want to update the test case and have time for that that would be great! "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13204745",
+            "date": "2012-02-09T19:09:28+0000",
+            "content": "I'll let you do the test case, as I don't have a lot of time to spend on this.  If there is a possibility of another 3.x release, I would like to backport the patch the 3x branch as well.  Let me know, and I can create the 3x backport once you have updated the test case and have your final 4.0 patch.  I have already created a 3_5 backport that we will be using internally until the next release.   "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13204773",
+            "date": "2012-02-09T19:41:40+0000",
+            "content": "You can share your 3.5 patch as you have it now. I think that applying the test changes to 3x branch isn't much effort.\nAs far as I know there will be a 3.6 release, so this bug fix will also be included in the this release.  "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13204778",
+            "date": "2012-02-09T19:46:49+0000",
+            "content": "Russell, when attaching a patch can you click on the option box with the label:\nGrant license to ASF for inclusion in ASF works \n\nAssuming that you want to include your bug fixes to Solr. "
+        },
+        {
+            "author": "Cody Young",
+            "id": "comment-13204841",
+            "date": "2012-02-09T20:48:09+0000",
+            "content": "\nThe bug is in the data structure used to map search groups to the shards which contain them. ResponseBuilder.searchGroupToShard assumes that a given search group only resides on one shard. I could not find this assumption documented anywhere, nor can I find a reason such a restriction need be imposed.\n\nPerhaps this could be left in as an advanced option. It would be a performance boost for anyone who can guarantee that a group will reside wholly on a single shard.\n\ngroup.distributeGroupCollation=true|false defaults to true "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13204862",
+            "date": "2012-02-09T20:58:32+0000",
+            "content": "\nPerhaps this could be left in as an advanced option. It would be a performance boost for anyone who can guarantee that a group will reside wholly on a single shard.\n\ngroup.distributeGroupCollation=true|false defaults to true\n\nAs the patch currently stands, someone who can guarantee that a group will reside wholly on a single shard will benefit already because it will only send the query the shard that contains the group of interest.  There would be no need to have a separate advanced option.  I simply made the data structure allow for the possibility of having multiple shards per group, but there is no additional overhead for the single-shard case.   "
+        },
+        {
+            "author": "Greg Bowyer",
+            "id": "comment-13204886",
+            "date": "2012-02-09T21:21:20+0000",
+            "content": "Since I need to test this to see if it is responsible for my large profiler costs spent in scoring and grouping I also backported this\n\nPatch attached that does a backport to Solr 3.5 +\n\nIf my patch is terrifying please scream at me and replace it with a better one, but I figure it will be much the one already commented on. "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13204973",
+            "date": "2012-02-09T22:40:53+0000",
+            "content": "Greg, I had some trouble applying your patch to my code base, although visually it looks like the right changes.  Is your patch intended for the 3_5 branch or 3x branch?  I have attached my own version of the patch.  It is a patch against the 3.5 branch (http://svn.apache.org/repos/asf/lucene/dev/branches/lucene_solr_3_5/). "
+        },
+        {
+            "author": "Greg Bowyer",
+            "id": "comment-13205088",
+            "date": "2012-02-10T00:14:28+0000",
+            "content": "Its for the 3.5 branch, but like I said I was jumping the gun, if your patch applies forget mine and go with that "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13205513",
+            "date": "2012-02-10T15:48:27+0000",
+            "content": "Re-uploaded the same 4.0 patch as before, this time with \"Grant license to ASF\" checked. "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13206571",
+            "date": "2012-02-13T00:14:03+0000",
+            "content": "\nThe current TestDistributedGrouping test case is constructed in such a way that each record has a unique value for it's search group field (i1), so that there is never more than one record in any given search group. This style of indexing conforms to the restriction discussed earlier. This is likely the reason there were no test failures.\nI think this issue doesn't exist in the released versions of Solr / 4.0-dev. Due to the bug that all shards were queried for each ShardRequest instance and all the matching top search groups still arrived at the right shard. Only after applying the changes to TopGroupsShardRequestFactory I could let the distributed grouping test fail. "
+        },
+        {
+            "author": "Martijn van Groningen",
+            "id": "comment-13206575",
+            "date": "2012-02-13T00:15:51+0000",
+            "content": "Committed to branch3x and trunk.\nThanks Russell and Greg for reporting and fixing this issue! "
+        },
+        {
+            "author": "Russell Black",
+            "id": "comment-13206588",
+            "date": "2012-02-13T00:35:27+0000",
+            "content": "Thanks for the quick turnaround on this! It was fun to contribute.   "
+        }
+    ]
+}

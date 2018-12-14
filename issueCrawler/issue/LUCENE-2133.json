@@ -1,0 +1,306 @@
+{
+    "id": "LUCENE-2133",
+    "title": "[PATCH] IndexCache: Refactoring of FieldCache, FieldComparator, SortField",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/search"
+        ],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "2.9.1,                                            3.0",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "Hi all,\n\nup to the current version Lucene contains a conceptual flaw, that is the FieldCache. The FieldCache is a singleton which is supposed to cache certain information for every IndexReader that is currently open\n\nThe FieldCache is flawed because it is incorrect to assume that:\n1. one IndexReader instance equals one index. In fact, there can be many clones (of SegmentReader) or decorators (FilterIndexReader) which all access the very same data.\n2. the cache information remains valid for the lifetime of an IndexReader. In fact, some IndexReaders may be reopen()'ed and thus they may contain completely different information.\n3. all IndexReaders need the same type of cache. In fact, because of the limitations imposed by the singleton construct there was no implementation other than FieldCacheImpl.\n\nFurthermore, FieldCacheImpl and FieldComparator are bloated by several static inner-classes that could be moved to package level.\n\nThere have been a few attempts to improve FieldCache, namely LUCENE-831, LUCENE-1579 and LUCENE-1749, but the overall situation remains the same: There is a central registry for assigning Caches to IndexReader instances.\n\nI now propose the following:\n1. Obsolete FieldCache and FieldCacheKey and provide index-specific, extensible cache instances (\"IndexCache\"). IndexCaches provide common caching functionality for all IndexReaders and may be extended (for example, SegmentReader would have a SegmentReaderIndexCache and store different data than a regular IndexCache)\n2. Add the index-specific field cache (IndexFieldCache) to the IndexCache. IndexFieldCache is an interface just like FieldCache and may support different implementations.\n3. The IndexCache instances may be flushed/closed by the associated IndexReaders whenever necessary.\n4. Obsolete FieldCacheSanityChecker because no more \"insanities\" are expected (or at least, they do not impact the overall performance)\n5. Refactor FieldCacheImpl and the related classes (FieldComparator, SortField) \n\nI have provided an patch which takes care of all these issues. It passes all JUnit tests.\n\nThe patch is quite large, admittedly, but the change required several modifications and some more to preserve backwards-compatibility. Backwards-compatibility is preserved by moving some of the updated functionality in the package org.apache.lucene.search.fields (field comparators and parsers, SortField) while adding wrapper instances and keeping old code in org.apache.lucene.search.\n\nIn detail and besides the above mentioned improvements, the following is provided:\n1. An IndexCache specific for SegmentReaders. The two ThreadLocals are moved from SegmentReader to SegmentReaderIndexCache.\n2. A housekeeping improvement to CloseableThreadLocal. Now delegates the close() method to all registered instances by calling an onClose() method with the threads' instances.\n3. Analyzer.close now may throw an IOException (this already is covered by java.io.Closeable).\n4. A change to Collector: allow IndexCache instead of IndexReader being passed to setNextReader()\n5. SortField's numeric types have been replaced by direct assignments of FieldComparatorSource. This removes the \"switch\" statements and the possibility to throw IllegalArgumentExceptions because of unsupported type values.\n\nThe following classes have been deprecated and replaced by new classes in org.apache.lucene.search.fields:\n\n\tFieldCacheRangeFilter (=> IndexFieldCacheRangeFilter)\n\tFieldCacheTermsFilter (=> IndexFieldCacheTermsFilter)\n\tFieldCache (=> IndexFieldCache)\n\tFieldCacheImpl (=> IndexFieldCacheImpl)\n\tall classes in FieldCacheImpl (=> several package-level classes)\n\tall subclasses of FieldComparator (=> several package-level classes)\n\n\n\nFinal notes:\n\n\tThe patch would be simpler if no backwards compatibility was necessary. The Lucene community has to decide which classes/methods can immediately be removed, which ones later, which not at all. Whenever new classes depend on the old ones, an appropriate notice exists in the javadocs.\n\tThe patch introduces a new, deprecated class IndexFieldCacheSanityChecker.java which is just there for testing purposes, to show that no sanity checks are necessary any longer. This class may be removed at any time.\n\tI expect that the patch does not impact performance. On the contrary, as the patch removes a few unnecessary checks we might even see a slight speedup. No benchmarking has been done so far, though.\n\tI have tried to preserve the existing functionality wherever possible and to focus on the class/method structure only. We certainly may improve the caches' behavior, but this out of scope for this patch.\n\tThe refactoring finally makes the high duplication of code visible: For all supported atomic types (byte, double, float, int, long, short) three classes each are required: *Cache, *Comparator and *Parser. I think that further simplification might be possible (maybe using Java generics?), but I guess the current patch is large enough for now.\n\n\n\nCheers,\nChristian",
+    "attachments": {
+        "LUCENE-2133.patch": "https://issues.apache.org/jira/secure/attachment/12427342/LUCENE-2133.patch",
+        "LUCENE-2133-complete.patch": "https://issues.apache.org/jira/secure/attachment/12427378/LUCENE-2133-complete.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2009-12-08T07:45:00+0000",
+            "content": "The main patch (for src/java) ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787355"
+        },
+        {
+            "date": "2009-12-08T07:46:31+0000",
+            "content": "Patch for JUnit tests (src/test) to enable them to use the new API\n(may be applied after approval of main patch) ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787356"
+        },
+        {
+            "date": "2009-12-08T07:47:07+0000",
+            "content": "Patch for demo code (src/demo), may be applied after approval of main patch ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787357"
+        },
+        {
+            "date": "2009-12-08T07:47:30+0000",
+            "content": "Patch for contrib code (src/contrib), may be applied after approval of main patch ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787358"
+        },
+        {
+            "date": "2009-12-08T09:04:03+0000",
+            "content": "Thanks for the patch and the explanation!\n\nSome notes, without a deep insight:\n\n\tThe problem with your current patch is the same as with the other propsals: backwards compatibility is not yet adressed, but is the most hairy problem with all other approaches.\n\tThe change of setNextReader() to use only the cache may not be the correct approach, as the collection of results is IndexReader-specific and not cache-specific (the Collectors in core for sorting only need that, but other collectors outside Lucene, e.g. in Solr need the IndexReader). It is e.g. needed for building filters and so on.\n\tThe solution for the above point is the same like with all other changes: IndexReader needs a method to get a cache instance not the other way round. By this the collector.setNextReader change is obsolete.\n\tAlso the patch file changes files, that are not related or removes import statements, that are clearly marked as \"// javadocs only\".\n\tFor version 3.1: The \"affects version\", setting should be 2.9/3.0, as 3.1 is not yet released. An fix version cannot be yet given, thats correct.\n\n\n\nThere may be more problems, but I will review the patch more detailed!\n\nUwe ",
+            "author": "Uwe Schindler",
+            "id": "comment-12787373"
+        },
+        {
+            "date": "2009-12-08T09:19:38+0000",
+            "content": "Hi Uwe,\n\nthanks for reviewing. Just a quick response to your comment:\n\nThe problem with your current patch is the same as with the other propsals: backwards compatibility is not yet adressed, but is the most hairy problem with all other approaches.\n\nAs I wrote, the patch does provide backwards compatibility. Please correct me if I am wrong \nI think actually over-stressed the backwards-compatibility issue because many classes were marked as \"Expert; can be changed in incompatible ways in the next release\" (e.g. SortField/FieldComparator, Collector)\n\nThe change of setNextReader() to use only the cache may not be the correct approach, as the collection of results is IndexReader-specific and not cache-specific (the Collectors in core for sorting only need that, but other collectors outside Lucene, e.g. in Solr need the IndexReader). It is e.g. needed for building filters and so on.\n\nYou can access the IndexReader from IndexCache and vice versa. The patch actually contains a few changes for contrib where this is actually utilized.\n\nPassing IndexCache instead of IndexReader to setNextReader gives a slight gain in performance for most cases (i.e. whenever only the IndexCache is accessed), since there is no need to traverse the IndexReader-to-IndexCache method chain (IndexReader#getIndexCache() and the synchronized getOrCreateIndexCache()) for each call to setNextReader.\n\nIn all the other cases, newCache.getIndexReader() gives full access to the IndexReader. There even is a default method which calls the (now-to-be-deprecated) newIndexReader(IndexReader,int) method, so there are actually zero changes necessary for existing code.\n\nAlso the patch file changes files, that are not related or removes import statements, that are clearly marked as \"// javadocs only\".\n\nThe corresponding references in the javadocs comments have been removed (e.g. FieldCache has been replaced to IndexFieldCache), so it made sense to remove the imports as well.\n\nFor version 3.1: The \"affects version\", setting should be 2.9/3.0, as 3.1 is not yet released. An fix version cannot be yet given, thats correct.\n\nIndeed.\n\n\nBest regards,\nChristian ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787378"
+        },
+        {
+            "date": "2009-12-08T10:06:36+0000",
+            "content": "The change of setNextReader() to use only the cache may not be the correct approach, as the collection of results is IndexReader-specific and not cache-specific (the Collectors in core for sorting only need that, but other collectors outside Lucene, e.g. in Solr need the IndexReader). It is e.g. needed for building filters and so on.\n\nThis is one of the backwards breaks. As noted, the Collector abstract methods cannot be changed and should not, as the IndexReader is the important part used for collecting the results. The cache is only used by sorting but not in general. Use of IndexCache here would be a design flaw, because it combines unrelated things.\n\nAnd setNextReader is only called seldom (only once for each segment). It would have an impact if you would need to call synchronized methods inside collect(). ",
+            "author": "Uwe Schindler",
+            "id": "comment-12787387"
+        },
+        {
+            "date": "2009-12-08T15:34:04+0000",
+            "content": "Hi Uwe,\n\nyour arguments seem reasonable to me. I have added a new patch (src/java only), leaving all test and contrib classes intact (but still passes all tests).\nThe new patch now keeps setNextReader as it is.\n\nCheers,\nChristian ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787502"
+        },
+        {
+            "date": "2009-12-08T15:35:23+0000",
+            "content": "Improved patch (src/java only), now without modification to newIndexReader. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787503"
+        },
+        {
+            "date": "2009-12-08T16:24:42+0000",
+            "content": "Added code to automatically evict entries from IndexFieldCache upon close of IndexCache/IndexReader\n(see also LUCENE-2135) ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787560"
+        },
+        {
+            "date": "2009-12-08T19:02:52+0000",
+            "content": "Christian, could you roll up all patches into a single attachment?  (Actually it looks like the separate demo, contrib, test, core patches were removed). ",
+            "author": "Michael McCandless",
+            "id": "comment-12787661"
+        },
+        {
+            "date": "2009-12-08T19:09:43+0000",
+            "content": "Michael, LUCENE-2133.patch now contains all the patches for src/java. I have removed the test, contrib and demo files because they actually do not belong to the patch (since LUCENE-2133.patch really provides complete backwards compatibility now). It would not make much sense to claim backwards compatibility and at the same time modify a bunch of test classes, would it? \n\nNevertheless, I am now preparing an updated LUCENE-2133-complete.patch with all these additional patches included. In the meantime you may simply apply LUCENE-2133.patch to your local trunk copy and see if it works for you. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787667"
+        },
+        {
+            "date": "2009-12-08T19:41:15+0000",
+            "content": "I have removed the test, contrib and demo files because they actually do not belong to the patch (since LUCENE-2133.patch really provides complete backwards compatibility now).\n\nAhh OK ",
+            "author": "Michael McCandless",
+            "id": "comment-12787699"
+        },
+        {
+            "date": "2009-12-08T19:51:04+0000",
+            "content": "The same patch as LUCENE-2133.patch plus the changes in src/test and contrib to fully utilize the new IndexFieldCache and SortField code. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787703"
+        },
+        {
+            "date": "2009-12-08T20:07:24+0000",
+            "content": "There are a bunch or unrelated changes (imports/names/exception thrown) that should be pulled from this patch. ",
+            "author": "Mark Miller",
+            "id": "comment-12787711"
+        },
+        {
+            "date": "2009-12-08T20:17:35+0000",
+            "content": "Hmm ... nevermind. The exception is related and most of the imports are correct - brain spin.\n\nDidn't see that \n\nimport org.apache.lucene.search.SortField; // for javadocs \n\nwasn't being used anymore anyway.\n\nimport org.apache.lucene.search.fields.IndexFieldCache in NumericQuery should get a //javadoc so someone doesn't accidently remove it.\n\nAnd I guess the t to threadLocal change doesn't hurt with the amount your changing that anyway. Its a better name.\n\nThis looks pretty nice overall. ",
+            "author": "Mark Miller",
+            "id": "comment-12787715"
+        },
+        {
+            "date": "2009-12-08T20:19:23+0000",
+            "content": "Mark, could you please name the changes you would like to be excluded?\nI thought I had only included necessary changes.\n\nSome dependent changes are not so obvious, but necessary.\n\nFor example, Analyzer.close now needs to throw an IOException because of CloseableThreadLocal now closing an IOException because of doClose() throwing an IOException because it may close references from an IndexCache that might throw an IOException. Luckily this is covered by java.io.Closeable (which declared #close() to throw an IOException), and Analyzer implements that interface already. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787718"
+        },
+        {
+            "date": "2009-12-08T20:21:27+0000",
+            "content": "Hmm ... nevermind. The exception is related and most of the imports are correct - brain spin.\n\nOK, no problem.\n\nThis looks pretty nice overall.\n\nThanks  ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787720"
+        },
+        {
+            "date": "2009-12-08T20:33:26+0000",
+            "content": "A couple more quick notes:\n\nI know the FieldComparator class is ugly, but I'm not sure we should pull the rug by putting the impls in a new package. On the other hand, its not likely to affect many and it was experimental - so its a tough call. Its a lot of classes in there \n\nI'm also not sure if fields is the right package name? And do the Filters belong in that package?\n\nAlso, almost a non issue, but extending a deprecated class is going to be an ultra minor back compat break when its removed. Not likely a problem though. But we might put a note to that affect to be clear. It is almost self documenting anyway though \n\nRather then changing the tests to the new classes, we should prob copy them and make new ones - then remove them when the deprecations are removed.\n\nAlso, you should pull the author tag(s) - all credit is through JIRA and Changes. (I only see it like once, so I bet thats eclipse?)\n\nI havn't done a thorough review it all, but this is pretty great stuff to appear so complete and out of nowhere  ",
+            "author": "Mark Miller",
+            "id": "comment-12787729"
+        },
+        {
+            "date": "2009-12-08T20:41:16+0000",
+            "content": "It looks like FieldCacheTermsFilterDocIdSet is using the wrong StringIndex? And I think the FieldCache import in that class can be removed (same with IndexFieldCacheRangeFilter). ",
+            "author": "Mark Miller",
+            "id": "comment-12787734"
+        },
+        {
+            "date": "2009-12-08T20:55:05+0000",
+            "content": "I dont quite understand why we would have no more insanity? What happens when you get the cache from a multireader and then from each segment reader within it? You double up right? Insanity? ",
+            "author": "Mark Miller",
+            "id": "comment-12787740"
+        },
+        {
+            "date": "2009-12-08T21:08:32+0000",
+            "content": "I know the FieldComparator class is ugly, but I'm not sure we should pull the rug by putting the impls in a new package. On the other hand, its not likely to affect many and it was experimental - so its a tough call. Its a lot of classes in there\n\nI think it makes sense to move the stuff into another package because o.a.l.search is already filled with a lot of classes. Since there are no package-level-protection dependencies to o.a.l.search, I think it does not hurt either.\n\nI'm also not sure if fields is the right package name? And do the Filters belong in that package?\n\nI couldn't really come up with a better name. It's all about the fields somehow (caches, comparators and value parsers).\n\nAlso, almost a non issue, but extending a deprecated class is going to be an ultra minor back compat break when its removed. Not likely a problem though. But we might put a note to that affect to be clear. It is almost self documenting anyway though \n\nYes. I thought it's better to make it as clear as possibe.\n\nAlso, almost a non issue, but extending a deprecated class is going to be an ultra minor back compat break when its removed. Not likely a problem though. But we might put a note to that affect to be clear. It is almost self documenting anyway though\n\nRather then changing the tests to the new classes, we should prob copy them and make new ones - then remove them when the deprecations are removed.\n\nYes, good idea. This way we can test the old and the new behaviour at once. Maybe it is enough to add new test methods to the same class?\n\nAlso, you should pull the author tag(s) - all credit is through JIRA and Changes. (I only see it like once, so I bet thats eclipse?)\n\nSorry, Eclipse defaults. I thought I had removed all of them.\n\nI haven't done a thorough review it all, but this is pretty great stuff to appear so complete and out of nowhere \n\nYes, it also just came over me the last weekend \n\n\nI will make a new patch tomorrow (CET time) with the new test cases incorporated. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787743"
+        },
+        {
+            "date": "2009-12-08T21:21:22+0000",
+            "content": "I think it does not hurt either.\n\nI didn't notice that you actually just deprecated the originals - I guess thats not a complete rug pull ...\n\nBy the way, I don't think you need to deprecate something in a new class (  IndexFieldCacheImpl):\n\n\n  /**\n   * @deprecated Use {@link #clear()} instead.\n   */\n  public void purgeAllCaches() {\n    init();\n  }\n\n ",
+            "author": "Mark Miller",
+            "id": "comment-12787748"
+        },
+        {
+            "date": "2009-12-08T21:24:59+0000",
+            "content": "It looks like FieldCacheTermsFilterDocIdSet is using the wrong StringIndex? And I think the FieldCache import in that class can be removed (same with IndexFieldCacheRangeFilter).\n\nGood catch. Since o.a.l.search.field.StringIndex extends o.a.l.search.StringIndex it's just a matter of declaration. The imports can indeed be removed (they were only required for javadocs, which should now also refer to the new classes instead). I have made the changes locally and will put them into the next update for this patch.\n\nI dont quite understand why we would have no more insanity? What happens when you get the cache from a multireader and then from each segment reader within it? You double up right? Insanity?\n\nThe MultiReader has a different cache than the internal SegmentReaders, there is no interconnection between the two. While change the testcases, my patch initially even triggered a JUnit failure because of this \u2013 o.a.l.util.TestFieldCacheSanityChecker expected a cache error which now will not happen anymore. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787750"
+        },
+        {
+            "date": "2009-12-08T21:28:55+0000",
+            "content": "And what about the doubling up insanity? It looks like you just commented out that check? It appears to me that thats still an issue we want to check for - we want to make sure Lucene core and users have a way to be sure they are not using a toplevel reader and its sub readers for caches unless they really intend to.\n\nedit\n\nThis type of change actually even exaggerates that problem (though if we want to improve things here, its something we will have to deal with).\n\nNow you might have a mixture of old api/new api caches as well if you don't properly upgrade everything at once. ",
+            "author": "Mark Miller",
+            "id": "comment-12787752"
+        },
+        {
+            "date": "2009-12-08T21:29:34+0000",
+            "content": "I didn't notice that you actually just deprecated the originals - I guess thats not a complete rug pull ...\n\nWriting the new code was one day, then making it backwards compatible with all these deprecations another one :-b\nI actually wouldn't care so much about backwards compatibility in the most cases, but I think it is better now to allow a smooth transition to the new code.\n\nBy the way, I don't think you need to deprecate something in a new class ( IndexFieldCacheImpl):\n\nIndeed. This was a leftover from the early changes to src/test code. It's removed now (locally). ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787754"
+        },
+        {
+            "date": "2009-12-08T21:36:49+0000",
+            "content": "After removing the very problematic change to the Collector class (which is very central in Lucene and should not be changed again after 2.9), thatI told you to do in the morning, the other changes are no longer too intrusive. I am quite happy with your new patch and I now also like it very much. It is as a good candiate for replacing the very, very ugly FieldCache impl we currently have.\n\nI am not really sure, if the package name is good and I would like to also add Earwins changes and not bind the cache so hard to the IndexReader (which was also the problem with the last FieldCache), instead just make it a plugin component (like all the other flex parts). For the functionality of Lucene, FieldCache is not needed, sorting is just an addon on searching, but not realy basic functionality (lots of users have other sorting algos). Also not sure if all classes in search that contain \"FieldCache\" should be renamed. The FieldCacheTermsFilter and RangeFilter only use the cache internally, they should simply be changed to use the new API and maybe only get additional ctors for the other parser instance classes. So some stuff still needs to be changed.\n\nIf it fits good together with the new flexible indexing branch, I see no problems with appling it soon. So its all good work. It is a pity, tht we heard not much from you in the past, the patch suddenly appeared in JIRA and almost nobody know you. I only found one introduction from you long time ago on java-dev. Are you still working at L3S? If yes, send nice greetings also to Jan Brase! \n\nThis patch and the flex branch together and the many deprecations would make a 3.9 soon and 4.0 without all ugly stuff soon would be nice. I again would do the cleaning heavy commiting police man!\n\nSo, good work. Thanks! ",
+            "author": "Uwe Schindler",
+            "id": "comment-12787757"
+        },
+        {
+            "date": "2009-12-08T21:39:56+0000",
+            "content": "And what about the doubling up insanity? It looks like you just commented out that check? It appears to me that thats still an issue we want to check for - we want to make sure Lucene core and users have a way to be sure they are not using a toplevel reader and its sub readers for caches unless they really intend to. \n\nThe new IndexFieldCacheSanityChecker can be removed out-of-the-box (as documented in the class itself). It is just kind of a \"showcase\" class for this issue.\nThe section I commented out is non-functional with the new change since there is no more ReaderKey in IndexFieldCache.CacheEntry. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787759"
+        },
+        {
+            "date": "2009-12-08T21:46:54+0000",
+            "content": "But we still want its functionality - we still want to check for \"doubling\" up insanity. ",
+            "author": "Mark Miller",
+            "id": "comment-12787763"
+        },
+        {
+            "date": "2009-12-08T21:54:56+0000",
+            "content": "not bind the cache so hard to the IndexReader (which was also the problem with the last FieldCache), instead just make it a plugin component\n\nAt a minimum, you should be able to set the cache for the reader.\n\nFor the functionality of Lucene, FieldCache is not needed, sorting is just an addon on searching\n\nThe way he has it, this is not just for the fieldache, but also the fieldsreader and vectorreader - if we go down that road, we should consider norms as well.\n\nI see no problems with appling it soon\n\nI still think it might be a little early. This has a lot of consequences. ",
+            "author": "Mark Miller",
+            "id": "comment-12787767"
+        },
+        {
+            "date": "2009-12-08T21:55:12+0000",
+            "content": "Uwe, thanks a lot for your assessment!\n\nI will definitely look at the flex branch and see what needs to be changed.\n\nYes, I still work at L3S, working hard for my PhD (planned to finish mid 2010). This is probably the main reason for not being so active in the Lucene community in the past. However, as I use Lucene for research and commercial systems over the last years, I always try to contribute back patches whenever possible.\n\nJan Brase doesn't work at L3S anymore, but I will happily forward the greetings.\n\nCheers,\nChristian ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787768"
+        },
+        {
+            "date": "2009-12-08T22:02:30+0000",
+            "content": "I still think it might be a little early. This has a lot of consequences.\n\nI mean we should not wait for years like with LUCENE-831  No heavy committing please g. ",
+            "author": "Uwe Schindler",
+            "id": "comment-12787772"
+        },
+        {
+            "date": "2009-12-08T22:33:42+0000",
+            "content": "New changes from the discussions incorporated into the src/java patch.\nThe complete patch (including src/test and contrib) follows tomorrow. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787786"
+        },
+        {
+            "date": "2009-12-08T22:41:58+0000",
+            "content": "But we still want its functionality - we still want to check for \"doubling\" up insanity. \n\nMark, \nthe latest patch re-inserts the commented fragment.\n\nThe \"readerkey\" in the original FieldCacheSanityChecker refers to the FieldCacheKey in IndexReader, which is now obsoleted by IndexReader#getIndexCache.getIndexReader(). I now use this as the reader key, even though I am still not quite sure if it is really necessary. Checking for insanity sounds so paranoid to me. If we know that there is a conceptional bug in the code, we should fix it, not circumvent and hotfix it using an insanity checker. But this is another story. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12787791"
+        },
+        {
+            "date": "2009-12-10T17:24:13+0000",
+            "content": "This patch is a good step forward \u2013 it associates the cache directly\nwith IndexReader, where it belongs; it cleanly decouples cache from\nreader (vs the hack we have today with IndexReader.getFieldCacheKey),\nso that eg cloned readers can share the same cache; it also preserves\nback compat, which is quite a stunning accomplishment \n\nBut... there are many more things I don't like about FieldCache, that\nI'm not sure  the patch addresses:\n\n\n\tUninversion to derive eg an int[] is horribly slow, compared to\n    say loading the pre-encoded binary ints from disk, created during\n    indexing.  Ie, I think, if we are going to overhaul FieldCache\n    API, we should somehow make LUCENE-1231 feasible.\n\n\n\n\n\tThere's no pluggability to customize where the int[] comes from\n    for a given field \u2013 most you can do is provide your own IntParser\n    that the uninverter uses.  EG the fact that the patch had to\n    \"move\" FieldCacheRange/TermsFilter down, is strange \u2013 these\n    filters (and in general any future \"cache consumers\") should live\n    in oal.search, but simply pull from a different int[] source,\n    somehow.\n\n\n\n\n\tError checking of single-value-per-field (for StringIndex) is\n    dangerous, today \u2013 it's intermittent, and, it's an unchecked\n    exception.  We should probably just remove the exception, or,\n    maybe make it checked.  Actually I'll go open a new issue for\n    this.  We should simply fix this.\n\n\n\n\n\tSingle-value-per-field limitation (though, that's a nice to have,\n    future improvement)\n\n\n\n\n\tEven accepting the single-value-per-field limitaiton, we should\n    allow multiple values per field during uninversion, w/\n    customizable logic about which value is kept as the single one\n    (there is an issue open for this I think).  This really should be\n    some sort of added extensibility to whatever class drives\n    uninversion...\n\n\n\n\n\tThe terror of accidentally asking for the array at the top-level\n    of Multi/DirReader.  I think this shouldn't even be allowed, at\n    least not easily, ie Dir/MultiReader.getIndexCache should throw\n    UOE.  If we really wanted to, we could provide sugar methods in\n    maybe ReaderUtil to \"glom N int[]'s into a new int[]\".  But it\n    should be named something scary  Then we wouldn't need any\n    insanity checking.\n\n\n\n\n\tNo control over caching policy (cannot evict things)\n\n\n\n\n\tIf we make field cache flexible enough, we could maybe fold norms\n    & deleted docs into it (would be a separate future issue to\n    actually do so...).\n\n\n\nSome other questions about the patch:\n\n\n\tConsumers of the cache API (the sort comparator,\n    FieldCacheTerms/RangeFilter, and any other future users of \"the\n    field cache\") shouldn't have to move down into fields sub-package?\n\n\n\n\n\tIt's a little strange that the term vectors & fields reader also\n    got pulled into the cache?\n\n ",
+            "author": "Michael McCandless",
+            "id": "comment-12788798"
+        },
+        {
+            "date": "2009-12-10T19:05:32+0000",
+            "content": "My impression is that this is not much different than LUCENE-831, and we are stuck on the same issues (831 started down the path of working with these goals, but its severely out of date now).\n\nIt's a little strange that the term vectors & fields reader also got pulled into the cache?\n\nCouldn't figure this out either ... if anything, you'd think norms might goto the cache, but the vector and fields reader ... ? ",
+            "author": "Mark Miller",
+            "id": "comment-12788846"
+        },
+        {
+            "date": "2009-12-10T19:40:25+0000",
+            "content": "This patch is a good step forward - it associates the cache directly\nwith IndexReader, where it belongs; it cleanly decouples cache from\nreader (vs the hack we have today with IndexReader.getFieldCacheKey),\nso that eg cloned readers can share the same cache; it also preserves\nback compat, which is quite a stunning accomplishment\n\nYes, backwards compatibility was actually the driving factor for this patch.\nI actually have not addressed major changes in functionality. This would definitely require rework that breaks backwards compatibility.\nI just wanted to get rid of the static FieldCache, which caused me a lot of OOME headaches.\n\nAs I wrote above, I see this patch as a good starting point for further development. Imagine I had submitted a real, complete rework of the FieldCache like in LUCENE-831 \u2013 it would be stuck as an open issue forever just like its predecessor.\n\nThere is nothing wrong with the current patch (that's why I suggest comitting it to trunk soon-ish) \u2013 it does not break anything (it could even go into 3.1 I guess).\nStarting from a common codebase we can then later on extend it and address all the points you mentioned in Michael's most recent post:\n\nBut... there are many more things I don't like about FieldCache, that I'm not sure the patch addresses:\n(snip) \n\nNone of these (very important) issues have been addressed by the patch. Intentionally (as described).\n\nSome other questions about the patch:\n\n* Consumers of the cache API (the sort comparator,\nFieldCacheTerms/RangeFilter, and any other future users of \"the\nfield cache\") shouldn't have to move down into fields sub-package?\n\nAs you wish. I don't have problems with keep it in o.a.l.search. I was just a little scared about the plethora of classes in that package. Since we do not need to utilize package-level protection, it was actually possible to \"encapsulate\" that field-related functionality in another namespace. I just personally prefer to use many nested packages, I do not have problems of moving classes back to its parent package.\n\n* It's a little strange that the term vectors & fields reader also\ngot pulled into the cache?\n\nThey are not in the FieldCache. Caching fields is only one functionality provided by IndexCache. I took the opportunity to demonstrate caching something other than fields. You now save a few bytes per SegmentReader instance because of that change. Maybe it would make sense to move SegmentReader.CoreReaders to SegmentReaderIndexCache completely. However, if I had included that as well into this issue, it would again be too large to be discussed in time for the next release.\n\nIf you have strong objections against moving these SegmentReader-specific things to the SegmentReaderIndexCache now, I can remove that part from the patch. However, I should probably then file another issue. Unfortunately, this will then depend on the outcome of this LUCENE-2133.\n\nTo summarize, I suggest:\n\n1. Complete the additions to src/test (i.e. do not remove/modify the existing test cases but rather add new ones, as discussed previously)\n2. Commit the patch to svn, target release for Lucene 3.1.\n3. File another issue and discuss functional improvements for the IndexFieldCache part. Use Michael's wishlist as a starting point. Agree on breaking backwards compatibility, target for Lucene 4.0, 3.5 or whatever fancy version number. Incorporate things from LUCENE-831, LUCENE-1231 and also LUCENE-2135.\n4. File a new issue for the improvements in SegmentReader (move things that are shared between the original reader and its clones to a common SegmentReaderIndexCache, such as CoreReader and ThreadLocals), keep backwards compatibility and target for Lucene 3.1.\n\nWhat do you think? ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12788863"
+        },
+        {
+            "date": "2009-12-10T19:53:56+0000",
+            "content": "I don't know that back compat is really a concern if we are just leaving the old API intact as part of that, with its own caching mechanism?\n\nJust deprecate the old API, and make a new one. This is a big pain, because you have to be sure you don't straddle the two apis on upgrading, but thats the boat we will be in anyway.\n\nWhich means a new impl should provide enough benefits to make that large pain worth enduring. 831 was not committed for the same reason - it didn't bring enough to table to be worth it after we got to a per segment cache in another way. Since I don't see that this provides anything over 831, I don't see how its not in the same boat.\n\nI'm not sure we should target a specific release with this - we don't even know when 3.1 is going to happen. 2.9 took a year. Its anybodies guess - we should prob just do what makes sense and commit it when its ready. ",
+            "author": "Mark Miller",
+            "id": "comment-12788874"
+        },
+        {
+            "date": "2009-12-10T20:24:51+0000",
+            "content": "I don't know that back compat is really a concern if we are just leaving the old API intact as part of that, with its own caching mechanism? \n\nI don't think that this is an option. FieldCache is fundamentally flawed and already creates a lot of trouble that has only been somehow fixed recently (FieldCacheKey, Insanity checks).\n\nFieldCache, the static \"registry\" of caches sort of violates fundamental OOP concepts \u2013 I mean, almost all methods require IndexReader as the first parameter. Since we allow IndexReader composition and decoration this apparently was not the right way to go because it exactly caused the problems that have later been addressed by the aformentioned FieldCacheKey and insanity checks.\n\nJust deprecate the old API, and make a new one. This is a big pain, because you have to be sure you don't straddle the two apis on upgrading, but thats the boat we will be in anyway.\n\nThat is always an option, but as you see Uwe's initial reaction I think it is not so easy to convince everybody. Which is fine, because we now have a solution that is somehow intermediate between the two extremes (keeping as it is vs. complete rework) and still is completely bw-compatible.\nWith a \"real\" complete overhaul of FieldCache, I imagine a lot of additional work to be then done for other projects such as SOLR, Nutch etc., which I would rather see not to happen abruptly.\n\nThe IndexCache abstraction allows us to separate the two issues 1: \"make caches non-static\" and 2: \"make the fieldcache snappier\" very easily. We start with issue 1 here in LUCENE-2133, and then develop a new FancyFieldCache in LUCENE-xyz (which can be used in parallel to the then-old IndexFieldCache).\n\nIn parallel we can integrate Michael's, Earwin's and Yonik's suggestions from LUCENE-2135 without starting the discussion from the beginning.\n\nI am not suggesting to take the current solution as a \"temporary workaround\", but as a base for future work. Anything else would make no sense indeed.\n\nSince I don't see that this provides anything over 831, I don't see how its not in the same boat.\n\nLUCENE-831 still requires a static FieldCache, the root of all evil  It addresses orthogonal problems (ValueSource, Tries etc.).\nFinally, to cite yourself from LUCENE-831: \"It probably makes sense to start from one of Hoss's original patches or even from scratch.\"\n\nI'm not sure we should target a specific release with this - we don't even know when 3.1 is going to happen. 2.9 took a year. Its anybodies guess - we should prob just do what makes sense and commit it when its ready.\n\nThe more complex the patches are, the longer it will take to integrate them into a new version.\nThe more such patches you have, the longer it will take to get to a new release.\n\nLet's make it simple, submit what we have and build upon that. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12788896"
+        },
+        {
+            "date": "2009-12-10T20:39:16+0000",
+            "content": "LUCENE-831 still requires a static FieldCache, the root of all evil   \n\nIt doesn't require one though? It supports a cache per segment reader just like this. Except its called a ValueSource.\n\nThe CacheByReaderValueSource is just there to handle a back compat issue - its something that we would want to get around and use the reader valuesource for instead - but that patch still had a long way to go.\n\nOverall, from what I can see, the approach was about the same.\n\nIt probably makes sense to start from one of Hoss's original patches or even from scratch\n\nThat was said before a lot more work was done. The API was actually starting to shape up nicely.\n\nThe more complex the patches are, the longer it will take to integrate them into a new version.\n\nOf course - and this is a complex issue with a lot of upgrade pain. Like with 831, it not really worth the pain to users without more benefits.\n\nThe more such patches you have, the longer it will take to get to a new release.\n\nThats not really true. 3.1 does't need this patch - there would be no reason to hold it for it. Patches go in when they are ready.\n\nLet's make it simple, submit what we have and build upon that.\n\nI dont think thats simple  The patch can be iterated on outside of trunk as easy as in.\n ",
+            "author": "Mark Miller",
+            "id": "comment-12788908"
+        },
+        {
+            "date": "2009-12-10T21:28:16+0000",
+            "content": "bq.    LUCENE-831 still requires a static FieldCache, the root of all evil  \nIt doesn't require one though? It supports a cache per segment reader just like this. Except its called a ValueSource.\n\nWith \"requires\" I mean it's still there, not marked as deprecated and still used. Plus a lot of \"ifs\" like\n\n{{{\n if(parserUninverter != null) \n{\n        currentReaderValues = uninversionValueSource.getLongs(reader, field, parserUninverter);\n      }\n else if(valueSource != null) \n{\n        currentReaderValues = valueSource.getLongs(reader, field);\n      }\n else \n{\n        currentReaderValues = reader.getValueSource().getLongs(reader, field);\n      }\n}}}\n\nThat is, it adds a lot of duplicated code / different possible implementations for the same thing.\n\nI am not saying LUCENE-831 was a bad idea. And apparently, apart from the different wording, we see a few similarities with LUCENE-2133. We just need to move on at some point.\n\nWhat is still different in my proposal is the additional abstraction layer of \"IndexCache\". Was this already somehow planned with \"ValueSourceFactory\"? That class exists in LUCENE-831 but was never used.\n\nAs we see from LUCENE-2135 Index-specific caches are much more than FieldCache/ValueSource implementations. They should store arbitrary data, allow cache inspection, eviction of entries and so on.\n\nbq.    Let's make it simple, submit what we have and build upon that.\n\nI dont think thats simple The patch can be iterated on outside of trunk as easy as in.\n\nIt is indeed a complex problem but it can easily be split into several subtasks that can be addressed by different people in parallel. To allow such a development, we have to somehow get the base code it into SVN, not necessarily trunk, admittedly, a branch would also do. Of course, this requires also additional work to keep it in sync with trunk. If we can really assume to have 3.1 in one year, we have lots of time for developing a stable, powerful new API directly in trunk. Of course, this is a decision related to release management and not to the actual problem. I can live with both ways (trunk vs. branch), but, in my opinion, managing the changes just as patch files in jira is not a viable option. ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12788936"
+        },
+        {
+            "date": "2009-12-10T21:48:12+0000",
+            "content": "That is, it adds a lot of duplicated code / different possible implementations for the same thing.\n\nThings that were still ugly were not likely to stick around - 831 was very much a work in progress. The solution there to handle back compat issues was a working solution that would need to be improved upon. 831 was still in experimentation state - issues that need more though had hacked in working solutions. We had a more general cache at one point, and began working towards ValueSources based on discussion. The latest 831 patch is an exploration of that, not a final product.\n\nThey should store arbitrary data, allow cache inspection, eviction of entries and so on.\n\nThats extremely simple to add to an IndexReader - we were thinking of a ValueSource as something different than a basic cache.\n\n\nIt is indeed a complex problem but it can easily be split into several subtasks that can be addressed by different people in parallel. To allow such a development, we have to somehow get the base code it into SVN, not necessarily trunk, admittedly, a branch would also do. Of course, this requires also additional work to keep it in sync with trunk. If we can really assume to have 3.1 in one year, we have lots of time for developing a stable, powerful new API directly in trunk. Of course, this is a decision related to release management and not to the actual problem. I can live with both ways (trunk vs. branch), but, in my opinion, managing the changes just as patch files in jira is not a viable option.\n\nA branch is certainly a possibility, but with only one person working on it, I think its overkill. With some additional interest, a branch can make sense - otherwise its not worth the merging headaches. You also have to have a committer(s) thats willing to take on the merging.\n\nAt one point, 831 was much more like this patch. Discussion along what Mike brought up above started transforming it to something else. We essentially decided that unless that much was brought to the table, the disrupting change just wasn't worth it for a different cache API.\n\nI'm def a proponent of FieldCache reform - but I think we want to fully flesh it out before committing to something in trunk. ",
+            "author": "Mark Miller",
+            "id": "comment-12788951"
+        },
+        {
+            "date": "2009-12-10T21:58:10+0000",
+            "content": "Mark,\n\nthat's great to hear overall.\nWhat I want to avoid are different competing implementations. Since there are indeed several people working on things that are closely related, esp. LUCENE-2135) a branch would make sense (if all agree, of course).\n\nCan we summarize all the open points for a \"worthy\" cache overhaul, close LUCENE-831 in favor of LUCENE-2133 and continue working here?\nI would like to hear the opionions of the other people involved: Earwin, Hoss, Mike, Uwe, Yonik to name a few.\n\nBest,\nChristian ",
+            "author": "Christian Kohlsch\u00fctter",
+            "id": "comment-12788956"
+        },
+        {
+            "date": "2009-12-11T11:27:40+0000",
+            "content": "I was just a little scared about the plethora of classes in that package. \n\nLet's separately worry about that?  I think consumers of the cache API\nshouldn't have to move.\n\nCaching fields is only one functionality provided by IndexCache. I took the opportunity to demonstrate caching something other than fields. You now save a few bytes per SegmentReader instance because of that change.\n\nOK but let's also do this separately (Earwin I think is working on a\npatch for componentizing SR, which'd be great).  FieldCache, \"just\"\none of IndexReaders components, is hard enough to fix; let's just\nfocus on it \n\nAlso, as hackish as it is, the getFieldCacheKey() works well.  The\nneed for insanity checking is annoying, so let's just disallow getting\ncached @ Dir/MultiReader level (and offer sugar APIs if really\nneeded).\n\nAnd as annoying as the static FieldCache is, LUCENE-2135 plugs yet\nanother hold in the dike, ie, now entries are purged on close, and you\ncan also explicitly purge a given IndexReader.\n\nI don't think we should wholesale move the cache APIs just for the\nsake of moving them.  That's alot of API noise; we need some real\nimprovements to justify making users switch.\n\nSince there are indeed several people working on things that are closely related, esp. LUCENE-2135) a branch would make sense\n\nCan we summarize all the open points for a \"worthy\" cache overhaul, close LUCENE-831 in favor of LUCENE-2133 and continue working here?\n\nI don't think we need a branch just yet.  (LUCENE-2135 is a very\nstandalone change from this issue).  And, before closing other issues,\ncommitting this one as a start, etc, we really first need to reach\nsome consensus on what even to do, here.\n\nI really want to see us first fix FieldCache's deep problems, then\nconcern ourselves with where the resulting API will go / what it looks\nlike.  Ie, we're putting the horse before the cart, here, so far...\n\nEG, what [minimal] changes could we make to allow someone to plugin\ntheir own values source?  If we make this:\n\n\nclass FieldValues {\n  public FIELD_TYPE getType();\n  public int[] getInts() {};\n // and all the other types...\n}\n\nclass FieldValuesSource implements Closeable {\n  public FieldValues getValues(FieldInfo field);\n  public void close();\n}\n\n\n\nWe could then make an UninverterFieldValuesSource, subclassing\nPerFieldValueSource, that takes IndexReader to its ctor, lets your\nregister parsers by field.  And it'd allow customization beyond simply\nchanging the parser, eg to control behavior of multi-valued fields,\nstopping early (NRQ does this), etc.\n\nWe'd have CachedFieldValueSource that'd wrap any FieldValuesSource and\ncache, allowing you to subclass it if you want to do eviction, etc.\nIt'd by default implement the same simplistic policy we have today \u2013\nretain everything, until close at which point you discard everything.\n\nAll consumers of field cache (sorting by field,\nFieldCacheRange/TermsFilter, function queries, etc.) should all allow\nme to pass in my own FieldValuesSource.  IndexReader would let me\ncustomize, but would default to the cached uninversion source.\n\nI could then in theory [external to Lucene] make a FieldValueSource\nthat slurped stuff from disk, and I could create LUCENE-1231 (= CSF)\noutside of Lucene.  [And, when we build CSF inside of Lucene it'd also\njust be another source].\n\nSomething along these lines maybe....? ",
+            "author": "Michael McCandless",
+            "id": "comment-12789249"
+        },
+        {
+            "date": "2009-12-11T16:37:31+0000",
+            "content": "I would like to hear the opionions of the other people involved\n.... Earwin I think is working on a patch for componentizing SR ..... FieldCache, \"just\" one of IndexReaders components ......\n\nMike answered for me \nMy wish is to keep IR's as basic as possible, while plugging all extras (that includes sorting/whatever caches) on as-needed basis.\nRight now I have a basic impl that works for me for half a year, but in practice it ended up a bit ugly and it doesn't handle IW-produced readers (never needed/liked this feature). So I hope to fix these two deficiencies on a weekend. ",
+            "author": "Earwin Burrfoot",
+            "id": "comment-12789377"
+        },
+        {
+            "date": "2009-12-11T16:57:32+0000",
+            "content": "Something along these lines maybe....?\n\nAnd we are back to 831  ",
+            "author": "Mark Miller",
+            "id": "comment-12789384"
+        },
+        {
+            "date": "2009-12-11T17:14:54+0000",
+            "content": "And we are back to 831\n\nYes   But maybe the fresh perspective will get us through it! ",
+            "author": "Michael McCandless",
+            "id": "comment-12789398"
+        }
+    ]
+}

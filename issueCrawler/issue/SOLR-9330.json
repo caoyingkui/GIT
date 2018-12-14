@@ -1,0 +1,128 @@
+{
+    "id": "SOLR-9330",
+    "title": "Race condition between core reload and statistics request",
+    "details": {
+        "components": [],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "6.3",
+            "7.0"
+        ],
+        "affect_versions": "5.5",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Things happened that we execute this two requests consecutively in Solr 5.5:\n\n\tCore reload: /admin/cores?action=RELOAD&core=coreName\n\tCheck core statistics: /coreName/admin/mbeans?stats=true\n\n\n\nAnd sometimes second request ends with this error:\n\nERROR org.apache.solr.servlet.HttpSolrCall - null:org.apache.lucene.store.AlreadyClosedException: this IndexReader is closed\n\tat org.apache.lucene.index.IndexReader.ensureOpen(IndexReader.java:274)\n\tat org.apache.lucene.index.StandardDirectoryReader.getVersion(StandardDirectoryReader.java:331)\n\tat org.apache.lucene.index.FilterDirectoryReader.getVersion(FilterDirectoryReader.java:119)\n\tat org.apache.lucene.index.FilterDirectoryReader.getVersion(FilterDirectoryReader.java:119)\n\tat org.apache.solr.search.SolrIndexSearcher.getStatistics(SolrIndexSearcher.java:2404)\n\tat org.apache.solr.handler.admin.SolrInfoMBeanHandler.addMBean(SolrInfoMBeanHandler.java:164)\n\tat org.apache.solr.handler.admin.SolrInfoMBeanHandler.getMBeanInfo(SolrInfoMBeanHandler.java:134)\n\tat org.apache.solr.handler.admin.SolrInfoMBeanHandler.handleRequestBody(SolrInfoMBeanHandler.java:65)\n\tat org.apache.solr.handler.RequestHandlerBase.handleRequest(RequestHandlerBase.java:155)\n\tat org.apache.solr.core.SolrCore.execute(SolrCore.java:2082)\n\tat org.apache.solr.servlet.HttpSolrCall.execute(HttpSolrCall.java:670)\n\tat org.apache.solr.servlet.HttpSolrCall.call(HttpSolrCall.java:458)\n\tat org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:225)\n\tat org.apache.solr.servlet.SolrDispatchFilter.doFilter(SolrDispatchFilter.java:183)\n\n\n\n\n\nIf my understanding of SolrCore internals is correct, it happens because of async nature of reload request:\n\n\tNew searcher is \"registered\" in separate thread\n\tOld searcher is closed in same separate thread and only after new one is registered\n\tWhen old searcher is closing, it removes itself from map with MBeans\n\tIf statistic requests happens before old searcher is completely removed from everywhere - exception can happen.\n\n\n\n\nWhat do you think if we will introduce new parameter for reload request which makes it fully synchronized? Basically it will force it to call \n\n  SolrCore#getSearcher(boolean forceNew, boolean returnSearcher, final Future[] waitSearcher, boolean updateHandlerReopens) \n\n with waitSearcher!= null",
+    "attachments": {
+        "SOLR-9390.patch": "https://issues.apache.org/jira/secure/attachment/12829370/SOLR-9390.patch",
+        "SOLR-9330.patch": "https://issues.apache.org/jira/secure/attachment/12829436/SOLR-9330.patch",
+        "too_sync.patch": "https://issues.apache.org/jira/secure/attachment/12829441/too_sync.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-07-22T17:03:40+0000",
+            "author": "Joel Bernstein",
+            "content": "We are currently looking at exactly this issue with Alfresco's Solr integration. So we'll be happy to help find the right fix for this. ",
+            "id": "comment-15389833"
+        },
+        {
+            "date": "2016-09-14T17:37:52+0000",
+            "author": "Mike Drob",
+            "content": "I ran into a similar problem recently as well. It can also happen on shutdown or regular core closing as well.\n\nIs there a reason that getVersion needs to ensureOpen first? I noticed that numDocs and maxDoc don't do this (comment claims for performance reasons) and they are called earlier in the same getStatistics method.\n\nIf we can't remove ensureOpen from StandardDirectoryReader::getVersion, then we can also work around this by checking it ourselves. That would look like:\nSolrIndexSearcher.java\n-    lst.add(\"indexVersion\", reader.getVersion());\n+    if (reader.getRefCount() > 0) lst.add(\"indexVersion\", reader.getVersion());\n\n\nI don't know what the full effects of missing an indexVersion field in the JMX stats will be, but I am fairly confident that it will be less damaging than the currently thrown Exception.\n\nJoel Bernstein - Do you have any thoughts on which approach to take? Happy to put up a patch for either one. ",
+            "id": "comment-15491014"
+        },
+        {
+            "date": "2016-09-20T09:37:18+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Here is straightforward test reproducing the race, it catches exception at least at every third run at my laptop. It might be dirty yet, nevertheless. \nI wonder if I need to mark it @Nightly if it run for 10 sec? ",
+            "id": "comment-15506173"
+        },
+        {
+            "date": "2016-09-20T12:57:44+0000",
+            "author": "Mikhail Khludnev",
+            "content": "I made a few common sense/best effort changes, but nothing beside try{}catch() helps. Perhaps it might be synchronized properly with solrCore._searcherLock but it's too much changes I suppose. \n\nI'll try to just cache reader.version or whole reader stats since it shouldn't be changed during searcher life (will check.) ",
+            "id": "comment-15506433"
+        },
+        {
+            "date": "2016-09-20T19:55:46+0000",
+            "author": "Mike Drob",
+            "content": "Mikhail Khludnev - that looks like a good start to a test. I do not think 10 seconds is long enough to relegate something to @Nightly runs.\n\nI'm putting up an alternative fix that seems to also make your test pass. I think I like my approach better because it may still return partial results when able, but I'm also not convinced that there won't be other handlers that suffer from similar problems that are still not addressed. Your approach may be able to fix everything at once.\n\nMaybe the best solution is to do both things. ",
+            "id": "comment-15507618"
+        },
+        {
+            "date": "2016-09-20T20:08:35+0000",
+            "author": "Andrey Kudryavtsev",
+            "content": "If we are talking about root cause of the race - it looks like things are a little bit more easily than I thought. There is just another  thread executor in CoreAdminHandler. If there will be API to avoid it, reload operation will become more synchronous (patch is attached).\n\nI thought that it will require to do something like too_sync.patch, but not this time probably.  ",
+            "id": "comment-15507657"
+        },
+        {
+            "date": "2016-09-20T20:17:20+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Mike Drob\nmy concern regarding \n\n  if (reader.getRefCount() > 0) {\n /// and here core is reloaded in parallel and closes the reader. I think it can be reproduced with sleep()\n     lst.add(\"indexVersion\", reader.getVersion());\n}\n\n\nCan you also share any observation regarding 'jmx exception on shutdown' or perhaps you have a test? Is it the same case or it's something different?   ",
+            "id": "comment-15507683"
+        },
+        {
+            "date": "2016-09-20T22:40:10+0000",
+            "author": "Mike Drob",
+            "content": "You're right about there still being a race condition in my solution. For some reason I wasn't thinking about what happens in that case.\n\nre: jmx exception - yea, it's the same thing. we have a custom jmx handler on top of the mbean endpoint that has run into this same issue. I should have cleaned up the commit message there.\n\nAndrey Kudryavtsev, the reload operation isn't the only place where this can throw exceptions - it can also happen during core delete or during shutdown. So if we add synchronization, we will need to look at CoreContainer::shutdown, SolrCores::close, etc. I don't have tests written for all of these, but it's a nearly identical stack trace, given that reload is essentially unload + load. ",
+            "id": "comment-15508026"
+        },
+        {
+            "date": "2016-09-21T09:46:49+0000",
+            "author": "Andrey Kudryavtsev",
+            "content": "Mike Drob, \n\nOff course, if you are going to execute in two separate (clients) threads  reload() and getStatistics() or deleteCore() and getStatistics() - you might still have trouble, and solving this races will require additional internal (probably complicated) synchronization (which by the way will affect all other cases when you don't really care about races executions)\n\nBut in my case I can do this synchronization on client side. I mean just don't send statistics requests when core is still reloading (I don't care about reloading core statistics). The only thing I need for this -  to know that reloading is still in progress. Some ability to make reload() fully synchronized operation. Does anybody know why it is async by default by any chance? ",
+            "id": "comment-15509406"
+        },
+        {
+            "date": "2016-09-21T11:24:03+0000",
+            "author": "Mikhail Khludnev",
+            "content": "The best way to win the race is to avoid it. Please check SOLR-9390.patch and expose your concern, I reduced sweeping fixes, but left one useless note commented (regarding removing from infoRegistry), let me know if you disagree to keep it in source. I think it's ready to be committed this week.  ",
+            "id": "comment-15509619"
+        },
+        {
+            "date": "2016-09-22T14:40:57+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Mike Drob, would you mind to review the last patch?   ",
+            "id": "comment-15513472"
+        },
+        {
+            "date": "2016-09-22T17:21:09+0000",
+            "author": "Mike Drob",
+            "content": "\n    lst.add(\"searcherName\", name);\n    lst.add(\"caching\", cachingEnabled);\n    lst.add(\"openedAt\", openTime);\n    if (registerTime != null) lst.add(\"registeredAt\", registerTime);\n    lst.add(\"warmupTime\", warmupTime);\n\n\nWhy not put these in the cached list as well? The first three are final and available before your call to snapStatistics. The last two are set during register which should only be called once, if I understand this correctly. Then the whole method becomes return readerStats; \u2013 much simpler and probably faster too!\n\n\n+    // core.getInfoRegistry().remove(STATISTICS_KEY, this);\n+    // decided to comment it, because it might upset users by showing stats, w/o \"searcher\" entry\n\n\nI don't think there is any reason to keep this in.\n\nOther than those minor points, the patch looks good to me.\n\nI've had a similar issue when calling /replication?command=details, but am not able to reproduce it in this test, so I think we're fine to handle that later. ",
+            "id": "comment-15513868"
+        },
+        {
+            "date": "2016-09-22T17:25:08+0000",
+            "author": "Mike Drob",
+            "content": "Ah, I see where the difference is, yes. In my case, the client process getting the statistics is an external monitoring application that gets them every 15 seconds and charts them. Since number of replicas can move, grow and shrink to accommodate usage, solving races like this is a very complicated problem. And at the end of the day, I don't care if my monitoring system misses one round of statistics, I'm more concerned about scary exceptions in the log that the ops team has to deal with. ",
+            "id": "comment-15513882"
+        },
+        {
+            "date": "2016-09-23T04:55:46+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit b50b9106f821915ced14a3efc1e09c265d648fa8 in lucene-solr's branch refs/heads/master from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b50b910 ]\n\nSOLR-9330: Fix AlreadyClosedException on admin/mbeans?stats=true ",
+            "id": "comment-15515411"
+        },
+        {
+            "date": "2016-09-23T08:41:15+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 4278356564d4928dfabfde6d4a2ebf57dcfcf81f in lucene-solr's branch refs/heads/branch_6x from Mikhail Khludnev\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4278356 ]\n\nSOLR-9330: Fix AlreadyClosedException on admin/mbeans?stats=true ",
+            "id": "comment-15515812"
+        },
+        {
+            "date": "2016-09-23T08:51:26+0000",
+            "author": "Mikhail Khludnev",
+            "content": "Exception should gone. Sometimes response contains no \"search\" entry, but only something like Searcher@deadbeaf [collection1] main. So, patterns consuming stats response might, but shouldn't be surprised.   ",
+            "id": "comment-15515842"
+        },
+        {
+            "date": "2016-11-09T08:39:00+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Closing after 6.3.0 release. ",
+            "id": "comment-15650303"
+        }
+    ]
+}

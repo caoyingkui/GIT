@@ -1,0 +1,65 @@
+{
+    "id": "LUCENE-4698",
+    "title": "Overhaul ShapeFieldCache because its a memory pig",
+    "details": {
+        "components": [
+            "modules/spatial"
+        ],
+        "fix_versions": [],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Won't Fix",
+        "status": "Closed"
+    },
+    "description": "The org.apache.lucene.spatial.util.ShapeFieldCache* classes together implement a spatial field cache for points, similar to FieldCache for other fields.  It supports a variable number of points per document, and it's currently only used by the SpatialPrefixTree strategy because that's the only strategy that supports a variable number of points per document.  The other spatial strategies use the FieldCache.  The ShapeFieldCache has problems:\n\n\tIt's a memory pig. Each point is stored as a Point object, instead of an array of x & y coordinates. Furthermore, each Point is in an ArrayList that exists for each Document. It's not done any differently when your spatial data isn't multi-valued.\n\tThe cache is not per-segment, it's per-IndexReader, thereby making it un-friendly to NRT search.\n\tThe cache entries don't self-expire optimally to free up memory. The cache is simply stored in a WeakHashMap<IndexReader,ShapeFieldCache>. The big cache entries are only freed when the WeakHashMap is used and the JVM realizes the IndexSearcher instance has been GC'ed.",
+    "attachments": {
+        "solr_spatial_leak1.png": "https://issues.apache.org/jira/secure/attachment/12587658/solr_spatial_leak1.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-01-20T22:08:30+0000",
+            "content": "A couple months ago I developed an alternative approach based on DocValues of bytes (StraightBytesDocValuesField)*.  I own the intellectual property but it's not committable as there were some hacks I had to do, and I did it Solr-side vs Lucene.\n\n*: FYI I couldn't simply use floats because the float based DV fields are a single float per document, not variable.  I was initially concerned about the overhead of converting 4 bytes to a float all the time but some benchmarking showed that this was quite negligible compared to the other things going on.  Besides, given more time, I'd like to use 3-bytes per float (the mantissa) and interleave the lat & lon and use sortable de-ref'ed bytes so that nearby spatial data is co-located.\n\nOne of the bigger obstacles to deal with in making progress is how multi-valued spatial is handled at the SpatialStrategy level.  With a non-DV approach, you can write code that looks at the indexed terms (varies per strategy) and figure out which points each document has (this is what the ShapeFieldCache does).  So no-change to the SpatialStrategy.  But with DV, SpatialStrategy.createFields() should only be called once per document, and with all of the points together so that it can return a DocValues based field.  We don't quite yet have a MultiPoint shape in Spatial4j (very close!), plus Solr has real problems with this model (to be addressed in another issue).  In particular, Solr's DocumentBuilder will take a java.util.Collection and invoke FieldType.createField() for each value without giving the FieldType the opportunity to see all values at once.  I firmly believe DocValues is the way to go so these problems need to be tackled. ",
+            "author": "David Smiley",
+            "id": "comment-13558403"
+        },
+        {
+            "date": "2013-06-13T16:35:30+0000",
+            "content": "We are seeing an issue where certain shapes are causing Solr to use up all available heap space when a record with one of those shapes is indexed. We were indexing polygons where we had the points going clockwise instead of counter-clockwise and the shape would be so large that we would run out of memory. We fixed those shapes but we are seeing this circle eat up about 700MB of memory before we get an OutOfMemory error (heap space) with a 1GB JVM heap. \n\nCircle(3.0 90 d=0.0499542757922153)\n\nGoogle Earth can't plot that circle either, maybe it is invalid or too close to the north pole due to the latitude of 90, but it would be nice if there was a way for shapes to be validated before they cause an OOM error. \n\nThe objects (4.5 million) are all GeohashPrefixTree$GhCell objects in an ArrayList owned by PrefixTreeStrategy$CellTokenStream. \n\nIs there anyway to have a max number of cells in a shape before it is considered too large and is not indexed? Is there a geo library that could validate the shape as being reasonably sized and bounded before it is processed?\n\nWe are currently using Solr 4.1. \n\n     <fieldType name=\"location_rpt\" class=\"solr.SpatialRecursivePrefixTreeFieldType\"\n               spatialContextFactory=\"com.spatial4j.core.context.jts.JtsSpatialContextFactory\"\n               geo=\"true\" distErrPct=\"0.025\" maxDistErr=\"0.000009\" units=\"degrees\" />\n\n\n ",
+            "author": "Hal Deadman",
+            "id": "comment-13682396"
+        },
+        {
+            "date": "2013-06-13T16:38:27+0000",
+            "content": "eclipse mat screenshot ",
+            "author": "Hal Deadman",
+            "id": "comment-13682399"
+        },
+        {
+            "date": "2013-06-13T23:25:00+0000",
+            "content": "Hal; the ShapeFieldCache is for holding all indexed points in memory.  It isn't related to indexing shapes, particularly non-point shapes. I created issue LUCENE-5056 for your bug report.  Thanks for reporting the problem. ",
+            "author": "David Smiley",
+            "id": "comment-13682895"
+        },
+        {
+            "date": "2013-08-18T00:22:24+0000",
+            "content": "This JIRA ticket is extremely important when using this ShapeFieldCache... David is there a way to :\n\n1. Use FieldCache when the field is defined as non multivalue?\n2. Add option to turn it off? ",
+            "author": "Bill Bell",
+            "id": "comment-13743072"
+        },
+        {
+            "date": "2013-08-18T15:49:45+0000",
+            "content": "Bill; if you don't use the field in a manner that would trigger the use of the ShapeFieldCache (i.e. you simply use the field for filtering) then you needn't worry about it.  If you've got one value per field then use LatLonType in Solr.  If you have more than one value (or even if you have one), then SOLR-5170 works great. The classes in that patch don't modify Solr so you can package them into a jar without having to actually patch Solr.\n\nOnce a suitable alternative exists, I'll remove the ShapeFieldCache. ",
+            "author": "David Smiley",
+            "id": "comment-13743248"
+        },
+        {
+            "date": "2017-03-12T04:26:35+0000",
+            "content": "I think LatLonDocValuesField (currently in sandbox) is currently the optimal way to go about storing points per document for the purposes of distance sorting/boosting.\n\nFor general per-document access to a \"shape\" (possibly a MultiPoint), there's the SerializedDVStrategy.\n\nHence I think ShapeFieldCache stuff should be deprecated/removed.  I'll close this as won't-fix. ",
+            "author": "David Smiley",
+            "id": "comment-15906423"
+        }
+    ]
+}

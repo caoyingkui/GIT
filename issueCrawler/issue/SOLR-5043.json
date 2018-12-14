@@ -1,0 +1,121 @@
+{
+    "id": "SOLR-5043",
+    "title": "hostname lookup in SystemInfoHandler should be refactored so it's possible to not block core (re)load for long periouds on misconfigured systems",
+    "details": {
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "6.4",
+            "7.0"
+        ],
+        "components": [],
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed"
+    },
+    "description": "SystemInfoHandler currently lookups the hostname of the machine on it's init, and caches for it's lifecycle \u2013 there is a comment to the effect that the reason for this is because on some machines (notably ones with wacky DNS settings) looking up the hostname can take a long ass time in some JVMs...\n\n\n  // on some platforms, resolving canonical hostname can cause the thread\n  // to block for several seconds if nameservices aren't available\n  // so resolve this once per handler instance \n  //(ie: not static, so core reload will refresh)\n\n\n\nBut as we move forward with a lot more multi-core, solr-cloud, dynamically updated instances, even paying this cost per core-reload is expensive.\n\nwe should refactoring this so that SystemInfoHandler instances init immediately, with some kind of lazy loading of the hostname info in a background thread, (especially since hte only real point of having that info here is for UI use so you cna keep track of what machine you are looking at)",
+    "attachments": {
+        "SOLR-5043.patch": "https://issues.apache.org/jira/secure/attachment/12593625/SOLR-5043.patch",
+        "SOLR-5043-lazy.patch": "https://issues.apache.org/jira/secure/attachment/12750672/SOLR-5043-lazy.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "author": "Hoss Man",
+            "id": "comment-13715952",
+            "date": "2013-07-23T01:05:35+0000",
+            "content": "Here's a quick and drity patch that spins up background thread to resolve the hostname.\n\nin practice, this works fine \u2013 startup and core reload times are short, and an error eventually gets logged by the background thread if/when the JVM gives up on resolving the hostname.\n\nthe hitch is: if we assume people might have bad DNS when running solr, we should probably also assume they might have bad DNS when running solr tests.  As things stand on trunk today, that just means your tests run dog ass slow \u2013 with this patch, the test will finish fast, but then the runner will fail because it treats this background DNS thread as a leak.\n\nprobably need to figure out a better way of dealing with this. "
+        },
+        {
+            "author": "Alan Woodward",
+            "id": "comment-13716231",
+            "date": "2013-07-23T08:38:06+0000",
+            "content": "Can we use a CompletionService for this?  Maybe have one running on the CoreContainer which can then be stopped when the container is shutdown, which should stop any thread leaks. "
+        },
+        {
+            "author": "Ramkumar Aiyengar",
+            "id": "comment-14698447",
+            "date": "2015-08-15T20:49:49+0000",
+            "content": "Having this on a per-instance basis like it does currently would also mean that you have one more thread running per core, even if temporarily, that might cause issues if you have lots of cores starting up at the same time in a JVM.\n\nIs it a big deal to just do this lazily and synchronously the first time the handler is requested? I know it just moves the delay elsewhere, but on the flip side, with this patch, you might sometimes not get the hostname when you expect it (so technically it's a functional difference) "
+        },
+        {
+            "author": "Ramkumar Aiyengar",
+            "id": "comment-14698454",
+            "date": "2015-08-15T21:13:32+0000",
+            "content": "Attached is a patch describing what I meant (untested) "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-14701720",
+            "date": "2015-08-18T18:17:52+0000",
+            "content": "Ram: the approach you're suggesting was explicitly discussed in the past and deemed a bad idea because it means that if DNS changes there is no way for a solr admin to trigger a \"refresh\" of the \"cached\" hostname \u2013 which is why the existing code explicitly has the comment \"not static, so core reload will refresh\" \u2013 that way users could at least trigger a core reload when doing things like server swaps (or disaster recovery fail over of whole colos using subnet aliases, etc...)\n\nHaving this on a per-instance basis like it does currently would also mean that you have one more thread running per core, even if temporarily, that might cause issues if you have lots of cores starting up at the same time in a JVM.\n\nwhich is why the suggestion of using a single threaded CompletionService, overwritting a single static variable each time there is a core reload, is a better one (that unfortunately noone has ever got arround to implementing)\n\n...on the flip side, with this patch, you might sometimes not get the hostname when you expect it (so technically it's a functional difference)\n\nIt's always been the case that if there is a DNS problem you'll get null instead of the canonical hostname, and at a later time you might start getting a new/different/correct hostname (currently if/when DNS is fixed and hte core reloads) so improvements that return null if/when a hostname is unresolvable shouldn't be ruled out just for that reason.\n\n\n\nThe more we talk about the various trade offs involved with this type of problem, the more and more I ultimately feel like we really shouldn't invest too much complexity in the code just to account for people with bad/broken DNS configurations.\n\nmy current feeling is:\n\n\twe should \"fix\" the current SystemInfoHandler init logic to log errors when there are DNS problems so they should up in the logs, but otherwise leave things along.\n\tFor situations like SOLR-7884 i think an advanced, seriously expert, system property that says \"hey solr, under no circumstances should you try to do any DNS lookups because i know my DNS is busted\" would be a good idea, and should be implemented by a generic helper method for use both here and in the various parts of the disributed update/search logic in the cloud code. (with forbidden API checks to prevent any future code other then this helper method from doing DNS related methods)\n\n\n "
+        },
+        {
+            "author": "Ramkumar Aiyengar",
+            "id": "comment-14701849",
+            "date": "2015-08-18T19:35:55+0000",
+            "content": "Ah, my bad, I interpreted the comment to mean \"not static (for other reasons), so core reload will (unfortunately) refresh (, but that's not a big deal)\" \n\nMakes sense overall.. "
+        },
+        {
+            "author": "Robert Kr\u00fcger",
+            "id": "comment-14954573",
+            "date": "2015-10-13T07:51:38+0000",
+            "content": "I agree that the solution to this should be simple because cases like SOLR-7884 are certainly not the norm (I am the reporter btw). The proposed system property would be a perfectly sufficient and very welcome fix for this. "
+        },
+        {
+            "author": "Robert Kr\u00fcger",
+            "id": "comment-15050937",
+            "date": "2015-12-10T12:55:48+0000",
+            "content": "Is anyone planning on scheduling this for an upcoming release? The proposed solution unfortunately is beyond my solr-knowledge, so I probably won't send a patch. "
+        },
+        {
+            "author": "Robert Kr\u00fcger",
+            "id": "comment-15360469",
+            "date": "2016-07-03T08:53:54+0000",
+            "content": "I would offer a bounty to have this fixed. Is there a systematic/recommended way of doing this in this project? "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-15408598",
+            "date": "2016-08-04T22:38:55+0000",
+            "content": "For situations like SOLR-7884 i think an advanced, seriously expert, system property that says \"hey solr, under no circumstances should you try to do any DNS lookups because i know my DNS is busted\" would be a good idea, and should be implemented by a generic helper method for use both here and in the various parts of the disributed update/search logic in the cloud code. (with forbidden API checks to prevent any future code other then this helper method from doing DNS related methods)\n\nI spent a little time looking into this, and it appears to be somewhat intractable.  There are too many InetAddress methods that may do reverse DNS lookups under the covers to try and write our own wrappers and suppress direct calls with forbidden-API \u2013 particularly since many of those methods are the same ones that just return the local hostname configuration if available (when dealing with InetAddress.getLocalHost()) or the previously specified hostname (when dealing with InetAddress.getByName(String))\n\nSo instead I punted on trying to solve the general problem of a sysprop to say \"Don't ever do any DNS lookups\" and just kept the problem constrained to sysprop that says \"Don't ever do this DNS lookup\" .. leaving open the possibility of refactoring it later if there are other places where we decide we want it to apply as well.\n\nRobert: can you try out this patch on a machine with a configuration you know currently causes you long delays in starting up solr, and confirm you get a helpful WARN message instructing you to set the solr.dns.prevent.reverse.lookup .. and then test out adding that to your startup params and confirm it eliminates the problem?\n "
+        },
+        {
+            "author": "Robert Kr\u00fcger",
+            "id": "comment-15408948",
+            "date": "2016-08-05T06:14:11+0000",
+            "content": "Thanks a lot! I will try and get back to you. "
+        },
+        {
+            "author": "Robert Kr\u00fcger",
+            "id": "comment-15536276",
+            "date": "2016-09-30T15:31:09+0000",
+            "content": "Works, thanks a lot! \n\nThe only question I have is why you don't set the host name to the inet address (or maybe even the result of getHostName?) in the case when the DNS lookup is suppressed. For admins looking into the logs this is still better than not having a host name in there and that should not block at all. The issue was with getCanonicalHostName making the reverse DNS lookup that caused the system to hang. Your call. Since I don't really care about host name in the logs, it fixes my problem as is but I thought I'd at least point out the possibility. "
+        },
+        {
+            "author": "Robert Kr\u00fcger",
+            "id": "comment-15725453",
+            "date": "2016-12-06T13:13:56+0000",
+            "content": "Is anything keeping you from pushing this into one of the next updates? It is still a big issue for us with no known workaround. "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-15726818",
+            "date": "2016-12-06T21:49:52+0000",
+            "content": "Commit 135604f6327032d0258227aaa524369203d40822 in lucene-solr's branch refs/heads/branch_6x from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=135604f ]\n\nSOLR-5043: New solr.dns.prevent.reverse.lookup system property that can be used to prevent long core (re)load delays on systems with missconfigured hostname/DNS\n\n(cherry picked from commit 8b98b158ff9cc2a71216e12c894ca14352d31f0e) "
+        },
+        {
+            "author": "ASF subversion and git services",
+            "id": "comment-15726819",
+            "date": "2016-12-06T21:49:56+0000",
+            "content": "Commit 8b98b158ff9cc2a71216e12c894ca14352d31f0e in lucene-solr's branch refs/heads/master from Chris Hostetter\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8b98b15 ]\n\nSOLR-5043: New solr.dns.prevent.reverse.lookup system property that can be used to prevent long core (re)load delays on systems with missconfigured hostname/DNS "
+        },
+        {
+            "author": "Hoss Man",
+            "id": "comment-15726882",
+            "date": "2016-12-06T22:09:40+0000",
+            "content": "Is anything keeping you from pushing this into one of the next updates? \n\nSorry \u2013 i lost track of it and didn't see your previous comment verifying hat the patch orked out for you.\n\nThe only question I have is why you don't set the host name to the inet address (or maybe even the result of getHostName?) in the case when the DNS lookup is suppressed. ...\n\nwell, 2 reasons...\n\n#1) conceptually, i don't like the idea of redefining what SystemInfoHandler reports as the host value ... this has always ment \"Either The Canonical Hostname of null if it can't be determined\" and I don't really like the idea that sometimes it's something else \u2013 partciularly when the primary usecase that might lead to \"sometimes\" is missconfigured DNS \u2013 i don't want to give users the impression \"The (canonical) hostname of this solr node is foobar\" when foobar is just some locally configured hostname and that name can't actaully be used to connect to the solr node.\n\nAdding distinct SystemInfoHandler variables for the IP Addr, or (locally configured) hostname might be conceptually ok \u2013 but personally i don't see much value, and leads me to...\n\n#2) the way the InetAddress API is designed, just calling InetAddress.getLocalHost() causes a DNS lookup to happen \u2013  leading to the whole potential long pause delay this issue was opened about (perhaps not necessarily in the same misconfiguration situation you face, but it could in other misconfiguration situations).  Likewise, getHostName() will do a reverse lookup in some situations if there isn't any locally configured hostname.\n\nThe bottom line being: since the entire predicate for this issue is \"Sometimes people have badly configure DNS and/or hostname settings, and we should give them a way to make life less painful\" I didn't want to make too many assumptions about the specific nature of how their DNS and/or hostname settings might be badly configured and/or introduce similar problems or more complexity in just trying to get the IP addr. "
+        }
+    ]
+}

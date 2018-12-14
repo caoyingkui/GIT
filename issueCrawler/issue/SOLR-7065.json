@@ -1,0 +1,144 @@
+{
+    "id": "SOLR-7065",
+    "title": "Let a replica become the leader regardless of it's last published state if all replicas participate in the election process.",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "7.3",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "",
+    "attachments": {
+        "SOLR-7065.patch": "https://issues.apache.org/jira/secure/attachment/12695422/SOLR-7065.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-01-30T01:38:08+0000",
+            "author": "Mark Miller",
+            "content": "First whack at a draft patch. ",
+            "id": "comment-14298054"
+        },
+        {
+            "date": "2015-01-30T01:42:18+0000",
+            "author": "Mark Miller",
+            "content": "This is working pretty well, but the new testing leads to some shard inconsistency fails I have to track down. ",
+            "id": "comment-14298060"
+        },
+        {
+            "date": "2015-01-30T05:09:34+0000",
+            "author": "Mark Miller",
+            "content": "My latest state. ",
+            "id": "comment-14298207"
+        },
+        {
+            "date": "2015-01-30T05:33:59+0000",
+            "author": "Mark Miller",
+            "content": "I never really liked that the leader would try to publish the down state for replicas. In this tougher test, you can run into leaders that have a DOWN state and think they are an active leader. I've taken that out in my latest work. I think there are races there that are hard to reason and we should usually avoid a node publishing state for another node. ",
+            "id": "comment-14298226"
+        },
+        {
+            "date": "2015-01-30T05:42:40+0000",
+            "author": "Mark Miller",
+            "content": "Ugg...the leader election code was hard enough to grasp before all of this out of order stuff.\n\nLove to see the following log line for a shard:\n\n log.info(\"was going to be leader {} , seq(0) {}\", context.leaderSeqPath, holdElectionPath + \"/\" + seqs.get(0));//but someone else jumped the line\n\nAnd then of course no new leader...where are you line jumper? ",
+            "id": "comment-14298230"
+        },
+        {
+            "date": "2015-01-30T05:55:03+0000",
+            "author": "Mark Miller",
+            "content": "This zk leader election recipe has spiraled out of control. It was super delicate to begin with, now it's a monster that can't be trusted or barley reasoned out fully. I think someone assumed we have much more thorough testing for it then we do. ",
+            "id": "comment-14298241"
+        },
+        {
+            "date": "2015-01-30T06:08:36+0000",
+            "author": "Mark Miller",
+            "content": "Probably we should look at using a better algorithm for ordering - having enough replicas to cause a 'thundering herd' problem is not too realistic and so a less scalable and better suited algorithm will be a lot better than trying to cram crazy on complicated. ",
+            "id": "comment-14298255"
+        },
+        {
+            "date": "2015-01-30T18:39:01+0000",
+            "author": "Erick Erickson",
+            "content": "Yeah, I started to take a whack at it at one point, basically taking control of the ordering of the election queue but abandoned it due to time constraints. One problem is that we're bastardizing the whole ephemeral election process in ZK and resorting to the \"tie breaker\" code that does things like \"find the next guy and jump down two, unless you're within the first two of the head in which case do nothing\". And the sorting is sensitive to the session ID to boot. \n\nThe TestRebalanceLeaders code exercises the shard leader election, we can see if we can extend it. I'm not sure how robust it is when nodes are flaky.\n\nYou mentioned at one point that you wondered whether the whole \"watch the guy in front\" and ZKs ephemeral-sequential node was the right way to approach this. The hack I started still used that mechanism, just took better control of how nodes were inserted into the leader election queue so I don't think that approach really addresses why this has spun out of control.\n\nI really wonder if we should change the mechanism. It seems to me that the fundamental fragility (apart from how hard the code is to understand) is that if the sequence of who watches which ephemeral node somehow gets out of whack, there is no mechanism for letting the other nodes in the queue know that there's a problem that needs to be sorted out which can result in no leaders I assume. Certainly happened often enough to me.\n\nI wonder if tying leader election into ZK state changes rather than watching the ephemeral election node-in-front is a better way?\n\nThis has not been thought out, but what about something like:\n\nSolr gets a notification of state change from ZK and drops into the \"should I be leader\" code which gets significantly less complex.\n  -1> If I'm not active, ??? Probably just return assuming the next state change will re-trigger this code.\n  0> If I'm not in the election queue, put myself at the tail. (handles mysterious out-of-whack situations)\n  1> If there is a leader and it's active, return. (if it's in the middle of going down, we should get another state change when it's down, right?)\n  2a> If some other node is both active and the preferred leader return (again depending on a state change message if that node goes down to get back to this code)\n  2b> If I'm the preferred leader, take over leadership.\n  3> If any other node in the leader election queue in front of me is active, return (state change gets us back here if those nodes are going down).\n  4> take over leadership.\n\nSince this operates off of state changes to ZK, it seems like it gives us the chance to recover from weird situations. I don't think it increases traffic, don't all ZK state changes have to go to all nodes anyway?\n\nI'm not sure in this case whether we even need a leader election queue at all. Is the clusterstate any less robust than the election queue? Even if it would be just as good, not sure how you'd express \"the node in front\". Actually, a simple counter property in the state for each replica would do it maybe. You'd set it at one more than any other node in the collection when a node changed its state to \"active\". I'll freely admit though, you've seen a lot more in the weeds here than I have so I'll defer to your experience.\n\nAnyway, let's kick the tires of what's to be done, maybe we can tag-team this. I consider the above just a jumping-off point to tame this beast. Be glad to chat if you or anyone else wants to kick it around...\n\nOne thing I'm not real clear on is how up-to-date the ZK cluster state is. Since changing the state is done through the Overseer, how to insure that the state is current when making decisions? ",
+            "id": "comment-14299026"
+        },
+        {
+            "date": "2015-01-30T19:00:59+0000",
+            "author": "Mark Miller",
+            "content": "You mentioned at one point that you wondered whether the whole \"watch the guy in front\" and ZKs ephemeral-sequential node was the right way to approach this. \n\nRight. This entire approach is an elegant ZooKeeper recipe that is actually quite difficult to program perfectly. It's point is to prevent a thundering herd problem when you have tons of nodes involved in the election - with simpler approaches, if a leader goes down, now you can have everyone in the election checking the same nodes about what has changed and this can cause problems. Except that you never have more than a handful of replicas. Even 20 replicas is kind of crazy, and it's still not even close to a herd.\n\nThis elegant solution is hard to nail, hard to test properly, and as can be seen, not very good for dealing with priorities and altering the election line.\n\nA very simple solution that involves the overseer or optimistic locking / writing would be much, much simpler for re ordering the election. ",
+            "id": "comment-14299052"
+        },
+        {
+            "date": "2015-01-30T21:56:29+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "not very good for dealing with priorities\n\nIn particular, the follow the leader approach makes it very hard to do things like assign arbitrary priorities to nodes (the current jump the queue stuff works because there are only two priorities, extending it to more will make it untenable very soon). You could on the other hand come up with a solution to do that with optimistic locking.. ",
+            "id": "comment-14299266"
+        },
+        {
+            "date": "2015-02-01T15:59:45+0000",
+            "author": "Erick Erickson",
+            "content": "Hmm, so in the optimistic locking case are you thinking of bypassing the Overseer completely for the shard leader election case? And maybe the overseer election case? ",
+            "id": "comment-14300244"
+        },
+        {
+            "date": "2015-02-01T16:30:29+0000",
+            "author": "Mark Miller",
+            "content": "Right, the optimistic election approach would not necessarily need to use the Overseer. It's similar to how each node would update the clusterstate itself (before the Overseer was added) - and if someone else changed it first, you retry. ",
+            "id": "comment-14300253"
+        },
+        {
+            "date": "2015-05-15T10:35:17+0000",
+            "author": "Mark Miller",
+            "content": "This is an important but tough issue to finish. Hope to get back to it after my hand heals up. ",
+            "id": "comment-14545281"
+        },
+        {
+            "date": "2015-12-09T19:27:16+0000",
+            "author": "Mark Miller",
+            "content": "I think some of the problems I hit while working on this were due to bugs - some of which have been fixed by now. I'm going to see if I can get this patch up to trunk soon. ",
+            "id": "comment-15049238"
+        },
+        {
+            "date": "2016-06-15T20:29:57+0000",
+            "author": "Mike Drob",
+            "content": "Recently saw something that might be this. Started trying to bring your patch up to current master, but ran into issues; some of the changes that you had in this patch got committed as part of SOLR-7033. I also didn't understand the advantage of returning an int instead of a boolean for sync. It looks like you used it to provide a ternary indicator of error, no sync necessary, or sync completed? That code changed a bunch with the fingerprinting from SOLR-8586.\n\nA specific case that doesn't make sense was\nSyncStrategy.java\n     if (SKIP_AUTO_RECOVERY) {\n-      return true;\n+      return -1;\n     }\n\n\nShould this be return 0?\n\nI see a lot of design discussion in this JIRA prior, but not a lot of consensus. What do you think is the easiest way forward from here, Mark Miller ",
+            "id": "comment-15332488"
+        },
+        {
+            "date": "2016-06-17T01:48:31+0000",
+            "author": "Mark Miller",
+            "content": "We are skipping recovery, so we want to return -1 (success).\n\nI think this is a tricky issue. Requires a bit of thought to make sure it's all okay. But I think I roughly had what we need in the patch. The main issue was that the test exposed some kind of problem where no leader would be elected. I think this may now be okay since another issue has been resolved. Most of the discussion above is not very related to this patch. ",
+            "id": "comment-15335191"
+        },
+        {
+            "date": "2016-07-15T15:05:13+0000",
+            "author": "Mike Drob",
+            "content": "We are skipping recovery, so we want to return -1 (success).\nThat's... not what I expected. Can you explain what the possible return values mean? I got the impression that the three options are -1, 0, and > 0? ",
+            "id": "comment-15379529"
+        },
+        {
+            "date": "2016-07-15T15:24:56+0000",
+            "author": "Mark Miller",
+            "content": "That wasn't a finished patch, just work on getting this to work, so don't insist on sticking to any of the impl.\n\nBut, if I remember right (and I may not), it was -1 means success, synced with all replicas and > 0 is how many replicas were synced with if it wasn't all of them. In that case, 0 would mean, did not sync with all of them, and actually synced with 0 of them. ",
+            "id": "comment-15379555"
+        },
+        {
+            "date": "2016-07-18T16:03:22+0000",
+            "author": "Mike Drob",
+            "content": "I had an updated version of the tests that was failing correctly on master, but it looks like it started to pass after SOLR-7280.\n\nOccasionally I will see the test stall out, but it doesn't actually fail, just never completes. And it's not consistent between runs using the same seed. I still think we're in a better place now than we were before, though. ",
+            "id": "comment-15382507"
+        },
+        {
+            "date": "2018-03-05T09:19:14+0000",
+            "author": "Cao Manh Dat",
+            "content": "Fixed by SOLR-12011 ",
+            "id": "comment-16385841"
+        }
+    ]
+}

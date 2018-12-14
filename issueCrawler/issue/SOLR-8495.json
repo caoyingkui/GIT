@@ -1,0 +1,75 @@
+{
+    "id": "SOLR-8495",
+    "title": "Schemaless mode cannot index large text fields",
+    "details": {
+        "components": [
+            "Data-driven Schema",
+            "Schema and Analysis"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.5",
+            "6.0"
+        ],
+        "affect_versions": "4.10.4,                                            5.3.1,                                            5.4",
+        "status": "Closed",
+        "resolution": "Duplicate",
+        "priority": "Major"
+    },
+    "description": "The schemaless mode by default indexes all string fields into an indexed StrField which is limited to 32KB text. Anything larger than that leads to an exception during analysis.\n\n\nCaused by: java.lang.IllegalArgumentException: Document contains at least one immense term in field=\"text\" (whose UTF8 encoding is longer than the max length 32766)",
+    "attachments": {
+        "SOLR-8495.patch": "https://issues.apache.org/jira/secure/attachment/12829481/SOLR-8495.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2016-01-06T17:29:02+0000",
+            "author": "Steve Rowe",
+            "content": "Here are the ways I can think of to address this problem:\n\n\n\tAutodetect space-separated text above a (customizable? maybe 256 bytes or so by default?) threshold as tokenized text rather than as StrField.\n\tMake StrField auto-truncate at Lucene's 32k limit.\n\tMake the guessed \"strings\" fieldType be TextField that uses KeywordTokenizer, and add a token filter that truncates StrField terms to Lucene's 32k limit\n\n\n\nI like #1 the best, because I think it aligns with likely user expectations, and it doesn't silently throw away data. ",
+            "id": "comment-15085882"
+        },
+        {
+            "date": "2016-01-06T17:34:42+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "+1 for #1 ",
+            "id": "comment-15085893"
+        },
+        {
+            "date": "2016-09-20T16:43:24+0000",
+            "author": "Hoss Man",
+            "content": "the root issue here is the same as SOLR-9526: assuming (untokenized) StrField.\n\nI think my suggestion in that issue makes the most sense \u2013 but it doesn't address the surface error noted in this issue: an exception when \"string\" values are too big.\n\nSo perhaps for that we should just just add TruncateFieldUpdateProcessorFactory to the data_drive configs with some reasonable upper limit?\n\n\n <processor class=\"solr.TruncateFieldUpdateProcessorFactory\">\n   <str name=\"typeClass\">solr.StrField</str>\n   <int name=\"maxLength\">10000</int>\n </processor>\n\n\n\nAutodetect space-separated text above a (customizable? maybe 256 bytes or so by default?) threshold as tokenized text rather than as StrField.\n\nI'm leary of this an approach like this, because it would be extremely trappy depending on the order docs were indexed: similar to the float/int problems we have now, but probably more so, and with more confusion because it wouldn't neccessarily be obvious at first glance when/why StrField was choosen vs TextField (or even that a diff choice was made if the user didn't go look, since unlike the int/float issue the output of the stored field would be the same \"String\" \n\n(and you'd only ever get an error if the first doc was a \"short\" string, and some other doc was above the 32K lucene limit ... if all the docs were under the 32K limit, but above the str/text threshold, you'd never get an error \u2013 regardless of the order the docs were indexed in.  but one doc ordering would give you searchable text fields, and another doc order would give you StrFields that didn't match any search you tried.\n ",
+            "id": "comment-15507076"
+        },
+        {
+            "date": "2016-09-21T01:30:59+0000",
+            "author": "Cao Manh Dat",
+            "content": "Here are the initial patch for this issue, It based on the idea #1 of Steve Rowe\n\nThis patch introduce new ParseLongStringFieldUpdateProcessorFactory which do the check\n\nif (valSize > 32000) {\n  return new LongStringField(stringVal);\n}\n\n\nSo we can add new type mapping to AddSchemaFieldsUpdateProcessorFactory\n\n<lst name=\"typeMapping\">\n  <str name=\"valueClass\">org.apache.solr.update.processor.LongStringField</str>\n  <str name=\"fieldType\">lstring</str>\n</lst>\n\n\n\nThere are some problems of this approach is :\n\n\tWe must define the size of chunk ( in which we split large string into ) inside schema file ( for ChunkTokenizerFactory ) not inside solrconfig.\n\tIn multi-value case, what should we do for case the first value is > 32kb and the second value is < 32kb? With this patch, first value is mapping into LongStringField and second value still a String, so AddSchemaFieldsUpdateProcessor#mapValueClassesToFieldType will \u0010create a field based on defaultFieldType ( should we modify the method? )\n\n ",
+            "id": "comment-15508368"
+        },
+        {
+            "date": "2016-09-21T23:59:23+0000",
+            "author": "Steve Rowe",
+            "content": "I looked at Cao Manh Dat's patch, and I think there's way more machinery there than we need to address the problem.  A couple things I noticed:\n\n\n\tChunkTokenizer splits values at a maximum token length (rather than truncating), but I can't think of a good use for that behavior.\n\tParseLongStringFieldUpdateProcessorFactory extends NumericFieldUpdateProcessorFactory, which doesn't make sense, since there's no parsing going on, and LongStringField isn't numeric.\n\tParseLongStringFieldUpdateProcessor.mutateValue() uses String.getBytes(Charset.defaultCharset()) to determine a value's length, but Lucene will use UTF-8 to string terms, so UTF-8 should be used when testing value lengths.\n\tI don't think we need new tokenizers or processors or field types here.\n\n\n\nI agree with Hoss Man that his SOLR-9526 approach is the way to go (including his TruncateFieldUpdateProcessorFactory idea mentioned above, to address the problem described on this issue - his suggested \"10000\" limit neatly avoids worrying about encoded length issues, since each char can take up at most 3 UTF-8 encoded bytes, and 3*10000 is less than the 32,766 byte IndexWriter.MAX_TERM_LENGTH.)\n\n\nAutodetect space-separated text above a (customizable? maybe 256 bytes or so by default?) threshold as tokenized text rather than as StrField.\nI'm leary of this an approach like this, because it would be extremely trappy depending on the order docs were indexed\n\nI agree, hoss'ss SOLR-9526 approach will index everything as text_general but then add \"string\" fieldtype copies for values that aren't \"too long\". ",
+            "id": "comment-15511574"
+        },
+        {
+            "date": "2016-09-30T14:47:22+0000",
+            "author": "Cao Manh Dat",
+            "content": "Ok, so we will wait for SOLR-9526 get commited before continue working on this issue. ",
+            "id": "comment-15536180"
+        },
+        {
+            "date": "2016-10-06T09:38:07+0000",
+            "author": "Jan H\u00f8ydahl",
+            "content": "See relevant comment in SOLR-9526 ",
+            "id": "comment-15551472"
+        },
+        {
+            "date": "2017-07-05T22:59:31+0000",
+            "author": "Jan H\u00f8ydahl",
+            "content": "Closing as duplicate of SOLR-9526 ",
+            "id": "comment-16075584"
+        }
+    ]
+}

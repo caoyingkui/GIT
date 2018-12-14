@@ -1,0 +1,129 @@
+{
+    "id": "SOLR-6666",
+    "title": "Dynamic copy fields are considering all dynamic fields, causing a significant performance impact on indexing documents",
+    "details": {
+        "components": [
+            "Schema and Analysis",
+            "update"
+        ],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "Result:\nAfter applying a fix for this issue, tests which we conducted show more than 40 percent improvement on our insertion performance.\n\nExplanation:\n\nUsing JVM profiler, we found a CPU \"bottleneck\" during Solr indexing process. This bottleneck can be found at org.apache.solr.schema.IndexSchema, in the following method, \"getCopyFieldsList()\":\n\ngetCopyFieldsList()\nfinal List<CopyField> result = new ArrayList<>();\n    for (DynamicCopy dynamicCopy : dynamicCopyFields) {\n      if (dynamicCopy.matches(sourceField)) {\n        result.add(new CopyField(getField(sourceField), dynamicCopy.getTargetField(sourceField), dynamicCopy.maxChars));\n      }\n    }\n    List<CopyField> fixedCopyFields = copyFieldsMap.get(sourceField);\n    if (null != fixedCopyFields) {\n      result.addAll(fixedCopyFields);\n    }\n\n\n\nThis function tries to find for an input source field all its copyFields (All its destinations which Solr need to move this field). \nAs you can probably note, the first part of the procedure is the procedure most \u201cexpensive\u201d step (takes O( n ) time while N is the size of the \"dynamicCopyFields\" group).\nThe next part is just a simple \"hash\" extraction, which takes O(1) time. \n\nOur schema contains over then 500 copyFields but only 70 of then are \"indexed\" fields. \nWe also have one dynamic field with  a wildcard ( * ), which \"catches\" the rest of the document fields. \nAs you can conclude, we have more than 400 copyFields that are based on this dynamicField but all, except one, are fixed (i.e. does not contain any wildcard).\n\nFrom some reason, the copyFields registration procedure defines those 400 fields as \"DynamicCopyField \" and then store them in the \u201cdynamicCopyFields\u201d array, \nThis step makes getCopyFieldsList() very expensive (in CPU terms) without any justification: All of those 400 copyFields are not glob and therefore do not need any complex pattern matching to the input field. They all can be store at the \"fixedCopyFields\".\nOnly copyFields with asterisks need this \"special\" treatment and they are (especially on our case) pretty rare.  \n\nTherefore, we created a patch which fix this problem by changing the registerCopyField() procedure.\nTest which we conducted show that there is no change in the Indexing results. Moreover, the fix still successfully passes the class unit tests (i.e. IndexSchemaTest.java).",
+    "attachments": {
+        "SOLR-6666.patch": "https://issues.apache.org/jira/secure/attachment/12677892/SOLR-6666.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2014-10-29T14:41:59+0000",
+            "author": "Erick Erickson",
+            "content": "Liram:\n\nGood stuff! \nCould you attach the patch to this JIRA? That'll make it easiest for someone to pick up.\nHere's a hint on how: http://wiki.apache.org/solr/HowToContribute#Working_With_Patches\n\nThanks! ",
+            "id": "comment-14188403"
+        },
+        {
+            "date": "2014-10-29T14:50:56+0000",
+            "author": "Liram Vardi",
+            "content": "Thanks \nThe patch is attached. ",
+            "id": "comment-14188411"
+        },
+        {
+            "date": "2014-10-29T14:53:14+0000",
+            "author": "Erick Erickson",
+            "content": "I'll take a look, but I won't have any serious tim until this weekend, so if anyone wants to pick this up feel free. ",
+            "id": "comment-14188412"
+        },
+        {
+            "date": "2014-11-26T09:04:43+0000",
+            "author": "Liram Vardi",
+            "content": "Hi all,\nDid anyone have a chance to take a look on this?\nThanks ",
+            "id": "comment-14225926"
+        },
+        {
+            "date": "2014-11-26T15:45:42+0000",
+            "author": "Erick Erickson",
+            "content": "Liram:\n\nSorry, it's been on my list for a bit but I haven't gotten to it yet. Over Thanksgiving, I promise.\n\nErick ",
+            "id": "comment-14226342"
+        },
+        {
+            "date": "2014-12-08T14:09:03+0000",
+            "author": "Erick Erickson",
+            "content": "And he breaks his promise again. Sorry, came down with something this weekend and got swamped. This week fer sure (he says again). ",
+            "id": "comment-14237881"
+        },
+        {
+            "date": "2014-12-14T00:33:24+0000",
+            "author": "Erick Erickson",
+            "content": "The problem here is that if you add this copyField directive to schema.xml\n<copyField source=\"fail_dynamic\" dest=\"dynamic_*\"/>\nthe schema won't load with the patch. It fails with a message\nabout the source field needing an asterisk if the destination\nhas one. Other tests have this pattern and fail BTW, see:\nTestFieldCollectionResource, TestManagedSotpFilterFactory\nand TestManagedSynonymFileFactory.\n\nThe fail_dynamic field \"fulfills\" this  requirement since it is actually a\nmatch for \"*_dynamic\" \n\nSo are you saying that if you have\n<field name=\"one\"... />\n<field name=\"two\".../>\n\nand a copyField of \n<copyField source=\"one\" dest=\"two\" /> that bogus logic happens because\nit matches a dynamic field? \n\nOr are your source fields \"explicit\", but only really instantiated by matching a \ndynamic field so there's no corresponding <field> definition?\n\nIf it's the former, then it seems that doing a test way up top similar to this:\n    if (destSchemaField != null && sourceSchemaField != null) { // Source and destination are explicit\n      List<CopyField> copyFieldList = copyFieldsMap.get(source);\n      if (copyFieldList == null) \n{\n        copyFieldList = new ArrayList<>();\n        copyFieldsMap.put(source, copyFieldList);\n      }\n      copyFieldList.add(new CopyField(sourceSchemaField, destSchemaField, maxChars));\n      incrementCopyFieldTargetCount(destSchemaField);\n      return;\n    }\n (and maybe taking this out from the end of the method?) would catch your case.\n\nIt's certainly an open question whether this is the way it \"should\" be of course. I don't\nquite know if there are shortcuts we could take that would satisfy both situations, i.e.\nshortcut non-asterisk source fields in copyField directives that happen to be instantiations\nof dynamic fields while still respecting all the ways a field could get into the \"explicit\" field\n(\"fail_dynamic\" above).\n\nIt's also possible that the test that blows up above is too restrictive, I'm not prepared\nto say one way or another. But I can't commit this without getting a resolution to that question.\n\nUnder any circumstances, it seems that beefing up the IndexSchemaTest would be a good thing,\non a quick look they aren't all that comprehensive. ",
+            "id": "comment-14245754"
+        },
+        {
+            "date": "2014-12-21T09:42:49+0000",
+            "author": "Liram Vardi",
+            "content": "Hi Erick,\n\nThanks you for the comprehensive review for this post.\n\nIndeed, my patch causes a loading failure and also to TestFieldCollectionResource to fail, when we are using the \u201cfail_dynamic\u201d example.\n(TestManagedSotpFilterFactory and TestManagedSynonymFileFactory failed on my environment regardless the patch.)\nAlthough, based on the following wiki, I was sure that this example is invalid. \nhttps://cwiki.apache.org/confluence/display/solr/Copying+Fields \nHowever, based on your explanation I tried to find a combine solution which satisfies  those two cases, as you said.\n\nThe case that I am trying to solve is the case that source is not explicit (which means that does not have a field definition and it is only instantiated by matching a dynamic field \u2013 the second case that you described on your response). \nSo, let make things a bit more ordered.\nLet us assume three possible types for each copyfield, source and destination:\n1)      Explicit \u2013 the field has explicit \u201cfield\u201d definition.\n2)      Glob \u2013 The field contains an asterisks on its copyField definition and it matches to one (or more) of the fields definitions (dynamic or static).\n3)      Reference \u2013 the copy field references to some dynamic field, but it is without any asterisks.\n\nEach copyfield\u2019s source and destination belongs to one of those types.\nWhen Solr reads the schema, it divides the copy fields eventually to two groups: fixedCopyFields and to dynamicCopyFields. \nAs I explained before, the \u201cfixedCopyFields\u201d is much less expensive than the \u201cdynamicCopyFields\u201d.\nNow, let define the following decision table:\n\n\n\nCase\nSource\nDestination\nDecision\n\n\n1\nExplicit\nExplicit\nfixedCopyFields\n\n\n2\nExplicit\nGlob\nError!\n\n\n3\nExplicit\nReference\ndynamicCopyFields\n\n\n4\nGlob\nExplicit\ndynamicCopyFields\n\n\n5\nGlob\nGlob\ndynamicCopyFields\n\n\n6\nGlob\nReference\ndynamicCopyFields\n\n\n7\nReference\nExplicit\nfixedCopyFields\n\n\n8\nReference\nGlob\ndynamicCopyFields\n\n\n9\nReference\nReference\ndynamicCopyFields\n\n\n\n\n\nAs you can see, until today only for case \u201c1\u201d (source and destination are explicit), Solr put those copy fields on the \u201cstatic\u201d hash.\nOn the next version of patch SOLR-6666, I did a refectory on the \u201cif\u201d statement which divides those copyfields.\nAt the previous version of the patch, the code throw exception on case 8 (.i.e fail_dynamic example).\nNow after the refectory, case \u201c8\u201d is legal again and case \u201c7\u201d, which is the one that I am trying to solve, sends those copyfields to the \u201cfixedCopyFields\u201d map.\n\nAnother open question is if cases 3 and 9 need also to stay as \u201cDynamicCopyFields\u201d or can we make the update more efficient by moving those also to the \u201cstatic\u201d map\u2026 But currently the patch does not change this.\n\nThe second version of the patch is attached.      \n\nThanks! ",
+            "id": "comment-14255107"
+        },
+        {
+            "date": "2014-12-31T01:37:54+0000",
+            "author": "Erick Erickson",
+            "content": "Hmmm, I like the way you've broken things out, it makes the code easier to follow. It gave me a headache looking the original code before either patch.\n\nWe have three other test failures, it's always best to run 'ant test' before putting up a patch. That said, I think the one I'm seeing (there are three, but they're all the same problem) is the following:\n\nUse account \"steve_rowe\" instead I'm particularly interested in what you think here.\n\nThe trunk code returns this fragment in TestCopyFieldCollectionResource.java\n\t    \n{\n\t      \"source\":\"src_sub_no_ast_i\",\n\t      \"sourceDynamicBase\":\"*_i\",\n\t      \"dest\":\"title\"}\n,\n\nwhereas the patched code returns:\n\t    \n{\n\t      \"source\":\"src_sub_no_ast_i\",\n\t      \"dest\":\"title\"}\n,\n\nThe schema.xml file (if I've got the right one) has this line:\n   <copyField source=\"src_sub_no_ast_i\" dest=\"title\"/>\n\nLike I said, the original code hurt my head, I suspect it was just wrong. Steve, do you have any comments here? Or am I mis-interpreting things?\n\nThe attached patch fixes these three problems, I'll run the whole test suite again too. ",
+            "id": "comment-14261778"
+        },
+        {
+            "date": "2015-01-05T14:20:41+0000",
+            "author": "Steve Rowe",
+            "content": "+1 for Erick's patch.\n\nSeparately, I've long thought that iterating through each dynamic copy field looking for matches was non-optimal - I think this could be converted into one or more regular expressions, like maybe one for prefix globs and one for suffix globs.\n\n\nWe have three other test failures, it's always best to run 'ant test' before putting up a patch. That said, I think the one I'm seeing (there are three, but they're all the same problem) is the following:\n\nSteve Rowe I'm particularly interested in what you think here.\n\nThe trunk code returns this fragment in TestCopyFieldCollectionResource.java\n\n{ \"source\":\"src_sub_no_ast_i\", \"sourceDynamicBase\":\"*_i\", \"dest\":\"title\"}\n\n,\nwhereas the patched code returns:\n\n{ \"source\":\"src_sub_no_ast_i\", \"dest\":\"title\"}\n\n,\nThe schema.xml file (if I've got the right one) has this line:\n\n<copyField source=\"src_sub_no_ast_i\" dest=\"title\"/>\n\n\nYeah the sourceDynamicBase is determined at schema parsing time and stored in a DynamicCopy instance.  While the optimization included in the patch removes this capability \u2013 DynamicCopy is not used in copyFieldsMap \u2013 the idea of a single source \"base\" is wrongheaded for at least two reasons: a) copyField source globs can match multiple dynamicField-s (as well as non-dynamic fields for that matter); and b) it's not always possible to identify the source field(s) at schema parsing time - see e.g. SOLR-4650.  Anyway, there is no real loss here in dropping support for sourceDynamicBase.\n\nLike I said, the original code hurt my head, I suspect it was just wrong. Steve, do you have any comments here? Or am I mis-interpreting things?\n\nThe code isn't changed much, really?  Can you say why you think it was (is?) wrong?  The code is trying to handle lots of cases - see the table on SOLR-4567.  That said, I think the code for handling dynamic copyField sources is more complicated than it needs to be: except for cases 14-16 in the above-linked table (copyField-s with a no-glob-dynamic-field-reference source and a dynamic field destination), it's not necessary to verify at schema parsing time that any (dynamic) field(s) are matched by copy field glob sources - see SOLR-4650 for a concrete example.  I think sourceDynamicBase should go away entirely. ",
+            "id": "comment-14264612"
+        },
+        {
+            "date": "2015-01-05T17:23:00+0000",
+            "author": "Erick Erickson",
+            "content": "bq: The code isn't changed much, really? Can you say why you think it was (is?) wrong?\n\nThis was just referring to the test case I referenced where even though there was\na copy that looked \"explicit\", although based on a dynamic field. But if I'm finally understanding,\nthe problem the old code was fine, just in this case we can take a shortcut.\n\nMy comment about the code hurting my head was mostly that I didn't have a framework\nfor trying to figure out what it was doing, I really wish I'd known about the table at SOLR-4567.\nwhen I was looking at the original patch to help organize things.\n\nIn case you can't tell, I'm doing some new year's cleanup of JIRAs I assigned to myself....\n\nThanks! I'll commit this shortly ",
+            "id": "comment-14264790"
+        },
+        {
+            "date": "2015-01-05T20:50:16+0000",
+            "author": "Erick Erickson",
+            "content": "Same patch with CHANGES.txt added. ",
+            "id": "comment-14265075"
+        },
+        {
+            "date": "2015-01-05T20:50:40+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1649657 from Erick Erickson in branch 'dev/trunk'\n[ https://svn.apache.org/r1649657 ]\n\nSOLR-6666: Dynamic copy fields are considering all dynamic fields, causing a significant performance impact on indexing documents ",
+            "id": "comment-14265077"
+        },
+        {
+            "date": "2015-01-05T22:30:57+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1649681 from Erick Erickson in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1649681 ]\n\nSOLR-6666: Dynamic copy fields are considering all dynamic fields, causing a significant performance impact on indexing documents ",
+            "id": "comment-14265242"
+        },
+        {
+            "date": "2015-01-05T22:31:59+0000",
+            "author": "Erick Erickson",
+            "content": "Thanks Liram and a big thanks to Steve for reviewing. ",
+            "id": "comment-14265244"
+        },
+        {
+            "date": "2015-01-06T08:36:26+0000",
+            "author": "Liram Vardi",
+            "content": "You are welcome!\nThanks  ",
+            "id": "comment-14265851"
+        },
+        {
+            "date": "2015-02-23T05:01:37+0000",
+            "author": "Anshum Gupta",
+            "content": "Bulk close after 5.0 release. ",
+            "id": "comment-14332733"
+        }
+    ]
+}

@@ -1,0 +1,81 @@
+{
+    "id": "SOLR-9978",
+    "title": "Reduce collapse query memory usage",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "Single shard test with one replica\n\t10M documents and 9M of those documents are unique. Test was for string\n\tCollapse query parser creates two arrays :\n\tint array for unique documents ( 9M in this case )\n\tfloat array for the corresponding scores ( 9M in this case )\n\tIt goes through all documents and puts the document in the array if the score is better than the previously existing score.\n\tSo collapse creates a lot of garbage when the total number of documents is high and the duplicates is very less\n\tEven for a query like this {{q=\n{!cache=false}\n:&fq=\n{!collapse field=collapseField_s cache=false}\n&sort=id desc}}\n  which has a top level sort , the collapse query parser creates the score array and scores every document\n\n\n\n\nIndexing script used to generate dummy data:\n\n    //Index 10M documents , with every 1/10 document as a duplicate.\n    List<SolrInputDocument> docs = new ArrayList<>(1000);\n    for(int i=0; i<1000*1000*10; i++) {\n      SolrInputDocument doc = new SolrInputDocument();\n      doc.addField(\"id\", i);\n      if (i%10 ==0 && i!=0) {\n        doc.addField(\"collapseField_s\", i-1);\n      } else {\n        doc.addField(\"collapseField_s\", i);\n      }\n      docs.add(doc);\n      if (docs.size() == 1000) {\n        client.add(\"ct\", docs);\n        docs.clear();\n      }\n    }\n    client.commit(\"ct\");\n\n\n\nQuery:\nq={!cache=false}:&fq={!collapse field=collapseField_s cache=false}&sort=id desc\n\nImprovements\n\n\tWe currently default to the SCORE implementation if no min|max|sort param is provided in the collapse query. Check if a global sort is provided and don't score documents picking the first occurrence of each unique value.\n\tInstead of creating an array for unique documents use a bitset",
+    "attachments": {
+        "SOLR-9978.patch": "https://issues.apache.org/jira/secure/attachment/12848013/SOLR-9978.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-18T08:26:24+0000",
+            "content": "Patch detects if we are using a top level sort. For this case we don't score documents and also use a bitset to mark the documents been collected. This way we don't allocate the 9M int and float arrays and just have a bitset of 9M \n\n\nHere is a test for 100 queries. This is for string field. \n                      100Q          FreedMemory  FreedMemory_ForceGC\nWith Top Level Sort :        525M               849M\nWithout Top Level Sort :   3885M             4345M\n\nTODOs:\n\n\tBenchmark Int performance to see how much reduction do we see there. I suspect it will be by ~50% and not more. Strings worked a lot better because we get ordinals and not the actual values allowing us to use a bitset. For int we needed a IntHashSet\n\tSee for performance slowdowns. OrdScoreCollector#finish is slower with the patch when needsScore=false .\n\tTests!\n\n ",
+            "author": "Varun Thacker",
+            "id": "comment-15827606"
+        },
+        {
+            "date": "2017-01-18T17:50:35+0000",
+            "content": "These seems like a strange case to optimize for in that the score is meaningless.  What document (for duplicates) does the user expect?  If the user truly doesn't care (i.e. pick a doc arbitrarily) then I think this should be a new GroupHeadSelectorType perhaps named like \"ANY\", and then maybe we could auto-detect when ANY is more appropriate perhaps only when the user didn't expressly indicate. ",
+            "author": "David Smiley",
+            "id": "comment-15828454"
+        },
+        {
+            "date": "2017-01-19T05:36:01+0000",
+            "content": "I think this should be a new GroupHeadSelectorType perhaps named like \"ANY\"\n\nI actually did that as my first implementation but since there the code of OrdScoreCollector and OrdAnyCollector would be very similar I merged them to avoid duplication. \n\nBut maybe having them separate is the best approach. I'll work on a patch for this and then decide if we want to overload the \"needsScore\" variable to behave like \"ANY\" as the first patch or have it as two separate classes ",
+            "author": "Varun Thacker",
+            "id": "comment-15829348"
+        },
+        {
+            "date": "2017-02-08T23:05:45+0000",
+            "content": "New patch with test cases.\n\nThe patch adds two new collectors : IntAnyCollector and OrdAnyCollector\n\nThese two collectors don't care about scoring and picks the first occurrence of a value in the collapsed set.  Hence it can make memory optimizations as scoring is not needed.\n\nWith this patch a query like this will automatically select the OrdAnyCollector\n\n{!collapse field=collapseField_s}&sort=id desc\n\n\n\nAny string or numeric field which is used for collapse, not having \"min\" or \"max\" specified to select group head and having a top level sort will use the *AnyCollector.\n\nMaybe we can expose this as an external parameter as well? Any suggestions on what the name for this could be? ",
+            "author": "Varun Thacker",
+            "id": "comment-15858668"
+        },
+        {
+            "date": "2017-02-09T17:21:35+0000",
+            "content": "Quick benchmark with the latest patch. 10 million documents \nwere indexed with 1 in 10 documents having the same collapse value.\n50 queries were run on this index and the freed memory in gc viewer was recorded.\n\n\n\n\nQuery\nFreed Memory\n\n\n{!collapse field=collapseField_s cache=false}&sort=id desc\n848 MB\n\n\n{!collapse field=collapseField_s cache=false}\n4385 MB\n\n\n{!collapse field=collapseField_ti cache=false}&sort=id desc\n5062 MB\n\n\n{!collapse field=collapseField_ti cache=false}\n9408 MB\n\n\n\n ",
+            "author": "Varun Thacker",
+            "id": "comment-15859846"
+        },
+        {
+            "date": "2017-02-09T17:36:17+0000",
+            "content": "You'll want to be sure and test with high cardinality collapse fields. Something like 1,000,000 unique groups. This is the use case that collapse was really designed for. Low cardinality use cases are probably better suited for grouping. ",
+            "author": "Joel Bernstein",
+            "id": "comment-15859868"
+        },
+        {
+            "date": "2017-02-09T17:39:21+0000",
+            "content": "Hi Joel,\n\nThe test setup on which I had reported the numbers had 10 million groups with cardinality of 9 million. The indexing script is attached in the Jira description for reference. \n\nApart from this test that I ran , would you want me to run other tests to see how this behaves? ",
+            "author": "Varun Thacker",
+            "id": "comment-15859875"
+        },
+        {
+            "date": "2017-02-09T18:17:14+0000",
+            "content": "Ah, I was confused by:\n\nQuick benchmark with the latest patch. 10 million documents were indexed with 1 in 10 documents having the same collapse value. ",
+            "author": "Joel Bernstein",
+            "id": "comment-15859940"
+        },
+        {
+            "date": "2017-02-09T18:46:52+0000",
+            "content": "This seems alright to me; I reviewed the code but due to its complexity and my limited time, I wasn't as thorough as I would have liked.  I'd like to see a bit more in the way of testing... or perhaps it's tested more than I realize.  For example will testNoDocsHaveGroupField trigger this new code?  And something for null policy & elevation component?\n\nBefore looking at the code I anticipated that the final bitset oriented collection (in finish() perhaps all of finish() would be the same for ord & numeric case since we collect into bits and at that point it shouldn't matter about null policy and/or boosted (elevated) docs.  Can you help me understand why these Ord vs Int can't share the same or at least more of the same code? ",
+            "author": "David Smiley",
+            "id": "comment-15859979"
+        },
+        {
+            "date": "2017-02-09T20:10:53+0000",
+            "content": "Thanks David for the review. Your comment on the finish() method got me thinking and I think we can make improvements there as well. I'll work on a patch .\n\ntestNoDocsHaveGroupField trigger this new code?\n\nYeah it does. But I'll still do a more thorough review of the code paths which might not be tested with this current patch and improve on it in my next iteration.  ",
+            "author": "Varun Thacker",
+            "id": "comment-15860112"
+        }
+    ]
+}

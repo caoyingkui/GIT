@@ -1,0 +1,154 @@
+{
+    "id": "LUCENE-2283",
+    "title": "Possible Memory Leak in StoredFieldsWriter",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "2.9.3",
+            "3.0.2",
+            "3.1",
+            "4.0-ALPHA"
+        ],
+        "affect_versions": "2.4.1",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "StoredFieldsWriter creates a pool of PerDoc instances\n\nthis pool will grow but never be reclaimed by any mechanism\n\nfurthermore, each PerDoc instance contains a RAMFile.\nthis RAMFile will also never be truncated (and will only ever grow) (as far as i can tell)\n\nWhen feeding documents with large number of stored fields (or one large dominating stored field) this can result in memory being consumed in the RAMFile but never reclaimed. Eventually, each pooled PerDoc could grow very large, even if large documents are rare.\n\nSeems like there should be some attempt to reclaim memory from the PerDoc[] instance pool (or otherwise limit the size of RAMFiles that are cached) etc",
+    "attachments": {
+        "LUCENE-2283.patch": "https://issues.apache.org/jira/secure/attachment/12437013/LUCENE-2283.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-02-24T11:00:50+0000",
+            "content": "\nTermVectorsTermsWriter has the same issue.\n\nYou're right: with \"irregular\" sized documents coming through, you can\nend up with PerDoc instances that waste space, because the RAMFile has\nbuffers allocated from past huge docs that the latest tiny docs don't\nuse.\n\nNote that the number of outstanding PerDoc instances is a function of\nhow \"out of order\" the docs are being indexed, because the PerDoc\nholds any state only until that doc can be written to the store files\n(stored fields, term vectors).  It's transient.\n\nEG with a single thread, there will only be one PerDoc \u2013 it's written\nimmediately.  With 2 threads, if you have a massive doc (which thread\n1 get stuck indexing) and then zillions of tiny docs (which thread 2\nburns through, while thread 1 is busy), then you can get a large\nnumber of PerDocs created, waiting for their turn because thread 1\nhasn't finished yet.\n\nBut this process won't use unbounded RAM \u2013 the RAM used by the\nRAMFiles is accounted for, and once it gets too high (10% of the RAM\nbuffer size), we forcefully idle the incoming threads until the \"out\nof orderness\" is resolved.  EG in this case, thread 2 will stall until\nthread 1 has finished its doc.  That byte accounting does account for\nthe allocated but not used byte[1024] inside RAMFile (we use\nRAMFile.sizeInBytes()).\n\nSo... this is not really a memory leak.  But it is a potential\nstarvation issue, in that if your PerDoc instances all grow to large\nRAMFiles over time (as each has had to service a very large document),\nthen it can mean the amount of concurrency that DW allows will become\n\"pinched\".  Especially if these docs are large relative to your\nram buffer size.\n\nAre you hitting this issue?  Ie seeing poor concurrency during\nindexing despite using many threads, because DW is forcefully idleing\nthe threads?  It should only happen if you sometimes index docs\nthat are larger than RAMBufferSize/10/numberOrIndexingThreads.\n\nI'll work out  a fix.  I think we should fix RAMFile.reset to trim its\nbuffers using ArrayUtil.getShrinkSize. ",
+            "author": "Michael McCandless",
+            "id": "comment-12837740"
+        },
+        {
+            "date": "2010-02-24T14:05:39+0000",
+            "content": "I came across this issue looking for a reported memory leak during indexing\n\na yourkit snapshot showed that the PerDocs for an IndexWriter were using ~40M of memory (at which point i came across this potentially unbounded memory use in StoredFieldsWriter)\nthis snapshot seems more or less at a stable point (memory grows but then returns to a \"normal\" state), however i have reports that eventually the memory is completely exhausted resulting in out of memory errors.\n\nI so far have not found any other major culprit in the lucene indexing code.\n\nThis index receives a routine mix of very large and very small documents (which would explain this situation)\nThe VM and system have more than ample amount of memory given the buffer size and what should be normal indexing RAM requirements.\n\nAlso, a major difference between this leak not occurring and it showing up is that previously, the IndexWriter was closed when performing commits, now the IndexWriter remains open (just calling IndexWriter.commit()). So, if any memory is leaking during indexing, it is no longer being reclaimed during commit. As a side note, closing the index writer at commit time would sometimes fail, resulting in some following updates to fail because the index writer was locked and couldn't be reopened until the old index writer was garbage collected, so i don't want to go back to this for commits.\n\nIts possible there is a leak somewhere else (i currently do not have a snapshot right before out of memory issues occur, so currently the only thing that stands out is the PerDoc memory use)\n\nAs far as a fix goes, wouldn't it be better to have the RAMFile's used for stored fields pull and return byte buffers from the byte block pool on the DocumentsWriter? This would allow the memory to be reclaimed based on the index writers buffer size (otherwise there is no configurable way to tune this memory use)\n ",
+            "author": "Tim Smith",
+            "id": "comment-12837793"
+        },
+        {
+            "date": "2010-02-24T14:47:38+0000",
+            "content": "a yourkit snapshot showed that the PerDocs for an IndexWriter were using ~40M of memory\n\nWhat was IW's ramBufferSizeMB when you saw this?\n\nhowever i have reports that eventually the memory is completely exhausted resulting in out of memory errors.\n\nHmm, that makes me nervous, because I think in this case the use should be bounded.\n\nAs a side note, closing the index writer at commit time would sometimes fail, resulting in some following updates to fail because the index writer was locked and couldn't be reopened until the old index writer was garbage collected, so i don't want to go back to this for commits.\n\nThat doesn't sound good!  Can you post some details on this (eg an exception)?\n\nBut, anyway, keeping the same IW open and just calling commit is (should be) fine.\n\nAs far as a fix goes, wouldn't it be better to have the RAMFile's used for stored fields pull and return byte buffers from the byte block pool on the DocumentsWriter?\n\nYes, that's a great solution \u2013 a single pool.  But that's a somewhat bigger change.  I guess we can pass a byte[] allocator to RAMFile.  It'd have to be a new pool, too (DW's byte blocks are 32KB not the 1KB that RAMFile uses). ",
+            "author": "Michael McCandless",
+            "id": "comment-12837811"
+        },
+        {
+            "date": "2010-02-24T14:59:14+0000",
+            "content": "ramBufferSizeMB is 64MB\n\nHere's the yourkit breakdown per class:\n\n\tDocumentsWriter - 256 MB\n\t\n\t\tTermsHash - 38.7 MB\n\t\tStoredFieldsWriter - 37.5 MB\n\t\tDocumentsWriterThreadState - 36.2 MB\n\t\tDocumentsWriterThreadState - 34.6 MB\n\t\tDocumentsWriterThreadState - 33.8 MB\n\t\tDocumentsWriterThreadState - 27.5 MB\n\t\tDocumentsWriterThreadState - 13.4 MB\n\t\n\t\n\n\n\nI'm starting to dig into the ThreadStates now to see if anything stands out here\n\nHmm, that makes me nervous, because I think in this case the use should be bounded.\n\nI should be getting a new profile dump at \"crash\" time soon, so hopefully that will make things clearer\n\nThat doesn't sound good! Can you post some details on this (eg an exception)?\n\nIf i recall correctly, I think the exception was caused by an out of disk space situation (which would recover)\nobviously not much that can be done about this other than adding more disk space, however the situation would recover, but docs would be lost in the interum\n\nBut, anyway, keeping the same IW open and just calling commit is (should be) fine.\n\nYeah, this should be the way to go, especially as it results in the pooled buffers not needing to be reallocated/reclaimed/etc, however right now this is the only change i can currently think of that could result in memory issues.\n\nYes, that's a great solution - a single pool. But that's a somewhat bigger change. \n\nSeems like this would be the best approach as it makes the memory bounded by the configuration of the engine, giving better reuse of byte blocks and better ability to reclaim memory (in DocumentsWriter.balanceRAM())\n\n ",
+            "author": "Tim Smith",
+            "id": "comment-12837821"
+        },
+        {
+            "date": "2010-02-24T16:39:51+0000",
+            "content": "\nramBufferSizeMB is 64MB\n\nHere's the yourkit breakdown per class:\n\nHmm \u2013 spooky.  With ram buffer @ 64MB, DocumentsWriter is using 256MB!?  Something is clearly amiss.  40 MB used by StoredFieldsWriter's PerDoc still leaves 152 MB unaccounted for... hmm.\n\nIf i recall correctly, I think the exception was caused by an out of disk space situation (which would recover)\n\nOh OK.  Though... closing the iW vs calling IW.commit should be not different in that regard.  Both should have the same transient disk space usage.  It's odd you'd see out of disk for .close but not also for .commit.\n\nSeems like this would be the best approach as it makes the memory bounded by the configuration of the engine, giving better reuse of byte blocks and better ability to reclaim memory (in DocumentsWriter.balanceRAM())\n\nI agree.  I'll mull over how to do it... unless you're planning on consing up a patch \n\nHow many threads do you pass through IW?  Are the threads forever from a static pool, or do they come and go?  I'd like to try to simulate your usage (huge docs & tiny docs)  in my dev area to see if I can provoke the same behavior. ",
+            "author": "Michael McCandless",
+            "id": "comment-12837865"
+        },
+        {
+            "date": "2010-02-24T16:50:10+0000",
+            "content": "I agree. I'll mull over how to do it... unless you're planning on consing up a patch \n\nI'd love to, but don't have the free cycles at the moment \n\nHow many threads do you pass through IW?\n\nhonestly don't 100% know about the origin of the threads i'm given\nIn general, they should be from a static pool, but may be dynamically allocated if the static pool runs out\n\nOne thought i had recently was to control this more tightly by having a limited number of static threads that called IndexWriter methods in case that was the issue (but that would be a pretty big change) ",
+            "author": "Tim Smith",
+            "id": "comment-12837875"
+        },
+        {
+            "date": "2010-02-24T17:02:06+0000",
+            "content": "latest profile dump has pointed out a non-lucene issue as causing some memory growth\n\nso feel free to drop down priority\n\nhowever it seems like using the bytepool for the stored fields would be good overall ",
+            "author": "Tim Smith",
+            "id": "comment-12837881"
+        },
+        {
+            "date": "2010-02-24T17:28:27+0000",
+            "content": "Yeah it would be good to make the pool shared...\n\nIt still bugs me that yourkit is claiming DW was using 256 MB when you've got a 64 MB ram buffer.... that's spooky. ",
+            "author": "Michael McCandless",
+            "id": "comment-12837896"
+        },
+        {
+            "date": "2010-02-24T18:10:46+0000",
+            "content": "another note is that this was on 64 bit vm\n\ni've noticed that all the memsize calculations assume 4 byte pointers, so perhaps that can lead to more memory being used that would otherwise be expected (although 256 MB is still well over the 2X mem use that would potentially be expected in that case)\n ",
+            "author": "Tim Smith",
+            "id": "comment-12837919"
+        },
+        {
+            "date": "2010-02-24T22:04:11+0000",
+            "content": "i'm working up a patch for the shared byteblock pool for stored field buffers (found a few cycles) ",
+            "author": "Tim Smith",
+            "id": "comment-12838017"
+        },
+        {
+            "date": "2010-02-25T16:01:44+0000",
+            "content": "Here's a patch for using a pool for stored fields buffers ",
+            "author": "Tim Smith",
+            "id": "comment-12838387"
+        },
+        {
+            "date": "2010-02-26T18:34:53+0000",
+            "content": "Patch looks great \u2013 thanks Tim!\n\nA few fixes:\n\n\n\tI think you should pass false to allocator.getByteBlock in PerDocBuffer.newBuffer.  We don't want this allocator to track allocations because this storage used is transient (reset per doc).  We only pass true for things like the terms hash, that keeps allocating RAM until it's time to flush.\n\n\n\n\n\tCan you also make the same changes to TermVectorsTermsWriter?  I think the same hazard applies to it.  It should just use the same pool.\n\n\n\n\n\tCan you add a CHANGES entry?\n\n\n\nThanks! ",
+            "author": "Michael McCandless",
+            "id": "comment-12838975"
+        },
+        {
+            "date": "2010-02-26T18:38:25+0000",
+            "content": "I'll work up another patch\n\nmight take me a few minutes to get my head wrapped around the TermVectorsTermsWriter stuff ",
+            "author": "Tim Smith",
+            "id": "comment-12838976"
+        },
+        {
+            "date": "2010-02-26T19:26:24+0000",
+            "content": "Here's a new patch with your suggestions ",
+            "author": "Tim Smith",
+            "id": "comment-12838991"
+        },
+        {
+            "date": "2010-02-26T20:13:52+0000",
+            "content": "Looks great Tim, thanks!  I think it's ready to commit... I'll wait a day or two. ",
+            "author": "Michael McCandless",
+            "id": "comment-12839010"
+        },
+        {
+            "date": "2010-02-28T19:50:33+0000",
+            "content": "New rev attached with some small improvements:\n\n\n\tChanged RAMOutputStream.reset to set currentBuffer to null (frees up that 1 buffer), and call that instead of close.\n\n\n\n\n\tRemoved the separate PerDoc.recycle \u2013 now I just do the recycle in the existing PerDoc.reset method\n\n\n\nAlso, this patch changes the RAM accounting to count buffers allocated not bytes written to the file.  This is a good change, and I think may explain the too-much-memory-allocated problem you saw.  Ie if you write tiny docs, Lucene was thinking they consumed tiny memory (not the 1024 bytes that the 1 buffer uses) and thus was undercounting.  When mixed in with massive docs this can cause way too much RAM to be allocated.\n\nHave you been able to test if this patch resolves Lucene's part of the mem growth you were seeing? ",
+            "author": "Michael McCandless",
+            "id": "comment-12839488"
+        },
+        {
+            "date": "2010-03-01T14:07:57+0000",
+            "content": "i haven't been able to fully replicate this issue in a unit test scenario, \n\nhowever it will definitely resolve that 40M of ram that was allocated and never released for the RAMFiles on the StoredFieldsWriter (keeping that bound to the configured memory size) ",
+            "author": "Tim Smith",
+            "id": "comment-12839682"
+        },
+        {
+            "date": "2010-03-04T16:46:20+0000",
+            "content": "Thanks Tim! ",
+            "author": "Michael McCandless",
+            "id": "comment-12841378"
+        },
+        {
+            "date": "2010-05-04T22:08:16+0000",
+            "content": "Is there a chance that this can also be applied to 3.0.2 / 3.1? It would be really helpful to get this as soon as possible in the next Lucene version.\n ",
+            "author": "Shay Banon",
+            "id": "comment-12864042"
+        },
+        {
+            "date": "2010-05-04T23:24:17+0000",
+            "content": "I'll merge back to 2.9.x / 3.0.x / 3.1.x. ",
+            "author": "Michael McCandless",
+            "id": "comment-12864066"
+        },
+        {
+            "date": "2010-05-05T11:44:21+0000",
+            "content": "Merged fix for this back to 29x, 30x.  It was already on 3x since we cut that branch after this landed. ",
+            "author": "Michael McCandless",
+            "id": "comment-12864287"
+        }
+    ]
+}

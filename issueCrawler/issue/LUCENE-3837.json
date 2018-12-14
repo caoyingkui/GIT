@@ -1,0 +1,107 @@
+{
+    "id": "LUCENE-3837",
+    "title": "A modest proposal for updateable fields",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "core/index"
+        ],
+        "type": "New Feature",
+        "fix_versions": [],
+        "affect_versions": "4.0-ALPHA",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "I'd like to propose a simple design for implementing updateable fields in Lucene. This design has some limitations, so I'm not claiming it will be appropriate for every use case, and it's obvious it has some performance consequences, but at least it's a start...\n\nThis proposal uses a concept of \"overlays\" or \"stacked updates\", where the original data is not removed but instead it's overlaid with the new data. I propose to reuse as much of the existing APIs as possible, and represent updates as an IndexReader. Updates to documents in a specific segment would be collected in an \"overlay\" index specific to that segment, i.e. there would be as many overlay indexes as there are segments in the primary index. \n\nA field update would be represented as a new document in the overlay index . The document would consist of just the updated fields, plus a field that records the id in the primary segment of the document affected by the update. These updates would be processed as usual via secondary IndexWriter-s, as many as there are primary segments, so the same analysis chains would be used, the same field types, etc.\n\nOn opening a segment with updates the SegmentReader (see also LUCENE-3836) would check for the presence of the \"overlay\" index, and if so it would open it first (as an AtomicReader? or it would open individual codec format readers? perhaps it should load the whole thing into memory?), and it would construct an in-memory map between the primary's docId-s and the overlay's docId-s. And finally it would wrap the original format readers with \"overlay readers\", initialized also with the id map.\n\nNow, when consumers of the 4D API would ask for specific data, the \"overlay readers\" would first re-map the primary's docId to the overlay's docId, and check whether overlay data exists for that docId and this type of data (e.g. postings, stored fields, vectors) and return this data instead of the original. Otherwise they would return the original data.\n\nOne obvious performance issue with this appraoch is that the sequential access to primary data would translate into random access to the overlay data. This could be solved by sorting the overlay index so that at least the overlay ids increase monotonically as primary ids do.\n\nUpdates to the primary index would be handled as usual, i.e. segment merges, since the segments with updates would pretend to have no overlays) would just work as usual, only the overlay index would have to be deleted once the primary segment is deleted after merge.\n\nUpdates to the existing documents that already had some fields updated would be again handled as usual, only underneath they would open an IndexWriter on the overlay index for a specific segment.\n\nThat's the broad idea. Feel free to pipe in - I started some coding at the codec level but got stuck using the approach in LUCENE-3836. The approach that uses a modified SegmentReader seems more promising.",
+    "attachments": {
+        "LUCENE-3837.patch": "https://issues.apache.org/jira/secure/attachment/12526171/LUCENE-3837.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2012-03-01T17:07:23+0000",
+            "content": "Some concerns about scoring:\n\n\n\tthe stats problem: maybe we should allow overlay readers to just return -1 for docfreq? I dont like the\n  situation today where preflex codec doesnt implement all the stats (the whole -1 situation and 'optional' stats\n  is frustrating), but I think its worse to return out of bounds stuff, e.g. where docfreq > maxdoc. I think \n  totalTermFreq is safe to just sum up though (its wrong, but not out of bounds), and similarity could use\n  this safely as to compute expected IDF instead. Still, this part will be messy, unlike the\n  newer stats in 4.0, lots of code I think expects that docFreq is always supported. Another possibility that\n  I think I like more is to treat this conceptually just like deletes in every way, so all stats are supported \n  but \"maxDoc\" is wrong (includes masked-away documents), then nothing is out of bounds. So in this case we \n  would add maxDoc(field), which is only used for scoring. For a normal reader this just returns maxDoc() as\n  implemented today...\n\tthe norms problem: although norms are implemented as docValues, currently all similarities assume that\n  getArray()/hasArray() is implemented... but here I'm not sure that would be the case? we \n  should probably measure if the method call really even hurts, in general its a burden on the codec\n  I think to require that norms actually be representable as an array (maybe other use cases would want\n  other data structures for less RAM)...\n\n\n\nwe could solve both of these issues separately and independently if we decide what what we want to do. ",
+            "author": "Robert Muir",
+            "id": "comment-13220163"
+        },
+        {
+            "date": "2012-03-01T18:03:23+0000",
+            "content": "Ad 1. I don't think it's such a big deal, we already return approximate stats (too high counts) in presence of deletes. I think we should go all the way, at least initially, and ignore stats from an overlay completely, unless the data is present only in the overlay - e.g. for terms not present in the main index.\n\nAd 2. I think that if getArray() is supported then on the first call we have to roll-in all updates to the main array created from the primary. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-13220194"
+        },
+        {
+            "date": "2012-03-01T18:21:23+0000",
+            "content": "Could we use the actual docID (ie same docID as the base segment)?  This way we wouldn't need the (possibly large) int[] to remap on each access.  I guess for postings this is OK (we can pass PostingsFormat any docIDs), but for eg stored fields, term vectors, doc values, it's not (they can't handle \"sparse\" docIDs).\n\nAlso, can't we directly write the stacked segments ourselves?  (Ie, within a single IW).\n\nWe'd need to extend SegmentInfo(s) to record which segments stack on which, and fix MP to understand stacking (and aggressively target the stacks). ",
+            "author": "Michael McCandless",
+            "id": "comment-13220207"
+        },
+        {
+            "date": "2012-03-01T18:21:59+0000",
+            "content": "\nAd 1. I don't think it's such a big deal, we already return approximate stats (too high counts) in presence of deletes. I think we should go all the way, at least initially, and ignore stats from an overlay completely, unless the data is present only in the overlay - e.g. for terms not present in the main index.\n\nI disagree: it may not be a big deal for DefaultSimilarity, but its important for other scoring implementations. Initially its extremely important\nwe get this stuff right before committing anything!\n\nLarge problems can result when the statistics are inconsistent with what is 'discovered' in the docsenum. This is because many scoring models expect\ncertain relationships to hold true: such as a single doc's tf value won't exceed totalTermFreq. We had to do significant work already to ensure\nconsistency, though in some cases the problems could not totally be solved (BasicModelD, BasicModelP, BasicModelBE+NormalizationH3, etc) and we\nhad to unfortunately resort to only leaving warnings in the javadocs.\n\nI'm fairly certain in all cases we avoid things like NaN or negative scores, but when the function 'inverts relevance' is aweful too.\n\nSo I think we need a consistent model for stats: thats why I lean towards maxDoc(field), which is consistent in every way with how we handle\ndeletes, and it won't yield any surprises. ",
+            "author": "Robert Muir",
+            "id": "comment-13220208"
+        },
+        {
+            "date": "2012-03-01T18:23:13+0000",
+            "content": "I think for scoring the \"wrong yet consistent stats\" approach is good?  (Just like deletes).\n\nSo, an update would affect scoring (eg on update the field now has 4 occurrences of python vs only 1 occurrence before, so now it gets a better score), but the scoring will not precisely match the scores I'd get from a full re-index instead of an update. ",
+            "author": "Michael McCandless",
+            "id": "comment-13220211"
+        },
+        {
+            "date": "2012-03-01T19:55:23+0000",
+            "content": "That was my point, we should be able to come up with estimates that yield \"slightly wrong yet consistent\" stats. I don't know the details of new similarities, so it's up to you Robert to come up with suggestions  ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-13220300"
+        },
+        {
+            "date": "2012-03-01T20:17:07+0000",
+            "content": "Could we use the actual docID (ie same docID as the base segment)?\nUpdates may arrive out of order, so the updates will naturally get different internal IDs (also, if you wanted to use the same ids they would have gaps). I don't know if various parts of Lucene can handle out of order ids coming from iterators? If we wanted to match the ids early then we would have to sort them, a la IndexSorter, on every flush and on every merge, which seems too costly. So, a re-mapping structure seems like a decent compromise. Yes, it could be large - we could put artificial limits on the number of updates before we force a merge.\n\nAlso, can't we directly write the stacked segments ourselves? (Ie, within a single IW).\nI don't know, it didn't seem likely to me - AFAIK IW operates on a single segment before flushing it? And updates could refer to docs outside the current segment. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-13220315"
+        },
+        {
+            "date": "2012-03-01T21:35:27+0000",
+            "content": "Andrzej, this brings back old memories .\n\nThe core difference in your proposal is that the updates are processed in a separate index, and that at runtime we use a PQ to match documents and collapse all the updates, right? And these updates will be reflected in the main index on segment merges, right?\n\nI personally prefer a more integrated solution then one that's based on matching PQs, but since I barely did something with my proposal for 2 years, I guess that your progress is better than no progress at all.\n\nOne comment \u2013 when the updates are collapsed, the may not just simply 'replace' what exists before them. I could see an update to a document which adds a stored field, and therefore if I'll call IndexReader.document, I'd expect to see that stored field with all the ones that existed before it.\n\nAt the time I felt that modifying Lucene to add stacked segments is way too complicated, and the indexing internals kept changing by the day. But now Codecs seem to be very stable, and trunk's code changes relax, so perhaps it'll be worthwhile taking a second look at that proposal? (but only if you feel like it) ",
+            "author": "Shai Erera",
+            "id": "comment-13220387"
+        },
+        {
+            "date": "2012-03-01T22:07:15+0000",
+            "content": "I guess that your progress is better than no progress at all.\nThat's my perspective too, and it's reflected in the title of this issue... I remember your description and in fact my proposal is somewhat similar. It does not use PQs, but indeed it merges updates on the fly, at the cost of keeping a static map of primary->secondary ids and random seeking in the secondary index to retrieve matching data. Please check the description above. And then once a segment merge is executed the overlay data will be integrated into the main data, because the merge process will pull in this mix of new and old without being aware of it - it will be hidden by Codec's read formats. Codec abstractions are great for this kind of manipulations.\nOne comment \u2013 when the updates are collapsed, the may not just simply 'replace' what exists before them.\nRight, old data will be returned if not overlaid by new data, meaning that e.g. old stored field values will be returned for all other fields except the updated field, and for that field the data from the overlay will be returned. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-13220420"
+        },
+        {
+            "date": "2012-03-02T12:46:28+0000",
+            "content": "it merges updates on the fly, at the cost of keeping a static map of primary->secondary ids\n\nah ok, I missed that part. ",
+            "author": "Shai Erera",
+            "id": "comment-13220885"
+        },
+        {
+            "date": "2012-05-09T15:32:46+0000",
+            "content": "Initial patch. I created also a branch lucene3837 based on the current trunk, so that others may join in.\n\nEdit: note that this is NOT a working implementation yet, it's missing many key pieces. Jump in if you want to help filling in the blanks  ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-13271484"
+        },
+        {
+            "date": "2012-06-19T15:17:48+0000",
+            "content": "How much more work needs to be done on the patch?  We have a client who is very interested in getting updateable fields working for document tagging, and could probably be persuaded to support working on this if it's not too far from viability. ",
+            "author": "Alan Woodward",
+            "id": "comment-13396847"
+        },
+        {
+            "date": "2012-06-19T15:30:21+0000",
+            "content": "It's still quite incomplete, I'm afraid. The patch needs to be updated to the changes in trunk, and then many missing pieces need to be implemented. Still, after discussing this with other developers it looks like the proposed design should work as intended, so it's viable in this sense ... ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-13396855"
+        },
+        {
+            "date": "2012-08-01T19:42:25+0000",
+            "content": "We should track these together... ",
+            "author": "Erick Erickson",
+            "id": "comment-13426847"
+        }
+    ]
+}

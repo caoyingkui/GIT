@@ -1,0 +1,102 @@
+{
+    "id": "SOLR-12088",
+    "title": "Shards with dead replicas cause increased write latency",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "fix_versions": [
+            "7.3.1",
+            "master (8.0)"
+        ],
+        "affect_versions": "7.2",
+        "resolution": "Fixed",
+        "status": "Resolved"
+    },
+    "description": "If a collection's shard contains dead replicas, write latency to the collection is increased. For example, if a collection has 10 shards with a replication factor of 3, and one of those\u00a0shards contains 3 replicas and 3 downed replicas, write latency is increased in comparison to a shard that contains only 3 replicas.\n\nMy feeling here is that downed replicas should be completely ignored\u00a0and not cause issues to other alive replicas in terms of write latency.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-03-14T04:38:23+0000",
+            "content": "Hi Jerry,\n\nSo if I was to put it in another way if this was the scenario then shard2's write latency will be higher?\u00a0\n\nshard1 : has 3 \"active\" replicas\n\nshard2 : has 3 \"active\" replicas and 3 replicas in \"down\" state\u00a0\n\nCan you tell me a few things about the cluster:\n\n1. How many nodes are there in the cluster\n\n2. Of the N nodes are there nodes that are part of the cluster but not hosting any replica of any shard on nodes\u00a0\n\n3. Are you indexing via a SolrJ based client ?\u00a0\n\n4. How are you measuring the latency? JMX ? ",
+            "author": "Varun Thacker",
+            "id": "comment-16398092"
+        },
+        {
+            "date": "2018-03-14T19:11:23+0000",
+            "content": "Another question:\n\nDoes the latency persist longer than any system timeouts? Put another way:\nIf you start all the Solr instances fresh and some nodes are down, is there still latency? \n\nWhat I'm thinking of here is that it may take up until some timeout for each Solr instance to \"see\" that the node is down.\n\nFor instance, if I kill a Solr node with a -9, it has no chance to tell ZK (and ZK in turn inform the rest of the collection) that it's going away. The rest of the collection finds out about this by one of several methods, all involving some timeout (ZK occasionally pings, leader sends request to update etc.).\n\nSo if this is transient it may be functioning as expected, but if it lasts well past all the possible timeouts it's another story. ",
+            "author": "Erick Erickson",
+            "id": "comment-16399138"
+        },
+        {
+            "date": "2018-03-14T19:32:04+0000",
+            "content": "Your scenario is what I experienced, so yes \n\n1. 30 nodes in the cluster\n\n2. There are no nodes part of the cluster that aren't hosting any replicas.\n\n3. Indexing via Lucidwork's Fusion (which I assume is using a SolrJ based client)\n\n4. Latency is measured through our own\u00a0service's instrumentation of roundtrip time to index. ",
+            "author": "Jerry Bao",
+            "id": "comment-16399167"
+        },
+        {
+            "date": "2018-03-14T19:41:51+0000",
+            "content": "Erick Erickson I don't have an answer to your question; this issue occurred from movement of\u00a0replicas\u00a0where the movement did not completely clean up the state of the replicas, causing it to be a zombie replicas (data gone but state still exists after movement).\n\nYour thinking definitely could explain why theres a higher latency of indexing times. That makes the most sense to me. How long is this timeout? ",
+            "author": "Jerry Bao",
+            "id": "comment-16399184"
+        },
+        {
+            "date": "2018-03-14T20:17:52+0000",
+            "content": "Jerry:\n\nIt Depends (tm). Most are reasonably short, 15 seconds to a couple of minutes. So if you're seeing this last much longer than that it's a red herring.\n\nSolr itself should be able to clean up dead replicas, what version are you using? By that I mean you can re-issue DELETEREPLICA and it \"should\" work.\n\nThere's a bit of a rough patch if you have legacyCloud set. Prior to 7x this was the default, and nodes could reconstruct themselves in ZK, the key is whether your ZooKeeper tree has partial collections representations in /clusterstate.json, likely corresponding to these deleted replicas. If that's the case, you can \n\n\n> stop the Solr instance\n\n> manually remove the dead replicas\n\n> start Solr back up.\n\nonce all that's done for the dead replicas, \n\n> replace /clusterstate.json with a single pair of empty brackets {} but ONLY if your /collections/whatever/state.json has the complete, accurate picture of the collection in question. This caveat is very important because if you don't have a valid state.json (i.e. you're in \"state format 2\") then you'll lose your collections, so be very cautious.\n\nNow, all that said, if performance is still slow after many minutes, it's a bug we should fix. The cluster maintenance stuff is steadily improving BTW.\n\nErick ",
+            "author": "Erick Erickson",
+            "id": "comment-16399238"
+        },
+        {
+            "date": "2018-03-14T23:35:16+0000",
+            "content": "We've been running on Solr 7.2.1, so its all been state.json and not clusterstate.json.\n\nIn regards to re-issuing the DELETEREPLICA command, sometimes that fails and I filed a Jira for that here:\u00a0SOLR-12087. That was what was causing this second issue here.\n\nFor example purposes, our indexing latency went from 2s to 1.7s after successfully deleting the dead replicas. One thing I did notice is that the dead replicas spam the logs with \"unable to unload non-existent core\" on the machine that hosts the dead replicas. Could be a side affect? ",
+            "author": "Jerry Bao",
+            "id": "comment-16399608"
+        },
+        {
+            "date": "2018-03-23T08:02:57+0000",
+            "content": "I wrote some test to benchmark the indexing throughput in case of\n\n\tHigh indexing + delete replica (on 7.2)\n\tHigh indexing + delete replica (after the fix SOLR-12087)\n\tHigh indexing + down node (on 7.2)\n\n\n\nI do see a downgrade in update per second for case 1. So it seems the problem relates to the implementation of old LIR.\n\nI modified DeleteReplicaTest.deleteReplicaOnIndexing to count the number of LIR threads get started and the number of time ZkController.ensureReplicaInLeaderInitiatedRecovery get called\n\n\n\nTime (in sec)\nLIR threads get started (times)\nZKController get called (times)\n\n\n100\n96132\n1504\n\n\n500\n6513\n509690\n\n\n1000\n6444\n594742\n\n\n\n\n\nAs we can see after 500 seconds, there are no more LIR threads get called and I do see the indexing get recovered.\u00a0Jerry Bao: are you sure that the downgrade indexing last forever? ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16410958"
+        },
+        {
+            "date": "2018-03-23T22:49:58+0000",
+            "content": "Cao Manh Dat It seems to last forever though I cannot confirm 100%. Definitely lasts past an hour. Why is the amount of LIR threads started decreasing as time goes on? ",
+            "author": "Jerry Bao",
+            "id": "comment-16412212"
+        },
+        {
+            "date": "2018-03-24T05:59:00+0000",
+            "content": "Jerry Bao When the leader saw the deleted replica as DOWN state, it will skip sending requests to that replica, hence no more LIR threads get started. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16412439"
+        },
+        {
+            "date": "2018-03-25T12:23:57+0000",
+            "content": "Since this seems to relate to LIR only, so the solution for this issue so far is fixing ZkController.ensureReplicaInLeaderInitiatedRecovery to skip adding an LIR thread in case of replica get deleted. ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16413009"
+        },
+        {
+            "date": "2018-05-29T04:26:52+0000",
+            "content": "Jerry Bao Since Solr 7.3.1 is released. Can you confirm about the state of this issue? ",
+            "author": "Cao Manh Dat",
+            "id": "comment-16493091"
+        },
+        {
+            "date": "2018-05-30T21:29:18+0000",
+            "content": "Cao Manh Dat I can't confirm or deny whether or not this has been fixed, but I'm happy with closing this out and reopening if we see it again. ",
+            "author": "Jerry Bao",
+            "id": "comment-16495708"
+        },
+        {
+            "date": "2018-08-30T02:41:13+0000",
+            "content": "I'm marking this as fixed by SOLR-12146. We can re-open if we see the problem again. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16597000"
+        }
+    ]
+}

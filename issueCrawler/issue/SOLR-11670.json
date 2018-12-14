@@ -1,0 +1,170 @@
+{
+    "id": "SOLR-11670",
+    "title": "Implement a periodic house-keeping task",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "AutoScaling"
+        ],
+        "type": "Sub-task",
+        "fix_versions": [
+            "7.4",
+            "master (8.0)"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Some high-impact cluster changes (such as split shard) leave the original data and original state that is no longer actively used. This makes sense due to safety reasons and to make it easier to roll-back the changes.\n\nHowever, this unused data will accumulate over time, especially when actions like split shard are invoked automatically by the autoscaling framework. We need a periodic task that would clean up this kind of data after a certain period.",
+    "attachments": {
+        "SOLR-11670.patch": "https://issues.apache.org/jira/secure/attachment/12912307/SOLR-11670.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-11-24T21:59:36+0000",
+            "content": "Here's a way to generate dead nodes in 6x:\n\nSet up a single solr instance, starting it like this:\nbin/solr start -z localhost:2181 -p 8981 -s example/cloud/node1/solr\n\nCreate a collection (one shard and one replica will do).\n\nStop that instance and start another changing  the port but keeping the same SOLR_HOME:\n\nbin/solr start -z localhost:2181 -p 8982 -s example/cloud/node1/solr\n\n(note, the port has changed, but the -s points to where the old core.properties file is located).\n\nlegacyCloud=true needs to be true for this case.\n\n7x doesn't exhibit the behavior at all. I think the issue is that coreNodeName gets defined in core.properties and is used to update an existing znode if things like the base_url or node_name change.\n\n\n ",
+            "author": "Erick Erickson",
+            "id": "comment-16265542"
+        },
+        {
+            "date": "2018-01-03T19:05:40+0000",
+            "content": "Another candidate data for periodic cleanups are async status ids - as of now, REQUESTSTATUS does not automatically clean up the tracking data structures, meaning the status of completed or failed tasks stays stored in ZooKeeper unless cleared manually. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16310110"
+        },
+        {
+            "date": "2018-02-27T17:50:30+0000",
+            "content": "Patch containing the following:\n\n\ta MaintenanceTask\u00a0API that components may use for registering tasks with Overseer. Tasks are initialized using key / value pairs from /clusterprops.json\n\tMaintenanceTasks component, which is a registry and runner of tasks. This component also monitors changes to /clusterprops.json\u00a0and re-initializes tasks and their schedule as needed.\n\timplementation of InactiveSliceCleanupTask, which deletes inactive slices that exceeded a configured TTL time. This task is registered by SplitShardCmd.\n\tchanges to SplitShardTest\u00a0to exercise this code.\n\n\n\nThis code is also available on branch jira/solr-11670. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16379030"
+        },
+        {
+            "date": "2018-03-05T19:54:22+0000",
+            "content": "Shalin Shekhar Mangar suggested another approach (thanks!) and this patch implements it - instead of a separate component for managing the tasks it reuses the ScheduledTrigger and custom trigger actions that implement maintenance tasks.\n\nThis indeed simplifies the execution and management of these tasks, and reuses familiar concepts. The (small) downside is that it's less convenient to pre-register some tasks that we know the cluster should run by default, but it's the same situation as with any default triggers (eg. autoAddReplicas trigger).\n\nScheduledMaintenanceTriggerTest illustrates the registration and how the InactiveShardCleanupAction works.\n\n(The patch seems larger than before but that's due to some refactoring of common utility methods for waiting on collection state.) ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16386652"
+        },
+        {
+            "date": "2018-03-06T19:31:13+0000",
+            "content": "Thanks Andrzej! A few comments:\n\n\n\tAutoscaling.java \u2013 the constant AUTO_ADD_REPLICAS_LISTENER_NAME is not used anywhere\n\tExecutePlanAction \u2013 the counter appended to the asyncId has been removed. It is not useful today I agree but it will be needed again when SOLR-11605 is implemented\n\tInactiveShardCleanupAction \u2013 It is not safe to compare nanotime if the overseer leader changed between the shard split and the cleanup task. Perhaps we stick to currentTimeMillis() here?\n\tPerhaps we should let InactiveShardCleanupAction only produce operations that are later executed by ExecutePlanAction? The advantage is that those operations (and others created by clean up tasks in future) can be performed in parallel once SOLR-11605 comes in. But more importantly, an exception thrown in one clean up action will not cause the action processing to be aborted. This point is moot however if you envision each future clean up action to have its own scheduled trigger (in which case we should increase the schedule interval for this one to something very large e.g. once a day). It is also possible that future clean up tasks do not produce solrj requests at all. I'm curious to know what you think about this.\n\tExceptions thrown from the delete shard API should also be added to context properties so that they can be sent to listeners\n\tSimSolrCloudTestCase \u2013 many unused imports\n\n ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16388379"
+        },
+        {
+            "date": "2018-03-07T12:55:05+0000",
+            "content": "Updated patch addressing the issues from review. Using ExecutePlanAction is a good idea - I changed InactiveShardCleanupAction to InactiveShardPlanAction, which only produces \"operations\" to be executed by ExecutePlanAction. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16389506"
+        },
+        {
+            "date": "2018-03-08T08:05:25+0000",
+            "content": "Looks great Andrzej! Only thing I don't understand is why do we make a copy of triggerListeners in the processor? +1 to commit regardless of that. ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16390895"
+        },
+        {
+            "date": "2018-03-08T10:23:20+0000",
+            "content": "\u00a0why do we make a copy of triggerListeners in the processor\nIf we change AutoScalingConfig while an event is being processed then we may get inconsistent listener notifications. I noticed this situation in tests where old events (from a previous test) would continue to be processed during the next test method, but they produced only some of the notifications one would normally expect (because the listeners have been cleared between eg. BEFORE_ACTION and AFTER_ACTION).\nUnder normal circumstances this shouldn't be a big deal, but in tests this is much more likely to happen. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16391030"
+        },
+        {
+            "date": "2018-03-08T11:44:03+0000",
+            "content": "Thanks for explaining! ",
+            "author": "Shalin Shekhar Mangar",
+            "id": "comment-16391127"
+        },
+        {
+            "date": "2018-03-08T14:05:25+0000",
+            "content": "Commit b17052e8520bb57bcfe126aa2f8e6bd0b9aa76c5 in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b17052e ]\n\nSOLR-11670: Implement a periodic house-keeping task. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16391281"
+        },
+        {
+            "date": "2018-03-13T12:47:21+0000",
+            "content": "Commit ed6feded6de7f1c268986df6de6a5dc9db6a3f34 in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ed6feded ]\n\nSOLR-11670: Use TimeSource's value of NOW consistently when parsing date math.\nAdd a unit test for TimeSource's epochTime. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16396897"
+        },
+        {
+            "date": "2018-03-13T15:12:43+0000",
+            "content": "Andrzej Bialecki  I think it's confusing that TimeSource.getTime & getEpochTime return nanoseconds.  I think the methods should be renamed so that it's clear what unit it is, otherwise the conditions are ripe for continuing bugs in unit conversions.  Perhaps rename getTime to getTimeNs. ",
+            "author": "David Smiley",
+            "id": "comment-16397085"
+        },
+        {
+            "date": "2018-03-13T15:27:25+0000",
+            "content": "it's confusing that TimeSource.getTime & getEpochTime return nanoseconds\nSystem.nanoTime returns time in ns, too ... but I see your point, we can rename these two methods to getTimeNs and getEpochTimeNs. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16397106"
+        },
+        {
+            "date": "2018-03-14T11:27:06+0000",
+            "content": "I created SOLR-12091 to track the method renaming. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16398413"
+        },
+        {
+            "date": "2018-03-15T10:35:08+0000",
+            "content": "Commit 17cfd87a28275b58deeec95d1172ed8cec2d1304 in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=17cfd87 ]\n\nSOLR-11670: Implement a periodic house-keeping task. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16400181"
+        },
+        {
+            "date": "2018-03-15T10:37:31+0000",
+            "content": "Commit e1b0f796af9363b5496cc4ca8f17755f3c10e59b in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e1b0f79 ]\n\nSOLR-11670: Use TimeSource's value of NOW consistently when parsing date math.\nAdd a unit test for TimeSource's epochTime. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16400189"
+        },
+        {
+            "date": "2018-03-15T10:53:17+0000",
+            "content": "Commit 25ec5cda0b2f4ce36366c56edc20e62e33040188 in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=25ec5cd ]\n\nSOLR-11670: Allow for larger diff in simulated time. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16400207"
+        },
+        {
+            "date": "2018-03-15T10:59:07+0000",
+            "content": "Commit 21e2915f0d7b64cec2e02280fb4035cf687165ec in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=21e2915 ]\n\nSOLR-11670: Allow for larger diff in simulated time. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16400214"
+        },
+        {
+            "date": "2018-03-19T02:17:14+0000",
+            "content": "Andrzej Bialecki  you put this into the 7.3 section of CHANGES.txt but I think it belongs in 7.4? ",
+            "author": "David Smiley",
+            "id": "comment-16404292"
+        },
+        {
+            "date": "2018-03-19T10:29:16+0000",
+            "content": "Commit fa03a3843c7e81046398d03bb5d4f1eb78e43fcb in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fa03a38 ]\n\nSOLR-11670 This functionality was added in 7.4 and not in 7.3.0. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16404602"
+        },
+        {
+            "date": "2018-03-19T10:31:19+0000",
+            "content": "Commit 80d7b2ada369d3caac8f6c6d94ccf8b2683ab5d6 in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=80d7b2a ]\n\nSOLR-11670 This functionality was added in 7.4 and not in 7.3.0. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16404605"
+        },
+        {
+            "date": "2018-03-19T10:31:58+0000",
+            "content": "You're right David Smiley - fixed, thanks. ",
+            "author": "Andrzej Bialecki",
+            "id": "comment-16404607"
+        },
+        {
+            "date": "2018-03-19T14:17:31+0000",
+            "content": "Commit ed2d3583300263fa6aff4ad41b262bb2c32ae01c in lucene-solr's branch refs/heads/master from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ed2d358 ]\n\nSOLR-11670: Make sure defaults are applied in simulated cluster. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16404885"
+        },
+        {
+            "date": "2018-03-19T14:17:54+0000",
+            "content": "Commit f6319d6d0a80e5f82b26f6b340ad250618f6b565 in lucene-solr's branch refs/heads/branch_7x from Andrzej Bialecki \n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f6319d6 ]\n\nSOLR-11670: Make sure defaults are applied in simulated cluster. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16404888"
+        }
+    ]
+}

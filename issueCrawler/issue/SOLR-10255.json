@@ -1,0 +1,57 @@
+{
+    "id": "SOLR-10255",
+    "title": "Large psuedo-stored fields via BinaryDocValuesField",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [],
+        "type": "Improvement",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "(sub-issue of SOLR-10117)  This is a proposal for a better way for Solr to handle \"large\" text fields.  Large docs that are in Lucene StoredFields slow requests that don't involve access to such fields.  This is fundamental to the fact that StoredFields are row-stored.  Worse, the Solr documentCache will wind up holding onto massive Strings.  While the latter could be tackled on it's own somehow as it's the most serious issue, nevertheless it seems wrong that such large fields are in row-stored storage to begin with.  After all, relational DBs seemed to have figured this out and put CLOBs/BLOBs in a separate place.  Here, we do similarly by using, Lucene BinaryDocValuesField.  BDVF isn't well known in the DocValues family as it's not for typical DocValues purposes like sorting/faceting etc.  The default DocValuesFormat doesn't compress these but we could write one that does.",
+    "attachments": {
+        "SOLR-10255.patch": "https://issues.apache.org/jira/secure/attachment/12856946/SOLR-10255.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-03-09T06:29:04+0000",
+            "content": "Here's a patch that's in-progress with a bunch of nocommits/discussion points.  It theoretically works but there are no tests yet so I doubt it .\n\n\tI added a \"large\" flag to FieldType but in hindsight perhaps this belongs on TextField because I'm only adding it there?  BTW a ramification of this is that you wouldn't be able to set it on the field definition, only the fieldType.  I could see this being useful on BinaryField but I don't intend to work on that.\n\tThe BinaryDocValuesField is given a separate name from the base name, __large prefix.  I didn't have to do this but I want to allow for TextField to some day have conventional SortedSetDocValues on analyzed/tokenized text.  In Lucene we can't have both types of DocValues for the same field name.\n\tI sorta cheat and we pretend the field is still \"stored\" but in reality it's not... at least it's not \"stored\" in the Lucene sense.  This is deliberate because I want this field to be compatible with various other Solr features that don't know anything about this new \"large\" concept.\n\tOne unfortunate thing here is that the doc related loading in SolrIndexSearcher now has to call DocValues.getBinary(getSlowAtomicReader(), TextField.LARGE_NAME_PREFIX + largeField) and then call advanceExact(docId) for each field in the schema that's marked as large.  This is done so that we know if the field even has a large value for this document.  It's almost always necessary to do this if there are any declared large fields.  This may not be a big deal in the scheme of things?  One possible solution is for TextField.createFields() to add a special stored field named perhaps ___largeFields} and supply the field name as a value.\n\n\n\nIn a separate issue I'll propose a compressed DocValuesFormat that Solr's SchemaCodecFactory will supply for fields starting with \"__large\". Or maybe I might have it be an auto-registed internal field type in the schema; we'll see.\n\nBTW this approach is incompatible with multiValued fields since BinaryDocValues has this limitation.\n\nI'd really appreciate peer review, even if it's just a cursory look at the patch ",
+            "author": "David Smiley",
+            "id": "comment-15902564"
+        },
+        {
+            "date": "2017-03-09T16:04:01+0000",
+            "content": "We have a use case that would be improved by this.  ",
+            "author": "Michael Braun",
+            "id": "comment-15903271"
+        },
+        {
+            "date": "2017-03-11T07:11:56+0000",
+            "content": "I'm sure you do Michael \n\nI temporarily hacked the default \"large\"-ness to be true (provided the field is otherwise compatible with large \u2013 stored & not multi-valued) and ran the Solr core tests so that I could tease out unforeseen issues.  Thankfully there were only two failures:\n\n\tsome Luke test or another failed \u2013 to be expected since it looks at the underlying index.\n\tRealtimeGet wanted to reconstitute the document and get a real stored field but didn't get it.  And it skipped over the BinaryDocValues field.  This'll require some adjustment to approach...\n\n\n\nHere's a substantially improved patch.\n\n\tMoved the index time large field handling from TextField.createField (now unmodified) to Solr's DocumentBuilder.\n\t\n\t\tHere I added an emum Mode to clarify the circumstances in which the DocumentBuilder is used thus refactoring it's API a little adjusting the call sites.  I also eliminated a couple convenience accessors like AddUpdateCommand.getLuceneDocument that hid this important Mode intention.  I think this is a definite improvement as it's clear in what circumstances an in-place-update happens vs realtime get etc., plus it's now clear we're actually building this Document instead of \"get\"-ing one.\n\t\tOnly in Mode.STANDARD_UPDATE does the large field handling occur.\n\t\tStrField (\"string\" field) works too; there's no explicit Solr FieldType assumption, just that the field: be stored, not multi-valued, not produce a number, must produce a string.\n\t\n\t\n\tIn order to streamline/reduce-processing at retrieval time further, the DocumentBuilder large field processing will insert a special marker stored field value that is seen by SolrIndexSearcher.doc(...) methods.\n\t\n\t\tThis allows us to easily conditionally put large fields separately... like only the actual long values, and maybe support multi-valued fields by handling the first occurrence.  This is all a TODO.\n\t\n\t\n\tRefactored the SolrIndexSearcher.doc(id,fields) loading to always use a new SolrDocumentStoredFieldVisitor inner class which handles both lazy field loading and large doc handling (and neither).  This seems simpler than trying to handle an increasingly large number of combinations of cases (doc cache, lazy fields, fields filter non-null, large fields) as separate paths.  Unfortunately the doc() method taking a visitor is an additional path that can't easily be combined.\n\tWhen creating the BinaryDocValuesField, I ported the large string handling in GrowableByteArrayDataOutput.writeString for efficiently allocating a UTF8 byte array to exactly the right size \u2013 very important for large doc handling.\n\n\n\nI've got a test failure to track down so this is definitely not bug free.  New tests need to be written.  And I think this feature would go hand-in-hand with a compressing BDV-only DocValuesFormat... which should be done in parallel to this.  And then it would be great if people could try this for real; and I should come up with some synthetic benchmark. ",
+            "author": "David Smiley",
+            "id": "comment-15906119"
+        },
+        {
+            "date": "2017-03-12T05:24:56+0000",
+            "content": "I think I want to scale back the scope of what I plan to do in the short term (for 6.5), while still allowing a BinaryDocValuesField (with compressed codec/format) in the future.\n\nI'll file a separate issue for this and try and throw up a patch Monday:  The field can remain stored but go last (and the DocumentBuilder can ensure this happens).  The last stored value will not be read from disk (well first 16KB but whatever) due to LUCENE-6898.  On the SolrIndexSearcher.doc(...) side, the \"lazy\" fields will get a LargeAlwaysDiskLazyField but one that goes to stored value not BinaryDocValues. ",
+            "author": "David Smiley",
+            "id": "comment-15906431"
+        },
+        {
+            "date": "2017-03-14T21:41:10+0000",
+            "content": "Update: I'm tracking down a bug that might even exist without this patch concerning RealtimeGet and an IndexReader \"AlreadyClosedException\". It seems RTG can ask SolrIndexSearcher for a Document, then close the searcher soon after, and then try to serialize the document later on.  But if the document contains an IndexableField that is lazy (be it the current LazyDocument.LazyField) or any other similar concoction (be it BinaryDocValues or whatever) then the index will be closed and it's too late.  It seems the LargeLazyField here is more likely to provoke this situation because it's especially lazy. ",
+            "author": "David Smiley",
+            "id": "comment-15925070"
+        },
+        {
+            "date": "2017-03-15T07:27:04+0000",
+            "content": "SOLR-10286 \"Declare a field as large, don't keep value in the document cache\".  It incorporates some pieces of this patch.\nI'm not sure if/when I'll return to this BinaryDocValuesField approach. ",
+            "author": "David Smiley",
+            "id": "comment-15925671"
+        }
+    ]
+}

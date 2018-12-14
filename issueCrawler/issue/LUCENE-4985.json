@@ -1,0 +1,134 @@
+{
+    "id": "LUCENE-4985",
+    "title": "Make it easier to mix different kinds of FacetRequests",
+    "details": {
+        "components": [
+            "modules/facet"
+        ],
+        "fix_versions": [
+            "4.5",
+            "6.0"
+        ],
+        "affect_versions": "None",
+        "priority": "Major",
+        "labels": "",
+        "type": "Improvement",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "Spinoff from LUCENE-4980, where we added a strange class called RangeFacetsAccumulatorWrapper, which takes an incoming FSP, splits out the FacetRequests into range and non-range, delegates to two accumulators for each set, and then zips the results back together in order.\n\nSomehow we should generalize this class and make it work with SortedSetDocValuesAccumulator as well.",
+    "attachments": {
+        "LUCENE-4985.patch": "https://issues.apache.org/jira/secure/attachment/12594665/LUCENE-4985.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2013-07-23T18:44:42+0000",
+            "content": "Bulk move 4.4 issues to 4.5 and 5.0 ",
+            "author": "Steve Rowe",
+            "id": "comment-13717030"
+        },
+        {
+            "date": "2013-07-25T13:55:58+0000",
+            "content": "I have been thinking about how to achieve that .. here's a proposal:\n\n\n\tMake FacetsAccumulator abstract with following current impls:\n\t\n\t\tTaxonomyFacetsAccumulator, assumes that TaxoReader is needed, FacetArrays etc.\n\t\tSortedSetFacetsAccumulator, assumes that categories were indexed to a SortedSetDVField\n\t\tRangeFacetsAccumulator, for computing facet ranges on NumericDV\n\t\tMultiFacetsAccumulator allows chaining several ones (basically a generic version of RangeFacetsAccumulatorWrapper)\n\t\n\t\n\n\n\n\n\tAdd to FacetRequest.createFacetsAccumulator()\n\t\n\t\tCountFacetRequest, Association**FacetRequest return TaxoFacetsAccumulator\n\t\tSortedSetCountFacetRequest returns SortedSetFA (and also verify that the given CategoryPath was actually indexed in a SortedSetDVField)\n\t\tRangeFacetRequest returns RangeFacetsAccumulator\n\t\n\t\n\n\n\nThis pretty much divides the FacetRequests into the \"source\" from which they read the facets information. Now we need to handle the different aggregation functions currently supported by the TaxoFacetAcc variants: counting, associations. TaxoFacetAcc will let you specify the FacetsAggregator:\n\n\tCountFacetRequest will set the aggregator to FastCounting (if possible) or just Counting.\n\t**AssociationFacetRequest will set the aggregator to the matching one\n\tAdditional requests can set their own aggregator\n\tFacetsAggregator will need to implement equals() and hashCode()\n\n\n\nThen we'll have FacetsAccumulator.create(List<FacetRequest>) which creates the right accumulator:\n\n\n\tGroup all requests that use the same FacetsAccumulator, so that all RangeFRs are grouped together, all TaxoFacetAcc requests together etc.\n\tFor the TaxoFacetAcc requests, it groups them by their aggregator, so that:\n\t\n\t\tAll CountingAggregators that read the same category list are grouped together, separate from ones that do counting yet on a different category list\n\t\tAll AssociationAggregators are grouped together, by their function, list id etc.\n\t\n\t\n\tIt then creates either a single accumulator, or MultiFacetAccumulator which chains the accumulate call\n\n\n\nWhat do we gain \u2013 it's easy for an app to create the right accumulator for a given list of requests. Today it needs to sort of do this logic on its own, which is sometimes impossible (e.g. if it's a component that doesn't know what it's given). Also, the requests are self-descriptive.\n\nWhat do we lose \u2013 today if one wants to count A, B and C using CachedOrdsCountingFacetsAggregator, it needs to override FacetsAccumulator.getAggregator(), once. With this change, he will need to do that for every CountFacetRequest he creates .. I think that's an OK tradeoff, given the situation today which makes apps' life tougher.\n\nI think we'll also need to create an Aggregator (old FacetsAggregator) wrapper. It is still needed by StandardFacetsAccumulator, until we finish the cleanup of sampling, complements counting etc. I'll look into that too, perhaps it can be done separately in a different issue.\n\nNow need to hope I took all the parameters into account, and won't hit a brick wall when trying to implement it . ",
+            "author": "Shai Erera",
+            "id": "comment-13719637"
+        },
+        {
+            "date": "2013-07-28T08:36:26+0000",
+            "content": "Didn't expect I'd run into it so quickly, but there are issues with adding createFacetsAccumulator to FacetRequest. Here are some details:\n\n\n\tRangeAccumulator only requires List<FacetRequest>\n\tTaxonomyFacetsAccumulator requires: List<FacetRequest>, FacetIndexingParams, TaxonomyReader and IndexReader\n\tSortedSetDVAccumulator requires: List<FacetRequest>, SortedSetDVReaderState\n\n\n\nAt first I made:\n\n\n\tFacetsAccumulator.create(FacetSearchParams, TaxonomyReader, IndexReader)\n\t\n\t\tFacetSearchParams covers List<FacetRequest> and FacetIndexingParams\n\t\n\t\n\tFacetRequest.createFacestAccumulator(FacetSearchParams, TxonomyReader, IndexReader).\n\n\n\nBut this is problematic on several fronts:\n\n\n\tA FacetRequest does not need List<FacetRequest> in createFacetsAccumulator(), only FacetIndexingParams\n\tNot all requests need FacetIndexingParams, TaxonomyReader and IndexReader\n\t\n\t\tWhile declaring parameters that aren't needed is not a big deal, it does mean that someone will need to pass e.g. taxoReader=null and hope for the best. Especially if someone uses only RangeAccumulator and SortedSetDVAccumulator.\n\t\n\t\n\tSome requests may need more than that, e.g. SortedSetDVReaderState.\n\n\n\nSo what's the best solution? It would be best if FacetRequest is self-descriptive so that apps can really just call FacetsAccumulator.create().\n\nIf we make FacetRequest take all the parameters it needs in the ctor, we sort of get that. A request is fully self-descriptive and FR.createFacetsAccumulator does not need any arguments. However, each new CountFacetRequest() will now need to pass many parameters, which is annoying and makes the code less readable, IMO.\n\nI was thinking perhaps we can extend FacetSearchParams to include additional parameters. So ctor takes only the facet requests, and you can optionally set FacetIndexingParams, IndexReader, TaxonomyReader, SortedSetDVReaderState. There are minor issues that I think can be resolved easily:\n\n\n\tIf in the future we'll create an accumulator which requires a different setting, we'll need to add that to FSP. That's easy.\n\tAn app may not know which parameters to set on FSP in the first place \u2013 sort of easy to fix (on app side) cause it will hit a hard exception, probably NPE or some sort, immediately.\n\t\n\t\tThis does show a slight problem though, as you need to create your FRs and then \"remember\" to set the right parameters on FSP.\n\t\n\t\n\n\n\nThere is another problem with FR.createFacetsAccumulator \u2013 the accumulators already take a List<FacetRequest> when created, however at the single FR level, it doesn't know the \"global picture\" and cannot pass all the requests up front. I was thinking that perhaps it can return a FacetAccumulatorBuilder which has API for addFacetRequest() and build(). FacetAccumulator.create() will call FR.createFacetAccumulatorBuilder() and will group all the requests that return the same builder, and then call builder.build() to get the proper FacetAccumulator instance. This is an orthogonal problem BTW to the fact that this builder will also need to know e.g. the SortedSetDVReaderState up front...\n\nSo ... making FR completely self-descriptive by taking all the parameters needed to execute it solves most of the problems \u2013 you have to resolve the needed parameters at ctor-time. But, it makes the code uglier. Moving parameters to FacetSearchParams keeps the FR ctors clean, but might be trappy for an app. I'll think about it more, but if someone has an idea how to tackle this ... don't be shy . ",
+            "author": "Shai Erera",
+            "id": "comment-13721923"
+        },
+        {
+            "date": "2013-07-28T12:35:39+0000",
+            "content": "I discussed this with Gilad and perhaps the situation today is not that bad, and we can do away with few minor changes. Today one can already construct a FacetsAccumulator given the FacetRequests that he wishes to execute. RangeAccumulatorWrapper attempts to allow you to work with RangeAccumulator and FacetsAccumulator (and it has a TODO to work for SortedSet too). So maybe what we need is the following simple solution:\n\n\n\tMake FacetsAccumulator abstract, as outlined above, with implementations for Taxonomy, Range, SortedSet and Multi.\n\tEach of the accumulator impls take the needed parameters in the ctor:\n\t\n\t\tList<FacetRequest> \u2013 the requests that are relevant to this accumulator only.\n\t\tSortedSetReaderState for SortedSetDVAccumulator, TaxoReader/FacetIndexingParams etc. for TaxonomyFacetAccumulator.\n\t\n\t\n\tIf you want to combine different requests, you construct the relevant accumulators and wrap w/ MultiFacetsAccumulator.\n\tTwo choices w.r.t. taxonomy accumulators:\n\t\n\t\tKeep them as FacetsAggregator - don't change much code, but keeps some aggregators with irrelevant API, such as rollupValues which is not implemented by the associations aggregators (only relevant for hierarchical facets and counting)\n\t\tConvert all of them to TaxonomyFacetsAccumulator which implement some abstract method, so that TaxoFA drives the accumulation and implements the common logic of computing top-k over FacetArrays and labeling. This changes existing aggregators ...\n\t\n\t\n\n\n\nBottom line is, a FacetRequest documents which accumulator should be used, but does not declare a createAccumulator() method, which leads to all the issues I've described above. Its matching accumulator will also make sure that the list of requests passed to it are \"OK\" (much like is done today).\n\nThis has another advantage of keeping e.g. CountFacetRequest as-is, and support it by both a CountingTaxonomyFacetsAccumulator and SortedSetFacetsAccumulator.\n\nI'll start with this route and see where it leads me. ",
+            "author": "Shai Erera",
+            "id": "comment-13721944"
+        },
+        {
+            "date": "2013-07-28T12:45:15+0000",
+            "content": "And I think that in this process I'll eliminate FacetSearchParams which today define only FacetIndexingParams (relevant to TaxonomyFacetsAccumulator only for now) and List<FacetRequest> which will not be a single list anymore, but per accumulator. Really .. FacetsAccumulator is another form of FacetsCollector, only results are collected once and processed afterwords by each accumulator. ",
+            "author": "Shai Erera",
+            "id": "comment-13721946"
+        },
+        {
+            "date": "2013-07-29T10:15:42+0000",
+            "content": "Patch addresses the following:\n\n\n\tAdded FacetRequest.createFacetsAggregator(FacetIndexingParams). All requests implement it except RangeFacetRequest which returns null. The method is abstract and documents that you are allowed return null.\n\n\n\n\n\tTaxonomyFacetsAccumulator: if a FacetRequest returns null from createFacetsAggregator, it throws an exception. Otherwise, it groups the requests into category lists as well as ensures that categories are not over counted. It uses MultiFacetsAggregator (new) and PerCategoryListAggregator (existing) to achieve that.\n\t\n\t\tThat allows passing a combination of requests, e.g. Count(A), Count(B), Count(C), SumScore(A), SumScore(F), SumIntAssociation(D)... and works correctly when e.g. A+B were indexed in the same category list, but C, D and F weren't.\n\t\n\t\n\n\n\n\n\tAdded FacetsAccumulator.create() variants which support RangeAccumulator and either TaxonomyFacetsAccumulator or SortedSetDocValuesAccumulator. Differences are in the methods signatures.\n\t\n\t\tRenamed RangeFacestAccumulatorWrapper to MultiFacetsAccumulator. Also, the FacetResults are returned in the order of the given accumulators.\n\t\tFacetsAccumulator.create documents that you may receive List<FacetResult> in a different order than you passed in, guaranteeing that all RangeFacetRequests come last.\n\t\n\t\n\n\n\n\n\tModified DrillSideways to take either TaxonomyReader or SortedSetDVReaderState because otherise it cannot be used with SortedSetDV facets. Mike, can you please review it?\n\n\n\nThese changes simplified e.g. the associations examples, as now FacetsAccumulator.create() takes care of them too, since they implement createFacetsAggregator. Also, any future FacetRequest which will support FacetsAggregator will be supported automatically. ",
+            "author": "Shai Erera",
+            "id": "comment-13722319"
+        },
+        {
+            "date": "2013-07-29T10:50:02+0000",
+            "content": "Could you post a patch with --show-copies-as-adds?  (The current patch isn't easily applied since there were \"svn mv\"s involved...).  Thanks. ",
+            "author": "Michael McCandless",
+            "id": "comment-13722338"
+        },
+        {
+            "date": "2013-07-29T10:54:00+0000",
+            "content": "Patch with --show-copies-as-adds ",
+            "author": "Shai Erera",
+            "id": "comment-13722345"
+        },
+        {
+            "date": "2013-07-29T11:39:00+0000",
+            "content": "This is a nice cleanup!\n\nIt's still hard to mix all three kinds of facet requests?  E.g. I\nthink it's realistic for an app to use SSDV for flat fields (less RAM\nusage than taxo, important if there are lots of ords), range for\n\"volatile\" numeric fields (e.g. time delta based), and taxo for\nhierarchies.\n\nIt seems like we could have a FacetsAccumulator.create that took both\nSSDVReaderState and TaxoReader and created the right\nFacetsAccumulator ... and I guess we'd need a SSDVFacetRequest.\n\nOr I guess I can just create the directly MultiFacetsAccumulator\nmyself ... FA.create is just sugar.\n\nThis all can wait for a follow-on issue ... these improvements are\nalready great.\n\nShould we move MultiFacetsAccumulator somewhere else (out of .range\npackage)?  It's more generic now?\n\nFacetsAccumulator.create documents that you may receive List<FacetResult> in a different order than you passed in, guaranteeing that all RangeFacetRequests come last.\n\nHmm, can we fix that?  (So that the order of the results matches the\norder of the requests).\n\nModified DrillSideways to take either TaxonomyReader or SortedSetDVReaderState because otherise it cannot be used with SortedSetDV facets. Mike, can you please review it?\n\nThose changes look good!  I think we can now simplify\nTestDrillSideways (previously it had to @Override\ngetDrillDown/SidewaysAccumulator to use sorted set)? ",
+            "author": "Michael McCandless",
+            "id": "comment-13722370"
+        },
+        {
+            "date": "2013-07-29T11:50:04+0000",
+            "content": "Adding State to .create() does not simplify life for an app I think, because someone (on the app side) will need to figure out if State should be null or not. I'm worried that users will end up creating State even if they don't need it?\n\nAnd since MultiFacetAccumulator lets you wrap any accumulator yourself, I think it's fine that these are separate methods, as a first step.\n\nI'm worried about adding SortedSetDVFacetRequest, because unlike Count/SumScore/SumIntAssociation, this request is solely about the underlying source? And it also implies only counting ...\n\nShould we move MultiFacetsAccumulator somewhere else\n\nYou're right! It was left there by mistake because I renamed RangeAccumulatorWrapper. Will move.\n\n\nHmm, can we fix that? (So that the order of the results matches the\norder of the requests).\n\nI don't know how important it is ... none of our tests depend on it, and it's not clear to me how to fix it at all. FA.create() is a factory method. If it returns a single Accumulator, then it happens already (order is maintained). MultiFacetAccum loses the order. Maybe if we passed it the list of facet requests it could re-order them after accumulation, but I don't know how important it is... an app can put the List<FacetResult> in a Map, and do lookups? Also, as a generic MultiFA, it's not easier to determine from which FA a source FacetRequest came?\n\nI think we can now simplify TestDrillSideways\n\nYou're right. Done. ",
+            "author": "Shai Erera",
+            "id": "comment-13722375"
+        },
+        {
+            "date": "2013-07-29T11:51:59+0000",
+            "content": "Patch with fixed comments. ",
+            "author": "Shai Erera",
+            "id": "comment-13722376"
+        },
+        {
+            "date": "2013-07-29T11:53:00+0000",
+            "content": "\nI don't know how important it is ... none of our tests depend on it, and it's not clear to me how to fix it at all. FA.create() is a factory method. If it returns a single Accumulator, then it happens already (order is maintained). MultiFacetAccum loses the order. Maybe if we passed it the list of facet requests it could re-order them after accumulation, but I don't know how important it is... an app can put the List<FacetResult> in a Map, and do lookups? Also, as a generic MultiFA, it's not easier to determine from which FA a source FacetRequest came?\n\nOK ...\n\nBut, I think we should not document that \"range facet requests come last\"?  Let's leave it defined as undefined?  Maybe we should return Collection not List? ",
+            "author": "Michael McCandless",
+            "id": "comment-13722377"
+        },
+        {
+            "date": "2013-07-29T11:58:56+0000",
+            "content": "But, I think we should not document that \"range facet requests come last\"?\n\nOk I will remove that comment. As soon as we add more accumulators, this comment is not important anyway.\n\nMaybe we should return Collection not List?\n\nWhy? I prefer that we don't change that since that will change tests. Many of the tests do results.get(idx).\nIf we don't need to, let's not complicate the users? If an app does pass the requests in known order, it shouldn't suffer.\nIt's only Multi that loses order. ",
+            "author": "Shai Erera",
+            "id": "comment-13722381"
+        },
+        {
+            "date": "2013-07-29T12:15:01+0000",
+            "content": "I just think it's a dangerous API if sometimes the order matches and sometimes it doesn't ... but we can pursue this separately ... ",
+            "author": "Michael McCandless",
+            "id": "comment-13722387"
+        },
+        {
+            "date": "2013-07-29T13:07:31+0000",
+            "content": "Commit 1508043 from Shai Erera in branch 'dev/trunk'\n[ https://svn.apache.org/r1508043 ]\n\nLUCENE-4985: Make it easier to mix different kinds of FacetRequests ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13722430"
+        },
+        {
+            "date": "2013-07-29T13:12:39+0000",
+            "content": "Commit 1508046 from Shai Erera in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1508046 ]\n\nLUCENE-4985: Make it easier to mix different kinds of FacetRequests ",
+            "author": "ASF subversion and git services",
+            "id": "comment-13722436"
+        },
+        {
+            "date": "2013-07-29T13:13:17+0000",
+            "content": "Committed to trunk and 4x. I think we can change .accumulate to return a Map<FacetRequest,FacetResult>, but this affects many of the tests, so let's do that separately. ",
+            "author": "Shai Erera",
+            "id": "comment-13722437"
+        },
+        {
+            "date": "2013-10-05T10:18:52+0000",
+            "content": "4.5 release -> bulk close ",
+            "author": "Adrien Grand",
+            "id": "comment-13787036"
+        }
+    ]
+}

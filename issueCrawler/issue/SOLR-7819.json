@@ -1,0 +1,116 @@
+{
+    "id": "SOLR-7819",
+    "title": "ZkController.ensureReplicaInLeaderInitiatedRecovery does not respect retryOnConnLoss",
+    "details": {
+        "components": [
+            "SolrCloud"
+        ],
+        "type": "Bug",
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "affect_versions": "5.2,                                            5.2.1",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "SOLR-7245 added a retryOnConnLoss parameter to ZkController.ensureReplicaInLeaderInitiatedRecovery so that indexing threads do not hang during a partition on ZK operations. However, some of those changes were unintentionally reverted by SOLR-7336 in 5.2.\n\nI found this while running Jepsen tests on 5.2.1 where a hung update managed to put a leader into a 'down' state (I'm still investigating and will open a separate issue about this problem).",
+    "attachments": {
+        "SOLR-7819.patch": "https://issues.apache.org/jira/secure/attachment/12747321/SOLR-7819.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2015-07-23T19:11:51+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Ramkumar Aiyengar - It looks like the commits for SOLR-7245 only added a retryOnConnLoss parameter but it was never used inside the ZkController.updateLeaderInitiatedRecoveryState method?\n\nAlso, now that I am thinking about this change, is it really safe? For example, if a leader was not able to write to a 'live' replica, and during the LIR process if the leader couldn't complete a ZK operation (because retryOnConnLoss=false) then  LIR won't be set and updates can be missed. Also, the code as it is currently written, bails on a ConnectionLossException and doesn't even start a LIR thread which is bad.\n\nI think not having a thread wait for LIR related activity is a noble cause but we should move the entire LIR logic to a background thread which must retry on connection loss until it either succeeds or a session expired exception is thrown.\n\nThoughts? ",
+            "id": "comment-14639380"
+        },
+        {
+            "date": "2015-07-23T19:45:06+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "Duh, this is why we need a good test for this (I gave up after trying a bit in the original ticket), and I need to pay attention to automated merges more. Looks like my initial patch had the change, but when I merged with your changes for SOLR-7109, looks like the local variable use just got removed \n\nI get your concern, I think we already do this, look at DistributedUpdateProcessor.java around line 883, if we are unable to set the LIR node, we start a thread to keep retrying the node set. We just need to return false in the connection loss case as well, we currently do it only if the node is not live (and hence we didnt even bother setting the node). ",
+            "id": "comment-14639404"
+        },
+        {
+            "date": "2015-07-24T14:24:37+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "I think we already do this, look at DistributedUpdateProcessor.java around line 883, if we are unable to set the LIR node, we start a thread to keep retrying the node set.\n\nUmm, it looks the reverse to me. If we are unable to set the LIR node or if there is an exception then sendRecoveryCommand=false and we do not create the LeaderInitiatedRecoveryThread at all? ",
+            "id": "comment-14640506"
+        },
+        {
+            "date": "2015-07-27T11:48:35+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Here's a patch which:\n\n\tAdds retryOnConnLoss in ZkController's ensureReplicaInLeaderInitiatedRecovery, updateLeaderInitiatedRecoveryState and markShardAsDownIfLeader method.\n\tStarts a LIR thread if leader cannot mark replica as down on connection loss. Earlier a session loss or connection loss both would skip starting the LIR thread.\n\n\n\nI'm still running Solr's integration and jepsen tests.\n\nThis causes a subtle change in behavior which is best analyzed with two different scenarios:\n\n\tLeader fails to send an update to replica but also suffers a temporary blip in its ZK connection during the DistributedUpdateProcessor's doFinish method\n\t\n\t\tCurrently, a few indexing threads will hang but eventually succeed in marking the 'replica' as down and the leader will start a new LIR thread to ask the replica to recover.\n\t\tWith this patch, the indexing threads do not hang but a connection loss exception is thrown. At this point, we started a new LIR thread to ask the replica to recover. Although this removes the safety of explicitly marking the 'replica' as down, the LIR thread does provide us a timeout-based safety of making sure that the replica does recover from the leader.\n\t\n\t\n\tLeader fails to send an update to replica but also suffers a long network partition between itself and ZK server during DUP.doFinish method.\n\t\n\t\tCurrently, a few indexing threads will hang in ZkController.ensureReplicaInLeaderInitiatedRecovery until the ZK operations time out because of connection loss or session loss and no LIR thread will be created. This seems okay because the current connection loss timeout value is higher than ZK session expiration time and session loss means that ZK has determined that our session has expired already. In both cases, a new leader election should have happened and there's no need to put the replica as 'down'.\n\t\tWith this patch, the difference is that the indexing threads do not hang and the ensureReplicaInLeaderInitiatedRecovery returns immediately with a connection loss exception. A new LIR thread is started in this scenario. This is also fine because we were not able to mark the replica as 'down' and we aren't sure that the session has expired so it is important that we start the LIR thread to ask the replica to recover. Even if a new leader has been elected, there's no major harm done by asking the replica to recover.\n\t\n\t\n\n\n\nSo, net-net this patch doesn't seem to introduce any new problems in the system. ",
+            "id": "comment-14642603"
+        },
+        {
+            "date": "2015-07-29T14:01:49+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Hmm, this last patch isn't quite right because it can create multiple LIR threads for the same replica on connection loss.\n\nFor example, I found the following in the logs in one of the nodes. Here 4 LIR threads were created to ask the same replica to recover:\n\n2015-07-29 13:21:24.629 INFO  (updateExecutor-2-thread-18-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread LeaderInitiatedRecoveryThread-jepsen5x3_shard2_replica1 completed successfully after running for 0 secs\n2015-07-29 13:21:24.978 INFO  (updateExecutor-2-thread-19-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.c.ZkStateReader Updating data for jepsen5x3 to ver 95\n2015-07-29 13:21:24.978 WARN  (updateExecutor-2-thread-19-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread Stop trying to send recovery command to downed replica core=jepsen5x3_shard2_replica1,coreNodeName=core_node2 on n1:8983_solr because core_node1 is no longer the leader! New leader is core_node2\n2015-07-29 13:21:24.978 INFO  (updateExecutor-2-thread-19-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread LeaderInitiatedRecoveryThread-jepsen5x3_shard2_replica1 completed successfully after running for 39 secs\n2015-07-29 13:21:24.979 INFO  (updateExecutor-2-thread-21-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.c.ZkStateReader Updating data for jepsen5x3 to ver 95\n2015-07-29 13:21:24.979 WARN  (updateExecutor-2-thread-21-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread Stop trying to send recovery command to downed replica core=jepsen5x3_shard2_replica1,coreNodeName=core_node2 on n1:8983_solr because core_node1 is no longer the leader! New leader is core_node2\n2015-07-29 13:21:24.979 INFO  (updateExecutor-2-thread-21-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread LeaderInitiatedRecoveryThread-jepsen5x3_shard2_replica1 completed successfully after running for 28 secs\n2015-07-29 13:21:24.981 INFO  (updateExecutor-2-thread-22-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.c.ZkStateReader Updating data for jepsen5x3 to ver 95\n2015-07-29 13:21:24.981 WARN  (updateExecutor-2-thread-22-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread Stop trying to send recovery command to downed replica core=jepsen5x3_shard2_replica1,coreNodeName=core_node2 on n1:8983_solr because core_node1 is no longer the leader! New leader is core_node2\n2015-07-29 13:21:24.981 INFO  (updateExecutor-2-thread-22-processing-x:jepsen5x3_shard2_replica2 r:core_node1 http:////n1:8983//solr//jepsen5x3_shard2_replica1// n:n5:8983_solr s:shard2 c:jepsen5x3) [c:jepsen5x3 s:shard2 r:core_node1 x:jepsen5x3_shard2_replica2] o.a.s.c.LeaderInitiatedRecoveryThread LeaderInitiatedRecoveryThread-jepsen5x3_shard2_replica1 completed successfully after running for 33 secs\n\n ",
+            "id": "comment-14646066"
+        },
+        {
+            "date": "2015-07-31T19:16:38+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "This patch moves all LIR related activity inside the LIR thread. The LIR thread now publishes LIR state, publishes node state and then starts a recovery loop depending on whether LIR state was published successfully or if it failed because of session expiry or connection loss. The indexing thread only consults the local replica map to ensure that only 1 LIR thread is started for any given replica. This ensures that the indexing thread never needs to wait for ZK operations needed for LIR. All tests pass except for HttpPartitionTest.testLeaderInitiatedRecoveryCRUD whose assumptions about the LIR workflow are no longer correct.\n\nStill running more tests. ",
+            "id": "comment-14649671"
+        },
+        {
+            "date": "2015-08-02T09:41:51+0000",
+            "author": "Ramkumar Aiyengar",
+            "content": "A couple of comments, looks sensible overall..\n\n\n      log.info(\"Node \" + replicaNodeName +\n              \" is not live, so skipping leader-initiated recovery for replica: core={} coreNodeName={}\",\n          replicaCoreName, replicaCoreNodeName);\n      // publishDownState will be false to avoid publishing the \"down\" state too many times\n      // as many errors can occur together and will each call into this method (SOLR-6189)\n\n\n\nIt goes ahead and does `publishDownState` still if `forcePublishState` is true, is that intentional? The caller does check for if the replica is live, but there could a race. Similarly, if our state is suspect due to zk disconnect/session (the block before this), should the force be respected?\n\n\n      // if the replica's state is not DOWN right now, make it so ...\n      // we only really need to try to send the recovery command if the node itself is \"live\"\n      if (getZkStateReader().getClusterState().liveNodesContain(replicaNodeName)) {\n\n        LeaderInitiatedRecoveryThread lirThread =\n\n\n\nThe comment doesn't make sense as the code has moved to LIRT. ",
+            "id": "comment-14650674"
+        },
+        {
+            "date": "2015-08-26T13:14:27+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Bulk move to 5.4 after 5.3 release. ",
+            "id": "comment-14713388"
+        },
+        {
+            "date": "2015-08-29T05:28:19+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Patch updated to trunk.\n\nThanks for the review Ramkumar Aiyengar and sorry for the delay in getting back to you.\n\nIt goes ahead and does `publishDownState` still if `forcePublishState` is true, is that intentional?\n\nYes, because if the replica somehow became 'active' when the LIR state is still 'down', we want to force publish its state again. The forcePublishState=true is only set in this one scenario.\n\nThe caller does check for if the replica is live, but there could a race. Similarly, if our state is suspect due to zk disconnect/session (the block before this), should the force be respected?\n\nI think you're right. We should short-circuit the publishing part complete if replica is not live or if our state is suspect.\n\nThis patch incorporates both of your review comments. ",
+            "id": "comment-14720979"
+        },
+        {
+            "date": "2015-09-07T13:52:57+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "My last patch had a merge error which was causing chaos monkey test failures. This patch fixes them.\n\nThis still has a few nocommits \u2013 the ZkControllerTest leaks threads which is due to LeaderInitiatedRecoveryThread taking on some of the responsibilities of ZkController. I think the LeaderInitiatedRecoveryThread has enough serious features that it should have its own test and not piggy back on ZkController. I'll attempt to refactor the class to make it more testable and write a unit test for it. ",
+            "id": "comment-14733730"
+        },
+        {
+            "date": "2015-09-08T19:17:25+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tAdds a new test: TestLeaderInitiatedRecoveryThread\n\tRemoves ZkControllerTest.testEnsureReplicaInLeaderInitiatedRecovery which is no longer correct\n\tRemoves portions of HttpPartitionTest.testLeaderInitiatedRecoveryCRUD which are no longer relevant to the new code\n\tFixed a bug in LeaderInitiatedRecoveryThread which would send recovery messages even when a node was not live. This is tested in the new test.\n\n ",
+            "id": "comment-14735444"
+        },
+        {
+            "date": "2015-09-09T14:27:51+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "\n\tRemoved some debug logging in ExecutorUtil that I accidentally left behind.\n\tRemoved the nocommit in DistributedUpdateProcessor which had a comment to the effect of \"not a StdNode, recovery command still gets sent once\" which isn't true because we short circuit errors on RetryNode at the beginning of the loop.\n\n\n\nI think this is ready. ",
+            "id": "comment-14736930"
+        },
+        {
+            "date": "2015-09-09T18:07:47+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1702067 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1702067 ]\n\nSOLR-7819: ZK connection loss or session timeout do not stall indexing threads anymore and LIR activity is moved to a background thread ",
+            "id": "comment-14737321"
+        },
+        {
+            "date": "2015-09-10T10:48:20+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1702213 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1702213 ]\n\nSOLR-7819: ZK connection loss or session timeout do not stall indexing threads anymore and LIR activity is moved to a background thread ",
+            "id": "comment-14738572"
+        },
+        {
+            "date": "2015-09-10T11:09:46+0000",
+            "author": "Shalin Shekhar Mangar",
+            "content": "Thanks Ramkumar for the review. ",
+            "id": "comment-14738589"
+        }
+    ]
+}

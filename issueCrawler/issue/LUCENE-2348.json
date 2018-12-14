@@ -1,0 +1,179 @@
+{
+    "id": "LUCENE-2348",
+    "title": "DuplicateFilter incorrectly handles multiple calls to getDocIdSet for segment readers",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "modules/other"
+        ],
+        "type": "Bug",
+        "fix_versions": [],
+        "affect_versions": "2.9.2",
+        "resolution": "Unresolved",
+        "status": "Open"
+    },
+    "description": "DuplicateFilter currently works by building a single doc ID set, without taking into account that getDocIdSet() will be called once per segment and only with each segment's local reader.",
+    "attachments": {
+        "LUCENE-2348.patch": "https://issues.apache.org/jira/secure/attachment/12448086/LUCENE-2348.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2010-03-26T05:05:38+0000",
+            "content": "Changing to contrib, only just realised it was in that location... ",
+            "author": "Trejkaz",
+            "id": "comment-12850006"
+        },
+        {
+            "date": "2010-06-01T19:36:12+0000",
+            "content": "I don't understand the problem here... looking at 2.9.x's DuplicateFilter, it looks like every call to .getDocIdSet will create a new OpenBitSet, per reader?  Can you post a testcase showing the issue? ",
+            "author": "Michael McCandless",
+            "id": "comment-12874185"
+        },
+        {
+            "date": "2010-06-01T19:36:34+0000",
+            "content": "Clearing fix version. ",
+            "author": "Michael McCandless",
+            "id": "comment-12874186"
+        },
+        {
+            "date": "2010-06-02T01:46:28+0000",
+            "content": "What you describe is precisely the problem.  It will deduplicate only over each segment, not over the text index as one would expect given the name of the class.\n ",
+            "author": "Trejkaz",
+            "id": "comment-12874370"
+        },
+        {
+            "date": "2010-06-02T01:53:54+0000",
+            "content": "I attempted to make a test but it fails with matching 0 instead of matching 2 like I would have expected.  Here is the code:\n\n\n    @Test\n    public void testDuplicateFilterAcrossSegments() throws Exception\n    {\n        RAMDirectory index1Dir = new RAMDirectory();\n        addDoc(index1Dir);\n\n        RAMDirectory index2Dir = new RAMDirectory();\n        addDoc(index2Dir);\n\n        IndexReader reader1 = IndexReader.open(index1Dir, true);\n        IndexReader reader2 = IndexReader.open(index2Dir, true);\n\n        IndexReader multi = new MultiReader(new IndexReader[] { reader1, reader2 });\n        IndexSearcher searcher = new IndexSearcher(multi);\n\n        TopDocs docs;\n\n        docs = searcher.search(new MatchAllDocsQuery(), null, 10);\n        assertEquals(\"Should only be two hits without the filter (just checking)\", 2, docs.totalHits);\n\n        docs = searcher.search(new MatchAllDocsQuery(), new DuplicateFilter(\"id\"), 10);\n        assertEquals(\"Should only be one hit because the second was a duplicate\", 1, docs.totalHits);\n    }\n\n    private void addDoc(Directory dir) throws IOException\n    {\n        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true, IndexWriter.MaxFieldLength.UNLIMITED);\n        try\n        {\n            Document doc = new Document();\n            doc.add(new Field(\"id\", \"1\", Field.Store.YES, Field.Index.NO));\n            writer.addDocument(doc);\n            writer.commit();\n        }\n        finally\n        {\n            writer.close();\n        }\n    }\n\n ",
+            "author": "Trejkaz",
+            "id": "comment-12874373"
+        },
+        {
+            "date": "2010-06-02T10:43:37+0000",
+            "content": "What you describe is precisely the problem. It will deduplicate only over each segment, not over the text index as one would expect given the name of the class.\n\nDuh, right!  You want dedup to apply to the entire index....\n\nUgh, so this has been broken since the cutover to per-segment searching (2.9.x).\n\nThis is tricky to fix.  Somehow DuplicateFilter needs to get ahold of the top reader.  It then must run its dup detection against the TermEnum from that top reader, but then when requested per sub-reader, it must return a slice into the bits for the top reader.\n\nThere's no way, now, given a sub-reader to figure out which parent reader it belongs to... so I think we'd have to change DuplicateFilter to take in the top reader to its ctor?  (But this is sort of messy \u2013 no other core/contrib filters have this \"state\" \u2013 they are normally free to be reused across readers).\n\nThe only other [big] change I can think of is if we could change the Filter API to be more like Scorer, which does first receive the top reader (since it needs to init measures like idf across all segments), and then separately steps through each sub-reader. ",
+            "author": "Michael McCandless",
+            "id": "comment-12874529"
+        },
+        {
+            "date": "2010-06-02T22:53:10+0000",
+            "content": "That change broke nearly all our own filters.  We have a lot of filters which get their data from a database where the IDs are across the top-level reader's doc IDs.  The DuplicateFilter in contrib was noticed because I was reading about how the Filter API had changed, but when I went to find an example of a filter which (in theory ) would have worked the same way so that I could borrow its solution, I found it was also making the same assumptions we were.\n\nOur workaround was the same as described, passing the top-level reader into the constructor and then computing the doc ID set for that, and splitting it up and doing the maths to create the sub-sets for each segment reader.\n\nThe downside is that now you can only use this Filter instance with this reader, whereas the original DuplicateFilter would have worked on multiple top-level readers happily.\n\nHaving the top reader passed in before each sub-reader sounds like a good idea.  It might make it possible for the same filter instance to support multiple top-level readers as well. ",
+            "author": "Trejkaz",
+            "id": "comment-12874841"
+        },
+        {
+            "date": "2010-06-22T01:55:10+0000",
+            "content": "Hi, All,\n\nHaving run into this very issue in our platform, I decided to take a stab at addressing it by defining what is essentially a stateful type of filter (for details, please see LUCENE-2506). In my mind, the stateful filter affords an easy and intuitive way for filters such as the DuplicateFilter, to work seamlessly across (the potentially many) segments of the index. \n\nIn a nutshell, I tweaked the DuplicateFilter so that it accepts a given term if and only if it does not already exist in its \"memory\". For details, please see the DedupingTermsEnum#accept method in the revised DuplicateFilter class attached here.  \n\nNote that I took the liberty of incorporating the test case shown above into DuplicateFilterTest, which is included in the patch. Finally, just to clarify, the patch for LUCENE-2506 must be applied prior to the one attached herein, given that the latter relies on the former. \n\nRegards,\nKarthick Sankarachary ",
+            "author": "Karthick Sankarachary",
+            "id": "comment-12881010"
+        },
+        {
+            "date": "2010-06-23T00:51:13+0000",
+            "content": "That does solve the specific issue I reported (against this specific filter)... I wonder if I need to open a new ticket now for our real problem, because there are two things not solved by that approach:\n\n1. If your filterable data is in another store (e.g. a database), then you would still need either some way to get to the top level reader or a way to know what its offset is, but there is no way to get that information from the reader which was passed in.\n\n2. If you want to return the newest item instead of the oldest item, it will be too late if getStatefulDocIdSet for an earlier call has already returned the older one. ",
+            "author": "Trejkaz",
+            "id": "comment-12881500"
+        },
+        {
+            "date": "2010-06-23T01:10:42+0000",
+            "content": "1. If your filterable data is in another store (e.g. a database), then you would still need either some way to get to the top level reader or a way to know what its offset is, but there is no way to get that information from the reader which was passed in.\n\nIn theory, one could try to obtain the top-level reader from a segment reader as follows: IndexReader.open(((SegmentReader) reader).directory()), where reader is what is provided to the filter. However, this approach breaks down if the top-level reader spans multiple directory, as is the case with MultiReaders.  Besides, the top-level reader that you obtain this way might be a little bit \"ahead\" of the segment reader's actual parent, given that it was created more recently. Given all that, I've introduced a StatefulFilter#setTopLevelReader method that can be used by the user to explicitly set the top-level reader. If the user chooses not to define the top-level reader, then the StatefulFilter will make a best-effort to guess what the top-level reader should be.\n\n2. If you want to return the newest item instead of the oldest item, it will be too late if getStatefulDocIdSet for an earlier call has already returned the older one.\n\nActually, if you create a DuplicateFilter with keepMode set to KM_USE_FIRST_OCCURRENCE, then it will return the document from the first matching segment, and ignore the ones in subsequent segments (due to its stateful behavior). However, the initial approach will break in the event keepMode is set to KM_USE_LAST_OCCURRENCE. To handle that case, we have the DedupingTermsEnum that the  DuplicateFilter defines, return a zero docFreq() in case the last term does not belong to the current segment being filtered. Specifically, the pre-condition for returning a non-zero docFreq is that the \"top-level\" and total of all the \"segment-level\" docFreq of the term are the same. In addition,the filter now automatically cleans up after itself (by detecting if the current segment is the last one or not). \n\nAlso, please note that I changed the DuplicateFilter's default keepMode to KM_USE_FIRST_OCCURRENCE, given that it will potentially, no definitely, save on IO.\n\nThe revised patches for LUCENE-2348 and LUCENE-2506 have been attached, and successfully tested for all of the cases described above (on top of the existing ones).  ",
+            "author": "Karthick Sankarachary",
+            "id": "comment-12881502"
+        },
+        {
+            "date": "2010-06-25T21:26:35+0000",
+            "content": "Trejkaz,\n\nCan you please take a look at the revised patch and the above comment to see if it address all of your concerns?\n\nMichael,\n\nGiven that you have some context around this issue already, can you also review the attached patch in conjunction with that for LUCENE-2506, and let me know what you think?\n\nRegards,\nKarthick  ",
+            "author": "Karthick Sankarachary",
+            "id": "comment-12882720"
+        },
+        {
+            "date": "2010-11-17T22:53:37+0000",
+            "content": "Finally got around to checking this out today, and it looks good to me.  Unfortunate how Lucene has changed so much lately that we can't backport this.   But will just await a release where it appears. ",
+            "author": "Trejkaz",
+            "id": "comment-12933222"
+        },
+        {
+            "date": "2010-11-18T17:46:52+0000",
+            "content": "Unfortunately I think LUCENE-2506 is too heavyweight, in general (eg it seems to have an unbounded cache of seg -> term -> docFreq). ",
+            "author": "Michael McCandless",
+            "id": "comment-12933498"
+        },
+        {
+            "date": "2010-11-19T03:28:09+0000",
+            "content": "Another way of solving this particular issue would be if segment readers knew which top-level reader they came from.  Then when we get an unknown one called on our filter, we have a way to crawl to the top and build up the mappings on our side.\n\nIf a segment reader can exist under more than one parent at the same time, though, it would cause issues for a solution like that. ",
+            "author": "Trejkaz",
+            "id": "comment-12933659"
+        },
+        {
+            "date": "2010-11-19T08:02:50+0000",
+            "content": "Here's my proposed patch for this issue.\n\nIn truth I don't think this functionality makes much sense as a filter, but I think\nwe should simply solve it in this way.\n\nIf the end result is to collapse duplicates in search results, we should seriously\nconsider pointing people at field collapsing or maybe doing this in a collector. ",
+            "author": "Robert Muir",
+            "id": "comment-12933715"
+        },
+        {
+            "date": "2010-11-21T01:34:52+0000",
+            "content": "Field collapsing has different semantics which don't match those of DuplicateFilter.  It's useful if you want to collapse two hits down to one hit, but it doesn't work if you are using DuplicateFilter to filter out previous copies of a document (whether you are working around the issue of Lucene shifting doc IDs when deleting, or simply want to keep the history in case you need it later.)  In this situation you want all but one filtered out, whether the one that matches the query matches the filter or not.  Initially this might not seem like removing duplicates, but it really is, since you're just removing duplicates based on the \"id\" field.\n\nSimilarly, I'm not sure how using a collector would help.  There is even a note in HitCollector saying not to look at the document during collection because it will reduce performance by an order of magnitude or more.  If you have to look at a field, then you have to look at the document.  FieldCache was introduced to try and avoid this, but in practice, it doesn't work once you have tens of millions of documents in your index, unless you have an extraordinary amount of RAM allocated to the JVM (and not every application is a server application!)  Even supposing you were willing to take the performance hit, or had a system where you had enough RAM to store the field cache, the collector only receives the ID of the document that hit, it doesn't provide any of the context you need to see which other documents had the same value in the field. ",
+            "author": "Trejkaz",
+            "id": "comment-12934214"
+        },
+        {
+            "date": "2010-11-25T11:59:17+0000",
+            "content": "Trejkaz, i think you are confused.\n\nThis is only a special case of TopFieldCollector, your notes about Hits/Hitcollector are irrelevant.\n\nThe situation here is it should never have been a filter in the first place, this is a bad design.\nSo I plan to commit this patch in a few days, as well as marking @deprecated.\n\nIf someone wants to later provide a 'replacement' thats fine, but this is contrib, and its not necessary\nfor us provide one to deprecate problems like this! ",
+            "author": "Robert Muir",
+            "id": "comment-12935731"
+        },
+        {
+            "date": "2010-11-25T13:07:42+0000",
+            "content": "I don't really want to argue good or bad design, because the fact is that it worked, and then Lucene core broke the functionality, and now you are claiming that some kinds of filter shouldn't be done as a filter anymore (what should they be done as, then?  I've already said that the other suggestions won't work in any fashion.)\n\nBut fine.\n\nThis wasn't the only filter in our system affected by this issue.  As long as LUCENE-2506 is put through, though, the rest of our filters which are not \"bad design\" will still be able to work in the future without hacks on our end to make them work.\n ",
+            "author": "Trejkaz",
+            "id": "comment-12935748"
+        },
+        {
+            "date": "2010-11-25T13:38:07+0000",
+            "content": "Actually I think Filter is the natural fit for this functionality. \n\nYou should be able to compute it once, cache it, pass it along with\nyour Query during searching, etc.\n\nDoing this during collection is of course possible, but not ideal\nsince you waste CPU on the query finding a hit only to then filter it\nout.  (In fact Filter used to be applied this way!).  Plus you must\nhave the dedup values RAM resident.  Especially w/ optos like\nLUCENE-1536 on the horizon, doing this during collection will be even\nslower.\n\nThat said, yes, it's trickier to implement, with the cutover to\nper-segment search, since it needs the full reader up front in order\nto decide how docs in each segment will be filtered.\n\nBut I don't consider this a show stopper \u2013 it'd be simple to change\nDuplicateFilter to receive the top IR up front, and pre-compute and\ncache the bit set for all segments. ",
+            "author": "Michael McCandless",
+            "id": "comment-12935753"
+        },
+        {
+            "date": "2010-11-25T13:58:30+0000",
+            "content": "That is exactly the workaround we performed for our own filters, including our private copy of a filter which works like DuplicateFilter.  All the ones which need the context now take the reader up-front.  The problem now, is that we have to use a different filter instance on each reader.  Previously we were caching them globally, and somewhere in the system we are evidently still caching them globally, because one time in a million we find the wrong filter being used on the wrong reader.  I am now thinking of making another kind of context-sensitive filter, which can somehow omnisciently know about all readers open in the entire JVM (e.g. we hook the place where we open the top-level reader, and push the information about its structure into some global watch.)\n\nI think Robert's comments possibly stem from the misconception that the duplicate filter somehow works like field collapsing.  I wrote a test just to illustrate how it actually behaves, just to make sure I wasn't confused myself (since he seemed to think I was...)\n\n\npublic class TestDuplicateFilter {\n\n    IndexReader reader;\n    IndexSearcher searcher;\n\n    @Before\n    public void setUpSampleData() throws Exception {\n        RAMDirectory dir = new RAMDirectory();\n        IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer(), true, IndexWriter.MaxFieldLength.UNLIMITED);\n        Document doc;\n        doc = new Document();\n        doc.add(new Field(\"id\", \"1\", Field.Store.YES, Field.Index.ANALYZED));\n        doc.add(new Field(\"text\", \"a\", Field.Store.YES, Field.Index.ANALYZED));\n        writer.addDocument(doc);\n        doc = new Document();\n        doc.add(new Field(\"id\", \"1\", Field.Store.YES, Field.Index.ANALYZED));\n        doc.add(new Field(\"text\", \"b\", Field.Store.YES, Field.Index.ANALYZED));\n        writer.addDocument(doc);\n        doc = new Document();\n        doc.add(new Field(\"id\", \"2\", Field.Store.YES, Field.Index.ANALYZED));\n        doc.add(new Field(\"text\", \"c\", Field.Store.YES, Field.Index.ANALYZED));\n        writer.addDocument(doc);\n        writer.close();\n\n        reader = IndexReader.open(dir, true);\n        searcher = new IndexSearcher(reader);\n    }\n\n    @Test\n    public void testHitOnOriginal() throws Exception {\n        Filter filter = new DuplicateFilter(\"id\", DuplicateFilter.KM_USE_FIRST_OCCURRENCE, DuplicateFilter.PM_FULL_VALIDATION);\n        TopDocs docs = searcher.search(new TermQuery(new Term(\"text\", \"a\")), filter, 3);\n        assertEquals(\"Expected one hit - matched the original\", 1, docs.totalHits);\n        assertEquals(\"Wrong doc hit\", 0, docs.scoreDocs[0].doc);\n    }\n\n    @Test\n    public void testHitOnCopy() throws Exception {\n        Filter filter = new DuplicateFilter(\"id\", DuplicateFilter.KM_USE_FIRST_OCCURRENCE, DuplicateFilter.PM_FULL_VALIDATION);\n        TopDocs docs = searcher.search(new TermQuery(new Term(\"text\", \"b\")), filter, 3);\n        // Field collapsing would return one hit here, which would be undesirable:\n        assertEquals(\"Expected no hits - matched the copy\", 0, docs.totalHits);\n    }\n}\n\n ",
+            "author": "Trejkaz",
+            "id": "comment-12935765"
+        },
+        {
+            "date": "2010-11-25T18:37:32+0000",
+            "content": "\nI think Robert's comments possibly stem from the misconception that the duplicate filter somehow works like field collapsing. I wrote a test just to illustrate how it actually behaves, just to make sure I wasn't confused myself (since he seemed to think I was...)\n\nNo, I understand exactly how this filter works. which is why my patch, that uses SlowMultiReaderWrapper and forces the index to appear as if it were a single segment, fixes the issue. \n\n\nActually I think Filter is the natural fit for this functionality.\n...\nBut I don't consider this a show stopper - it'd be simple to change\nDuplicateFilter to receive the top IR up front, and pre-compute and\ncache the bit set for all segments.\n\nSo now you contradict yourself. the only way is like you said, in the ctor, \nin other words, its forcefully cached. This is unnatural !\n\nWe should deprecate this functionality.\n\nIf someone wants to make a \"DuplicateBitSetBuilder\" that is a factory for creating a BitSet,\nto me that is more natural and obvious as to what is going on.\n\nif its not doing the work in getdocidset, it shouldn't extend Filter! ",
+            "author": "Robert Muir",
+            "id": "comment-12935835"
+        },
+        {
+            "date": "2010-11-25T22:23:45+0000",
+            "content": "It used to do the work in getDocIdSet() - it wasn't us who broke that, it was Lucene core! ",
+            "author": "Trejkaz",
+            "id": "comment-12935894"
+        },
+        {
+            "date": "2010-11-26T10:53:19+0000",
+            "content": "if its not doing the work in getdocidset, it shouldn't extend Filter!\n\nI don't think we can or should dictate that.\n\nI think it's fair game for a Filter to compute/cache whatever it\nwants.  The only requirement for Filter is that it implement\ngetDocIdSet.  Where it does its work, what it's storing in its\ninstance, etc., is up to it.\n\nSure, we strive for a strong separation of \"computing the bits\" vs\n\"caching them\", but for some cases that ideal is not feasible.\n\nIn fact in this case the filter is so costly to build that no\nrealistic app can possibly rely on the filter without first wrapping\nit in CachingWrapperFilter.  So I see no harm in conflating caching\nwith this.  We could rename it to CachingDuplicateFilter.  In fact we\ncould factor out the FilterCache utility class now inside\nCachingWrapperFilter and make it easily reused by other filters like\nthis one that need to compute & cache right off.\n\nThis would also be cleaner if we change the filter API so getDocIdSet\nreceives the top reader and docBase in addition to the sub; this way a\nCachingDuplicateFilter instance could be reused across reopened top\nreaders.\n\n\nIf someone wants to make a \"DuplicateBitSetBuilder\" that is a factory for creating a BitSet,\nto me that is more natural and obvious as to what is going on.\n\nThat sounds good... but how would it work?  Ie how would an app tie\nthat into a Filter? ",
+            "author": "Michael McCandless",
+            "id": "comment-12935970"
+        },
+        {
+            "date": "2012-02-21T05:55:03+0000",
+            "content": "The IndexReaderContext API in Lucene trunk looks like a reasonable solution to this problem. It is now possible to figure out the docBase relative to the top-level reader, which allows putting the work back into getDocIdSet. ",
+            "author": "Trejkaz",
+            "id": "comment-13212391"
+        },
+        {
+            "date": "2012-02-21T07:31:52+0000",
+            "content": "The new AtomicReaderContexts passed to getDocIdSet are exactly made for this problem. ",
+            "author": "Uwe Schindler",
+            "id": "comment-13212423"
+        },
+        {
+            "date": "2014-11-25T20:23:53+0000",
+            "content": "any update on this? Or should I use lucene grouping for this? ",
+            "author": "Martin Braun",
+            "id": "comment-14225148"
+        }
+    ]
+}

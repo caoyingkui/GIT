@@ -1,0 +1,68 @@
+{
+    "id": "SOLR-12258",
+    "title": "V2 API should \"retry\" for unresolved collections/aliases (like V1 does)",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "components": [
+            "SolrCloud",
+            "v2 API"
+        ],
+        "type": "Improvement",
+        "fix_versions": [
+            "7.4"
+        ],
+        "affect_versions": "None",
+        "resolution": "Fixed",
+        "status": "Closed"
+    },
+    "description": "When using V1, if the request refers to a possible collection/alias that fails to resolve, HttpSolrCall will invoke AliasesManager.update() then retry the request as if anew (in collaboration with SolrDispatchFilter). \u00a0If it fails to resolve again we stop there and return an error; it doesn't go on forever.\n\nV2 (V2HttpCall specifically) doesn't have this retry mechanism. \u00a0It'll return\u00a0\"no such collection or alias\".\n\nThe retry will not only\u00a0work for an alias but the retrying is a delay that will at least help the odds of a newly made collection from being known to this Solr node. \u00a0It'd be nice if this was more explicit \u2013 i.e. if there was a mechanism similar to AliasesManager.update() but for a collection. \u00a0I'm not sure how to do that?\n\nBTW I discovered this while debugging a Jenkins failure of\u00a0TimeRoutedAliasUpdateProcessorTest.test where it early on simply goes to issue a V2 based request to change the configuration of a collection that was created immediately before it. \u00a0It's pretty mysterious. \u00a0I am aware of SolrCloudTestCase.waitForState which is maybe something that needs to be called? \u00a0But if that were true then every SolrCloud test would need to use it; it just seems wrong to me that we ought to use this method commonly.",
+    "attachments": {
+        "SOLR-12258.patch": "https://issues.apache.org/jira/secure/attachment/12921887/SOLR-12258.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2018-04-23T20:31:21+0000",
+            "content": "To be extra clear, here's a small excerpt from\u00a0org.apache.solr.update.processor.TimeRoutedAliasUpdateProcessorTest#test (line 97-111) that is minimally sufficient to be showing the problem. The payload part is irrelevant.; what matters is that it's simply a V2 request:\n\n    CollectionAdminRequest.createCollection(configName, configName, 1, 1).process(solrClient);\n\n    // manipulate the config...\n    checkNoError(solrClient.request(new V2Request.Builder(\"/collections/\" + configName + \"/config\")\n        .withMethod(SolrRequest.METHOD.POST)\n        .withPayload(\"{\" +\n            \"  'set-user-property' : {'update.autoCreateFields':false},\" + // no data driven\n            \"  'add-updateprocessor' : {\" +\n            \"    'name':'tolerant', 'class':'solr.TolerantUpdateProcessorFactory'\" +\n            \"  },\" +\n            \"  'add-updateprocessor' : {\" + // for testing\n            \"    'name':'inc', 'class':'\" + IncrementURPFactory.class.getName() + \"',\" +\n            \"    'fieldName':'\" + intField + \"'\" +\n            \"  },\" +\n            \"}\").build()));\n\n\nThe second call, where we manipulate the config, sometimes/rarely fails because V2HttpCall can't resolve the collection (line 119). It's ZK state simply isn't up to date (I surmise). In principle, a V1 call could fail as well but in practice maybe it's more rare because the \"retry\" aspect of V1 buys it sufficient extra time. Adding a SolrCloudTestCase.waitForState in-between the calls here may help but again there's no guarantee since waitForState waits for the state of the client's state reader (not for state readers of Solr nodes).\n\nFor aliases, we can call ZooKeeper.sync(\"/aliases.json\",...) \u2013 and in fact I made sure ZkStateReader now does this in update(). For cases where our code expects to operate on a collection (thus it had better exist or we have an error) we could try and do a similar thing for collections? In fact we have ZkStateReader.forceUpdateCollection(collection) added by Shalin Shekhar Mangar in SOLR-8745 though it doesn't call ZooKeeper.sync().... but shouldn't it? ",
+            "author": "David Smiley",
+            "id": "comment-16448816"
+        },
+        {
+            "date": "2018-05-04T15:35:00+0000",
+            "content": "The attached patch:\n\n\tV2HttpCall: moved the alias resolution into getDocCollection and renamed to resolveDocCollection to handle both alias & collection resolution. \u00a0Added retry logic, both for aliases and for collections (via\u00a0 ZkStateReader.forceUpdateCollection(collection)\n\tHttpSolrCall: after we call aliases.update(), added a call to cores.getZkController().zkStateReader.forceUpdateCollection(collectionName); \u00a0And I removed the comment about admin UI elements triggering this code path because this is no longer true \u2013\u00a0I checked by using Solr with a breakpoint both cloud and standard, and by researching the original issue.\n\tZkStateReader.forceUpdateCollection: added TODO comment that we ought to call ZooKeeper.sync().\n\n\n\nTests are running now.\n\nAny comments Gus Heck, Noble Paul or Shalin Shekhar Mangar? \u00a0If not I'll commit this maybe Monday. \u00a0I'm looking forward to not seeing spurious CI failures for TimeRoutedAliasUpdateProcessorTest\u00a0that will be solved by this. ",
+            "author": "David Smiley",
+            "id": "comment-16464033"
+        },
+        {
+            "date": "2018-05-07T23:56:34+0000",
+            "content": "I think it might read better to move the contents of the two\n\nif (secondTry)\n\nblocks into the\n\nif(!secondTry)\n\nblock just before recursion. (conditionally \"Update\u00a0and recurse\" rather than recurse then conditionally update)\n\n\u00a0\n\nAlso in inspecting usages of\n\nforceUpdateCollection(collectionName) \n\nI came across the javadoc comment on\n\norg.apache.solr.common.cloud.ZkStateReader#forciblyRefreshAllClusterStateSlow\n\nmethod. That method seems like an even bigger candidate for a Zookeeper.sync(), but maybe that's another jira\n\n\u00a0 ",
+            "author": "Gus Heck",
+            "id": "comment-16466632"
+        },
+        {
+            "date": "2018-05-08T02:56:28+0000",
+            "content": "Thanks for the input.  Here's another variation of this method; this time without a secondTry arg which I don't really like:\n\n  protected DocCollection resolveDocCollection(String collectionStr) {\n    if (!cores.isZooKeeperAware()) {\n      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, \"Solr not running in cloud mode \");\n    }\n    ZkStateReader zkStateReader = cores.getZkController().getZkStateReader();\n    \n    Supplier<DocCollection> logic = () -> {\n      this.collectionsList = resolveCollectionListOrAlias(collectionStr); // side-effect\n      String collectionName = collectionsList.get(0); // first\n      //TODO an option to choose another collection in the list if can't find a local replica of the first?\n\n      return zkStateReader.getClusterState().getCollectionOrNull(collectionName);\n    };\n    \n    DocCollection docCollection = logic.get();\n    if (docCollection != null) {\n      return docCollection;\n    }\n    // ensure our view is up to date before trying again\n    try {\n      zkStateReader.aliasesManager.update();\n      zkStateReader.forceUpdateCollection(collectionsList.get(0));\n    } catch (Exception e) {\n      log.error(\"Error trying to update state while resolving collection.\", e);\n      //don't propagate exception on purpose\n    }\n    return logic.get();\n  }\n\n\nI can't come up with anything elegant.  At least the lambda had little ceremony to it, helped by the fact that no checked exceptions are involved and so I could use the standard Supplier interface.\n\n\nforciblyRefreshAllClusterStateSlow\n\nHeh; I didn't notice it.  It sure does look like a candidate!  Yeah, adding sync() over there ought to be its own JIRA. ",
+            "author": "David Smiley",
+            "id": "comment-16466789"
+        },
+        {
+            "date": "2018-05-08T18:30:59+0000",
+            "content": "Yeah I like that. I wasn't a fan of the secondTry arg either, except I'm not sure if we can put the aliasManager.update() in the same try bloack as .forceUpdateCollection() since we probably still want to force update the collection even if aliases update isn't happy... either that or we don't want to ignore the exception after all. ",
+            "author": "Gus Heck",
+            "id": "comment-16467801"
+        },
+        {
+            "date": "2018-05-08T19:10:37+0000",
+            "content": "Commit c3d28a5b0fbd56859d65a9907ad2b3064511b7e6 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c3d28a5 ]\n\nSOLR-12258: A V2 request referencing a collection or alias may fail to resolve it if it was just recently created.\nNow we sync with ZooKeeper and try one more time.  V1 partially did this but only for aliases; now it does both. ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16467834"
+        },
+        {
+            "date": "2018-05-08T19:12:06+0000",
+            "content": "Commit cfa4a82b3b0462a3d921bddfbaaf97f7cabb24a4 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cfa4a82 ]\n\nSOLR-12258: A V2 request referencing a collection or alias may fail to resolve it if it was just recently created.\nNow we sync with ZooKeeper and try one more time.  V1 partially did this but only for aliases; now it does both.\n\n(cherry picked from commit c3d28a5) ",
+            "author": "ASF subversion and git services",
+            "id": "comment-16467836"
+        }
+    ]
+}

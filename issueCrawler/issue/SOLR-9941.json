@@ -1,0 +1,145 @@
+{
+    "id": "SOLR-9941",
+    "title": "log replay redundently (pre-)applies DBQs as if they were out of order",
+    "details": {
+        "components": [],
+        "type": "Improvement",
+        "labels": "",
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "resolution": "Fixed",
+        "priority": "Major"
+    },
+    "description": "There's kind of an odd situation that arises when a Solr node starts up (after a crash) and tries to recover from it's tlog that causes deletes to be redundantly & excessively applied \u2013 at a minimum it causes confusing really log messages....\n\n\n\tUpdateLog.init(...) creates TransactionLog instances for the most recent log files found (based on numRecordsToKeep) and then builds a RecentUpdates instance from them\n\tDelete entries from the RecentUpdates are used to populate 2 lists:\n\t\n\t\tdeleteByQueries\n\t\toldDeletes (for deleteById).\n\t\n\t\n\tThen when UpdateLog.recoverFromLog is called a LogReplayer is used to replay any (uncommited) TransactionLog enteries\n\t\n\t\tduring replay UpdateLog delegates to the UpdateRequestProcessorChain to for the various adds/deletes, etc...\n\t\twhen an add makes it to RunUpdateProcessor it delegates to DirectUpdateHandler2, which (independent of the fact that we're in log replay) calls UpdateLog.getDBQNewer for every add, looking for any \"Reordered\" deletes that have a version greater then the add\n\t\t\n\t\t\tif it finds any DBQs \"newer\" then the document being added, it does a low level IndexWriter.updateDocument and then immediately executes all the newer DBQs ... once per add\n\t\t\n\t\t\n\t\tthese deletes are also still executed as part of the normal tlog replay, because they are in the tlog.\n\t\n\t\n\n\n\nWhich means if you are recovering from a tlog with 90 addDocs, followed by 5 DBQs, then each of those 5 DBQs will each be executed 91 times \u2013 and for 90 of those executions, a DUH2 INFO log messages will say \"Reordered DBQs detected. ...\" even tough the only reason they are out of order is because Solr is deliberately applying them out of order.\n\n\n\tAt a minimum we should improve the log messages\n\tIdeally we should stop (pre-emptively) applying these deletes during tlog replay.",
+    "attachments": {
+        "SOLR-9941.hoss-test-experiment.patch": "https://issues.apache.org/jira/secure/attachment/12846384/SOLR-9941.hoss-test-experiment.patch",
+        "SOLR-9941.patch": "https://issues.apache.org/jira/secure/attachment/12846152/SOLR-9941.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "date": "2017-01-07T01:33:24+0000",
+            "author": "Hoss Man",
+            "content": "\nI'm guessing this situation exists because the RecentUpdates code was added to UpdateLog to handle (true) out of order updates while a system was \"live\", but it's not clear to me why the RecentUpdates are used the way they are during UpdateLog.init ... it seems like at a minimum DUH2 could inspect the UpdateCommand flags to see if this is a REPLAY command and if it is skip the UpdateLog.getDBQNewer call?\n\nHere's some steps that make it easy to see how weird this situation can get...\n\n\nbin/solr -e techproducts\n\ncurl -X POST http://localhost:8983/solr/techproducts/config -H 'Content-Type: application/json' --data-binary '{\"set-property\":{\"updateHandler.autoCommit.maxTime\":\"-1\"}}'\n\ncurl -X POST http://localhost:8983/solr/techproducts/update -H 'Content-Type: application/json' --data-binary '{\n  \"add\":{\n    \"doc\": {\n      \"id\": \"DOCX\",\n      \"foo_i\": 41\n    }\n   },\n  \"delete\": { \"query\":\"foo_i:42\" },\n  \"delete\": { \"query\":\"foo_i:43\" },\n  \"add\":{\n     \"doc\": {\n      \"id\": \"DOCX\",\n      \"foo_i\": { \"inc\" : \"1\" }\n    }\n  },\n  \"delete\": { \"query\":\"foo_i:41\" },\n  \"delete\": { \"query\":\"foo_i:43\" },\n  \"add\":{\n    \"doc\": {\n      \"id\": \"DOCX\",\n      \"foo_i\": { \"inc\" : \"1\" }\n    }\n  },\n  \"delete\": { \"query\":\"foo_i:41\" },\n  \"delete\": { \"query\":\"foo_i:42\" }\n}'\n\n# verify the updates were applied correctly and doc didn't get deleted by mistake\ncurl 'http://localhost:8983/solr/techproducts/get?wt=json&id=DOCX'\n{\n  \"doc\":\n  {\n    \"id\":\"DOCX\",\n    \"foo_i\":43,\n    \"_version_\":1555827152896655360}}\n\n\nkill -9 PID # use whatever PID you get from \"ps -ef | grep start.jar | grep techproducts\"\n\nbin/solr start -s example/techproducts/solr/\n\n# re-verify the updates were applied correctly during replay\ncurl 'http://localhost:8983/solr/techproducts/get?wt=json&id=DOCX'\n{\n  \"doc\":\n  {\n    \"id\":\"DOCX\",\n    \"foo_i\":43,\n    \"_version_\":1555827152896655360}}\n\n\n\n\nAnd here's a snippet of solr's logs during the replay on (second) startup...\n\n\nWARN  - 2017-01-07 01:27:45.408; [   x:techproducts] org.apache.solr.update.UpdateLog$LogReplayer; Starting log replay tlog{file=/home/hossman/lucene/dev/solr/example/techproducts/solr/techproducts/data/tlog/tlog.0000000000000000001 refcount=2} active=false starting pos=0\nINFO  - 2017-01-07 01:27:45.422; [   x:techproducts] org.apache.solr.update.DirectUpdateHandler2; Reordered DBQs detected.  Update=add{flags=a,_version_=1555827152848420864,id=DOCX} DBQs=[DBQ{version=1555827152905043968,q=foo_i:42}, DBQ{version=1555827152897703936,q=foo_i:41}, DBQ{version=1555827152894558208,q=foo_i:43}, DBQ{version=1555827152883023872,q=foo_i:41}, DBQ{version=1555827152872538112,q=foo_i:43}, DBQ{version=1555827152849469440,q=foo_i:42}]\nINFO  - 2017-01-07 01:27:45.434; [   x:techproducts] org.apache.solr.core.SolrCore; [techproducts]  webapp=null path=null params={q=static+firstSearcher+warming+in+solrconfig.xml&distrib=false&event=firstSearcher} hits=3 status=0 QTime=62\nINFO  - 2017-01-07 01:27:45.446; [   x:techproducts] org.apache.solr.core.QuerySenderListener; QuerySenderListener done.\nINFO  - 2017-01-07 01:27:45.446; [   x:techproducts] org.apache.solr.handler.component.SpellCheckComponent$SpellCheckerListener; Loading spell index for spellchecker: default\nINFO  - 2017-01-07 01:27:45.446; [   x:techproducts] org.apache.solr.handler.component.SpellCheckComponent$SpellCheckerListener; Loading spell index for spellchecker: wordbreak\nINFO  - 2017-01-07 01:27:45.448; [   x:techproducts] org.apache.solr.core.SolrCore; [techproducts] Registered new searcher Searcher@1826a6c8[techproducts] main{ExitableDirectoryReader(UninvertingDirectoryReader(Uninverting(_0(7.0.0):C32)))}\nINFO  - 2017-01-07 01:27:45.532; [   x:techproducts] org.apache.solr.search.SolrIndexSearcher; Opening [Searcher@5bd6b40f[techproducts] realtime]\nINFO  - 2017-01-07 01:27:45.536; [   x:techproducts] org.apache.solr.update.DirectUpdateHandler2; Reordered DBQs detected.  Update=add{flags=a,_version_=1555827152881975296,id=DOCX} DBQs=[DBQ{version=1555827152905043968,q=foo_i:42}, DBQ{version=1555827152897703936,q=foo_i:41}, DBQ{version=1555827152894558208,q=foo_i:43}, DBQ{version=1555827152883023872,q=foo_i:41}]\nINFO  - 2017-01-07 01:27:45.546; [   x:techproducts] org.apache.solr.search.SolrIndexSearcher; Opening [Searcher@667a386f[techproducts] realtime]\nINFO  - 2017-01-07 01:27:45.555; [   x:techproducts] org.apache.solr.update.DirectUpdateHandler2; Reordered DBQs detected.  Update=add{flags=a,_version_=1555827152896655360,id=DOCX} DBQs=[DBQ{version=1555827152905043968,q=foo_i:42}, DBQ{version=1555827152897703936,q=foo_i:41}]\nINFO  - 2017-01-07 01:27:45.573; [   x:techproducts] org.apache.solr.search.SolrIndexSearcher; Opening [Searcher@3ed8aa7e[techproducts] realtime]\nINFO  - 2017-01-07 01:27:45.579; [   x:techproducts] org.apache.solr.update.DirectUpdateHandler2; start commit{flags=2,optimize=false,openSearcher=true,waitSearcher=true,expungeDeletes=false,softCommit=false,prepareCommit=false}\nINFO  - 2017-01-07 01:27:45.580; [   x:techproducts] org.apache.solr.update.SolrIndexWriter; Calling setCommitData with IW:org.apache.solr.update.SolrIndexWriter@363e3fe6\nINFO  - 2017-01-07 01:27:45.615; [   x:techproducts] org.apache.solr.search.SolrIndexSearcher; Opening [Searcher@7af13db2[techproducts] main]\nINFO  - 2017-01-07 01:27:45.617; [   x:techproducts] org.apache.solr.update.DirectUpdateHandler2; end_commit_flush\nINFO  - 2017-01-07 01:27:45.617; [   x:techproducts] org.apache.solr.core.QuerySenderListener; QuerySenderListener sending requests to Searcher@7af13db2[techproducts] main{ExitableDirectoryReader(UninvertingDirectoryReader(Uninverting(_0(7.0.0):C32) Uninverting(_3(7.0.0):C1)))}\nINFO  - 2017-01-07 01:27:45.617; [   x:techproducts] org.apache.solr.core.QuerySenderListener; QuerySenderListener done.\nINFO  - 2017-01-07 01:27:45.619; [   x:techproducts] org.apache.solr.core.SolrCore; [techproducts] Registered new searcher Searcher@7af13db2[techproducts] main{ExitableDirectoryReader(UninvertingDirectoryReader(Uninverting(_0(7.0.0):C32) Uninverting(_3(7.0.0):C1)))}\nINFO  - 2017-01-07 01:27:45.620; [   x:techproducts] org.apache.solr.update.processor.LogUpdateProcessorFactory$LogUpdateProcessor; [techproducts] {add=[DOCX (1555827152848420864), DOCX (1555827152881975296), DOCX (1555827152896655360)],deleteByQuery=foo_i:42 (-1555827152849469440),deleteByQuery=foo_i:43 (-1555827152872538112),deleteByQuery=foo_i:41 (-1555827152883023872),deleteByQuery=foo_i:43 (-1555827152894558208),deleteByQuery=foo_i:41 (-1555827152897703936),deleteByQuery=foo_i:42 (-1555827152905043968)} 0 212\nWARN  - 2017-01-07 01:27:45.620; [   x:techproducts] org.apache.solr.update.UpdateLog$LogReplayer; Log replay finished. recoveryInfo=RecoveryInfo{adds=3 deletes=0 deleteByQuery=6 errors=0 positionOfStart=0}\n\n\n\n...notice how many times each of those DBQs was listed as being \"Reordered\" (and thus preemptively applied) even though they are also applied as part of the regular replay (note the INFO msg from LogUpdateProcessor) ",
+            "id": "comment-15806431"
+        },
+        {
+            "date": "2017-01-07T02:38:46+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "The attached patch seems to fix the problem, and feels like the right thing to do. Based on Hoss' idea:\n\nit seems like at a minimum DUH2 could inspect the UpdateCommand flags to see if this is a REPLAY command and if it is skip the UpdateLog.getDBQNewer call?\n\nThe corresponding test failure in jira/solr-5944 branch passes with this patch (even after excluding the getUpdateLog().deleteAll() call). ",
+            "id": "comment-15806557"
+        },
+        {
+            "date": "2017-01-07T08:19:05+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Seems like the fix I posted in my previous patch won't work due to the fact that doing so would preclude us from processing actually re-ordered DBQs also, and hence leave out some documents that should've been deleted. Added a test for this (which should anyway be committed, I think). ",
+            "id": "comment-15807087"
+        },
+        {
+            "date": "2017-01-07T11:31:52+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Attaching a fix to clear out the DBQs and oldDeletes lists before a log replay upon a startup. Hoss Man, Mark Miller, Yonik Seeley, can you please review / suggest alternate fixes? ",
+            "id": "comment-15807338"
+        },
+        {
+            "date": "2017-01-09T16:28:34+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Fyi, Shalin Shekhar Mangar, Cao Manh Dat please review. ",
+            "id": "comment-15812165"
+        },
+        {
+            "date": "2017-01-09T18:15:52+0000",
+            "author": "Hoss Man",
+            "content": "The patch looks pretty good to me \u2013 but i'm not a tlog expert.\n\nOne question i have is: if the only code paths that call recoverFromLog(boolean) are \"startup\" paths that pass true why do we need the optional argument?  why not just refactor the method to always use the new logic? ",
+            "id": "comment-15812443"
+        },
+        {
+            "date": "2017-01-09T18:50:24+0000",
+            "author": "Hoss Man",
+            "content": "I wanted to beef up Ishan's testLogReplayWithReorderedDBQ to prove that if another (probably ordered) DBQ arrived during log replay it would correctly be applied \u2013 even if some affected docs hadn't been added yet as part of replay.  (ie: prove that \"RecentUpdates\" was still being used during replay)\n\nBut for some reason my modified test fails even on master.  I suspect either i'm misunderstanding something about how recovery works, or about the way TestRecovery works (or i just have a silly bug/typo somewhere)\n\nIn anycase, i've attached only my test idea in SOLR-9941.hoss-test-experiment.patch if anyone wants to take a look ",
+            "id": "comment-15812518"
+        },
+        {
+            "date": "2017-01-09T23:26:44+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\nOne question i have is: if the only code paths that call recoverFromLog(boolean) are \"startup\" paths that pass true why do we need the optional argument? why not just refactor the method to always use the new logic?\nMy thought there was that if someone wanted to reuse the recoverFromLog() method later for use during a live node, and not during the startup of a node/core (for whatever reason that I cannot forsee right now), that they not end up clearing their deletes lists in the process. Though, given the current use of the method now, I am also open to eliminate that extra parameter if you suggest. ",
+            "id": "comment-15813195"
+        },
+        {
+            "date": "2017-01-09T23:51:59+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\nI wanted to beef up Ishan's testLogReplayWithReorderedDBQ to prove that if another (probably ordered) DBQ arrived during log replay it would correctly be applied \u2013 even if some affected docs hadn't been added yet as part of replay. (ie: prove that \"RecentUpdates\" was still being used during replay)\n\nSeems to me that updates arriving during the log replay (in TestRecovery) are being silently dropped. There's definitely something fishy about it, but I think that is another issue altogether, since even adds during the log replay are not persisting after the replay. Here's [0] a modified version of your test that applies the DBQ after recovery has finished. Of course, not nearly as effective in proving anything, and also doesn't test for the premise you were after: prove that \"RecentUpdates\" was still being used during replay.\n\n[0] - https://paste.fedoraproject.org/524485/05608148 ",
+            "id": "comment-15813256"
+        },
+        {
+            "date": "2017-01-10T00:12:13+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "\nSeems to me that updates arriving during the log replay (in TestRecovery) are being silently dropped.\nOne possible explanation came to mind: During log replay, the state of the core is REPLAYING. Hence, perhaps, incoming updates are not applied (and dropped) until the recovery has finished and state is back to ACTIVE? ",
+            "id": "comment-15813309"
+        },
+        {
+            "date": "2017-01-10T03:30:17+0000",
+            "author": "Cao Manh Dat",
+            "content": "Here are the reason to explain why Hoss's test fails :\n\n\tWhen the test add updates, it will be written to tlog-0000\n\tAfter the core is restarted, it will replay the updates from tlog-0000\n\tIn the same time, the test add another DEQ, because the ulog is not active, DUP will write this DEQ to another file ( tlog-0001, buffering updates) and ignore apply this DEQ to IW.\nDistributedUpdateProcess.java\n// we're not in an active state, and this update isn't from a replay, so buffer it.\ncmd.setFlags(cmd.getFlags() | UpdateCommand.BUFFERING);\nulog.add(cmd);\n\n\n\tAfter LogReplay finish, we call a commit, which will write a commit update at the end of tlog-0001\n\n\n\nSo this DEQ update will never be replayed ( because it belong tlog-0001 not tlog-0000 ), and it've never been applied to IW, so that DEQ update is lost.\n\nBut this do not mean we have a problem with SolrCloud mode or single instance mode. \nIn SolrCloud mode, when a replica run recoverFromLog, replica in this time period will have state = DOWN, so It won't receive any updates.\n\nIn single instance mode, we will run in leader logic, so the DEQ is applied to IW immediately ( along with update ulog.deleteByQueries ).\n\nIn TestRecovery, we kinda mixed up single instance code path along with SolrCloud mode code path, so we end up with the fail. ",
+            "id": "comment-15813726"
+        },
+        {
+            "date": "2017-01-10T09:37:50+0000",
+            "author": "Cao Manh Dat",
+            "content": "+1 for remove boolean onStartup. \nThe rest a good to me. ",
+            "id": "comment-15814488"
+        },
+        {
+            "date": "2017-01-10T17:29:57+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Thanks Cao Manh Dat. Updated the patch, removed the conditional parameter for startup.\n\nUnless someone has any objections or suggests some modifications, I'd like to commit this after the 6.4 branch is cut (or alternatively, commit this to master and wait for backporting after the 6.4 branch is cut). ",
+            "id": "comment-15815591"
+        },
+        {
+            "date": "2017-01-10T17:38:21+0000",
+            "author": "Christine Poerschke",
+            "content": "Tentatively linking SOLR-8760 and SOLR-9941 as related (but haven't yet had chance to catchup on SOLR-9941 here to see if it would solve SOLR-8760 also or indeed if the issues are different). ",
+            "id": "comment-15815615"
+        },
+        {
+            "date": "2017-01-10T18:47:01+0000",
+            "author": "Hoss Man",
+            "content": "In TestRecovery, we kinda mixed up single instance code path along with SolrCloud mode code path, so we end up with the fail.\n\nyeah, that was the piece i wasn't clear about \u2013 makes sense.\n\nbased on Dat's comments, I re-did my previous idea as a new independent testNewDBQAndDocMatchingOldDBQDuringLogReplay method:\n\n\n\tthe \"client\" only sends regular updates (w/o fake versions) as it would to a leader/single-node instance\n\tconfirms that a DBQ which arrives during recovery is processed correctly, even if the docs being deleted haven't been added yet as part of recovery\n\tAlso includes a DBQ in the tlog which may (randomly) be applied before/after the new DBQ arrives\n\t\n\t\tjust to sanity check that the new delete doesn't muck with the replay of old deletes\n\t\n\t\n\tthe DBQ from the tlog also matches a doc which isn't added until recovery is in process (randomly before/after the DBQ from the tlog is applied) to verify that doc isn't deleted by mistake\n\n\n\n...i've added this new test method to the patch to help with the coverage of the affected code paths.\n\nUnless someone has any objections or suggests some modifications, I'd like to commit this after the 6.4 branch is cut (or alternatively, commit this to master and wait for backporting after the 6.4 branch is cut).\n\nThe sooner it gets committed to master, the sooner jenkins starts helping us do randomized testing \u2013 since Dat thinks the change makes sense, and there are no objections I would encourage committing to master early and waiting to backport.\n ",
+            "id": "comment-15815819"
+        },
+        {
+            "date": "2017-01-11T16:21:22+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 04f45aab768b053f32feece7343f994d25f0bb26 in lucene-solr's branch refs/heads/master from Ishan Chattopadhyaya\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=04f45aa ]\n\nSOLR-9941: Clear deletes lists before log replay ",
+            "id": "comment-15818754"
+        },
+        {
+            "date": "2017-01-16T21:38:34+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 302ce326d5a2eee043445918fa3e3885dc003b2f in lucene-solr's branch refs/heads/branch_6x from Ishan Chattopadhyaya\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=302ce32 ]\n\nSOLR-9941: Clear deletes lists before log replay ",
+            "id": "comment-15824614"
+        },
+        {
+            "date": "2017-01-16T21:38:35+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7ef8cf7d6aad25888de4cffc4c20239694a67a45 in lucene-solr's branch refs/heads/branch_6x from Ishan Chattopadhyaya\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7ef8cf7 ]\n\nSOLR-9941: Adding the Optimizations section to the CHANGES.txt ",
+            "id": "comment-15824615"
+        },
+        {
+            "date": "2017-01-16T21:42:31+0000",
+            "author": "ASF subversion and git services",
+            "content": "Commit 38af094d175daebe4093782cc06e964cfc2dd14b in lucene-solr's branch refs/heads/master from Ishan Chattopadhyaya\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=38af094 ]\n\nSOLR-9941: Moving changelog entry from 7.0.0 to 6.5.0 ",
+            "id": "comment-15824621"
+        },
+        {
+            "date": "2017-01-16T21:45:07+0000",
+            "author": "Ishan Chattopadhyaya",
+            "content": "Will change the Fix version to 6.5 as soon as the version is available on JIRA. ",
+            "id": "comment-15824627"
+        }
+    ]
+}
