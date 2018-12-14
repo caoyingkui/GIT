@@ -15,6 +15,7 @@ import git.GitAnalyzer;
 import graph.Graph;
 import graph.HashSolver;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.revwalk.RevCommit;
 import util.WriterTool;
 
 import java.io.*;
@@ -51,15 +52,6 @@ public class CommitDependencyAnalyzer {
         }
     }
 
-    public void writeFile(String path, String content){
-        try{
-            BufferedWriter writer = new BufferedWriter(new FileWriter(new File(path)));
-            writer.write(content);
-            writer.close();
-        }catch (Exception e){
-            e.printStackTrace();
-        }
-    }
 
     public Graph start(String commitId){
         this.id = gitAnalyzer.getId(commitId);
@@ -69,7 +61,7 @@ public class CommitDependencyAnalyzer {
         for(String file: files){
             String fileContent = gitAnalyzer.getFileFromCommit(id, file);
             String path = Path.diffDir + "/" + file.substring(file.lastIndexOf("/") + 1);
-            writeFile(path, fileContent);
+            WriterTool.write(path, fileContent);
             fileList.add(new File(path));
             fileNameList.add(file);
         }
@@ -226,19 +218,19 @@ public class CommitDependencyAnalyzer {
 
 
         CommitDependencyAnalyzer analyzer = new CommitDependencyAnalyzer("Head");
-        List<String> commits = analyzer.gitAnalyzer.getLog();
+        List<RevCommit> commits = analyzer.gitAnalyzer.getCommits();
         int total = 0;
         int count = 0;
-        for(String commit: commits){
+        for(RevCommit commit: commits){
             analyzer.pathInitialize();
             //commit = "f1a30bfb00cc3f72ee30a3356c153aee3a402433";
-            int size = analyzer.howManyMethodsAreModified(commit);
+            int size = analyzer.howManyMethodsAreModified(commit.getName());
             total ++;
             count += (size == 1 ? 1 : 0);
             if(total % 200 == 0 ) {
                 System.out.println("total: " + total);
             }else if(size == 1){
-                System.out.println(commit + ": 1     total: " + total);
+                System.out.println(commit.getName() + ": 1     total: " + total);
             }
         }
         System.out.println("1 fix result:" + count);

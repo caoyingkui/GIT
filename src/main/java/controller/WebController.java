@@ -7,6 +7,7 @@ import analyzer.histories.HistoryAnalyzer;
 import git.GitAnalyzer;
 import javafx.util.Pair;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.revwalk.RevCommit;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +21,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 
 @EnableScheduling
@@ -40,10 +42,10 @@ public class WebController {
     @MessageMapping("/log")
     public void codeSearch() throws Exception{
 
-        List<String> commits = analyzer.getLog();
+        List<RevCommit> commits = analyzer.getCommits();
         JSONArray array = new JSONArray();
-        commits.forEach(item -> {array.put(item);});
-        template.convertAndSend("/message/commit", commits);
+        commits.forEach(item -> {array.put(item.getName());});
+        template.convertAndSend("/message/commit", array.toString());
     }
 
     @MessageMapping("/commit")

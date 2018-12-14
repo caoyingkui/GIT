@@ -41,14 +41,26 @@ public class GitAnalyzer {
         }
     }
 
-    public List<String> getLog(){
-        List<String> result = new ArrayList<String>();
+    public RevCommit getCommit(String commitId) {
+        try {
+            Iterator<RevCommit> commits = git.log().addRange(getId(commitId + "^"), getId(commitId)).call().iterator();
+            if (commits.hasNext()) {
+                return commits.next();
+            }
+        }catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public List<RevCommit> getCommits(){
+        List<RevCommit> result = new ArrayList<>();
 
         try {
             Iterator<RevCommit> commits = git.log().call().iterator();
             while (commits.hasNext()) {
                 RevCommit commit = commits.next();
-                result.add(commit.getName());
+                result.add(commit);
             }
 
         }catch (Exception e) {
@@ -131,7 +143,6 @@ public class GitAnalyzer {
      */
     public List<String> getAllFilesModifiedByCommit(String commitId, String ...fileFilters){
         List<String > result = new ArrayList<>();
-
         try {
             RevWalk rw = new RevWalk(repository);
             ObjectId curId = repository.resolve(commitId);
@@ -310,11 +321,12 @@ public class GitAnalyzer {
         //poi_analyzer.start();
 
         GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
-        List<String> logs = lucene_analyzer.getLog();
-        for (String log: logs) {
-            String msg = lucene_analyzer.getCommitMessage(log);
+        RevCommit comdmit = lucene_analyzer.getCommit("HEAD");
+        List<RevCommit> commits = lucene_analyzer.getCommits();
+        for (RevCommit commit: commits) {
+            String msg = commit.getShortMessage();
             if(msg.contains("SOLR-12759")){
-                System.out.println(log);
+                System.out.println(msg);
             }
         }
         /*GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
