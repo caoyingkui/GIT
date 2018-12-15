@@ -18,6 +18,7 @@ import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import util.DateTool;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -51,10 +52,14 @@ public class WebController {
     @MessageMapping("/commit")
     public void getTargetCommit(String commit) throws Exception{
         List<String> files = analyzer.getAllFilesModifiedByCommit(commit);
-        String commitMessage = analyzer.getCommitMessage(commit);
+        //String commitMessage = analyzer.getCommitMessage(commit);
+        RevCommit com = analyzer.getCommit(commit);
 
         JSONObject object = new JSONObject();
-        object.put("message", commitMessage);
+        String msg = DateTool.toString(com.getCommitTime()) + "\n" +
+                com.getCommitTime() + "\n" +
+                com.getShortMessage();
+        object.put("message", msg);
 
         JSONArray array = new JSONArray();
         files.forEach(item -> array.put(item));
@@ -93,6 +98,18 @@ public class WebController {
             array.put(((ObjectId)(pair.getKey())).getName());
         }
 
+        this.template.convertAndSend("/message/commit", array);
+    }
+
+    @MessageMapping("/specific_issue_commit")
+    public void searchCommitsForASpecificIssue(String issue) {
+        List<RevCommit> commits = analyzer.getCommits();
+        JSONArray array = new JSONArray();
+        for (RevCommit commit: commits) {
+            if (commit.getShortMessage().contains(issue.toUpperCase())) {
+                array.put(commit.getName());
+            }
+        }
         this.template.convertAndSend("/message/commit", array);
     }
 

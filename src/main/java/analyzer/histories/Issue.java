@@ -37,6 +37,10 @@ public class Issue {
         //这两个鬼东西没有处理
         //details.put("fix_versions", (String) detailsObject.get("fix_versions"));
         //details.put("components")
+        JSONObject attach = (JSONObject)object.get("attachments");
+        for (String key: attach.keySet()) {
+            attachements.add((String)attach.get(key));
+        }
 
         this.comments = new ArrayList<>();
         JSONArray comments = (JSONArray) object.get("comments");

@@ -12,7 +12,7 @@ public class ReaderTool {
             FileInputStream in = new FileInputStream(new File(filePath));
             byte[] bytes = new byte[in.available()];
             in.read(bytes, 0, in.available());
-            return new String(bytes);
+            return new String(bytes).replaceAll("\r", "");
         }catch (FileNotFoundException e) {
             System.out.println("No such file:" + Paths.get(filePath).toAbsolutePath().toString());
             return "";

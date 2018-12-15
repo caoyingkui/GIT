@@ -28,6 +28,10 @@ function get_log_modify_specific_file(){
     stompClient.send("/search/specific_file_commit", {}, $("#input_file").val());
 }
 
+function get_log_related_to_specific_issue(){
+    stompClient.send("/search/specific_issue_commit", {}, $("#input_issue").val());
+}
+
 
 
 function get_target_commit(){
@@ -75,7 +79,7 @@ function update_commit(commits){
     var com = JSON.parse(commits.body);
 
     $("#commit_list").empty();
-    for(var i = 0; i < 1000; i ++){
+    for(var i = 0; i < com.length && i < 100; i ++){
         $("#commit_list").append("<option>" + com[i] +"</option>");
     }
     $("#commit_list").val(com[0]);

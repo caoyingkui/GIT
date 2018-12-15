@@ -19,7 +19,9 @@ import org.json.JSONObject;
 import util.ReaderTool;
 import util.WriterTool;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
 import java.util.*;
 import java.util.regex.Pattern;
 
@@ -342,9 +344,113 @@ public class HistoryAnalyzer {
     }
 
     public static void main(String[] args) {
-        GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+        /*GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
         HistoryAnalyzer analyzer = new HistoryAnalyzer();
         analyzer.getHistories("solr/contrib/extraction/src/test/org/apache/solr/handler/extraction/ExtractingRequestHandlerTest.java");
+        */
+
+        GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+        List<RevCommit> commits = git.getCommits();
+        Set<String> timezore = new HashSet<>();
+        for (RevCommit commit: commits) {
+            if (commit.getAuthorIdent().getTimeZone().getID().equals("GMT+09:00")) {
+                int aaa = 2;
+            }
+            timezore.add(commit.getAuthorIdent().getTimeZone().getID());
+        }
+        for (String time: timezore) {
+            System.out.println(time);
+        }
+        /*int total = 0;
+        double sim = 0;
+        for (String issue: issueCommitMap.keySet()) {
+            System.out.println(issue);
+            List<RevCommit> commits = issueCommitMap.get(issue);
+
+            if (commits.size() > 1) {
+                RevCommit first = commits.get(0);
+                List<String> files1 = git.getAllFilesModifiedByCommit(first.getName(), ".java");
+
+                for (int i = 1; i < commits.size() ; i ++) {
+                    total ++;
+                    List<String> files2 = git.getAllFilesModifiedByCommit(commits.get(i).getName(), ".java");
+                    double count = 0;
+                    for (String file: files1) {
+                        if (files2.contains(file)) count ++;
+                    }
+                    if ((files2.size() + files1.size() - count) > 0)
+                        sim += count / (files2.size() + files1.size() - count);
+                    files1 = files2;
+                }
+            }
+        }
+        System.out.println(sim / total);
+*/
+
+        /*查看当issue为bug时，commit有多个
+        当为newfeature时，commit只有一个
+        int newFeature = 0, newFeatureTotal = 0;
+        int bug = 0, bugTotal = 0;
+        for (String issue: issueCommitMap.keySet()) {
+            Issue i = new Issue(issue);
+            if (i == null) continue;
+            try {
+                if (i.details.get("type").equals("New Feature")) {
+                    newFeatureTotal++;
+                    if (issueCommitMap.get(issue).size() == 1) {
+                        newFeature++;
+                    }
+                } else if (i.details.get("type").equals("Bug")) {
+                    bugTotal++;
+                    if (i.attachements.size() > 1) {
+                        bug++;
+                    } else {
+                        int a = 2;
+                    }
+                }
+            } catch (Exception e) {
+                ;
+            }
+        }
+        System.out.println(String.format("new_total:%d new:%d, bug_total:%d, bug:%d",
+                newFeatureTotal,newFeature,bugTotal, bug));
+                */
+        /*
+        GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+        List<RevCommit> commits = git.getCommits();
+        Scanner scanner = new Scanner(System.in);
+        while (scanner.hasNext()) {
+            String issue = scanner.next();
+            for (RevCommit commit: commits) {
+                String msg = commit.getShortMessage();
+                if (msg.contains(issue)) {
+                    System.out.print(commit.getName() + " ");
+                }
+            }
+            System.out.println();
+        }
+        */
+
+        /*统计修改一个issue的commit大于2的比例
+        try {
+            BufferedReader reader = new BufferedReader(new FileReader(new File("issueCrawler/issue_commit.txt")));
+            String line = "";
+            int count = 0;
+            int total = 0;
+            while ((line = reader.readLine()) != null) {
+                String[] temp = line.split(":",0);
+                String issue = temp[0];
+                String[] commit = temp[1].split("\\|", 0);
+                if (commit.length > 1)
+                    count ++;
+                total ++;
+            }
+            reader.close();
+
+            System.out.println(total + " " + count);
+        }catch (Exception e){
+            e.printStackTrace();
+        }*/
 
     }
 
