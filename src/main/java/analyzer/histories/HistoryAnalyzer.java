@@ -16,6 +16,7 @@ import org.eclipse.jgit.patch.Patch;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import util.DateTool;
 import util.ReaderTool;
 import util.WriterTool;
 
@@ -350,13 +351,13 @@ public class HistoryAnalyzer {
         */
 
         GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+        //GitAnalyzer git = new GitAnalyzer("E:\\Intellij workspace\\GIT");
+
         List<RevCommit> commits = git.getCommits();
         Set<String> timezore = new HashSet<>();
         for (RevCommit commit: commits) {
-            if (commit.getAuthorIdent().getTimeZone().getID().equals("GMT+09:00")) {
-                int aaa = 2;
-            }
-            timezore.add(commit.getAuthorIdent().getTimeZone().getID());
+            System.out.println(DateTool.toLocalTime(DateTool.getGMTTime(commit)));
+            int a = 2 + 1;
         }
         for (String time: timezore) {
             System.out.println(time);
