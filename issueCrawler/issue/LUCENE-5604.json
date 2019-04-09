@@ -1,0 +1,237 @@
+{
+    "id": "LUCENE-5604",
+    "title": "Should we switch BytesRefHash to MurmurHash3?",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/index"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.8",
+            "6.0"
+        ]
+    },
+    "description": "MurmurHash3 has better hashing distribution than the current hash function we use for BytesRefHash which is a simple multiplicative function with 31 multiplier (same as Java's String.hashCode, but applied to bytes not chars).  Maybe we should switch ...",
+    "attachments": {
+        "BytesRefHash.perturb.patch": "https://issues.apache.org/jira/secure/attachment/12639982/BytesRefHash.perturb.patch",
+        "LUCENE-5604.patch": "https://issues.apache.org/jira/secure/attachment/12639981/LUCENE-5604.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13967779",
+            "author": "Michael McCandless",
+            "content": "Initial patch, Lucene tests pass, but solrj doesn't yet compile....\n\nI factored out Hash.murmurhash3_x86_32 from Solr into Lucene's StringHelper, and cut over BytesRef.hash, TermToBytesRefAttribute.fillBytesRef, and BytesRefHash.\n\nI left some nocommits: I think we should change TermToBytesRefAttribute to not return this hashCode?  And also remove the BytesRefHash.add method that takes a hashCode?  Seems awkward to make the hash code impl of BytesRefHash so public ... it should be under the hood.\n\nI also randomized/salted the hash seed per JVM instance (poached this from Guava), by setting a common static seed on JVM init (just System.currentTimeMillis()).  This should frustrate denial of service attacks, and also can catch any places where we rely on this hash function not changing across JVM instances (e.g. persisting to disk somewhere). ",
+            "date": "2014-04-13T10:19:49+0000"
+        },
+        {
+            "id": "comment-13967781",
+            "author": "Michael McCandless",
+            "content": "I ran performance tests on first 5M Wikipedia \"medium\" (1 KB sized)\ndocs and Geonames (sources for the benchmark are all in luceneutil):\n\n\nWiki first 5M docs, no merge policy, 64 MB RAM buffer, 4 indexing threads, default codec:\n  trunk:    136.985 sec, 189729244 conflicts\n  murmur:   134.156 sec, 164990724 conflicts\n\nGeonames, no merge policy, 64 MB RAM buffer, 4 indexing threads, default codec:\n  trunk:    167.354 sec, 236051203 conflicts\n  murmur:   168.101 sec, 179747265 conflicts\n\n\n\nNet/net the indexing time is the same (within noise of run-to-run).\nThe conflict count is how many times we had to probe in the open\naddressed hash table inside BytesRefHash, and Murmur3 gives a nice\nreduction (~ 13-24%).  I think we should switch. ",
+            "date": "2014-04-13T10:26:37+0000"
+        },
+        {
+            "id": "comment-13967783",
+            "author": "Michael McCandless",
+            "content": "Separately, I also tried a different probing function inside\nBytesRefHash, poaching the \"perturbing\" approach from Python's\ndictionary object:\n\n\nWiki\n  murmur + perturb: 134.228 sec, 176358406 conflicts\n\nGeonames\n  murmur + perturb: 167.735 sec, 200311281 conflicts\n\n\n\nCuriously, it increased the number of collisions from Murmur3 alone.\nIt's possible I messed up the implementation (though all Lucene tests\ndid pass).\n\nOr, it could be that because we only use 32 bits for our hash code\n(Python uses 64 bit hash codes on 64 bit arch), we just don't have\nenough bits to mixin when probing for new addresses.\n\nIn fact, if we move all hashing to be private (under the hood) of\nBytesRefHash, maybe we could switch to the 128 bit variant MurmurHash3\nand then the \"perturbing\" might help. ",
+            "date": "2014-04-13T10:37:46+0000"
+        },
+        {
+            "id": "comment-13967811",
+            "author": "Robert Muir",
+            "content": "Can we use methods like Integer.reverseBytes/rotateLeft instead of doing byte swapping or bit rotations manually? this may improve the speed, e.g. the former is a jvm intrinsic. ",
+            "date": "2014-04-13T12:02:13+0000"
+        },
+        {
+            "id": "comment-13967851",
+            "author": "Yonik Seeley",
+            "content": "The JVM recognizes pairs of shifts that amount to a rotate and replaces them with an intrinsic.\n\nInitial patch, Lucene tests pass, but solrj doesn't yet compile....\n\nRight - SolrJ does not have lucene dependencies.  Solr also depends on the exact hash, so it can't be tweaked (for example if a variant turns out to be better for lucene indexing).  Perhaps Lucene should just make a copy of the one it needs (the byte[] version). ",
+            "date": "2014-04-13T14:33:33+0000"
+        },
+        {
+            "id": "comment-13967866",
+            "author": "Uwe Schindler",
+            "content": "The JVM recognizes pairs of shifts that amount to a rotate and replaces them with an intrinsic.\n\nI still think we should replace them by the \"methods\". This is the same like replacing the ternary ? : with Number.compare(x,y) for comparators. Brings no improvements, just better readability in Java 7 and is less error-prone (cf. the possible overflows if implementing the compare with a dumb ternary op). ",
+            "date": "2014-04-13T15:28:00+0000"
+        },
+        {
+            "id": "comment-13967884",
+            "author": "Dawid Weiss",
+            "content": "> by setting a common static seed on JVM init (just System.currentTimeMillis()).\n\nThis will render any tests that rely on hash ordering, etc. not-repeatable. I suggest initializing this to current time millis OR to the current random seed value (system property 'tests.seed'). ",
+            "date": "2014-04-13T16:41:17+0000"
+        },
+        {
+            "id": "comment-13967961",
+            "author": "Michael McCandless",
+            "content": "New patch, folding in all feedback (thanks!).  I think it's ready:\n\n\n\tI reverted the Solr changes\n\n\n\n\n\tI dup'd the murmurhash3_x86_32 taking byte[] into StringHelper, but changed to the intrinsics for Integer.rotateLeft\n\n\n\n\n\tI added a small test case, confirming our MurmurHash3 impl matches a separate Python/C impl I found\n\n\n\n\n\tI made the hashing private to BytesRefHash, and changed TermToBytesAtt.fillBytesRef to return void\n\n\n\n\n\tFor the seed/salt, I now pull from tests.seed property if it's non-null\n\n ",
+            "date": "2014-04-13T22:18:37+0000"
+        },
+        {
+            "id": "comment-13968122",
+            "author": "Adrien Grand",
+            "content": "Strong +1 on this change!\n\nSeparately, I also tried a different probing function inside BytesRefHash\n\nI'm wondering if we should try linear probing? Now that we use a good hash function, the likelyness of having clusters of hashes in the hash table is much lower (especially given that BytesRefHash hard-codes quite a low load factor: 0.5) so linear probing might help get some performance back since it tends to be more cache-friendly?\n\nI added a small test case, confirming our MurmurHash3 impl matches a separate Python/C impl I found\n\nMaybe we could add Guava as a test dependency and do some duels on random bytes? ",
+            "date": "2014-04-14T06:41:24+0000"
+        },
+        {
+            "id": "comment-13968124",
+            "author": "Robert Muir",
+            "content": "Surely we can avoid depending on guava, lets please not do this. ",
+            "date": "2014-04-14T06:45:10+0000"
+        },
+        {
+            "id": "comment-13968126",
+            "author": "Dawid Weiss",
+            "content": "> I'm wondering if we should try linear probing? \n\nIt's what fastutil and hppc use internally. I remember Mike did try switching to linear probing a while back (was it for BytesRefHash or the FST work?) and it didn't bring any reasonable improvement. Also, there are minor gotchas with linear probing like this one: http://issues.carrot2.org/browse/HPPC-80 ",
+            "date": "2014-04-14T06:50:20+0000"
+        },
+        {
+            "id": "comment-13968511",
+            "author": "Michael McCandless",
+            "content": "OK, new patch using simple linear probe.\n\nFor the benchmark, I switched to a single indexing thread,\nNoMergePolicy, and set RAM buffer to 512 MB (so more entries in the\nhash table before flushing, to provoke more conflict chances).  I\nindex the first 5M docs of Wikipedia medium, and full Geonames corpus:\n\n\nwiki\n   trunk:                     402.8 sec, 194906771 conflicts\n   murmur3 + current probe:   410.8 sec, 136527391 conflicts\n   murmur3 + linear probe:    395.8 sec,  63403239 conflicts\n\ngeonames\n   trunk:                     624.1 sec, 368781904 conflicts\n   murmur3 + current probe:   607.1 sec, 168310018 conflicts\n   murmur3 + linear probe:    606.6 sec, 176405531 conflicts\n\n\n\nCurious how the linear probe was such a big win for Wikipedia in\nreducing conflicts, but slightly higher conflicts for Geonames, but\nnet/net I think we should switch to linear probe. ",
+            "date": "2014-04-14T16:44:05+0000"
+        },
+        {
+            "id": "comment-13968513",
+            "author": "Michael McCandless",
+            "content": "I remember Mike did try switching to linear probing a while back (was it for BytesRefHash or the FST work?) and it didn't bring any reasonable improvement.\n\nLooks like it was LUCENE-2967, for FSTs. ",
+            "date": "2014-04-14T16:46:52+0000"
+        },
+        {
+            "id": "comment-13968538",
+            "author": "Dawid Weiss",
+            "content": "Looks good to me (although only skimmed through the patch, didn't see the consolidated code). ",
+            "date": "2014-04-14T17:13:22+0000"
+        },
+        {
+            "id": "comment-13969382",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587489 from mikemccand@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1587489 ]\n\nLUCENE-5604: switch BytesRef/BytesRefHash hashing to MurmurHash3 ",
+            "date": "2014-04-15T09:35:36+0000"
+        },
+        {
+            "id": "comment-13969388",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587492 from mikemccand@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1587492 ]\n\nLUCENE-5604: switch BytesRef/BytesRefHash hashing to MurmurHash3 ",
+            "date": "2014-04-15T09:41:43+0000"
+        },
+        {
+            "id": "comment-13969433",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587509 from mikemccand@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1587509 ]\n\nLUCENE-5604: woops, remove diagnostic conflict counter ",
+            "date": "2014-04-15T10:59:26+0000"
+        },
+        {
+            "id": "comment-13969434",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587510 from mikemccand@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1587510 ]\n\nLUCENE-5604: woops, remove diagnostic conflict counter ",
+            "date": "2014-04-15T10:59:53+0000"
+        },
+        {
+            "id": "comment-13969896",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587684 from mikemccand@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1587684 ]\n\nLUCENE-5604: switch these 'many terms' tests back to previous adversarial hash conflict case ",
+            "date": "2014-04-15T18:55:13+0000"
+        },
+        {
+            "id": "comment-13969899",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587685 from mikemccand@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1587685 ]\n\nLUCENE-5604: switch these 'many terms' tests back to previous adversarial hash conflict case ",
+            "date": "2014-04-15T18:55:45+0000"
+        },
+        {
+            "id": "comment-13969903",
+            "author": "Michael McCandless",
+            "content": "I confirmed that the new hash + probe \"fixes\" the adversarial case (sequential byte[] terms) that affected the old hash+probe, and converted two of our @Monster tests to use sequential bytes not random bytes.\n\nGiven that sequential bytes could be a fairly common case (e.g. an app that assigns IDs sequentially), maybe we should back-port this fix for 4.8? ",
+            "date": "2014-04-15T18:57:43+0000"
+        },
+        {
+            "id": "comment-13969916",
+            "author": "Robert Muir",
+            "content": "Personally I am +1, I think we should at least discuss the risks. We know the old behavior is close to bug territory at least, I hit this problem several times (e.g. trying to test increasing DV values for SortedBytes). And I think this is probably really common in practice. ",
+            "date": "2014-04-15T19:05:36+0000"
+        },
+        {
+            "id": "comment-13970100",
+            "author": "Michael McCandless",
+            "content": "Uwe Schindler what do you think? ",
+            "date": "2014-04-15T21:49:17+0000"
+        },
+        {
+            "id": "comment-13970104",
+            "author": "Simon Willnauer",
+            "content": "I'm +1 on getting this into 4.8 as well - I ran into a lot of problems where BytesRef#hashCode() had problems ",
+            "date": "2014-04-15T21:54:42+0000"
+        },
+        {
+            "id": "comment-13970202",
+            "author": "Uwe Schindler",
+            "content": "I think the first release candidate will delay a bit ,onger, so why not. If this patch does not change index format, I am fine. ",
+            "date": "2014-04-15T23:35:47+0000"
+        },
+        {
+            "id": "comment-13970635",
+            "author": "Michael McCandless",
+            "content": "OK, thanks Uwe Schindler, there's no index format change; I'll reopen & backport. ",
+            "date": "2014-04-16T10:08:20+0000"
+        },
+        {
+            "id": "comment-13970636",
+            "author": "Michael McCandless",
+            "content": "Reopen for 4.8 backport. ",
+            "date": "2014-04-16T10:08:32+0000"
+        },
+        {
+            "id": "comment-13970699",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587873 from mikemccand@apache.org in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1587873 ]\n\nLUCENE-5604: switch BytesRef/BytesRefHash hashing to MurmurHash3 ",
+            "date": "2014-04-16T11:33:34+0000"
+        },
+        {
+            "id": "comment-13970700",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587874 from mikemccand@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1587874 ]\n\nLUCENE-5604: move CHANGES entry ",
+            "date": "2014-04-16T11:33:58+0000"
+        },
+        {
+            "id": "comment-13970701",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1587875 from mikemccand@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1587875 ]\n\nLUCENE-5604: move CHANGES entry ",
+            "date": "2014-04-16T11:34:20+0000"
+        },
+        {
+            "id": "comment-13970879",
+            "author": "Uwe Schindler",
+            "content": "Move issue to Lucene 4.9. ",
+            "date": "2014-04-16T12:54:47+0000"
+        },
+        {
+            "id": "comment-13989286",
+            "author": "David Smiley",
+            "content": "Unless I'm missing something; shouldn't this be marked as resolved/closed and for 4.8? ",
+            "date": "2014-05-05T05:18:40+0000"
+        },
+        {
+            "id": "comment-13989405",
+            "author": "Michael McCandless",
+            "content": "Woops, yes, thanks for reminding me David Smiley ",
+            "date": "2014-05-05T10:30:02+0000"
+        },
+        {
+            "id": "comment-13990011",
+            "author": "David Smiley",
+            "content": "The system property \"tests.seed\" is being set to the empty string \"\" in my test setup, and it would be annoying to have it not do this.  If one looks at the Maven pom.xml we generate, it's written to pass along certain system properties which get defaulted essentially to \"\", unless set on the command-line.  Can we have the static initializer in StringHelper guard against the empty string case so that it doesn't hit an exception? I'd be happy to commit the trivial change (and to 4.8.1) ",
+            "date": "2014-05-05T21:44:25+0000"
+        },
+        {
+            "id": "comment-13990016",
+            "author": "Robert Muir",
+            "content": "Please open a new issue. i dont think this tests.seed stuff is useful anyway. but its not for here: this issue is released. ",
+            "date": "2014-05-05T21:48:52+0000"
+        }
+    ]
+}

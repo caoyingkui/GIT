@@ -1,0 +1,222 @@
+{
+    "id": "LUCENE-6697",
+    "title": "Use 1D KD tree for alternative to postings based numeric range filters",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.3",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "New Feature"
+    },
+    "description": "Today Lucene uses postings to index a numeric value at multiple\nprecision levels for fast range searching.  It's somewhat costly: each\nnumeric value is indexed with multiple terms (4 terms by default)\n... I think a dedicated 1D BKD tree should be more compact and perform\nbetter.\n\nIt should also easily generalize beyond 64 bits to arbitrary byte[],\ne.g. for LUCENE-5596, but I haven't explored that here.\n\nA 1D BKD tree just sorts all values, and then indexes adjacent leaf\nblocks of size 512-1024 (by default) values per block, and their\ndocIDs, into a fully balanced binary tree.  Building the range filter\nis then just a recursive walk through this tree.\n\nIt's the same structure we use for 2D lat/lon BKD tree, just with 1D\ninstead.  I implemented it as a DocValuesFormat that also writes the\nnumeric tree on the side.",
+    "attachments": {
+        "LUCENE-6697.patch": "https://issues.apache.org/jira/secure/attachment/12747334/LUCENE-6697.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14642750",
+            "author": "Michael McCandless",
+            "date": "2015-07-27T14:04:43+0000",
+            "content": "Work in progress patch, basically a fork of the 2D case. "
+        },
+        {
+            "id": "comment-14642753",
+            "author": "Michael McCandless",
+            "date": "2015-07-27T14:05:27+0000",
+            "content": "For a benchmark I took the same ~60.8 M lat/lon points from\nOpenStreetMaps benchmark, but just indexed and searched the lat\nvalue.  Benchmark source code is here: https://github.com/mikemccand/luceneutil/blob/master/src/main/perf/IndexAndSearchOpenStreetMaps1D.java\n\nUsing LongField/NumericRangeQuery (trunk):\n\n\t152 sec to index\n\t42 sec to optimize\n\t491 MB total index\n\t5.6 MB heap for terms index\n\t9.6 sec for 225 queries total 667,206,375 hits\n\n\n\nUsing 1D BKD tree (patch):\n\n\t290 sec to index\n\t256 sec to optimize\n\t442 MB total index (204 MB doc values, 233 MB BKD tree)\n\t5.2 sec for 225 queries total 667,206,375 hits\n\t1.0 MB heap used for KD index\n\n\n\nBKD tree is quite a bit slower to index, especially merging since it fully\nre-builds the binary tree, and it's using offline sorting, but then is\n~46% faster to search, and uses less heap for the in-memory index\nstructure.\n\nIndex size is a bit smaller, but it is also storing doc values so\ne.g. you could sort by this field as well vs. LongField which would\nhave to also index doc values to enable sorting = larger index size. "
+        },
+        {
+            "id": "comment-14644102",
+            "author": "Michael McCandless",
+            "date": "2015-07-28T09:21:38+0000",
+            "content": "\nIt should also easily generalize beyond 64 bits to arbitrary byte[],\ne.g. for LUCENE-5596, but I haven't explored that here.\n\nI started to explore this, since it's an easy \"fork\" for the 1D numeric case, but I was stopped dead in my tracks when I tried to add the doc values integration ... I'm trying to wrap SortedSetDocValues, and unfortunately the iterables passed to addSortedSetField don't let me quickly look up the byte[] for each doc ... it's like a I somehow need to pull a DocValuesProducer at write time ... "
+        },
+        {
+            "id": "comment-14644103",
+            "author": "Michael McCandless",
+            "date": "2015-07-28T09:22:41+0000",
+            "content": "I was stopped dead in my tracks\n\nHmm, actually, I think I should simply use the ords, not the byte[] values, and then it will work well! "
+        },
+        {
+            "id": "comment-14645717",
+            "author": "Michael McCandless",
+            "date": "2015-07-29T08:48:31+0000",
+            "content": "Another iteration, I think it's ready.  I renamed the thing to RangeTree.\n\nIt turned out it was simple to support fast ranges over arbitrary byte[], by requiring SortedSetDVs and just indexing the long ord value into the BKD tree which is already designed to index long values.\n\nThis means range tree should be a fast (at search time) way to support range filtering for values that need more than 64 bits, e.g. BigInteger, INET v6, etc. (LUCENE-5596).\n\nThere are some things we could do to make indexing faster, e.g. a single sequential scan over all points to fill the binary tree index values, avoid the \"copy over again to fixed width\" step, etc., but I think we can do these later... "
+        },
+        {
+            "id": "comment-14645912",
+            "author": "Adrien Grand",
+            "date": "2015-07-29T11:47:57+0000",
+            "content": "I don't understand everything yet but what I understand looks good.  There are a few variable names that look like they come from the geo impl (eg. latSorter in RangeTreeWriter), and maybe NumericRangeTreeQuery.createWeight could reuse ConstantScoreWeight/ConstantScoreScorer (like most of our other constant-score queries do) to avoid reimplementing explain/normalize/etc.? "
+        },
+        {
+            "id": "comment-14646055",
+            "author": "Michael McCandless",
+            "date": "2015-07-29T13:51:13+0000",
+            "content": "Thanks for the review Adrien Grand!\n\nThere are a few variable names that look like they come from the geo impl (eg. latSorter in RangeTreeWriter), a\n\nWoops, I'll fix \n\nmaybe NumericRangeTreeQuery.createWeight could reuse ConstantScoreWeight/ConstantScoreScorer (like most of our other constant-score queries do) to avoid reimplementing explain/normalize/etc.?\n\nOh, good idea, I'll do that. "
+        },
+        {
+            "id": "comment-14647934",
+            "author": "Michael McCandless",
+            "date": "2015-07-30T16:58:40+0000",
+            "content": "New patch, folding in Adrien Grand's feedback (thanks!).\n\nI also changed search-time to an iterative impl (vs recursive before), which I think simplifies it quite a bit.  Now it just finds the range of sequential blocks that need to be visited, and sweeps those, doing per-hit filtering only on the leading and trailing blocks that may have documents outside the requested range.\n\nI re-ran the benchmark and it's no faster but the searhc-time code is much simpler.\n\nThere are corresponding simplifications on the indexing side but I'd like to defer... I think this is a good addition already. "
+        },
+        {
+            "id": "comment-14648942",
+            "author": "Michael McCandless",
+            "date": "2015-07-31T08:45:54+0000",
+            "content": "I also changed search-time to an iterative impl (vs recursive before)\n\nActually once nice benefit of this is it's easy to estimate up front how many hits we'll have, so I can call grow up front.  I'll add that and commit soon... "
+        },
+        {
+            "id": "comment-14648955",
+            "author": "Michael McCandless",
+            "date": "2015-07-31T09:00:32+0000",
+            "content": "it's easy to estimate up front how many hits we'll have, so I can call grow up front\n\nThis gives a nice speedup: ~5.2 sec down to ~4.7 sec for the \"225 bbox lats around London\" benchmark. "
+        },
+        {
+            "id": "comment-14650204",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-01T07:48:55+0000",
+            "content": "Commit 1693682 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1693682 ]\n\nLUCENE-6697: add range tree for fast numeric and binary range filtering "
+        },
+        {
+            "id": "comment-14650205",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-01T07:52:16+0000",
+            "content": "Commit 1693683 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1693683 ]\n\nLUCENE-6697: add range tree for fast numeric and binary range filtering "
+        },
+        {
+            "id": "comment-14650240",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-01T09:39:45+0000",
+            "content": "Commit 1693693 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1693693 ]\n\nLUCENE-6697: rename NumericTree -> RangeTree "
+        },
+        {
+            "id": "comment-14650241",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-01T09:40:38+0000",
+            "content": "Commit 1693694 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1693694 ]\n\nLUCENE-6697: rename NumericTree -> RangeTree "
+        },
+        {
+            "id": "comment-14650675",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-02T09:45:19+0000",
+            "content": "Commit 1693800 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1693800 ]\n\nLUCENE-6697: test bug: the stupid-simple-yet-hopefully-bug-free numeric range filter was buggy "
+        },
+        {
+            "id": "comment-14650676",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-02T09:46:24+0000",
+            "content": "Commit 1693801 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1693801 ]\n\nLUCENE-6697: test bug: the stupid-simple-yet-hopefully-bug-free numeric range filter was buggy "
+        },
+        {
+            "id": "comment-14663007",
+            "author": "Steve Rowe",
+            "date": "2015-08-08T15:12:13+0000",
+            "content": "Seeing 100% reproducible failure on branch_5x:\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestRangeTree -Dtests.method=testMultiValued -Dtests.seed=FD1D848DDE038459 -Dtests.slow=true -Dtests.locale=hr_HR -Dtests.timezone=Europe/Madrid -Dtests.asserts=true -Dtests.file.encoding=US-ASCII\n   [junit4] ERROR   0.05s J8 | TestRangeTree.testMultiValued <<<\n   [junit4]    > Throwable #1: java.lang.IllegalArgumentException: maxValuesSortInHeap must be >= maxValuesInLeafNode; got 1250 vs maxValuesInLeafNode=2013\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([FD1D848DDE038459:293DE0BF10C1C411]:0)\n   [junit4]    > \tat org.apache.lucene.rangetree.RangeTreeWriter.verifyParams(RangeTreeWriter.java:114)\n   [junit4]    > \tat org.apache.lucene.rangetree.RangeTreeDocValuesFormat.<init>(RangeTreeDocValuesFormat.java:98)\n   [junit4]    > \tat org.apache.lucene.rangetree.TestRangeTree.testMultiValued(TestRangeTree.java:128)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene53): {}, docValues:{}, sim=DefaultSimilarity, locale=hr_HR, timezone=Europe/Madrid\n   [junit4]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=1,free=441475104,total=504365056\n   [junit4]   2> NOTE: All tests run in this JVM: [TestRangeTree]\n\n "
+        },
+        {
+            "id": "comment-14663012",
+            "author": "Michael McCandless",
+            "date": "2015-08-08T15:14:18+0000",
+            "content": "Hmm, I'll dig, thanks Steve Rowe. "
+        },
+        {
+            "id": "comment-14663014",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-08T15:16:08+0000",
+            "content": "Commit 1694808 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1694808 ]\n\nLUCENE-6697: fix test bug "
+        },
+        {
+            "id": "comment-14663018",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-08T15:16:35+0000",
+            "content": "Commit 1694809 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1694809 ]\n\nLUCENE-6697: fix test bug "
+        },
+        {
+            "id": "comment-14663019",
+            "author": "Michael McCandless",
+            "date": "2015-08-08T15:16:53+0000",
+            "content": "I committed a fix ... thanks Steve Rowe "
+        },
+        {
+            "id": "comment-14663026",
+            "author": "Steve Rowe",
+            "date": "2015-08-08T15:21:49+0000",
+            "content": "Mike, the test fix should be committed to the lucene_solr_5_3 branch too, shouldn't it? "
+        },
+        {
+            "id": "comment-14663041",
+            "author": "Michael McCandless",
+            "date": "2015-08-08T15:50:11+0000",
+            "content": "Oh yeah I'll backport to 5.3.x ... why don't we have an RC0 here yet  "
+        },
+        {
+            "id": "comment-14663045",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-08T15:51:59+0000",
+            "content": "Commit 1694814 from Michael McCandless in branch 'dev/branches/lucene_solr_5_3'\n[ https://svn.apache.org/r1694814 ]\n\nLUCENE-6697: fix test bug "
+        },
+        {
+            "id": "comment-14696999",
+            "author": "Steve Rowe",
+            "date": "2015-08-14T13:33:19+0000",
+            "content": "Not sure if this warrants reopen or a new issue given the 5.3 release in process, so just leaving a comment:\n\nMy Jenkins found a failing seed on branch_5x w/Java8 for TestRangeTree.testAllEqual() that reproduces rarely (http://jenkins.sarowe.net/job/Lucene-Solr-tests-5.x-Java8/1288/) - beasting triggered it reliably for me once or twice on the first round with 10 dups, on the same box:\n\n\n [beaster] Beast round: 1\n   [junit4] Duplicate suite name used with XML reports: org.apache.lucene.rangetree.TestRangeTree. This may confuse tools that process XML reports. Set 'ignoreDuplicateSuites' to true to skip this message.\n  [beaster] Executing 10 suites with 10 JVMs.\n  [beaster] \n  [beaster] Started J0 PID(12439@localhost).\n  [beaster] Started J2 PID(12438@localhost).\n  [beaster] Started J5 PID(12398@localhost).\n  [beaster] Started J6 PID(12409@localhost).\n  [beaster] Started J8 PID(12414@localhost).\n  [beaster] Started J9 PID(12437@localhost).\n  [beaster] Started J4 PID(12402@localhost).\n  [beaster] Started J3 PID(12430@localhost).\n  [beaster] Started J7 PID(12400@localhost).\n  [beaster] Started J1 PID(12397@localhost).\n  [beaster]   2> Aug 14, 2015 9:24:01 AM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n  [beaster]   2> WARNING: Uncaught exception in thread: Thread[T0,5,TGRP-TestRangeTree]\n  [beaster]   2> java.lang.AssertionError: T0: iter=2 id=11552 docID=11478 value=-4284574795410342043 (range: -7914835514817223401 TO -3409576459183210390) expected true but got: false deleted?=false query=NumericRangeTreeQuery:field=sn_value:[-7914835514817223401 TO -3409576459183210390]\n  [beaster]   2>        at __randomizedtesting.SeedInfo.seed([A757E5A079F28A1B]:0)\n  [beaster]   2>        at org.junit.Assert.fail(Assert.java:93)\n  [beaster]   2>        at org.apache.lucene.rangetree.TestRangeTree$4._run(TestRangeTree.java:502)\n  [beaster]   2>        at org.apache.lucene.rangetree.TestRangeTree$4.run(TestRangeTree.java:433)\n  [beaster]   2> \n  [beaster]   2> NOTE: reproduce with: ant test  -Dtestcase=TestRangeTree -Dtests.method=testAllEqual -Dtests.seed=A757E5A079F28A1B -Dtests.slow=true -Dtests.locale=de_GR -Dtests.timezone=Canada/Eastern -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n  [beaster] [09:23:57.007] ERROR   6.34s J5  | TestRangeTree.testAllEqual <<<\n  [beaster]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=22, name=T0, state=RUNNABLE, group=TGRP-TestRangeTree]\n  [beaster]    >        at __randomizedtesting.SeedInfo.seed([A757E5A079F28A1B:75B730E5DA2C13B5]:0)\n  [beaster]    > Caused by: java.lang.AssertionError: T0: iter=2 id=11552 docID=11478 value=-4284574795410342043 (range: -7914835514817223401 TO -3409576459183210390) expected true but got: false deleted?=false query=NumericRangeTreeQuery:field=sn_value:[-7914835514817223401 TO -3409576459183210390]\n  [beaster]    >        at __randomizedtesting.SeedInfo.seed([A757E5A079F28A1B]:0)\n  [beaster]    >        at org.junit.Assert.fail(Assert.java:93)\n  [beaster]    >        at org.apache.lucene.rangetree.TestRangeTree$4._run(TestRangeTree.java:502)\n  [beaster]    >        at org.apache.lucene.rangetree.TestRangeTree$4.run(TestRangeTree.java:433)\n  [beaster]   2> NOTE: test params are: codec=Asserting(Lucene53): {}, docValues:{}, sim=DefaultSimilarity, locale=de_GR, timezone=Canada/Eastern\n  [beaster]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=1,free=471275456,total=522715136\n  [beaster]   2> NOTE: All tests run in this JVM: [TestRangeTree]\n  [beaster]   2> Aug 14, 2015 9:24:02 AM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n  [beaster]   2> WARNING: Uncaught exception in thread: Thread[T2,5,TGRP-TestRangeTree]\n  [beaster]   2> java.lang.AssertionError: T2: iter=3 id=10830 docID=10756 value=-4284574795410342043 (range: -6351025883581717437 TO 7103712746369706722) expected true but got: false deleted?=false query=NumericRangeTreeQuery:field=sn_value:{-6351025883581717437 TO 7103712746369706722]\n  [beaster]   2>        at __randomizedtesting.SeedInfo.seed([A757E5A079F28A1B]:0)\n  [beaster]   2>        at org.junit.Assert.fail(Assert.java:93)\n  [beaster]   2>        at org.apache.lucene.rangetree.TestRangeTree$4._run(TestRangeTree.java:502)\n  [beaster]   2>        at org.apache.lucene.rangetree.TestRangeTree$4.run(TestRangeTree.java:433)\n  [beaster]   2> \n  [beaster]   2> NOTE: reproduce with: ant test  -Dtestcase=TestRangeTree -Dtests.method=testAllEqual -Dtests.seed=A757E5A079F28A1B -Dtests.slow=true -Dtests.locale=de_GR -Dtests.timezone=Canada/Eastern -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n  [beaster] [09:23:57.229] ERROR   7.52s J6  | TestRangeTree.testAllEqual <<<\n  [beaster]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=24, name=T2, state=RUNNABLE, group=TGRP-TestRangeTree]\n  [beaster]    >        at __randomizedtesting.SeedInfo.seed([A757E5A079F28A1B:75B730E5DA2C13B5]:0)\n  [beaster]    > Caused by: java.lang.AssertionError: T2: iter=3 id=10830 docID=10756 value=-4284574795410342043 (range: -6351025883581717437 TO 7103712746369706722) expected true but got: false deleted?=false query=NumericRangeTreeQuery:field=sn_value:{-6351025883581717437 TO 7103712746369706722]\n  [beaster]    >        at __randomizedtesting.SeedInfo.seed([A757E5A079F28A1B]:0)\n  [beaster]    >        at org.junit.Assert.fail(Assert.java:93)\n  [beaster]    >        at org.apache.lucene.rangetree.TestRangeTree$4._run(TestRangeTree.java:502)\n  [beaster]    >        at org.apache.lucene.rangetree.TestRangeTree$4.run(TestRangeTree.java:433)\n  [beaster]   2> NOTE: test params are: codec=Asserting(Lucene53): {}, docValues:{}, sim=DefaultSimilarity, locale=de_GR, timezone=Canada/Eastern\n  [beaster]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=1,free=462995928,total=522715136\n  [beaster]   2> NOTE: All tests run in this JVM: [TestRangeTree]\n  [beaster] \n  [beaster] Tests with failures:\n  [beaster]   - org.apache.lucene.rangetree.TestRangeTree.testAllEqual\n  [beaster]   - org.apache.lucene.rangetree.TestRangeTree.testAllEqual\n\n "
+        },
+        {
+            "id": "comment-14697025",
+            "author": "Michael McCandless",
+            "date": "2015-08-14T13:53:40+0000",
+            "content": "Thanks Steve Rowe, I'm also unsure!  But I'll dig ... "
+        },
+        {
+            "id": "comment-14698417",
+            "author": "Steve Rowe",
+            "date": "2015-08-15T19:46:07+0000",
+            "content": "Another failing test in the TestRangeTree suite, didn't try to repro, from http://jenkins.sarowe.net/job/Lucene-Solr-tests-5.x-Java7/1519/:\n\n\n   [junit4] Suite: org.apache.lucene.rangetree.TestRangeTree\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestRangeTree -Dtests.method=testMultiValuedSortedSet -Dtests.seed=824523825E862EFE -Dtests.slow=true -Dtests.locale=en -Dtests.timezone=SystemV/EST5 -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   0.09s J0 | TestRangeTree.testMultiValuedSortedSet <<<\n   [junit4]    > Throwable #1: java.lang.IllegalArgumentException: maxValuesSortInHeap must be >= maxValuesInLeafNode; got 1552 vs maxValuesInLeafNode=1624\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([824523825E862EFE:F93C7006ECC25330]:0)\n   [junit4]    > \tat org.apache.lucene.rangetree.RangeTreeWriter.verifyParams(RangeTreeWriter.java:114)\n   [junit4]    > \tat org.apache.lucene.rangetree.RangeTreeDocValuesFormat.<init>(RangeTreeDocValuesFormat.java:98)\n   [junit4]    > \tat org.apache.lucene.rangetree.TestRangeTree.testMultiValuedSortedSet(TestRangeTree.java:215)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n "
+        },
+        {
+            "id": "comment-14698823",
+            "author": "Michael McCandless",
+            "date": "2015-08-16T19:16:19+0000",
+            "content": "Thanks Steve Rowe, I'll fix ... that one is much easier  "
+        },
+        {
+            "id": "comment-14698883",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-16T23:15:24+0000",
+            "content": "Commit 1696181 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1696181 ]\n\nLUCENE-6697: fix test bugs "
+        },
+        {
+            "id": "comment-14698884",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-16T23:16:08+0000",
+            "content": "Commit 1696182 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1696182 ]\n\nLUCENE-6697: fix test bugs "
+        },
+        {
+            "id": "comment-14701836",
+            "author": "Michael McCandless",
+            "date": "2015-08-18T19:26:04+0000",
+            "content": "My Jenkins found a failing seed on branch_5x w/Java8 for TestRangeTree.testAllEqual()\n\nThis was a fun one to track down \n\nhttps://issues.apache.org/jira/browse/LUCENE-6745 is the root cause... "
+        },
+        {
+            "id": "comment-14707297",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-21T19:19:45+0000",
+            "content": "Commit 1697046 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697046 ]\n\nLUCENE-6697: never use the original IndexInput for real IO "
+        },
+        {
+            "id": "comment-14713111",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-08-26T13:05:47+0000",
+            "content": "Bulk close for 5.3.0 release "
+        }
+    ]
+}

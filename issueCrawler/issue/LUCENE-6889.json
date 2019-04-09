@@ -1,0 +1,114 @@
+{
+    "id": "LUCENE-6889",
+    "title": "BooleanQuery.rewrite could easily optimize some simple cases",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.5",
+            "6.0"
+        ],
+        "priority": "Minor",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "Follow-up of SOLR-8251: APIs and user interfaces sometimes encourage to write BooleanQuery instances that are not optimal, for instance a typical case that happens often with Solr/Elasticsearch is to send a request that has a MatchAllDocsQuery as a query and some filter, which could be executed more efficiently by directly wrapping the filter into a ConstantScoreQuery.\n\nHere are some ideas of rewrite operations that BooleanQuery could perform:\n\n\tremove FILTER clauses when they are also a MUST clause\n\trewrite queries of the form \"+: #filter\" to a ConstantScoreQuery(filter)\n\trewrite to a MatchNoDocsQuery when a clause that is a MUST or FILTER clause is also a MUST_NOT clause",
+    "attachments": {
+        "LUCENE-6889.patch": "https://issues.apache.org/jira/secure/attachment/12772061/LUCENE-6889.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14998808",
+            "author": "Terry Smith",
+            "date": "2015-11-10T15:57:47+0000",
+            "content": "I like the last one but believe that the other two aren't correct.\n\n\nremove FILTER clauses when they are also a MUST clause\n\nSeeing as a FILTER is a non scoring MUST this just doesn't sound right. The FILTER could constrain the result set more than just the MUST alone.\n\ne.g. +foo #(+foo +bar)\n\n\nrewrite queries of the form +: #filter\" to a ConstantScoreQuery(filter)\n\nI don't think you can drop a +:: without affecting the score, but you could drop a #: if the BooleanQuery has something else to force inclusion (other MUST, FILTER or some SHOULD with an appropriate minNumShouldMatch).\n\nFor this case could Solr/ElasticSearch add the MatchAllDocs as a FILTER instead of a MUST to allow for this optimization?\n\n\nWe could detect duplicate FILTER and MUST_NOT clauses as described in LUCENE-6787.\n\nJira is turning star colon star (:) to a bold colon, so apologies if this doesn't read well through the web interface.\n\n\n "
+        },
+        {
+            "id": "comment-14998882",
+            "author": "Uwe Schindler",
+            "date": "2015-11-10T16:44:06+0000",
+            "content": "Seeing as a FILTER is a non scoring MUST this just doesn't sound right. The FILTER could constrain the result set more than just the MUST alone\n\nWe were talking about a FILTER and a identical MUST clause on the base level without any additional brackets/bbols inside. In those cases the FILTER does not do more than the MUST clause already did.\n\nrewrite queries of the form +*:* #filter to a ConstantScoreQuery(filter)\n\nThis works, because that is the reason for this issue and was done exactly like that since Lucene 4.0 in FilteredQuery, which did exactly that: FilteredQuery(MatchAllDocs,Filter) => ConstantScoreQuery(Filter). You just have to copy the boost of the matchall docs to the constant score query. Of course you have to make sure, you don't break coordination factors, which is not a problem for filters (they have no effect on coordination factor). "
+        },
+        {
+            "id": "comment-14998891",
+            "author": "Terry Smith",
+            "date": "2015-11-10T16:55:31+0000",
+            "content": "Ah, that makes sense. I didn't realize the first scenario was dropping the MUST when the FILTER and MUST wrapped identical clauses or that the second scenario also included boost handling to avoid the scoring issue. Given that, this sounds like a great optimization.\n\nI'll summarize the rules below, mind shouting out if I still misunderstand?\n\nRule 1\n\n#a +a -> +a\n\n\n\n Rule 2\n\n+*:*^b #f -> ConstantScoreQuery(f)^b\n\n\n\nRule 3\n\n-a +a -> MatchNoDocsQuery\n-a #a -> MatchNoDocsQuery\n\n\n\n\n\n "
+        },
+        {
+            "id": "comment-15003063",
+            "author": "Adrien Grand",
+            "date": "2015-11-12T22:19:07+0000",
+            "content": "Here is a patch that does the following rewrites:\n\nRemoval of FILTER clauses that are also MUST clauses\n\n#a +a -> +a\n\n\n\nFilteredQuery rewrite when the query is a MatchAllDocsQuery\n\n+*:*^b #f -> ConstantScoreQuery(f)^b\n\n\n\nRemoval of filters on MatchAllDocsQuery if they are a MUST clause as well\n\n+a #*:* -> +a\n\n\n\nDeduplication of FILTER and MUST_NOT clauses\n\n+a #f #f -f -f -> +a #f -f\n\n\n\nThey have the nice property of being able to execute things that we used to execute as a disjunction or a conjunction as a simple term query.\n\nI also wanted to rewrite queries to a MatchAllDocsQuery when there was an intersection between required and prohibited clauses (Terry's rule 3) or when the mininumShouldMatch is greater than the number of SHOULD clauses but this broke weight normalization. We can probably solve the MUST_NOT/MUST intersection at the Scorer level but I propose to defer it to another issue.\n\nThe patch includes unit tests for the above rewrite rules as well as a random test that makes sure that the same set of matches and scores are produced if no rewriting is performed. "
+        },
+        {
+            "id": "comment-15003129",
+            "author": "Hoss Man",
+            "date": "2015-11-12T22:51:32+0000",
+            "content": "maybe i'm reading the patch wrong, but it looks like the \"actuallyRewritten\" check from the recursive rewriting will return before several of the optimizations.  Shouldn't things like \"remove duplicate FILTER and MUST_NOT clauses\" and \"remove FILTER clauses that are also MUST clauses\" still be tested/done against the rewritten sub-clauses?\n\nlikewise isn't doing the \"remove FILTER clauses that are also MUST clauses\" optimization still worthwhile even if the \"remove duplicate FILTER and MUST_NOT clauses\" optimization finds & removes things? (it also looks like it has a short-circuit return)\n\n... as well as a random test that makes sure that the same set of matches and scores are produced if no rewriting is performed.\n\nwhy not randomize the docs/fields in the index as well?  At first glance one concern i have is that no doc has a single term more then once, so spotting subtle score discrepancies between the query and it's optimize version may never come into play with this test.\n\nother small concerns about the current random query generation:\n\n\tis rarely() really appropriate for the BoostQuery wrapping? is that something that really makes sense to increase depending on wether the test is nightly? ... seems like something more straight forward like 0==TestUtil.nextInt(random(), 0, 10) would make more sense for these tests\n\trandomizing setMinimumNumberShouldMatch between 0 and numClauses means that it's going to be very rare for the minimumNumberShouldMatch setting to actually impact the query unless there are also a lot of random SHOULD clauses (ie: if there are 5 clauses but only 2 SHOULD clauses there's only a 2:5 chance of that setting getting a random value that actually affects anything) ... probably better to count the actual # of SHOULD clauses generated randomly and then randomize the setting between 0 and #+1.\n\tMatchNoDocsQuery should probably be included in the randomization to better coverage of all the optimization situations.\n\n "
+        },
+        {
+            "id": "comment-15003151",
+            "author": "Adrien Grand",
+            "date": "2015-11-12T23:01:23+0000",
+            "content": "but it looks like the \"actuallyRewritten\" check from the recursive rewriting will return before several of the optimizations\nlikewise isn't doing the \"remove FILTER clauses that are also MUST clauses\" optimization still worthwhile even if the \"remove duplicate FILTER and MUST_NOT clauses\" optimization finds & removes things? (it also looks like it has a short-circuit return)\n\nIt works fine because rewrite's contract is that it should be called until the return value is the same as the provided query. So for instance maybe one optimization will be performed on the first call, then another one, etc.\n\nOther comments make sense to me, I'll update the patch. "
+        },
+        {
+            "id": "comment-15003169",
+            "author": "Hoss Man",
+            "date": "2015-11-12T23:14:17+0000",
+            "content": "It works fine because rewrite's contract is that it should be called until the return value is the same as the provided query...\n\nAh ... yeah, I totally forgot about that. sorry for the noise. "
+        },
+        {
+            "id": "comment-15007031",
+            "author": "Adrien Grand",
+            "date": "2015-11-16T18:12:41+0000",
+            "content": "Here is an updated patch. I did not add MatchNoDocsQuery to the randomly-generated queries because it makes the IndexSearcher that has rewriting disabled fail since calling createWeight directly on a MatchNoDocsQuery fails with an UnsupportedOperationException: \"Query does not implement createWeight\". "
+        },
+        {
+            "id": "comment-15037761",
+            "author": "ASF subversion and git services",
+            "date": "2015-12-03T13:10:34+0000",
+            "content": "Commit 1717757 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1717757 ]\n\nLUCENE-6889: Add some basic rewrite rules to BooleanQuery that can make it run significantly faster in some cases. "
+        },
+        {
+            "id": "comment-15037956",
+            "author": "ASF subversion and git services",
+            "date": "2015-12-03T15:44:38+0000",
+            "content": "Commit 1717782 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1717782 ]\n\nLUCENE-6889: Add some basic rewrite rules to BooleanQuery that can make it run significantly faster in some cases. "
+        },
+        {
+            "id": "comment-15108536",
+            "author": "Stephan Lagraulet",
+            "date": "2016-01-20T13:30:05+0000",
+            "content": "Hello Adrien Grand do you think this change can be included on the 5.4 branch for the upcoming 5.4.1 release? "
+        },
+        {
+            "id": "comment-15108567",
+            "author": "Adrien Grand",
+            "date": "2016-01-20T13:49:56+0000",
+            "content": "A 5.4.1 release candidate is currently being voted, so it is too late to fold more changes in, unless they are critical like a corruption fix. However nothing prevents us from releasing 5.5 soon. "
+        },
+        {
+            "id": "comment-15108603",
+            "author": "Stephan Lagraulet",
+            "date": "2016-01-20T14:14:20+0000",
+            "content": "It depends what means \"soon\". Can it be included in a 5.4.2 release or do you prefer to push an early release of 5.5 ? "
+        },
+        {
+            "id": "comment-15108669",
+            "author": "Adrien Grand",
+            "date": "2016-01-20T15:05:47+0000",
+            "content": "I would much prefer push for a 5.5 release. Introducing bugs in bugfix releases is pretty bad so we strive at only backporting safe changes to bugfix releases. "
+        },
+        {
+            "id": "comment-15108906",
+            "author": "Hoss Man",
+            "date": "2016-01-20T16:57:46+0000",
+            "content": "Improvements/Optimizations are also not typically candidates for inclusion in bug fix releases except in special circumstances (ie: sometimes while working on an optimization it's discovered that the new code also fixes a bug, and backporting the optimization to the bug fix branch may be the safest way to fix the bug there as well) "
+        }
+    ]
+}

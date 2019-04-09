@@ -1,0 +1,227 @@
+{
+    "id": "LUCENE-6825",
+    "title": "Add multidimensional byte[] indexing support to Lucene",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Resolved",
+        "type": "New Feature"
+    },
+    "description": "I think we should graduate the low-level block KD-tree data structure\nfrom sandbox into Lucene's core?\n\nThis can be used for very fast 1D range filtering for numerics,\nremoving the 8 byte (long/double) limit we have today, so e.g. we\ncould efficiently support BigInteger, BigDecimal, IPv6 addresses, etc.\n\nIt can also be used for > 1D use cases, like 2D (lat/lon) and 3D\n(x/y/z with geo3d) geo shape intersection searches.\n\nThe idea here is to add a new part of the Codec API (DimensionalFormat\nmaybe?) that can do low-level N-dim point indexing and at runtime\nexposes only an \"intersect\" method.\n\nIt should give sizable performance gains (smaller index, faster\nsearching) over what we have today, and even over what auto-prefix\nwith efficient numeric terms would do.\n\nThere are many steps here ... and I think adding this is analogous to\nhow we added FSTs, where we first added low level data structure\nsupport and then gradually cutover the places that benefit from an\nFST.\n\nSo for the first step, I'd like to just add the low-level block\nKD-tree impl into oal.util.bkd, but make a couple improvements over\nwhat we have now in sandbox:\n\n\n\tUse byte[] as the value not int (@rjernst's good idea!)\n\n\n\n\n\tGeneralize it to arbitrary dimensions vs. specialized/forked 1D,\n    2D, 3D cases we have now\n\n\n\nThis is already hard enough   After that we can build the\nDimensionalFormat on top, then cutover existing specialized block\nKD-trees.  We also need to fix OfflineSorter to use Directory API so\nwe don't fill up /tmp when building a block KD-tree.\n\nA block KD-tree is at heart an inverted data structure, like postings,\nbut is also similar to auto-prefix in that it \"picks\" proper\nN-dimensional \"terms\" (leaf blocks) to index based on how the specific\ndata being indexed is distributed.  I think this is a big part of why\nit's so fast, i.e. in contrast to today where we statically slice up\nthe space into the same terms regardless of the data (trie shifting,\nmorton codes, geohash, hilbert curves, etc.)\n\nI'm marking this as trunk only for now... as we iterate we can see if\nit could maybe go back to 5.x...",
+    "attachments": {
+        "LUCENE-6825.patch": "https://issues.apache.org/jira/secure/attachment/12764988/LUCENE-6825.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14943108",
+            "author": "Michael McCandless",
+            "date": "2015-10-05T09:15:33+0000",
+            "content": "Initial patch.\n\nMany nocommits still, but the randomized multi-dimensional int[]\nindexing test case seems to pass at least once.\n\nThere are many classes under oal.util.bkd, but all are package private\nexcept for the BKDWriter/Reader classes.\n\nOne limitation here is that every dimension must be the same number of\nbytes.  This is fine for all the KD-tree use cases today, but e.g. it\nmeans you can't have one dim that's a long, and another dim that's an\nint.  I think this is fine for starters (progress not perfection!),\nand it is a big simplification of the code since it means all encoding\nwhile building the tree is fixed byte width per document.\n\nThis is just the low-level data structure!  It's like FST.java.  Later (separate issues, separate commits) we need DimensionalFormat, queries that use the read-time API to execute, etc.\n\nI'll open a separate issue to cutover OfflineSorter to Directory API;\nI think it's a blocker for this one. "
+        },
+        {
+            "id": "comment-14945626",
+            "author": "Ryan Ernst",
+            "date": "2015-10-06T19:31:53+0000",
+            "content": "This looks good. I think this is a great plan, to separate this out into a separate codec format, and to do it in pieces. And this patch is a good start. \n\nA few comments on the patch:\n\n\tI see a number of debugging s.o.p, these should be commented out or removed?\n\tIs this nocommit still relevant?\n\n// nocommit can we get this back?\n//state.docs.grow(count);\n\tThere is a nocommit on the bytesToInt method. I think as a follow up we should investigate packing values, but is the nocommit still needed? Also, it seems to exist in both reader and writer? Could it be in one place, but still package private, perhaps in `oal.util.bkd.Util`?\n\tCan we avoid the bitflip in bytesToInt by using a long accumulator and casting to int? we can assert no upper bits are set before casting?\n\tCan we limit the num dims to 3 for now? I see a check for < 255 to fit in a byte, but it might be nice later to use those extra bits for some other information (essentially lets reserve the bits for now, instead of allowing silly number of dimensions)\n\tIn `BKDWriter.finish()`, can the try/catch around building be simplified? I think you could remove the `success` marker and do the regular cleanup after build, and change the `finally` to a `catch`, then add any failures when destroying the per dim writers as suppressed exceptions to the original?\n\tIn `BKDWriter.build()`, there is a nocommit about destroying perdim writers, but I think that is handled by the caller in `finish()` mentioned in my previous comment? I also see some destroy calls below that...is there double destroying going on, or is this more complicated than it looks?\n\n "
+        },
+        {
+            "id": "comment-14945944",
+            "author": "Nicholas Knize",
+            "date": "2015-10-06T22:39:16+0000",
+            "content": "+1000 for graduating the data structure to core.\n\n// Sort all docs once by lat, once by lon:  \n\n\tI'm assuming lat, lon specific naming will be refactored to more generalized naming?\n\tIn an XTree implementation (similar to BKD but with more rigorous split criteria) I ran into bias issues when sorting by incremental dimensions (simple for loop like this). This is often why sort is done by a reduced dimensional encoding value (e.g., Hilbert, Morton). This is particularly important as the tree grows (which I'm guessing happens when BKD segments merge?). Maybe another new issue to investigate simple interleave packing and sorting on the packed value?\n\n\n\n// Find which dim has the largest span so we can split on it:\n\n\tMaybe refactor this into a split method?  It would give an opportunity to override for investigating improvements based on other split criteria (e.g., squareness, area)\n\n\n "
+        },
+        {
+            "id": "comment-14946494",
+            "author": "Michael McCandless",
+            "date": "2015-10-07T08:25:52+0000",
+            "content": "Thanks Ryan Ernst!\n\nI see a number of debugging s.o.p, \n\nI'll nuke all of these once things seem to be working ... also, those bytesToInt in the reader/writer are temporary just for debugging the test case that's encoding ints into the byte[].\n\n\nIs this nocommit still relevant?\n\n// nocommit can we get this back?\n//state.docs.grow(count);\n\nUnfortunately, yes.  One source of efficiency for the 1D,2D,3D specialized BKDs now is they can \"notify\" the consumer of the incoming docIDs that a chunk is coming ... but I didn't expose any means to do this in the intersect API.  I could add it but held back for now since that dirties the read-time API.  Though for the 1D case, this was a big speedup, because in that case I can give a pretty accurate estimate up front of how large the result set will be ... I'll mull, probably leave as a TODO for now.\n\nCan we avoid the bitflip in bytesToInt by using a long accumulator and casting to int?\n\nHmm I don't think that's the same thing?  We flip that big so that in binary space negative ints sort before positive ints?  But remember this is only a test issue at this point (for this issue) ... in future issues we will need clever \"encode/decode foobar as byte[]\" ...\n\nCan we limit the num dims to 3 for now?\n\nHow about limit to 15?  I think 3 is a bit too low (and 255 is a way too high!), but there are maybe interesting things to do w/ more than 3 dims, e.g. index household income along with x, y, z points or something.  So this would still give us 4 free bits in case we want them later...\n\nIn `BKDWriter.finish()`, can the try/catch around building be simplified?\n\nI'll try your suggestion.  I think if I change destroy to close instead, I can just tap into IOUtils goodness...\n\nIn `BKDWriter.build()`, there is a nocommit about destroying perdim writers, but I think that is handled by the caller in `finish()` \n\nIt is confusing!\n\nEach level of the recursion may have written its own files, so I think we need the toplevel destroy (removes the fully sorted by each dim file we created up front) and the destroy as we recurse (removes the partitioned subset of each dim). "
+        },
+        {
+            "id": "comment-14946506",
+            "author": "Michael McCandless",
+            "date": "2015-10-07T08:31:15+0000",
+            "content": "Thanks Nicholas Knize!\n\nI'm assuming lat, lon specific naming will be refactored to more generalized naming?\n\nWoops, yes: I have a nocommit to make sure I don't talk about lat/lon anymore.  I'll fix ...\n\nIn an XTree implementation (similar to BKD but with more rigorous split criteria) I ran into bias issues when sorting by incremental dimensions (simple for loop like this).\n\nThe bias only happens if we index shapes right?  I agree for indexing shapes things get more complex, but I was hoping to do that \"later\" and focus on making points work well for now.\n\nMaybe refactor this into a split method? It would give an opportunity to override for investigating improvements based on other split criteria (e.g., squareness, area)\n\nGood idea, will do! "
+        },
+        {
+            "id": "comment-14946507",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-07T08:32:15+0000",
+            "content": "Commit 1707202 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1707202 ]\n\nLUCENE-6825: make branch "
+        },
+        {
+            "id": "comment-14946509",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-07T08:34:31+0000",
+            "content": "Commit 1707203 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1707203 ]\n\nLUCENE-6825: starting patch "
+        },
+        {
+            "id": "comment-14946510",
+            "author": "Michael McCandless",
+            "date": "2015-10-07T08:34:54+0000",
+            "content": "I put the current patch on this branch: https://svn.apache.org/repos/asf/lucene/dev/branches/lucene6825\n\nI'll iterate there... "
+        },
+        {
+            "id": "comment-14946523",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-07T08:50:17+0000",
+            "content": "Commit 1707206 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1707206 ]\n\nLUCENE-6825: rename classes "
+        },
+        {
+            "id": "comment-14946578",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-07T09:23:54+0000",
+            "content": "Commit 1707213 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1707213 ]\n\nLUCENE-6825: fix some nocommits; remove some difficult try/finally logic "
+        },
+        {
+            "id": "comment-14951562",
+            "author": "David Smiley",
+            "date": "2015-10-10T03:28:41+0000",
+            "content": "Exciting!  Mike, have you considered a new module for this; like \"bkd\" or \"multidimensional\"?  Or of course the existing spatial module? I wonder what others think. "
+        },
+        {
+            "id": "comment-14953813",
+            "author": "Michael McCandless",
+            "date": "2015-10-12T21:52:49+0000",
+            "content": "have you considered a new module for this\n\nWell, I think a codec format is a natural way to expose this service, since (like postings, doc values, etc.), it's a low-level utility that can be used for diverse use cases (2D and 3D spatial, numeric range filtering, binary range filtering so we can support IPv6, BigInteger, BigDecimal, etc.).  For it to be exposed as a part of the codec means it needs to be in core... "
+        },
+        {
+            "id": "comment-14958695",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-15T10:25:42+0000",
+            "content": "Commit 1708778 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1708778 ]\n\nLUCENE-6825: merge trunk "
+        },
+        {
+            "id": "comment-14960362",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-16T08:32:54+0000",
+            "content": "Commit 1708913 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1708913 ]\n\nLUCENE-6825: cutover to Directory API, fix some bugs "
+        },
+        {
+            "id": "comment-14960745",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-16T13:54:59+0000",
+            "content": "Commit 1709001 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709001 ]\n\nLUCENE-6825: remove sops, add more tests (e.g. BigInteger!); cutover to try-with-resources/TrackingDirectoryWrapper; remove some nocommits "
+        },
+        {
+            "id": "comment-14962676",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-18T23:15:45+0000",
+            "content": "Commit 1709330 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709330 ]\n\nLUCENE-6825: remove all nocommits; add missing MDW.createTempOutput wrapping; fix double-write per dim during build "
+        },
+        {
+            "id": "comment-14962680",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-18T23:23:36+0000",
+            "content": "Commit 1709331 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709331 ]\n\nLUCENE-6825: merge trunk "
+        },
+        {
+            "id": "comment-14963427",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-19T15:01:15+0000",
+            "content": "Commit 1709429 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709429 ]\n\nLUCENE-6825: simplify the writer/reader classes, remove DEBUG outputs, fix ant precommit "
+        },
+        {
+            "id": "comment-14963975",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-19T20:12:44+0000",
+            "content": "Commit 1709473 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709473 ]\n\nLUCENE-6825: merge trunk "
+        },
+        {
+            "id": "comment-14963977",
+            "author": "Michael McCandless",
+            "date": "2015-10-19T20:18:12+0000",
+            "content": "I think this first step is ready.  Tests pass, ant precommit passes.\n\nHere's a patch from the branch vs current trunk\n\nIt just adds the low-level block KD data structure to oal.util.bkd, plus a couple other fixes:\n\n\n\tI forgot to add a wrapper for createTempOutput to MDW in\n    LUCENE-6829\n\n\n\n\n\tImproved OfflineSorter a bit: don't create so much young garbage\n    while sorting and allow for fixed-width byte[] sequences encoding\n    so BKD doesn't have to double-write its inputs\n\n\n\nNext step (I'll open a followon issue) is to make a DimensionFormat that uses this data structure... "
+        },
+        {
+            "id": "comment-14966021",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-21T00:22:05+0000",
+            "content": "Commit 1709705 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709705 ]\n\nLUCENE-6825: pull out MAX_DIMS as constant; remove sop; add comment "
+        },
+        {
+            "id": "comment-14966534",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-21T09:34:08+0000",
+            "content": "Commit 1709778 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709778 ]\n\nLUCENE-6825: put this back "
+        },
+        {
+            "id": "comment-14966540",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-21T09:38:40+0000",
+            "content": "Commit 1709779 from Michael McCandless in branch 'dev/branches/lucene6825'\n[ https://svn.apache.org/r1709779 ]\n\nLUCENE-6825: merge trunk "
+        },
+        {
+            "id": "comment-14966572",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-21T09:56:43+0000",
+            "content": "Commit 1709783 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1709783 ]\n\nLUCENE-6825: add low-level support for block-KD trees "
+        },
+        {
+            "id": "comment-14968068",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-21T22:12:03+0000",
+            "content": "Commit 1709928 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1709928 ]\n\nLUCENE-6825: make sure we close open file on exception "
+        },
+        {
+            "id": "comment-14968074",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-21T22:17:48+0000",
+            "content": "Commit 1709930 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1709930 ]\n\nLUCENE-6825: fix test bug "
+        },
+        {
+            "id": "comment-14976085",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-27T09:31:37+0000",
+            "content": "Commit 1710752 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1710752 ]\n\nLUCENE-6825: add dimensionally indexed values "
+        },
+        {
+            "id": "comment-14976476",
+            "author": "Steve Rowe",
+            "date": "2015-10-27T14:29:45+0000",
+            "content": "My Jenkins found a seed that reproduces for me: TestDimensionalValues tests (testMultiValued() 100% and testMerge() sometimes) trigger an NPE in DimensionalWriter.merge() in the DimensionalReader.intersect() implementation there:\n\n\n   [junit4] Suite: org.apache.lucene.index.TestDimensionalValues\n   [junit4]   2> NOTE: download the large Jenkins line-docs file by running 'ant get-jenkins-line-docs' in the lucene directory.\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestDimensionalValues -Dtests.method=testMultiValued -Dtests.seed=367B5FB4E6C5CEFF -Dtests.slow=true -Dtests.linedocsfile=/home/jenkins/lucene-data/enwiki.random.lines.txt -Dtests.locale=ga_IE -Dtests.timezone=Mexico/BajaSur -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n   [junit4] ERROR   0.57s J0 | TestDimensionalValues.testMultiValued <<<\n   [junit4]    > Throwable #1: org.apache.lucene.store.AlreadyClosedException: this IndexWriter is closed\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([367B5FB4E6C5CEFF:E25B3B8628078EB7]:0)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.ensureOpen(IndexWriter.java:713)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.ensureOpen(IndexWriter.java:727)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.updateDocument(IndexWriter.java:1457)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.addDocument(IndexWriter.java:1240)\n   [junit4]    > \tat org.apache.lucene.index.RandomIndexWriter.addDocument(RandomIndexWriter.java:173)\n   [junit4]    > \tat org.apache.lucene.index.TestDimensionalValues.verify(TestDimensionalValues.java:829)\n   [junit4]    > \tat org.apache.lucene.index.TestDimensionalValues.verify(TestDimensionalValues.java:791)\n   [junit4]    > \tat org.apache.lucene.index.TestDimensionalValues.testMultiValued(TestDimensionalValues.java:212)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]    > Caused by: java.lang.NullPointerException\n   [junit4]    > \tat org.apache.lucene.codecs.DimensionalWriter$1.intersect(DimensionalWriter.java:56)\n   [junit4]    > \tat org.apache.lucene.codecs.simpletext.SimpleTextDimensionalWriter.writeField(SimpleTextDimensionalWriter.java:139)\n   [junit4]    > \tat org.apache.lucene.codecs.DimensionalWriter.merge(DimensionalWriter.java:45)\n   [junit4]    > \tat org.apache.lucene.index.SegmentMerger.mergeDimensionalValues(SegmentMerger.java:168)\n   [junit4]    > \tat org.apache.lucene.index.SegmentMerger.merge(SegmentMerger.java:117)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.mergeMiddle(IndexWriter.java:4055)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3635)\n   [junit4]    > \tat org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:588)\n   [junit4]    > \tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:626)\n   [junit4]   2> DF\u00f3mh 27, 2015 6:47:10 A.M. com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n   [junit4]   2> WARNING: Uncaught exception in thread: Thread[Lucene Merge Thread #1,5,TGRP-TestDimensionalValues]\n   [junit4]   2> org.apache.lucene.index.MergePolicy$MergeException: java.lang.NullPointerException\n   [junit4]   2> \tat __randomizedtesting.SeedInfo.seed([367B5FB4E6C5CEFF]:0)\n   [junit4]   2> \tat org.apache.lucene.index.ConcurrentMergeScheduler.handleMergeException(ConcurrentMergeScheduler.java:668)\n   [junit4]   2> \tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:648)\n   [junit4]   2> Caused by: java.lang.NullPointerException\n   [junit4]   2> \tat org.apache.lucene.codecs.DimensionalWriter$1.intersect(DimensionalWriter.java:56)\n   [junit4]   2> \tat org.apache.lucene.codecs.simpletext.SimpleTextDimensionalWriter.writeField(SimpleTextDimensionalWriter.java:139)\n   [junit4]   2> \tat org.apache.lucene.codecs.DimensionalWriter.merge(DimensionalWriter.java:45)\n   [junit4]   2> \tat org.apache.lucene.index.SegmentMerger.mergeDimensionalValues(SegmentMerger.java:168)\n   [junit4]   2> \tat org.apache.lucene.index.SegmentMerger.merge(SegmentMerger.java:117)\n   [junit4]   2> \tat org.apache.lucene.index.IndexWriter.mergeMiddle(IndexWriter.java:4055)\n   [junit4]   2> \tat org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3635)\n   [junit4]   2> \tat org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:588)\n   [junit4]   2> \tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:626)\n   [junit4]   2> \n   [junit4]   2> NOTE: download the large Jenkins line-docs file by running 'ant get-jenkins-line-docs' in the lucene directory.\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestDimensionalValues -Dtests.method=testMerge -Dtests.seed=367B5FB4E6C5CEFF -Dtests.slow=true -Dtests.linedocsfile=/home/jenkins/lucene-data/enwiki.random.lines.txt -Dtests.locale=ga_IE -Dtests.timezone=Mexico/BajaSur -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n   [junit4] ERROR   0.14s J0 | TestDimensionalValues.testMerge <<<\n   [junit4]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=222, name=Lucene Merge Thread #1, state=RUNNABLE, group=TGRP-TestDimensionalValues]\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([367B5FB4E6C5CEFF:85DA8150E91E786A]:0)\n   [junit4]    > Caused by: org.apache.lucene.index.MergePolicy$MergeException: java.lang.NullPointerException\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([367B5FB4E6C5CEFF]:0)\n   [junit4]    > \tat org.apache.lucene.index.ConcurrentMergeScheduler.handleMergeException(ConcurrentMergeScheduler.java:668)\n   [junit4]    > \tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:648)\n   [junit4]    > Caused by: java.lang.NullPointerException\n   [junit4]    > \tat org.apache.lucene.codecs.DimensionalWriter$1.intersect(DimensionalWriter.java:56)\n   [junit4]    > \tat org.apache.lucene.codecs.simpletext.SimpleTextDimensionalWriter.writeField(SimpleTextDimensionalWriter.java:139)\n   [junit4]    > \tat org.apache.lucene.codecs.DimensionalWriter.merge(DimensionalWriter.java:45)\n   [junit4]    > \tat org.apache.lucene.index.SegmentMerger.mergeDimensionalValues(SegmentMerger.java:168)\n   [junit4]    > \tat org.apache.lucene.index.SegmentMerger.merge(SegmentMerger.java:117)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.mergeMiddle(IndexWriter.java:4055)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3635)\n   [junit4]    > \tat org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:588)\n   [junit4]    > \tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:626)\n   [junit4]   2> NOTE: leaving temporary files on disk at: /var/lib/jenkins/jobs/Lucene-Solr-tests-trunk/workspace/lucene/build/core/test/J0/temp/lucene.index.TestDimensionalValues_367B5FB4E6C5CEFF-001\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene53): {}, docValues:{}, sim=RandomSimilarityProvider(queryNorm=false,coord=yes): {}, locale=ga_IE, timezone=Mexico/BajaSur\n   [junit4]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=1,free=263920904,total=390594560\n   [junit4]   2> NOTE: All tests run in this JVM: [TestTermScorer, Test2BPostings, TestLucene50CompoundFormat, TestFilterLeafReader, TestStressNRT, TestBagOfPostings, TestLazyProxSkipping, Test2BBinaryDocValues, TestTimSorter, TestPagedBytes, TestTerms, TestSizeBoundedForceMerge, TestMultiTermQueryRewrites, TestFileSwitchDirectory, TestSpanSearchEquivalence, TestDeletionPolicy, TestVersion, TestNumericDocValuesUpdates, TestSpanCollection, TestSpanBoostQuery, TestExternalCodecs, TestDocsAndPositions, TestTermVectors, TestSimpleFSLockFactory, TestMergedIterator, Test2BPagedBytes, TestTopDocsMerge, TestIsCurrent, TestNot, TestWeakIdentityMap, TestBytesRefHash, TestConstantScoreQuery, TestBufferedChecksum, TestRollingBuffer, TestSimilarity2, TestLSBRadixSorter, TestRollingUpdates, TestParallelTermEnum, TestDimensionalValues]\n   [junit4] Completed [83/400] on J0 in 27.01s, 25 tests, 2 errors <<< FAILURES!\n\n "
+        },
+        {
+            "id": "comment-14976481",
+            "author": "Michael McCandless",
+            "date": "2015-10-27T14:33:42+0000",
+            "content": "Thanks Steve Rowe, I'll dig ... "
+        },
+        {
+            "id": "comment-14976486",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-27T14:37:12+0000",
+            "content": "Commit 1710830 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1710830 ]\n\nLUCENE-6825: don't NPE when trying to merge a segment that has no documents that indexed dimensional values "
+        },
+        {
+            "id": "comment-15306340",
+            "author": "Lvton. Smith",
+            "date": "2016-05-30T07:36:05+0000",
+            "content": "For 1D case, would B+ tree perform as well as bkd-tree? I think so. What about you, Michael? "
+        },
+        {
+            "id": "comment-15306351",
+            "author": "Lvton. Smith",
+            "date": "2016-05-30T07:43:24+0000",
+            "content": "For 1D case, would B+ tree perform as well as bkd-tree? I think so. What about you, Michael? "
+        },
+        {
+            "id": "comment-15306402",
+            "author": "Michael McCandless",
+            "date": "2016-05-30T08:42:48+0000",
+            "content": "I think a B+ tree would be overkill in the 1D case?  Also, Lucene segments are write-once, so the ability/freedom to \"insert\" in the tree (and \"delete\") would be unused. "
+        },
+        {
+            "id": "comment-15307202",
+            "author": "Lvton. Smith",
+            "date": "2016-05-31T04:47:42+0000",
+            "content": "It should give sizable performance gains (smaller index, faster searching) over what we have today, and even over what auto-prefix with efficient numeric terms would do.\n\nsmaller index \n   yes!!\n\nfaster searching?? \nI cannot understand that \n    \"Auto-prefix\" uses less terms, although larger index. But, \"bkd\", I think, is equal to using \"every number term between the range\".  Why faster? "
+        }
+    ]
+}

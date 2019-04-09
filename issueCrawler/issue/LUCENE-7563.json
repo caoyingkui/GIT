@@ -1,0 +1,145 @@
+{
+    "id": "LUCENE-7563",
+    "title": "BKD index should compress unused leading bytes",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Resolved",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "6.4",
+            "7.0"
+        ]
+    },
+    "description": "Today the BKD (points) in-heap index always uses dimensionNumBytes per dimension, but if e.g. you are indexing LongPoint yet only use the bottom two bytes in a given segment, we shouldn't store all those leading 0s in the index.",
+    "attachments": {
+        "LUCENE-7563.patch": "https://issues.apache.org/jira/secure/attachment/12840066/LUCENE-7563.patch",
+        "LUCENE-7563-prefixlen-unary.patch": "https://issues.apache.org/jira/secure/attachment/12841739/LUCENE-7563-prefixlen-unary.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15667700",
+            "date": "2016-11-15T17:17:14+0000",
+            "content": "+1 ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15687381",
+            "date": "2016-11-22T17:43:26+0000",
+            "content": "Initial patch, compacting (at indexing time) the long[] leafBlockFPs\nand byte[] splitPackedValues in the current BKD index, into a smaller\npacked byte[] structure.\n\nI still have a number of nocommits but the core idea seems to be\nworking ... Lucene's tests pass at least once.\n\nAt first I prototyped using an FST to compact the binary tree index,\nand it reduced quite a bit, but then I realized even FST has some\nannoying inefficiency for this usage, so I made this dedicated packed\nbyte[] structure instead which compressed even better.\n\nOn our nightly 20M NYC taxis benchmark\n(https://home.apache.org/~mikemccand/lucenebench/sparseResults.html)\nthis reduces heap usage by ~60%.\n\nIt compresses N>1 dimension too but I haven't tested by how much...\n\nThe structure should work very well for apps that e.g. index a short\nas if it were a long, prefix-coding away all those leading 0s.  It\ntakes advantage of how the BKD tree is traversed at search time,\nalways starting at root and pushing down to children.\n\nSeparately, I think we could consider increasing the max leaf block size\nfrom 1024 points to maybe 2048 or 4096 points ... I'll open a new\nissue for that. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15697899",
+            "date": "2016-11-26T13:01:40+0000",
+            "content": "Another iteration on the patch; I think it's ready.\n\nI tested on the 20M sparse taxis data set and this change gives a\nsizable (~56% - ~59%) reduction in heap usage:\n\n\n\tsparse-sorted: 6.14 MB -> 2.49 MB\n\n\n\n\n\tsparse: 4.93 MB -> 2.17 MB\n\n\n\n\n\tdense: 4.88 MB -> 2.09 MB\n\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15701587",
+            "date": "2016-11-28T10:41:04+0000",
+            "content": "It seems we are always delta coding with the split value of the parent level, but for the multi-dimensional case, I think it would be better to delta-code with the last split value that was on the same dimension? Otherwise compression would be very poor if both dimensions store a very different range of values?\n\nSomething else I was wondering is whether we can make bigger gains. For instance we use whole bytes to store the split dimension or the prefix length while they only need 3 and 4 bits? In the multi-dimensional case we could store both on a single byte. Maybe we can do even better, I haven't though much about it.\n\nIt doesn't need to be done in the same patch, but it would also be nice for SimpleText to not use the legacy format of the index. I'm not sure how to proceed however. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15702280",
+            "date": "2016-11-28T15:51:40+0000",
+            "content": "It seems we are always delta coding with the split value of the parent level, but for the multi-dimensional case, I think it would be better to delta-code with the last split value that was on the same dimension?\n\nHmm I think I am already doing that?  Note that the\nsplitValuesStack in BKDReader.PackedIndexTree holds all\ndimensions' last split values, and then when I read the suffix bytes\nin, I copy them into the packed values for the current split\ndimension:\n\n\n        in.readBytes(splitValuesStack[level], splitDim*bytesPerDim+prefix, suffix);\n\n\n\nI think?\n\nI'll test on the OpenStreetMaps geo benchmark to measure the impact\n... I'll also run the 2B tests to make sure nothing broke.\n\nFor instance we use whole bytes to store the split dimension or the prefix length while they only need 3 and 4 bits? In the multi-dimensional case we could store both on a single byte.\n\nOooh that's a great idea!  Saves 1 byte per inner node.  We need 5\nbits for the prefix I think since it can range 0 .. 16 inclusive, and\n3 bits for the splitDim since it's 0 .. 7 inclusive.\n\nIt doesn't need to be done in the same patch, but it would also be nice for SimpleText to not use the legacy format of the index. I'm not sure how to proceed however.\n\nYeah I'm not sure what to do here either ... but it felt wrong to just\npass these packed bytes to the simple text format ... that packed form\nis even further from \"simple\" than the two arrays we have now. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15702891",
+            "date": "2016-11-28T19:38:04+0000",
+            "content": "Hmm I think I am already doing that?\n\nYou are right, I had not read the code correctly.\n\nOooh that's a great idea! Saves 1 byte per inner node. We need 5 bits for the prefix I think since it can range 0 .. 16 inclusive, and 3 bits for the splitDim since it's 0 .. 7 inclusive.\n\nI have been thinking about it more and I think we can make it more general. The first two bytes that differ are likely close to each other, so if we call their difference firstByteDelta, we could pack firstByteDelta, splitDim and prefix into a single vint (eg. (firstByteDelta * (1 + bytesPerDim) + prefix) * numDims + splitDim) that would sometimes only take one byte (quite often when numDims and bytesPerDim are small and rarely in the opposite case).\n\nbut it felt wrong to just pass these packed bytes to the simple text format ...\n\nAgreed. Maybe we should duplicate the curent BKDReader/BKDWriter into a new impl that would be specific to SimpleText and would not need all those optimizations so that both impls can evolve separately. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15703749",
+            "date": "2016-11-29T01:00:41+0000",
+            "content": "New patch, folding in Adrien Grand's first idea.  I like the second idea\n... I'll try that next.\n\nI tested on LatLonPoint and Geo3D with the ~60M document\nOpenStreetMaps geo benchmark and it reduces heap usage from from 2.29\nMB -> 1.79 (Geo3D) and 2.29 -> 1.77 (LatLonPoint), ~22% smaller. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15714902",
+            "date": "2016-12-02T11:42:07+0000",
+            "content": "New patch; I think it's ready.\n\nThis breaks out a private BKD implementation for SimpleText which\nis a nice cleanup for the core BKD implementation, e.g. BKDReader\nis now final; its strange protected constructor is gone; protected\nmethods are now private.\n\nThis patch also implements Adrien Grand's last compression idea, to often\nuse only 1 byte to encode prefix, splitDim and first-byte-delta of the\nsuffix instead of the 2 bytes required in the previous iterations.\nThis gives another ~4-5% further compression improvement:\n\n\n\tsparse-sorted -> 2.37 MB\n\n\n\n\n\tsparse -> 2.07 MB\n\n\n\n\n\tdense -> 2.00 MB\n\n\n\nAnd the OpenStreetMaps geo benchmark:\n\n\n\tgeo3d -> 1.75 MB\n\n\n\n\n\tLatLonPoint -> 1.72 MB\n\n\n\nI'm running the 2B BKD and Points tests now ... if those pass, I plan\nto push to master first and let this bake a bit before backporting. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15719702",
+            "date": "2016-12-04T10:18:21+0000",
+            "content": "Commit 5e8db2e068f2549b9619d5ac48a50c8032fc292b in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5e8db2e ]\n\nLUCENE-7563: use a compressed format for the in-heap BKD index ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15721984",
+            "date": "2016-12-05T11:09:02+0000",
+            "content": "The change looks good and the drop is quite spectacular. http://people.apache.org/~mikemccand/lucenebench/sparseResults.html#searcher_heap  I think there is just a redundant arraycopy in clone()?\n\nFor the record, I played with another idea leveraging the fact that the prefix lengths on two consecutive levels are likely close to each other, and the most common values for the deltas are 0, then 1, then -1. So we might be able to do more savings by encoding the delta between consecutive prefix length using unary coding on top of zig-zag encoding, which would allow to encode 0 on 1 bit, 1 on 2 bits, 2 on 3 bits, etc. However it only saved 1% memory on IndexOSM and less than 1% on IndexTaxis. I'm attaching it here if someone wants to have a look but I don't think the gains are worth the complexity. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15722054",
+            "date": "2016-12-05T11:45:36+0000",
+            "content": "Commit bd8b191505d92c89a483a6189497374238476a00 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bd8b191 ]\n\nLUCENE-7563: remove redundant array copy in PackedIndexTree.clone ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15722090",
+            "date": "2016-12-05T12:05:51+0000",
+            "content": "I think there is just a redundant arraycopy in clone()?\n\nThanks, I pushed a fix!\n\nFor the record, I played with another idea leveraging the fact that the prefix lengths on two consecutive levels are likely close to each other,\n\nI like this idea!  But I hit this test failure ... doesn't reproduce on trunk:\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestBKD -Dtests.method=testWastedLeadingBytes -Dtests.seed=2E5F0E183BBA1098 -Dtests.locale=es-PR -Dtests.timezone=CST -Dtests.asserts=true -Dtests.file.encoding=US-ASCII\n   [junit4] ERROR   0.90s J1 | TestBKD.testWastedLeadingBytes <<<\n   [junit4]    > Throwable #1: java.lang.ArrayIndexOutOfBoundsException: -32\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([2E5F0E183BBA1098:ABD9D50B47794EFC]:0)\n   [junit4]    > \tat org.apache.lucene.util.bkd.BKDReader$PackedIndexTree.readNodeData(BKDReader.java:442)\n   [junit4]    > \tat org.apache.lucene.util.bkd.BKDReader$PackedIndexTree.<init>(BKDReader.java:343)\n   [junit4]    > \tat org.apache.lucene.util.bkd.BKDReader.getIntersectState(BKDReader.java:526)\n   [junit4]    > \tat org.apache.lucene.util.bkd.BKDReader.intersect(BKDReader.java:498)\n   [junit4]    > \tat org.apache.lucene.util.bkd.TestBKD.testWastedLeadingBytes(TestBKD.java:1042)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15722349",
+            "date": "2016-12-05T14:06:21+0000",
+            "content": "I digged into it, the test failure may happen with large numbers of bytes per dimension. It could be fixed if we limited the number of bytes per value of BKDWriter to 16 (like we do in FieldInfos) and made code a long. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15722537",
+            "date": "2016-12-05T15:27:38+0000",
+            "content": "Ahh, OK; I think we should restrict TestBKD to the same dimension count / bytes per dimension limits that Lucene enforces?  As we tighten up how we compress it on disk and the in-heap index we should only test for what we actually offer to the end user. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725826",
+            "date": "2016-12-06T15:33:28+0000",
+            "content": "Here is an updated patch that makes BKDWriter ensure each dimension has 16 bytes at most, plus some minor tweaks to get a few bits back on average. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15727036",
+            "date": "2016-12-06T23:13:07+0000",
+            "content": "Commit 5e8db2e068f2549b9619d5ac48a50c8032fc292b in lucene-solr's branch refs/heads/apiv2 from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5e8db2e ]\n\nLUCENE-7563: use a compressed format for the in-heap BKD index ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15727037",
+            "date": "2016-12-06T23:13:09+0000",
+            "content": "Commit bd8b191505d92c89a483a6189497374238476a00 in lucene-solr's branch refs/heads/apiv2 from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bd8b191 ]\n\nLUCENE-7563: remove redundant array copy in PackedIndexTree.clone ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15728811",
+            "date": "2016-12-07T13:47:41+0000",
+            "content": "Commit f51766c00fc374a6fc6f407b723bd8458556de7d in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f51766c ]\n\nLUCENE-7563: use a compressed format for the in-heap BKD index ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15728813",
+            "date": "2016-12-07T13:47:43+0000",
+            "content": "Commit fd1f608b49a7a8b5f7e6cc805378da2217ec657a in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fd1f608 ]\n\nLUCENE-7563: remove redundant array copy in PackedIndexTree.clone ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15728814",
+            "date": "2016-12-07T13:47:44+0000",
+            "content": "Commit 0c8e8e396a4ccc41e6af78ac7d0342716c36902a in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0c8e8e3 ]\n\nLUCENE-7563: fix 6.x backport compilation errors ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

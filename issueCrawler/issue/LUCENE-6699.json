@@ -1,0 +1,1345 @@
+{
+    "id": "LUCENE-6699",
+    "title": "Integrate lat/lon BKD and spatial3d",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "New Feature"
+    },
+    "description": "I'm opening this for discussion, because I'm not yet sure how to do\nthis integration, because of my ignorance about spatial in general and\nspatial3d in particular \n\nOur BKD tree impl is very fast at doing lat/lon shape intersection\n(bbox, polygon, soon distance: LUCENE-6698) against previously indexed\npoints.\n\nI think to integrate with spatial3d, we would first need to record\nlat/lon/z into doc values.  Somewhere I saw discussion about how we\ncould stuff all 3 into a single long value with acceptable precision\nloss?  Or, we could use BinaryDocValues?  We need all 3 dims available\nto do the fast per-hit query time filtering.\n\nBut, second: what do we index into the BKD tree?  Can we \"just\" index\nearth surface lat/lon, and then at query time is spatial3d able to\ngive me an enclosing \"surface lat/lon\" bbox for a 3d shape?  Or\n... must we index all 3 dimensions into the BKD tree (seems like this\ncould be somewhat wasteful)?",
+    "attachments": {
+        "LUCENE-6699.patch": "https://issues.apache.org/jira/secure/attachment/12748860/LUCENE-6699.patch",
+        "Geo3DPacking.java": "https://issues.apache.org/jira/secure/attachment/12747802/Geo3DPacking.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14644204",
+            "author": "Karl Wright",
+            "date": "2015-07-28T10:37:58+0000",
+            "content": "Hi Mike,\n\nThe coordinates you'd need to store for geospatial3d are: (x,y,z), rather than (lat,lon,z).  The values are floating-point numbers that range between -1.0 and 1.0 for a sphere, and slightly more than that in abs value for a WGS84 ellipsoid.\n\nThere was a ticket where I attached code for a packing scheme that would ram all three values into a 64-bit long; I'll see if I can find it.  That packing scheme basically gave you resolution of about a meter.  However, as you have pointed out, it's not strictly necessary to stick to 64-bit longs either, so you're free to propose anything that makes sense.  "
+        },
+        {
+            "id": "comment-14644248",
+            "author": "Karl Wright",
+            "date": "2015-07-28T11:23:09+0000",
+            "content": "Can we \"just\" index earth surface lat/lon, and then at query time is spatial3d able to give me an enclosing \"surface lat/lon\" bbox for a 3d shape?\n\nMichael McCandless Ok, so now you have me confused a bit as to what your requirements are for BKD.  If you want to split the globe up into lat/lon rectangles, and use BKD that way to descend, then obviously you'd need points to be stored in lat/lon.  But that would make less sense for geospatial3d, because what you're really trying to do is assess membership in a shape, or distance also in regards to a shape, both of which require (x,y,z) not lat/lon.  Yes, you can convert to (x,y,z) from lat/lon, but the conversion is relatively expensive.\n\nInstead, I could imagine just staying natively in (x,y,z), and doing your splits in that space, e.g. split in x, then in y, then in z.  So you'd have a GeoPoint3D which would pack (x,y,z) in a format you could rapidly extract, and a splitting algorithm that would use the known ranges for these values.  Does that make sense to you?  Would that work with BKD? "
+        },
+        {
+            "id": "comment-14645732",
+            "author": "Michael McCandless",
+            "date": "2015-07-29T08:56:38+0000",
+            "content": "OK, thanks Karl Wright, I think I understand.\n\nYes BKD tree can easily split on the 3 (x,y,z) dimensions ... I just need to generalize it (it's currently \"hardwired\" for just 2 dimensions).\n\nSo for this to work, I need to be able to efficiently ask the query shape whether it separately overlaps with a range in each of the 3 dimensions.  E.g. \"do you intersect  0.3 <= x < 0.7\", and same for y and z.  I assume this is fast/simple to do with the spatial3d APIs?\n\nAnd then of course with each indexed x,y,z point I also need to test whether the shape includes it.\n\nHmm, one source of efficiency for the BKD tree is it can recognize at search time when a given indexed cell is fully contained by the query shape, and then it doesn't need to test every point against the shape (it just blindly collects all docIDs in that cell).  But in the 3D case, I think that optimization would never apply?  I.e, the leaf cells would all be little cubes on the earth's surface, which include a volume (above and below earth's surface) that the shape does not accept? "
+        },
+        {
+            "id": "comment-14645839",
+            "author": "Karl Wright",
+            "date": "2015-07-29T10:24:24+0000",
+            "content": "Michael McCandless\nSo for this to work, I need to be able to efficiently ask the query shape whether it separately overlaps with a range in each of the 3 dimensions. E.g. \"do you intersect 0.3 <= x < 0.7\", and same for y and z. I assume this is fast/simple to do with the spatial3d APIs?\n\nHmm. There's a \"bounds()\" method which obtains the lat/lon bounds of a shape.  But for 3d we'd not be able to use that.  However:\n\nHmm, one source of efficiency for the BKD tree is it can recognize at search time when a given indexed cell is fully contained by the query shape, and then it doesn't need to test every point against the shape (it just blindly collects all docIDs in that cell). But in the 3D case, I think that optimization would never apply?\n\nWell, IF we presume that the records all lie on the surface of the world, then you can ask the question, \"do these x, y, z bounds, when intersected with the world surface, all lie within the shape, or overlap the shape?\"  I'll have to think about how efficient that can be made to work, but you ARE after all describing a second surface shape by your x-y-z ranges, so in theory this should be doable.  In particular, the GeoBBox construct allows you to find the relationship between a specific kind of surface shape (currently only lat/lon rectangles and their degenerate 3d equivalents) and any other GeoShape.  We could try to introduce x-y-z 3d rectangles as shapes; they'd be completely describable by planes, so really all the same logic would apply.  I would need to create a new GeoAreaFactory method, and a family of x-y-z bounding shapes, e.g. GeoXYZArea, and it should all work.\n\nTo be sure, have a look at the functionality that GeoArea gives you.  If that looks like what you need, and you can convince yourself that it would be reasonably efficient as far as BKD is concerned, then I'll go ahead and create a patch that does what you need.\n\nThinking in more detail about BKD efficiency, I realize that GeoXYZArea could describe a huge number of 3D rectangles that have NO intersection with the world surface.  That's worrisome because it implies that BKD over the (x,y,z) space may not be a very good way of organizing records?  Or does it?\n "
+        },
+        {
+            "id": "comment-14645893",
+            "author": "Karl Wright",
+            "date": "2015-07-29T11:24:53+0000",
+            "content": "More analysis:\n\n(1) Your BKD search would need to construct a GeoArea object each time it descends a level.\n(2) Construction of an XYZ area will definitely involve construction of up to six additional objects (all planes), but should otherwise be computationally cheap.\n(3) To minimize work on both construction and comparison, I'd need to create the following new classes, where Dg indicates \"degenerate\" in that dimension, e.g. \"DgX\" means \"degenerate in X\":\n\nXYZArea\nDgXYZArea\nXDgYZArea\nXYDgZArea\nDgXDgYArea\nDgXYDgZArea\nXDgYDgZArea\nDgXDgYDgZArea\n\nNote: these are not named \"Geo\" objects, because they do not have anything to do with the surface of the world. "
+        },
+        {
+            "id": "comment-14646068",
+            "author": "Michael McCandless",
+            "date": "2015-07-29T14:02:31+0000",
+            "content": "you ARE after all describing a second surface shape by your x-y-z ranges\n\nThat's exactly it.  Essentially the BKD tree needs a way to recursively chop up the earth surface into smaller and smaller curved-rectangle-like (I think?) shapes on the earth's surface, both at indexing time and at search time.\n\nAt search time, for a given cell, it needs to \"relate\" to the query shape to know if the query shape full contains the cell, does not overlap with the cell, or partially overlaps.\n\nBut I don't understand the \"degenerate in X/Y\" Area objects... it seems like GeoArea would be used for the lat/lon \"approximation\" (outer bounding box?) to a GeoShape?  Seems like it's better if we can do all functions using proper earth-surface shapes?  Sorry this is still all very new to me  "
+        },
+        {
+            "id": "comment-14646121",
+            "author": "Karl Wright",
+            "date": "2015-07-29T14:34:45+0000",
+            "content": "Essentially the BKD tree needs a way to recursively chop up the earth surface into smaller and smaller curved-rectangle-like (I think?) shapes on the earth's surface, both at indexing time and at search time.\n\nWith x/y/z splitting, actually you're not quite doing that.  Instead, you are chopping up the space that the entire world lives in (not just its surface).  One these 3d rectangles may or may not actually intersect the surface (which is where all the geo shapes actually lie).  If it does intersect, it might intersect on only one side of the world, or it might intersect on two sides of the world.  A long, thin 3d rectangle could well encompass a little bit of territory in (say) the UK as well as Alaska, for instance.  But as you describe the algorithm, I'm not sure that this is important at all to know.\n\nAt search time, for a given cell, it needs to \"relate\" to the query shape to know if the query shape full contains the cell, does not overlap with the cell, or partially overlaps.\n\nThe GeoArea interface gives you all of that, which is why I wanted to implement objects that aren't limited to the surface but do implement GeoArea.\n\nBut I don't understand the \"degenerate in X/Y\" Area objects... it seems like GeoArea would be used for the lat/lon \"approximation\" (outer bounding box?) to a GeoShape? Seems like it's better if we can do all functions using proper earth-surface shapes?\n\nGeoArea objects are not constrained to be surface objects.  Right now the only implementers of GeoArea are bounding boxes, bounded in latitude and longitude, but that's merely due to lack of need for anything else.  The relationship types GeoArea objects can determine are against general GeoShape objects (which are surface objects), so the semantics are perfect for what you are trying to do.  You can determine whether a lat/lon rectangle overlaps, contains, is within, or doesn't intersect at all with, any arbitrary spatial3d surface shape.\n\nBut let's be clear: for BKD in the x,y,z space, GeoArea objects bounding in lat/lon are useless.  So we need to invent GeoArea objects that represent 3d rectangles.  If we try to talk about a general XYZ-bounded area, then there will be up to two bounds for X (min and max), two bounds for Y (min and max), and two bounds for Z (min and max).  The degenerate cases come into play when min-X == max-X, or min-Y == max-Y, etc, or when there is no min-X bound but just a max-X one, for instance.  This can be conditional logic but the whole thing is faster and more efficient if there's an object for each funky case.\n\nHope this helps.\n\nMichael McCandless If this all is clear now, and you want to proceed, let me know and I can start working on it tonight. "
+        },
+        {
+            "id": "comment-14646331",
+            "author": "Nicholas Knize",
+            "date": "2015-07-29T16:14:46+0000",
+            "content": "I had thrown this code together a while ago before I put the GeoPointField / Geo3d integration work on hold.  This rough draft converts 3D LLA coordinates into ECEF cartesian coordinates using the WGS84 based non-iterative approach in GeoProjectionUtils (derived from the conversion approach illustrated in the Manual of Photogrammetry using 2 sin/cos and 1 sqrt). The ECEF cartesian coordinate is scaled to a unit spheroid (since this is presumably what Geo3D requires) and each of the 32 bits are interleaved (XYZ) akin to MortonEncoding. Decoding procedures are also provided. While this encoding is not nicely represented as a long (not yet convinced 21 bits per will preserve \"acceptable\" precision, though we could allocate bits differently since larger altitudes degrade w/ conversion) it is BinaryDocValue friendly and enables a space partitioning/prefix coded approach similar to the way GeoPointField currently works. The Most-Significant 3 bits represent an Oct-Cell at the first level, next 3 for level 2, etc. "
+        },
+        {
+            "id": "comment-14646426",
+            "author": "Michael McCandless",
+            "date": "2015-07-29T17:06:26+0000",
+            "content": "Instead, you are chopping up the space that the entire world lives in (not just its surface). \n\nRight, but, that approach seems wasteful?  I mean it should work correctly, but as you said some cells will span strange parts of the surface.  It should work fine but seems inefficient ...\n\nLike, if there is a way instead to make smaller and smaller surface shapes in the BKD tree that would be best?  I.e. fix BKD to operate entirely on the surface ...\n\nMichael McCandless If this all is clear now, and you want to proceed, let me know and I can start working on it tonight.\n\nThank you for being so eager and volunteering here but maybe wait until we figure out the likely best approach here!  I am still a newbie/lost in the details... I lack intuition. "
+        },
+        {
+            "id": "comment-14646934",
+            "author": "Karl Wright",
+            "date": "2015-07-29T23:55:29+0000",
+            "content": "Right, but, that approach seems wasteful? I mean it should work correctly, but as you said some cells will span strange parts of the surface. It should work fine but seems inefficient ... Like, if there is a way instead to make smaller and smaller surface shapes in the BKD tree that would be best? I.e. fix BKD to operate entirely on the surface ...\n\nSo, if you turn the BKD descent into something other than (x,y,z), it would imply that you store points for records in something other than (x,y,z) too, no?  I am unsure whether the additional cost of representing records with, say, lat/lon, and doing the conversion to (x,y,z) at search time for every records encountered would be more or less expensive than having a somewhat wasteful representation for the tree itself.  I expect the conversion  for every record would turn out to be more expensive, but maybe this is something we'd just have to try.  The obvious alternative would be to store just lat/lon, exactly like is done for Nicholas's code, and use the same BKD tree.  The only difference would be: (a) you'd need to construct a GeoBBox, using GeoBBoxFactory, representing your area, and then use getRelationship() to determine intersection, contains, within, or disjoint for the shape, and (b) you'd have to create a GeoPoint at search time for every record encountered.\n "
+        },
+        {
+            "id": "comment-14647128",
+            "author": "Nicholas Knize",
+            "date": "2015-07-30T03:37:35+0000",
+            "content": "The obvious alternative would be to store just lat/lon, exactly like is done for Nicholas's code\n\nJust to clarify, so there's no confusion, the attached code converts from lat/lon to ECEF (either full range in meters, or scaled to the unit spheroid) and stores the result in a 96 bit BitSet. GeoPointField stores encoded lat/lon (if that's what you were referring to).  The attached was intended to be used for a Geo3d integration w/ GeoPointField.\n\nI expect the conversion for every record would turn out to be more expensive.\n\nJust to note again, the conversion from lat/lon to ECEF XYZ is a non-iterative conversion (2 sines, 2 cosines, 1 sqrt).  Conversion cost vs. wateful representation is the interesting question, so I threw together a quick encoding/decoding benchmark (on my i7 16GB System76) and ran it on 100M points (converting from lla to ECEF and back). The law of large numbers took over at around 35M. For interest the results are provided:\n\n\nAvg computation: 620.4319757666667 ns  Trials: 30000000  Total time: 18612.959273 ms\nAvg computation: 621.3008362285715 ns  Trials: 35000000  Total time: 21745.529268 ms\nAvg computation: 621.582647925 ns  Trials: 40000000  Total time: 24863.305917 ms\nAvg computation: 621.3724589555555 ns  Trials: 45000000  Total time: 27961.760653 ms\nAvg computation: 621.16271364 ns  Trials: 50000000  Total time: 31058.135682 ms\nAvg computation: 621.3857686909091 ns  Trials: 55000000  Total time: 34176.217278 ms\nAvg computation: 621.8110524 ns  Trials: 60000000  Total time: 37308.663144 ms\nAvg computation: 621.6768083230769 ns  Trials: 65000000  Total time: 40408.992541 ms\nAvg computation: 621.5324306714285 ns  Trials: 70000000  Total time: 43507.270147 ms\nAvg computation: 621.4440536933333 ns  Trials: 75000000  Total time: 46608.304027 ms\nAvg computation: 621.7594845875 ns  Trials: 80000000  Total time: 49740.758767 ms\nAvg computation: 621.9327540705882 ns  Trials: 85000000  Total time: 52864.284096 ms\nAvg computation: 621.9429434555556 ns  Trials: 90000000  Total time: 55974.864911 ms\nAvg computation: 621.8868688947368 ns  Trials: 95000000  Total time: 59079.252545 ms\nAvg computation: 621.98037608 ns  Trials: 100000000  Total time: 62198.037608 ms\n\n\n\nAgain, those are both conversions to ECEF and back to LLA.  So roughly 1 minute for 100M points.  Halve those numbers and you have the cost for converting either direction. \n\nNext we could benchmark tree access and compare?  I suspect traversal cost should be a function of the on-disk representation and chosen split method (that's where RTrees tend to become costly). Since BKD splits a sorted space, and it can exploit file system cache? I suspect there aren't many random seeks? Seems benchmarking might be relatively straightforward? "
+        },
+        {
+            "id": "comment-14647198",
+            "author": "Karl Wright",
+            "date": "2015-07-30T05:15:20+0000",
+            "content": "Just to note again, the conversion from lat/lon to ECEF XYZ is a non-iterative conversion (2 sines, 2 cosines, 1 sqrt).\n\nRight, but you'd be comparing 2 sines, 2 cosines, and 1 sqrt against only the cost of unpacking, which for 1 billion records would be a noticeable amount of time.\n\nSince BKD splits a sorted space, and it can exploit file system cache? I suspect there aren't many random seeks? Seems benchmarking might be relatively straightforward?\n\nMany Lucene systems (including ours) store the index in memory, using memory mapping, and SSDs would be expected too even when not, so I'd think a benchmarking should not overemphasize seeks as being costly.  But Mike is the expert as far as that is concerned. "
+        },
+        {
+            "id": "comment-14647540",
+            "author": "Nicholas Knize",
+            "date": "2015-07-30T12:17:36+0000",
+            "content": "Right, but you'd be comparing 2 sines, 2 cosines, and 1 sqrt against only the cost of unpacking\n\nEncoding/Decoding ECEF into 96 Bits:\n\n\nAvg computation: 664.6969666857143 ns  Trials: 35000000  Total time: 23264.393834 ms\nAvg computation: 664.829008375 ns  Trials: 40000000  Total time: 26593.160335 ms\nAvg computation: 667.3625471333334 ns  Trials: 45000000  Total time: 30031.314621 ms\nAvg computation: 668.46880436 ns  Trials: 50000000  Total time: 33423.440218 ms\nAvg computation: 667.8703028909091 ns  Trials: 55000000  Total time: 36732.866659 ms\nAvg computation: 669.3753888666666 ns  Trials: 60000000  Total time: 40162.523332 ms\nAvg computation: 668.4362739230769 ns  Trials: 65000000  Total time: 43448.357805 ms\nAvg computation: 667.9539851 ns  Trials: 70000000  Total time: 46756.778957 ms\nAvg computation: 667.3638297333333 ns  Trials: 75000000  Total time: 50052.28723 ms\nAvg computation: 675.024778375 ns  Trials: 80000000  Total time: 54001.98227 ms\nAvg computation: 674.1673578352941 ns  Trials: 85000000  Total time: 57304.225416 ms\nAvg computation: 673.4723439777778 ns  Trials: 90000000  Total time: 60612.510958 ms\nAvg computation: 673.0372402842105 ns  Trials: 95000000  Total time: 63938.537827 ms\nAvg computation: 672.55224382 ns  Trials: 100000000  Total time: 67255.224382 ms\n\n\n\nCompared to packing/unpacking lat/lon into 64 bits using using GeoPointField morton bit twiddling:\n\n\nAvg computation: 60.397136 ns  Trials: 35000000  Total time: 2113.89976 ms\nAvg computation: 61.6391708 ns  Trials: 40000000  Total time: 2465.566832 ms\nAvg computation: 62.744074222222224 ns  Trials: 45000000  Total time: 2823.48334 ms\nAvg computation: 63.51111108 ns  Trials: 50000000  Total time: 3175.555554 ms\nAvg computation: 64.18207294545455 ns  Trials: 55000000  Total time: 3530.014012 ms\nAvg computation: 64.73684656666667 ns  Trials: 60000000  Total time: 3884.210794 ms\nAvg computation: 65.18073341538461 ns  Trials: 65000000  Total time: 4236.747672 ms\nAvg computation: 65.5902512 ns  Trials: 70000000  Total time: 4591.317584 ms\nAvg computation: 65.02902253333333 ns  Trials: 75000000  Total time: 4877.17669 ms\nAvg computation: 63.6249806 ns  Trials: 80000000  Total time: 5089.998448 ms\nAvg computation: 62.4193206 ns  Trials: 85000000  Total time: 5305.642251 ms\nAvg computation: 61.344433977777776 ns  Trials: 90000000  Total time: 5520.999058 ms\nAvg computation: 61.402236642105265 ns  Trials: 95000000  Total time: 5833.212481 ms\nAvg computation: 61.10019762 ns  Trials: 100000000  Total time: 6110.019762 ms\n\n\n\nSo using the 3D BitSet approach is 10 times longer, with the obvious culprit being the for loop for each bit. This can be optimized, though, using a 3-way bit twiddle and 2 longs if a 64 bit 3D packing yields unacceptable loss of precision.\n\nso I'd think a benchmarking should not overemphasize seeks as being costly\n\nMaybe not. But it does depend on the on-disk representation of the tree (and I typically don't use SSDs as an excuse for not paying attention to good file layout).  I was mentioning this in the context of index size as a function of a \"wasteful\" vs. efficient encoding.  "
+        },
+        {
+            "id": "comment-14647584",
+            "author": "Karl Wright",
+            "date": "2015-07-30T12:51:19+0000",
+            "content": "If the decision is made to use (x,y,z) encoding rather than (lat,lon), then FWIW I think the right way forward with spatial3d would be to extend the current Bounds infrastructure to allow the finding of x,y,z bounds for a shape, rather than just lat/lon. I've thought about this for a day and have concluded it would be far and away the fastest solution, since computing the Bounds for any shape would need to be done only once.\n\nOnce x, y, and z bounds are known for a shape, the BKD code itself can make most of its decisions itself, without much computation at all, for most of the recursive steps.  Only when descending within the computed bounds would it be necessary to construct a GeoArea XYZArea object to determine the exact relationship between a 3d rectangle and the specified GeoShape. "
+        },
+        {
+            "id": "comment-14647778",
+            "author": "Michael McCandless",
+            "date": "2015-07-30T15:16:32+0000",
+            "content": "I can't follow all the spatial-heavy discussion here, but:\n\nSince BKD splits a sorted space, and it can exploit file system cache?\n\nBKD tree's \"tree\" (the internal nodes) is already forced into heap, at least in the current impl.  So walking that tree should always be fast, and then there's only seeking once we hit the leaf nodes.  But that seeking should be sequential walk through the file...\n\nIf the decision is made to use (x,y,z) encoding rather than (lat,lon),\n\nSo, if you turn the BKD descent into something other than (x,y,z), it would imply that you store points for records in something other than (x,y,z) too, no?\n\nI think the encoding for each point's value can be different from what the BKD tree uses?\n\nI suspect the points shoudl use (x,y,z) encoding when stored in doc-values per document, because when we need to filter hits for the BKD leaf cells overlapping the shape's boundary, we want to take advantage of the fast math in (x,y,z) space that spatial3d gives us?\n\nBut then, for the inner-nodes (split values) for the BKD tree, we could use either (lat,lon) or (x,y,z), whichever gives us fastest shape relation computations?  At each step in the recursion, BKD tree must check a split in one dimension against the query shape. "
+        },
+        {
+            "id": "comment-14658291",
+            "author": "Karl Wright",
+            "date": "2015-08-05T14:30:11+0000",
+            "content": "Patch to geo3d creating an XYZArea object, which can be used to determine intersection with any GeoShape.  This is a preliminary patch; I will be including unit tests as well as a more general class of XYZArea degenerate objects if that should prove necessary. "
+        },
+        {
+            "id": "comment-14658297",
+            "author": "Michael McCandless",
+            "date": "2015-08-05T14:33:35+0000",
+            "content": "Thanks Karl Wright, I'll try to generalize BKD to 3 dimensions soon ... "
+        },
+        {
+            "id": "comment-14659790",
+            "author": "Karl Wright",
+            "date": "2015-08-06T10:07:53+0000",
+            "content": "Michael McCandless: Turns out that my class is having problems properly relating to GeoWorld.  I'm going to have to make some modifications to make things play nicely.  Stay tuned. "
+        },
+        {
+            "id": "comment-14659964",
+            "author": "Karl Wright",
+            "date": "2015-08-06T12:56:33+0000",
+            "content": "Revised patch that fixes some of the corner cases, especially interactions with the GeoWorld shape. "
+        },
+        {
+            "id": "comment-14682392",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T20:06:16+0000",
+            "content": "Initial dirty patch, but its testBasic and testRandom seem to be passing!  I just made a 3D version of BKD, and the random test tests across the full cube of +/- 1.022.\n\nI did a naive double -> int encoding for each dimension, storing in 12 byte binary DV per doc.  Multi-valued docs aren't supported yet but I think it shouldn't be too hard.\n\nThere are tons of nocommits because I don't know how to tie into the geo3d APIs...\n\nI think we should make a branch here, commit the two patches, and then iterate? "
+        },
+        {
+            "id": "comment-14682421",
+            "author": "Karl Wright",
+            "date": "2015-08-11T20:22:34+0000",
+            "content": "If you create a branch I can generate patches against it. "
+        },
+        {
+            "id": "comment-14682432",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-11T20:30:07+0000",
+            "content": "Commit 1695368 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695368 ]\n\nLUCENE-6699: make branch "
+        },
+        {
+            "id": "comment-14682437",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-11T20:33:01+0000",
+            "content": "Commit 1695369 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695369 ]\n\nLUCENE-6699: Karl's patch to extend geo3d apis to 3d rectangles "
+        },
+        {
+            "id": "comment-14682438",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-11T20:33:50+0000",
+            "content": "Commit 1695370 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695370 ]\n\nLUCENE-6699: initial 3D BKD implementation "
+        },
+        {
+            "id": "comment-14682439",
+            "author": "Karl Wright",
+            "date": "2015-08-11T20:34:05+0000",
+            "content": "Ok, for a start \u2013 the way you get X, Y, and Z ranges for a given planet model is via PlanetModel.getMinimumX(), getMaximumX(), getMinimumY(), getMaximumY(), getMinimumZ(), getMaximumZ().  The GeoShape interface does not provide a means of obtaining the PlanetModel, so you will need to pass this in to your constructor in addition to what you currently have.\n\nSecond, the following code:\n\n\n+                                             double x = BKD3DTreeDocValuesFormat.decodeValue(BKD3DTreeDocValuesFormat.readInt(bytes.bytes, bytes.offset));\n+                                             double y = BKD3DTreeDocValuesFormat.decodeValue(BKD3DTreeDocValuesFormat.readInt(bytes.bytes, bytes.offset+4));\n+                                             double z = BKD3DTreeDocValuesFormat.decodeValue(BKD3DTreeDocValuesFormat.readInt(bytes.bytes, bytes.offset+8));\n+                                             //return GeoUtils.pointInPolygon(polyLons, polyLats, lat, lon);\n+                                             // nocommit fixme!\n+                                             return true;\n\n\n\n... should call GeoShape.isWithin(x,y,z) to determine membership within the shape.\n\nFinally,\n\n\n+                                           public BKD3DTreeReader.Relation compare(int xMin, int xMax, int yMin, int yMax, int zMin, int zMax) {\n+                                             // nocommit fixme!\n+                                             return BKD3DTreeReader.Relation.INSIDE;\n+                                           }\n\n\n\n... should do the following:\n\n\nGeoArea xyzSolid = new XYZSolid(planetModel, xMin, xMax, yMin, yMax, zMin, zMax);\nreturn xyzSolid.getRelationship(geoShape) == GeoArea.<WHATEVER>?xxx:yyy\n\n "
+        },
+        {
+            "id": "comment-14682440",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T20:34:20+0000",
+            "content": "OK I created the branch and committed our two latest patches!\n\nhttps://svn.apache.org/repos/asf/lucene/dev/branches/lucene6699 "
+        },
+        {
+            "id": "comment-14682446",
+            "author": "Karl Wright",
+            "date": "2015-08-11T20:37:13+0000",
+            "content": "ok, I'll try to work my proposed changes into them.  The biggest thing, though, is that we need access to a PlanetModel instance inside the compare() method.  So some plumbing will be necessary to set that up.  Stay tuned.  "
+        },
+        {
+            "id": "comment-14682488",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T20:55:13+0000",
+            "content": "Thanks Karl Wright, I started on one part, lemme go commit so we don't stomp on each other! "
+        },
+        {
+            "id": "comment-14682491",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-11T20:56:36+0000",
+            "content": "Commit 1695377 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695377 ]\n\nLUCENE-6699: fold in some feedback "
+        },
+        {
+            "id": "comment-14682492",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T20:56:59+0000",
+            "content": "OK I committed my change, hack away! "
+        },
+        {
+            "id": "comment-14682495",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T20:58:52+0000",
+            "content": "So some plumbing will be necessary to set that up.\n\nAhh yes, now they are static methods.  So I guess this means you must pass PlanetModel to the doc values format, and to the query. "
+        },
+        {
+            "id": "comment-14682501",
+            "author": "Karl Wright",
+            "date": "2015-08-11T21:01:03+0000",
+            "content": "One other question: what should I return for the four cases listed below?\n\n\n                                           @Override\n                                           public BKD3DTreeReader.Relation compare(int xMin, int xMax, int yMin, int yMax, int zMin, int zMax) {\n                                             final GeoArea xyzSolid = new XYZSolid(planetModel, xMin, xMax, yMin, yMax, zMin, zMax);\n                                             final int relationship = xyzSolid.getRelationship(shape);\n                                             switch (relationship) {\n                                             case GeoArea.WITHIN:\n                                               // nocommit: shape is within xyzsolid\n                                               return BKD3DTreeReader.Relation.INSIDE;\n                                             case GeoArea.CONTAINS:\n                                               // nocommit: shape contains xyzsolid\n                                               return BKD3DTreeReader.Relation.INSIDE;\n                                             case GeoArea.OVERLAPS:\n                                               // nocommit: shape overlaps xyzsolid\n                                               return BKD3DTreeReader.Relation.INSIDE;\n                                             case GeoArea.DISJOINT:\n                                               // nocommit: shape has nothing to do with xyzsolid\n                                               return BKD3DTreeReader.Relation.INSIDE;\n                                             default:\n                                               throw new RuntimeException(\"Unexpected result value from getRelationship(): \"+relationship);\n                                             }\n                                           }\n                                         });\n\n "
+        },
+        {
+            "id": "comment-14687391",
+            "author": "Karl Wright",
+            "date": "2015-08-11T21:12:46+0000",
+            "content": "And Michael McCandless, I just ran into something else.  tree.intersect() accepts only int values at the moment, but x,y,z are doubles in the range of roughly -1.0 to 1.0, and need to be treated as such.  It looks like the integer stuff goes fairly deep into the BKD3DTreeReader code.  Question: If I embark on turning these all into doubles, what kinds of problems will I have?\n "
+        },
+        {
+            "id": "comment-14692331",
+            "author": "Nicholas Knize",
+            "date": "2015-08-11T22:01:50+0000",
+            "content": "Wait... PlanetModel just gives WGS84 parameters along with the same Vincenty distance formula provided by GeoDistanceUtils in sandbox (which can be quite an expensive convergence, btw).  So why not just use the static calls in sandbox and save passing around a PlanetModel object?  You can also use the attached patch I provided which provides static calls to convert to/from unit spheroid and lat/lon. "
+        },
+        {
+            "id": "comment-14692351",
+            "author": "Karl Wright",
+            "date": "2015-08-11T22:12:04+0000",
+            "content": "Hi Nicholas,\n\nThere's no cost to instantiating PlanetModel.SPHERE or PlanetModel.WGS84; they're already instantiated.  I don't understand why you think the cost would be high to pass this object in to the query or the writer?  It seems to me to be dirt cheap, and just as efficient as passing in something else to distinguish between various planet models. "
+        },
+        {
+            "id": "comment-14692425",
+            "author": "Nicholas Knize",
+            "date": "2015-08-11T22:46:12+0000",
+            "content": "The biggest thing, though, is that we need access to a PlanetModel instance inside the compare()\n\nI didn't say anything about cost. It was a matter of saving work, making maintenance less of a nightmare, de-duping code and using what's already available. "
+        },
+        {
+            "id": "comment-14692426",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T22:48:52+0000",
+            "content": "tree.intersect() accepts only int values at the moment, but x,y,z are doubles\n\nWait, this was by design (having BKD operate only on int): the encoding of double -> int should happen outside BKD.\n\nI'm assuming 32 bits precision for each dimension is enough? "
+        },
+        {
+            "id": "comment-14692438",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T22:56:59+0000",
+            "content": "One other question: what should I return for the four cases listed below?\n\nOh this was the part I committed already ... if you svn up do you see conflicts? "
+        },
+        {
+            "id": "comment-14692445",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:01:06+0000",
+            "content": "Thanks, that clarifies.  Stay tuned. "
+        },
+        {
+            "id": "comment-14692446",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T23:01:59+0000",
+            "content": "It seems like we need PlanetModel at query time, for the XYZSolid ctor, and also at indexing time, to know the full range for x, y, z during the encode of double -> int (hmm and also at query time for the decode from int -> double, so we can do the per-hit filtering on the boundary cells). "
+        },
+        {
+            "id": "comment-14692448",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:03:32+0000",
+            "content": "New patch which finishes some of the remaining \"fix mes\" "
+        },
+        {
+            "id": "comment-14692450",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:04:11+0000",
+            "content": "Michael McCandless see the new patch "
+        },
+        {
+            "id": "comment-14692451",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-11T23:08:36+0000",
+            "content": "Commit 1695400 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695400 ]\n\nLUCENE-6699: iterate "
+        },
+        {
+            "id": "comment-14692453",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T23:08:48+0000",
+            "content": "Thanks Karl Wright, I committed.\n\nHmm the minX/maxX etc. in the query was supposed to be for the query shape, not for the planet (i.e., the 3D bbox for the query).  But if this is problematic I think we could simply remove it, and let BKD recurse from the entire world down.... I put a nocommit about this. "
+        },
+        {
+            "id": "comment-14692454",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:08:55+0000",
+            "content": "not to worry; I fixed it in my new patch. "
+        },
+        {
+            "id": "comment-14692456",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:11:01+0000",
+            "content": "Ok, did not understand that.  We don't yet have the ability to get a Bounds result for a shape that is x,y,z instead of lat/lon.  (That was the optimization we discussed but decided to do as a second step).  But I presume you do want the ability to know, for a given planet model, the actual bounds of the planet.   That's gotta go somewhere. "
+        },
+        {
+            "id": "comment-14692467",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:19:04+0000",
+            "content": "Introducing a stray dependency outside of spatial3d seems like it would make maintenance more of a nightmare rather than less.  Objects representing abstractions don't necessarily make things more messy either. Static methods are fine but when you have lack of any significant data abstraction you have a very messy picture indeed.  And I don't recall you complaining over the last seven months about geo3d's architecture and organization, so I presume that it was acceptable to you.\n\nAs for duping code, I guess it's all part of the bigger question is whether geo3d should remain separable from Lucene.  For me, Geo3d at the moment needs to remain as a working whole without dependencies on the rest of Lucene, because otherwise it will not be usable in my employer's environment.  That may change in the long run, after there's a public release of this stuff and we upgrade to it, but for now it would just make things much more complicated for me. "
+        },
+        {
+            "id": "comment-14692470",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T23:19:27+0000",
+            "content": "We don't yet have the ability to get a Bounds result for a shape that is x,y,z instead of lat/lon.\n\nOK, no problem, this is just an optimization (to reduce the number of compare calls), so it's optional.\n\nI'll fix BKD tree to have another .intersect that just goes from the global min/max down.\n\nBut I presume you do want the ability to know, for a given planet model, the actual bounds of the planet. \n\nYES, this is important: the encode/decodeValue methods in BKD3DTreeDocValuesFormat need to be fixed to refer to the PlanetModel instead I think?  This is a bit spooky, since it means you could index with one PlanetModel and then query with another ... maybe it'd be better to leave the encoding as is?  And have an assert somewhere that the PlanetModel min/max never exceeds what our encoding is using? "
+        },
+        {
+            "id": "comment-14692475",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:21:55+0000",
+            "content": "I think changing the encoding would be scary; let's just assert the proper range somewhere that's not expensive.  "
+        },
+        {
+            "id": "comment-14692491",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-11T23:32:10+0000",
+            "content": "Commit 1695409 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695409 ]\n\nLUCENE-6699: remove 3D bbox opto "
+        },
+        {
+            "id": "comment-14692500",
+            "author": "Michael McCandless",
+            "date": "2015-08-11T23:33:27+0000",
+            "content": "OK, actually, at indexing time you'll hit an exc already if the x/y/z is ever out of bounds (encodeValue checks this) ... but, are there any known PlanetModels with a larger max than the 1.002 I randomly picked!\n\nI committed the \"remove 3D query bbox opto\". "
+        },
+        {
+            "id": "comment-14692548",
+            "author": "Karl Wright",
+            "date": "2015-08-11T23:50:53+0000",
+            "content": "are there any known PlanetModels with a larger max than the 1.002 I randomly picked!\n\nWell, you can construct your own planet model object.  Presumably if you were modeling something pretty oblate, like Saturn, 1.002 would not do.  I provided the min/max methods precisely so you could determine this for real.  But at the moment we can go ahead and get things working before crossing that bridge, if you like. "
+        },
+        {
+            "id": "comment-14692912",
+            "author": "Nicholas Knize",
+            "date": "2015-08-12T04:49:26+0000",
+            "content": "\nIntroducing a stray dependency outside of spatial3d seems like it would make maintenance more of a nightmare rather than less.\n\nI don't recall module dependency for Geo3D being an issue when it was part of the spatial package, now we have spatial code in 3 separate modules and suddenly you oppose module dependency? It makes no sense and this disarray of spatial functionality only introduces more confusion, disorganization, and a wider gap for getting more spatial contributors involved. Nevertheless, I assume (hope) it resolves itself in time, otherwise lucene spatial capabilities will continue to fragment. \n\nI don't recall you complaining over the last seven months about geo3d's architecture and organization...\n\nRather combative. Don't confuse my suggestions for keeping things light, approachable, and organized, as holding any enmity towards geo3d.\n\nI guess it's all part of the bigger question is whether geo3d should remain separable from Lucene.\n\nI still prefer it be a part of core/util so that (once again) the 90% geo use case can be accomplished with no dependencies other than core. Having it in a 3d specific package seems no better than simply moving it to Apache SIS (where all EPSG ellipsoids, OGC compliance, etc. are already provided). But that's not my call.\n\nFor me, Geo3d at the moment needs to remain as a working whole without dependencies on the rest of Lucene\n\nThis messaging seems to change based on the agenda. Not that it matters except for keeping in mind whats best for the lucene project as a whole.\n "
+        },
+        {
+            "id": "comment-14693198",
+            "author": "Karl Wright",
+            "date": "2015-08-12T09:19:52+0000",
+            "content": "Rather combative. Don't confuse my suggestions for keeping things light, approachable, and organized, as holding any enmity towards geo3d.\n\nI am not trying to be combative; I'm interested in the same things you are, although I seem to look at the world a bit differently perhaps.  My major concern is that since January there's been quite a bit of back-and-forth with David Smiley and others about various aspects of geo3d organization, structure, abstractions, etc., and it seems like we'd be undoing quite a bit of what was agreed on then to meet your concerns now? \n\nI still prefer it be a part of core/util so that (once again) the 90% geo use case can be accomplished with no dependencies other than core. Having it in a 3d specific package seems no better than simply moving it to Apache SIS (where all EPSG ellipsoids, OGC compliance, etc. are already provided). But that's not my call.\n\nUnfortunately, I have constraints, in addition to Lucene.  I cannot at the moment contribute to Apache SIS, without going through a laborious and time consuming company process.  So if/when geo3d leaves Lucene, I won't immediately be able to leave with it.\n\nAlso, as we've discussed before at some length, geo3d was developed and optimized specifically for the search problem.  While that seems like a minor thing at first glance, it's actually quite a big deal.  My impression was that this was pretty far from the Apache SIS core mission.\n\nThis messaging seems to change based on the agenda. Not that it matters except for keeping in mind whats best for the lucene project as a whole.\n\nI've got two masters here.  First, it's essential that my company continues to be able to use geo3d, even before it is released via lucene.  Remember that development is taking place all the time on both sides.  Right now, geo3d is reasonably separable, and we've deliberately built the dependency structure to maintain that.  That was one of the reasons behind having a separate module.\n\nIf/when geo3d is actually pulled into core (which I still don't know will definitely happen or not), then it's a different ballgame, and integration with other core code will likely take place.  But that hasn't happened yet and may never happen. "
+        },
+        {
+            "id": "comment-14693403",
+            "author": "Michael McCandless",
+            "date": "2015-08-12T12:24:46+0000",
+            "content": "I'll address the \"rename\" nocommits shortly... "
+        },
+        {
+            "id": "comment-14693415",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-12T12:36:52+0000",
+            "content": "Commit 1695494 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695494 ]\n\nLUCENE-6699: fix some nocommits "
+        },
+        {
+            "id": "comment-14693480",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-12T13:32:25+0000",
+            "content": "Commit 1695510 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695510 ]\n\nLUCENE-6699: add basic test for the point field / query "
+        },
+        {
+            "id": "comment-14693482",
+            "author": "Michael McCandless",
+            "date": "2015-08-12T13:34:40+0000",
+            "content": "I committed a basic test, but it fails in a fun way:\n\n\nTime: 0.202\nThere was 1 failure:\n1) testBasic(org.apache.lucene.bkdtree3d.TestGeo3DPointField)\njava.lang.IllegalArgumentException: X values in wrong order or identical\n\tat __randomizedtesting.SeedInfo.seed([71BA4E421B49E771:DA405357C495615F]:0)\n\tat org.apache.lucene.geo3d.XYZSolid.<init>(XYZSolid.java:94)\n\tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1$1.compare(PointInGeo3DShapeQuery.java:124)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:190)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:129)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:113)\n\tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.scorer(PointInGeo3DShapeQuery.java:99)\n\tat org.apache.lucene.search.Weight.bulkScorer(Weight.java:135)\n\tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n\tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:618)\n\tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:92)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:425)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:544)\n\tat org.apache.lucene.search.IndexSearcher.searchAfter(IndexSearcher.java:402)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:413)\n\tat org.apache.lucene.bkdtree3d.TestGeo3DPointField.testBasic(TestGeo3DPointField.java:58)\n\n\n\nI think the X values are in fact identical ... I indexed a single point into the BKD tree, and so minX == maxX and the recursion uses these global min/max when recursing ... I think I might just remove the global min/max and instead recurse from the full int space.  This was a change I had \"tried\" vs the 2D BKD tree and I think I don't like it  "
+        },
+        {
+            "id": "comment-14693486",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-12T13:37:18+0000",
+            "content": "Commit 1695513 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695513 ]\n\nLUCENE-6699: don't use the global min/max "
+        },
+        {
+            "id": "comment-14693487",
+            "author": "Michael McCandless",
+            "date": "2015-08-12T13:37:37+0000",
+            "content": "I think I don't like it\n\nOK I removed it and now testBasic passes! "
+        },
+        {
+            "id": "comment-14693500",
+            "author": "Michael McCandless",
+            "date": "2015-08-12T13:48:39+0000",
+            "content": "On the module dependencies, I think it's fine if we have some small code dup for now across modules.  We will sort this out over time: maybe sandbox depends on spatial3d, or vice versa, or we \"graduate\" the postings-based and 2D BKD implementations from sandbox into spatial3d (and rename it), or move them into core/util, or ... something.  I think we shouldn't fret about it at this point: things are moving quickly and it's a little too early to figure out where things will eventually land.\n\nI've got two masters here.\n\nThis is fine.\n\nWe all (necessarily: capitalism) have our own sometimes conflicting motives for improving Lucene (and other open-source projects), but it works out that when you sum up all those motives across all players what emerges is something that benefits many, many people.\n\nmoving it to Apache SIS\n\nI think the Apache SIS project should feel free to poach geo3d at any time, but ...\n\nSelfishly (for Lucene) I think we should also keep it here as we iterate on the \"unique\" requirements we have for efficient searching.  E.g. here in this issue we already see that we need new APIs in geo3d for the BKD integration, maybe future issues require more such iterating. "
+        },
+        {
+            "id": "comment-14694251",
+            "author": "Karl Wright",
+            "date": "2015-08-12T21:58:44+0000",
+            "content": "Well, as we discussed a while back, I'm going to need to implement some \"degenerate\" solids in any case, if this all works, and a factory method that picks among them.  That's a better fix methinks than changing stuff around.  I'll get going on that tonight. "
+        },
+        {
+            "id": "comment-14694253",
+            "author": "Karl Wright",
+            "date": "2015-08-12T22:00:03+0000",
+            "content": "Ok \u2013 let me synch up and see what new feature should have what priority... "
+        },
+        {
+            "id": "comment-14694324",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-12T22:34:07+0000",
+            "content": "Commit 1695616 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695616 ]\n\nLUCENE-6699: fix more names "
+        },
+        {
+            "id": "comment-14694346",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-12T22:46:01+0000",
+            "content": "Commit 1695619 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695619 ]\n\nLUCENE-6699: fix more nocommits "
+        },
+        {
+            "id": "comment-14694381",
+            "author": "Karl Wright",
+            "date": "2015-08-12T23:06:07+0000",
+            "content": "This patch adds the basic architecture for handling degenerate cases of XYZSolids.  Still need to implement the specific cases though. "
+        },
+        {
+            "id": "comment-14694671",
+            "author": "Karl Wright",
+            "date": "2015-08-13T04:35:10+0000",
+            "content": "Updated patch, including degenerate (but untested) classes for single-dimension degeneracy.  Still four additional degeneracy classes to implement. "
+        },
+        {
+            "id": "comment-14694941",
+            "author": "Michael McCandless",
+            "date": "2015-08-13T09:25:28+0000",
+            "content": "Thanks Karl Wright, I committed the last patch. "
+        },
+        {
+            "id": "comment-14695068",
+            "author": "Karl Wright",
+            "date": "2015-08-13T11:16:34+0000",
+            "content": "Hmm, either there was an svn hiccup, or you got the wrong patch. \n\nActually, it appears that I uploaded the same patch twice, so it's my fault.  But in any case, attaching a new one based on the current branch status. "
+        },
+        {
+            "id": "comment-14695150",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-13T12:29:30+0000",
+            "content": "Commit 1695700 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695700 ]\n\nLUCENE-6699: another iteration on degenerate solids "
+        },
+        {
+            "id": "comment-14695151",
+            "author": "Michael McCandless",
+            "date": "2015-08-13T12:29:50+0000",
+            "content": "Thanks Karl Wright, I committed the last patch "
+        },
+        {
+            "id": "comment-14697304",
+            "author": "Karl Wright",
+            "date": "2015-08-14T16:12:54+0000",
+            "content": "Patch to complete the degenerate solid classes and construction logic.\nMichael McCandless: I will be adding some unit tests for this code, later today or tomorrow. "
+        },
+        {
+            "id": "comment-14697486",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-14T18:17:03+0000",
+            "content": "Commit 1695950 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695950 ]\n\nLUCENE-6699: more degenerate solids "
+        },
+        {
+            "id": "comment-14697487",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-14T18:17:17+0000",
+            "content": "Commit 1695951 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1695951 ]\n\nLUCENE-6699: more degenerate solids "
+        },
+        {
+            "id": "comment-14697488",
+            "author": "Michael McCandless",
+            "date": "2015-08-14T18:18:07+0000",
+            "content": "Thanks Karl Wright, I committed these to the branch... I'll work on fixing the test case to test the indexing and searching, not just the lower level direct unit tests for the BKD3DTree. "
+        },
+        {
+            "id": "comment-14698235",
+            "author": "Karl Wright",
+            "date": "2015-08-15T11:24:49+0000",
+            "content": "Add basic tests for degenerate shapes, as well as a fix for degenerate single point. Michael McCandless, hopefully you can remove all constraints now about generating identical min/max values in your random tests. "
+        },
+        {
+            "id": "comment-14698407",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-15T19:07:53+0000",
+            "content": "Commit 1696089 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696089 ]\n\nLUCENE-6699: add tests, fix bugs "
+        },
+        {
+            "id": "comment-14698409",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-15T19:11:19+0000",
+            "content": "Commit 1696090 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696090 ]\n\nLUCENE-6699: more degenerate solids "
+        },
+        {
+            "id": "comment-14698411",
+            "author": "Michael McCandless",
+            "date": "2015-08-15T19:13:58+0000",
+            "content": "Thanks Karl Wright, I committed your last patch to the branch.  I think I'll leave the \"global min/max\" opto out, but, handling degenerate solids is still necessary because an adversary could have a bunch of identical points as a subset of non-identical points, which can cause degenerate cells even if the global min/max are not degenerate.\n\nI also got testRandom working, it uncovered some fun bugs, but seems to be passing now!\n\nI think we're getting close... "
+        },
+        {
+            "id": "comment-14698506",
+            "author": "Karl Wright",
+            "date": "2015-08-16T01:01:35+0000",
+            "content": "I've been considering the question of how to get x,y,z bounds for the purposes of optimization.  It's a bit more complex than I originally thought; maybe I'll have an idea by tomorrow.  The complexity revolves around the fact that x,y,z bounds are always explicit, but lat/lon bounds have concepts like \"no longitude bound\" and \"no top latitude bound\". "
+        },
+        {
+            "id": "comment-14698551",
+            "author": "Karl Wright",
+            "date": "2015-08-16T06:36:45+0000",
+            "content": "I think I worked it out; I should have a usable patch sometime later this morning.\nWith that, I think the geo3d additions are complete, so yeah, we're getting closer.  "
+        },
+        {
+            "id": "comment-14698623",
+            "author": "Karl Wright",
+            "date": "2015-08-16T11:04:58+0000",
+            "content": "Hmm, ran into another snag.\nI think I had better think this through over the next day or so. "
+        },
+        {
+            "id": "comment-14699523",
+            "author": "Karl Wright",
+            "date": "2015-08-17T13:29:17+0000",
+            "content": "Revamp how we do bounds, so we can compute (x,y,z) bounds cheaply too.\n\nThis patch has a couple of known issues, and needs tests too, both of which I'll be addressing shortly. "
+        },
+        {
+            "id": "comment-14699543",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T13:42:35+0000",
+            "content": "Thanks Karl Wright, I'll commit shortly.\n\nI ran the same \"225 bboxes around London on the 61M OpenStreetMap\nlat/lon points\" perf tests with the current branch, plus the 3 other\nexisting options:\n\n\n\tGeo3D + BKD (PointInGeo3DShapeQuery, this issue/branch): index is\n    936 MB, took 423 + 96 (close, waiting for merges) sec to build.\n    7.01 sec to run 225 queries, total hits 221,118,860.\n\n\n\n\n\t2D BKD (BKDPointInBBoxQuery): index is 704 MB, took 163 + 97 sec\n    to build.  2.32 sec to run 225 queries, total hits 221,118,844.\n    It's OK (I think) that number of hits is a wee bit smaller than\n    geo3d because the geo3d bbox when projected to 2D space is a bit\n    bowed out (I think?) and can therefore include a few more\n    points.\n\n\n\n\n\tPostings + DV (GeoPointInBBoxQuery): index is 3.4 GB, took 349 +\n    11 sec to build.  3.60 sec to run 225 queries, total 221,120,393\n    hits (hmm: I'm not sure why this is not identical to 2D BKD?)\n\n\n\n\n\tPackedQuadPrefixTree (RecursivePrefixTreeStrategy), with maxLevels=25:\n    990 + 11 seconds to build, 7.7 GB, 3.82 seconds to run 225 queries, total\n    221,123,206 hits.\n\n\n\nAll these benchmarks are in luceneutil. "
+        },
+        {
+            "id": "comment-14699545",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-17T13:45:44+0000",
+            "content": "Commit 1696275 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696275 ]\n\nLUCENE-6699: first cut to support x,y,z bounds "
+        },
+        {
+            "id": "comment-14699546",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T13:47:00+0000",
+            "content": "Karl Wright I committed the patch but svn got a bit furious:\n\n\nmike@haswell:/l/3dbkd$ svn patch patch.x\nU         lucene/spatial/src/java/org/apache/lucene/spatial/spatial4j/Geo3dShape.java\nC         lucene/spatial/src/test/org/apache/lucene/spatial/spatial4j/Geo3dShapeRectRelationTestCase.java\n>         rejected hunk @@ -58,7 +58,8 @@\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/Bounds.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoBaseShape.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoCircle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoCompositeMembershipShape.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoConvexPolygon.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoDegenerateHorizontalLine.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoDegenerateLatitudeZone.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoDegenerateLongitudeSlice.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoDegeneratePoint.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoDegenerateVerticalLine.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoLatitudeZone.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoLongitudeSlice.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoNorthLatitudeZone.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoNorthRectangle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoPath.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoRectangle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoShape.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoSouthLatitudeZone.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoSouthRectangle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoWideDegenerateHorizontalLine.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoWideLongitudeSlice.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoWideNorthRectangle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoWideRectangle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoWideSouthRectangle.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/GeoWorld.java\nA         lucene/spatial3d/src/java/org/apache/lucene/geo3d/LatLonBounds.java\nU         lucene/spatial3d/src/java/org/apache/lucene/geo3d/Plane.java\nA         lucene/spatial3d/src/java/org/apache/lucene/geo3d/XYZBounds.java\n>         hunk @@ -138,7 +138,7 @@ already applied\n>         hunk @@ -145,6 +145,7 @@ already applied\n>         hunk @@ -154,6 +155,7 @@ already applied\n>         hunk @@ -160,12 +162,12 @@ already applied\n>         hunk @@ -81,7 +81,7 @@ already applied\n>         hunk @@ -88,6 +88,7 @@ already applied\n>         hunk @@ -96,18 +97,13 @@ already applied\nU         lucene/spatial3d/src/test/org/apache/lucene/geo3d/GeoBBoxTest.java\nU         lucene/spatial3d/src/test/org/apache/lucene/geo3d/GeoCircleTest.java\nU         lucene/spatial3d/src/test/org/apache/lucene/geo3d/GeoConvexPolygonTest.java\nU         lucene/spatial3d/src/test/org/apache/lucene/geo3d/GeoModelTest.java\nU         lucene/spatial3d/src/test/org/apache/lucene/geo3d/GeoPathTest.java\nU         lucene/spatial3d/src/test/org/apache/lucene/geo3d/GeoPolygonTest.java\n>         hunk @@ -27,16 +27,15 @@ already applied\n>         hunk @@ -67,5 +66,160 @@ already applied\nSummary of conflicts:\n  Text conflicts: 1\n\n\n\nI resolved the one conflict by hand, but can you svn up and confirm things look OK?  Tests did pass after applying the patch... "
+        },
+        {
+            "id": "comment-14699554",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-17T13:53:59+0000",
+            "content": "Commit 1696276 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696276 ]\n\nLUCENE-6699: round up when dividing by 2 to find size of BKD tree "
+        },
+        {
+            "id": "comment-14699561",
+            "author": "Karl Wright",
+            "date": "2015-08-17T14:01:30+0000",
+            "content": "It all looks OK.  I don't know why svn was unhappy. Maybe I should rebuild my workarea... "
+        },
+        {
+            "id": "comment-14699563",
+            "author": "Karl Wright",
+            "date": "2015-08-17T14:07:13+0000",
+            "content": "FWIW, Michael McCandless, I convinced myself that the one case I was worried about should, in fact, not be an issue.  So you should be able to start using XYZBounds to obtain bounds information for shapes.\n\nSpecifically, you want to do this:\n\n\nXYZBounds bounds = new XYZBounds();\nmyshape.getBounds(bounds);\ndouble minX = bounds.getMinimumX();\n...\n\n\n\nI will work on the tests shortly, but that's basically all there should be to it.  Please let me know if you find any weird behavior. "
+        },
+        {
+            "id": "comment-14699570",
+            "author": "Karl Wright",
+            "date": "2015-08-17T14:09:12+0000",
+            "content": "patch to remove unused code "
+        },
+        {
+            "id": "comment-14699610",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-17T14:48:35+0000",
+            "content": "Commit 1696299 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696299 ]\n\nLUCENE-6699: remove unused code "
+        },
+        {
+            "id": "comment-14699611",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T14:49:02+0000",
+            "content": "Thanks Karl Wright, I'll try using the bounds in the BKD tree ... and I committed your last patch! "
+        },
+        {
+            "id": "comment-14699644",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-17T15:07:44+0000",
+            "content": "Commit 1696305 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696305 ]\n\nLUCENE-6699: use bbox, but test fails "
+        },
+        {
+            "id": "comment-14699647",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T15:08:58+0000",
+            "content": "OK I fixed the query to use the new XYZBounds API, but I hit NPE:\n\n\n   [junit4] Suite: org.apache.lucene.bkdtree3d.TestGeo3DPointField\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testBasic -Dtests.seed=1600287909381DEB -Dtests.locale=el_CY -Dtests.timezone=America/Mexico_City -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n   [junit4] ERROR   0.22s J0 | TestGeo3DPointField.testBasic <<<\n   [junit4]    > Throwable #1: java.lang.NullPointerException\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([1600287909381DEB:BDFA356CD6E49BC5]:0)\n   [junit4]    > \tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.scorer(PointInGeo3DShapeQuery.java:102)\n   [junit4]    > \tat org.apache.lucene.search.Weight.bulkScorer(Weight.java:135)\n   [junit4]    > \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]    > \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:618)\n   [junit4]    > \tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:92)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:425)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:544)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.searchAfter(IndexSearcher.java:402)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:413)\n   [junit4]    > \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField.testBasic(TestGeo3DPointField.java:90)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n\n\n\nIs it expected that sometimes the bounds would be null?  If so, I could just swap in Integer.MIN/MAX_VALUE for that dimension... (seems like in this failure it's only the z dimension that's null). "
+        },
+        {
+            "id": "comment-14699711",
+            "author": "Karl Wright",
+            "date": "2015-08-17T15:44:49+0000",
+            "content": "They are not expected to be null.  I have a fix for the problem (happened to hit it myself just moments ago). "
+        },
+        {
+            "id": "comment-14699713",
+            "author": "Karl Wright",
+            "date": "2015-08-17T15:45:25+0000",
+            "content": "Some tests and some fixes "
+        },
+        {
+            "id": "comment-14699825",
+            "author": "Karl Wright",
+            "date": "2015-08-17T17:05:15+0000",
+            "content": "Michael McCandless: Here's an updated patch that has a fix for the problem I discovered. "
+        },
+        {
+            "id": "comment-14699898",
+            "author": "Karl Wright",
+            "date": "2015-08-17T17:37:37+0000",
+            "content": "And, yet another patch which cleans up stuff "
+        },
+        {
+            "id": "comment-14700163",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-17T20:24:21+0000",
+            "content": "Commit 1696334 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696334 ]\n\nLUCENE-6699: cleanups "
+        },
+        {
+            "id": "comment-14700164",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T20:24:39+0000",
+            "content": "Thanks Karl Wright, I committed your last patch, but I'm still seeing (different) test failures ... "
+        },
+        {
+            "id": "comment-14700168",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T20:26:54+0000",
+            "content": "Hmm, with the attached patch, which fixes the query to not use the new XYZBounds, the test passes ... so either something is wrong in the bbox computation, or something is wrong in how the BKD tree / the query optimization uses the bbox ... "
+        },
+        {
+            "id": "comment-14700211",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T20:56:43+0000",
+            "content": "Hmm, I added an assertion that the XYZBounds contains the shape, but the assertion fails...\n\nOr could this just be a boundary issue? "
+        },
+        {
+            "id": "comment-14700292",
+            "author": "Karl Wright",
+            "date": "2015-08-17T21:51:37+0000",
+            "content": "So what is the code?  Are you constructing an XYZSolid from the XYZBounds for the shape?\n\nThe shape should definitely be contained by an XYZ solid constructed from the XYZBounds for the shape.  Round off should not be a concern.  It's possible, though, that you might be misinterpreting the result from getRelationship().  Either that, or some specific shape has code problems I am unaware of and need to debug.  So code would help. \n "
+        },
+        {
+            "id": "comment-14700318",
+            "author": "Michael McCandless",
+            "date": "2015-08-17T22:15:23+0000",
+            "content": "Karl Wright Here's the patch that should trip the assert for you?  And it's entirely possible I messed up the order of the relation! "
+        },
+        {
+            "id": "comment-14700336",
+            "author": "Karl Wright",
+            "date": "2015-08-17T22:25:01+0000",
+            "content": "Thanks \u2013 I was able to reproduce at least a variant of this in one of my test cases.\n\nWhat is happening for me is that I'm getting back OVERLAPS instead of WITHIN.  This is tricky because it's happening due to edge intersection between the XYZSolid I created and the GeoRectangle I'm looking at.  But the edges really do intersect in this case \u2013 indeed, they are on top of each other \u2013 so I will need to think hard about how to structure the logic so that it is correct given that.\n\nIn the meantime, you can probably just treat OVERLAPS and WITHIN as being comparable. "
+        },
+        {
+            "id": "comment-14700354",
+            "author": "Karl Wright",
+            "date": "2015-08-17T22:35:32+0000",
+            "content": "I confirmed this basic picture with the following code:\n\n\n    xyzb = new XYZBounds();\n    c.getBounds(xyzb);\n\n    GeoArea area = GeoAreaFactory.makeGeoArea(PlanetModel.SPHERE,\n      xyzb.getMinimumX() - 2.0 * Vector.MINIMUM_RESOLUTION,\n      xyzb.getMaximumX() + 2.0 * Vector.MINIMUM_RESOLUTION,\n      xyzb.getMinimumY() - 2.0 * Vector.MINIMUM_RESOLUTION,\n      xyzb.getMaximumY() + 2.0 * Vector.MINIMUM_RESOLUTION,\n      xyzb.getMinimumZ() - 2.0 * Vector.MINIMUM_RESOLUTION,\n      xyzb.getMaximumZ() + 2.0 * Vector.MINIMUM_RESOLUTION);\n    assertEquals(GeoArea.WITHIN, area.getRelationship(c));\n\n\n\nThis always seems to pass for me.\nI believe that this problem is pervasive throughout geo3d, not just for xyz solids.  As such, it will be difficult to easily fix.  Let me think on it overnight to see if I can come up with something that makes everyone happy.\n "
+        },
+        {
+            "id": "comment-14700857",
+            "author": "Karl Wright",
+            "date": "2015-08-18T07:38:04+0000",
+            "content": "Michael McCandless: In order to reliably distinguish between the case of an edge just touching a shape and actually crossing into it, which is what I need here, I need to count the number of crossings per edge.  This is fundamentally easy to do, for a single edge.  However, there are quite a number of downstream complications, because shapes include a number of edges, not just one, and we have to put it all together.  For example, if one shape happens to go through an endpoint where two edges intersect, it should really count as one intersection, not two.  Making matters more complicated, composite shapes may consist of simple shapes that overlap and thus the algorithm will be even more fraught and need correspondingly more thought.\n\nThe upshot of this is that the infrastructure I currently have in place needs a substantial upgrade in order to be able to reliably distinguish WITHIN from OVERLAP in the corner case where the shape just abuts the solid.  This will take me a couple of days, most likely.  Unfortunately, there's also a corner case with composite shapes where OVERLAP may be returned instead of CONTAINS, so this clearly has to be fixed for BKD to work correctly for all shapes.  So I apologize for the delay.\n\nStay tuned.\n "
+        },
+        {
+            "id": "comment-14701038",
+            "author": "Karl Wright",
+            "date": "2015-08-18T10:15:12+0000",
+            "content": "Michael McCandless: I take part of this back.\n\nThe Bkd query code looks in part like this:\n\n\n                                             case GeoArea.OVERLAPS:\n                                               // They do overlap but neither contains the other:\n                                               //System.out.println(\"    crosses1\");\n                                               return BKD3DTreeReader.Relation.CROSSES;\n                                             case GeoArea.WITHIN:\n                                               // Cell fully contains the shape:\n                                               //System.out.println(\"    crosses2\");\n                                               return BKD3DTreeReader.Relation.CROSSES;\n\n\n\nSo, you are already treating WITHIN and OVERLAPS the same.\nAs for the case where, instead of CONTAINS, an OVERLAPS result may occur, I believe that will simply mean that the algorithm needs to work harder than it strictly should, in that case.  Please tell me if I am wrong!  (FWIW, there aren't any current examples of this behavior that I know of, other than to use GeoCompositeShape to glue together other shapes.)\n\nSo I guess what I'm saying is that we should be able to get bkd working without changing geo3d's code further, unless there are other bugs.\n\nFWIW, this is why the problem hasn't been noted until now; the spatial4j definitions are loose enough to allow the current degree of behavior.  Given the difficulty of changing that behavior, I may simply change the comments, if we can get bkd working. "
+        },
+        {
+            "id": "comment-14701092",
+            "author": "Karl Wright",
+            "date": "2015-08-18T11:13:45+0000",
+            "content": "Here's the proposed comment change to GeoArea:\n\n\n  /**\n   * Find the spatial relationship between a shape and the current geo area.\n   * Note: return value is how the GeoShape relates to the GeoArea, not the\n   * other way around. For example, if this GeoArea is entirely within the\n   * shape, then CONTAINS should be returned.  If the shape is entirely enclosed\n   * by this GeoArea, then WITHIN should be returned.\n   *\n   * It is permissible to return OVERLAPS instead of WITHIN if the shape\n   * intersects with the area at even a single point.  So, a circle inscribed in\n   * a rectangle could return either OVERLAPS or WITHIN, depending on\n   * implementation.  It is not permissible to return CONTAINS or DISJOINT\n   * in this circumstance, however.\n   *\n   * Similarly, it is permissible to return OVERLAPS instead of CONTAINS\n   * under conditions where the shape consists of multiple independent overlapping\n   * subshapes, and the area overlaps one of the subshapes.  It is not permissible\n   * to return WITHIN or DISJOINT in this circumstance, however.\n   *\n   * @param shape is the shape to consider.\n   * @return the relationship, from the perspective of the shape.\n   */\n  public int getRelationship(GeoShape shape);\n\n "
+        },
+        {
+            "id": "comment-14701269",
+            "author": "Karl Wright",
+            "date": "2015-08-18T13:47:57+0000",
+            "content": "Same as last patch, except the description for GeoArea has been updated.\nMichael McCandless "
+        },
+        {
+            "id": "comment-14701277",
+            "author": "Michael McCandless",
+            "date": "2015-08-18T13:51:00+0000",
+            "content": "OK +1 to just improve the docs, I'll commit that.\n\nWhich means my added assert is invalid.\n\nWhich means the bug lies elsewhere: somehow, when using the XYZ bounding box, the test fails. "
+        },
+        {
+            "id": "comment-14701299",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-18T14:06:18+0000",
+            "content": "Commit 1696419 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696419 ]\n\nLUCENE-6699: improve GeoArea.getRelationship javadocs "
+        },
+        {
+            "id": "comment-14701651",
+            "author": "Karl Wright",
+            "date": "2015-08-18T17:31:52+0000",
+            "content": "Patch which fixes Mike's tests; it seems like the query implementation is unhappy when the bounds does not start outside the area that needs to be searched. "
+        },
+        {
+            "id": "comment-14702068",
+            "author": "Michael McCandless",
+            "date": "2015-08-18T22:08:06+0000",
+            "content": "Hmm why do we need this fudge factor   Does +1 not work? "
+        },
+        {
+            "id": "comment-14702096",
+            "author": "Karl Wright",
+            "date": "2015-08-18T22:24:09+0000",
+            "content": "+/- 1 would work, but would remove all benefit, and then some.\n\nBear in mind that I still don't know why your code needs this, but within Geo3d, everything +/-Vector.MINIMUM_RESOLUTION (which is 1e-12 at the moment) is considered the same. "
+        },
+        {
+            "id": "comment-14702100",
+            "author": "Michael McCandless",
+            "date": "2015-08-18T22:27:52+0000",
+            "content": "Hmm I'm still seeing test failures w/ the patch, e.g.:\n\n\nago 18, 2015 11:28:37 PM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\nADVERTENCIA: Uncaught exception in thread: Thread[T0,5,TGRP-TestGeo3DPointField]\njava.lang.AssertionError: T0: iter=71 id=5758 docID=1056 lat=-0.7503052868590764 lon=0.03113194606309409 expected true but got: false deleted?=false\n  point1=[X=0.731126293194162, Y=0.022768740606807995, Z=-0.6818621032520755], iswithin=true\n  point2=[X=0.731126292820613, Y=0.0227687404615659, Z=-0.6818621031259476], iswithin=true\n  query=PointInGeo3DShapeQuery: field=point:PlanetModel: PlanetModel.SPHERE Shape: GeoCircle: {planetmodel=PlanetModel.SPHERE, center=[X=0.22316407597143118, Y=0.8640521337091807, Z=-0.45123353757054624], radius=1.0586809798482488(60.65795199607921)}\n\tat __randomizedtesting.SeedInfo.seed([BE582B0DCB72C9AE]:0)\n\tat org.junit.Assert.fail(Assert.java:93)\n\tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:617)\n\tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:514)\n\nEEEENOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testRandomMedium -Dtests.seed=BE582B0DCB72C9AE -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt.fixed -Dtests.locale=es_VE -Dtests.timezone=Africa/Algiers -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n.I....ENOTE: test params are: codec=FastDecompressionCompressingStoredFields(storedFieldsFormat=CompressingStoredFieldsFormat(compressionMode=FAST_DECOMPRESSION, chunkSize=13655, maxDocsPerChunk=627, blockSize=8), termVectorsFormat=CompressingTermVectorsFormat(compressionMode=FAST_DECOMPRESSION, chunkSize=13655, blockSize=8)), sim=DefaultSimilarity, locale=es_VE, timezone=Africa/Algiers\nNOTE: Linux 3.13.0-46-generic amd64/Oracle Corporation 1.8.0_40 (64-bit)/cpus=8,threads=1,free=428823904,total=514850816\nNOTE: All tests run in this JVM: [TestGeo3DPointField]\nNOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.seed=BE582B0DCB72C9AE -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt.fixed -Dtests.locale=es_VE -Dtests.timezone=Africa/Algiers -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n\n "
+        },
+        {
+            "id": "comment-14702107",
+            "author": "Karl Wright",
+            "date": "2015-08-18T22:30:48+0000",
+            "content": "I was able to repro this with that seed as well.  Looking deeper. "
+        },
+        {
+            "id": "comment-14702132",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-18T22:49:08+0000",
+            "content": "Commit 1696511 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696511 ]\n\nLUCENE-6699: rename relations "
+        },
+        {
+            "id": "comment-14702136",
+            "author": "Michael McCandless",
+            "date": "2015-08-18T22:50:39+0000",
+            "content": "Karl Wright I committed a renaming of the relations: I was driving myself insane trying to reason about them.\n\nI also added a new relation, for when the cell fully contains the shape, and a new assertion which now trips.\n\nI didn't commit the fudge factors yet ... if you find they are needed I can ... but I'm still not sure where the bug is  "
+        },
+        {
+            "id": "comment-14702163",
+            "author": "Karl Wright",
+            "date": "2015-08-18T23:23:16+0000",
+            "content": "Michael McCandless: This has GOT to be wrong:\n\n\n    if (cellXMin >= state.xMin ||\n        cellXMax <= state.xMax ||\n        cellYMin >= state.yMin ||\n        cellYMin >= state.yMin ||\n        cellZMin <= state.zMin ||\n        cellZMax <= state.zMax) {\n\n\n\n... if for no other reason than you have two identical clauses... "
+        },
+        {
+            "id": "comment-14702172",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-18T23:36:29+0000",
+            "content": "Commit 1696512 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696512 ]\n\nLUCENE-6699: fix wrong cell/bbox check "
+        },
+        {
+            "id": "comment-14702174",
+            "author": "Michael McCandless",
+            "date": "2015-08-18T23:36:57+0000",
+            "content": "You're right!  Two silly bugs in that multi-line if statement   I committed a fix ... but test is still angry. "
+        },
+        {
+            "id": "comment-14702677",
+            "author": "Karl Wright",
+            "date": "2015-08-19T08:05:14+0000",
+            "content": "The failing test doesn't even seem to be exercising geo3d?  At least, it never creates a query.  It seems to just be looking for proper bkd decomposition? "
+        },
+        {
+            "id": "comment-14703056",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T13:59:50+0000",
+            "content": "I'm seeing failures in both testBKDRandom (proper BKD decomposition), from the new assert I added, and in testRandomMedium, where hits were expected but not found ... I'll dig on the first one, seems maybe easier  "
+        },
+        {
+            "id": "comment-14703064",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-19T14:06:37+0000",
+            "content": "Commit 1696591 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696591 ]\n\nLUCENE-6699: also detect when SHAPE_INSIDE_CELL in test case "
+        },
+        {
+            "id": "comment-14703077",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T14:15:24+0000",
+            "content": "OK I committed a fix for the testBKDRandom ... just a test bug: it failed to detect the SHAPE_INSIDE_CELL case.\n\nJust need to understand the assert trips for testRandomXXX ... "
+        },
+        {
+            "id": "comment-14703091",
+            "author": "Karl Wright",
+            "date": "2015-08-19T14:26:33+0000",
+            "content": "Ok, I'm swamped at the moment, so anything you can do to describe the sequence of interactions with Geo3D that demonstrate a problem or inconsistency would be very useful.  I will have time Thursday evening and Friday morning to look at those in detail I think.  "
+        },
+        {
+            "id": "comment-14703096",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T14:29:09+0000",
+            "content": "OK I'll see if I can contain the failure somehow ...\n\nOr: we could maybe disable this buggy opto for now, and wrap up / land this branch?  I.e. open a follow-on issue for the opto.\n\nThe tests seem to pass w/o the opto.\n\nThe opto should be a sizable win for smallish query shapes, because it means BKD tree can recurse with very fast bbox overlap checking (a few if statements, no new objects) instead of building a GeoArea for each BKD cell (3d rect) and then relating that to the shape, as it recurses. "
+        },
+        {
+            "id": "comment-14703130",
+            "author": "Karl Wright",
+            "date": "2015-08-19T14:53:08+0000",
+            "content": "Hi Michael McCandless,\n\nI'm not comfortable with landing the branch until we at least understand the problem.  If the tests always pass without the optimization, then the problem must be that the bounds are simply incorrect for some particular shape.  It should be trivial to determine which shape leads to a bad bounds, and I can chase it from there.  Can we confirm that picture?\n\n "
+        },
+        {
+            "id": "comment-14703427",
+            "author": "Karl Wright",
+            "date": "2015-08-19T17:37:13+0000",
+            "content": "Ok, I was able to isolate one case of failure and incorporate it into a simple test:\n\n\n    // Test case from BKD\n    c = new GeoCircle(PlanetModel.SPHERE, -0.765816119338, 0.991848766844, 0.8153163226330487);\n    GeoPoint p1 = new GeoPoint(0.7692262265236023, -0.055089298115534646, -0.6365973465711254);\n    assertTrue(c.isWithin(p1));\n    xyzb = new XYZBounds();\n    c.getBounds(xyzb);\n    assertTrue(p1.x >= xyzb.getMinimumX() && p1.x <= xyzb.getMaximumX());\n    assertTrue(p1.y >= xyzb.getMinimumY() && p1.y <= xyzb.getMaximumY());\n    assertTrue(p1.z >= xyzb.getMinimumZ() && p1.z <= xyzb.getMaximumZ());\n\n\n\n\nNow I can look at it.  "
+        },
+        {
+            "id": "comment-14703458",
+            "author": "Karl Wright",
+            "date": "2015-08-19T17:53:46+0000",
+            "content": "Michael McCandless: Found it.  Patch attached. "
+        },
+        {
+            "id": "comment-14703503",
+            "author": "Karl Wright",
+            "date": "2015-08-19T18:15:47+0000",
+            "content": "Investigating another failure:\n\n\n   [junit4] Suite: org.apache.lucene.bkdtree3d.TestGeo3DPointField\n   [junit4]   2> VIII 19, 2015 11:13:35 PM com.carrotsearch.randomizedtesting.Ra\nndomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n   [junit4]   2> WARNING: Uncaught exception in thread: Thread[T3,5,TGRP-TestGeo\n3DPointField]\n   [junit4]   2> java.lang.AssertionError\n   [junit4]   2>        at __randomizedtesting.SeedInfo.seed([D03EF31A709F9117]:\n0)\n   [junit4]   2>        at org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.\nscorer(PointInGeo3DShapeQuery.java:105)\n   [junit4]   2>        at org.apache.lucene.search.LRUQueryCache$CachingWrapper\nWeight.scorer(LRUQueryCache.java:581)\n   [junit4]   2>        at org.apache.lucene.search.Weight.bulkScorer(Weight.jav\na:135)\n   [junit4]   2>        at org.apache.lucene.search.AssertingWeight.bulkScorer(A\nssertingWeight.java:69)\n   [junit4]   2>        at org.apache.lucene.search.AssertingWeight.bulkScorer(A\nssertingWeight.java:69)\n   [junit4]   2>        at org.apache.lucene.search.IndexSearcher.search(IndexSe\narcher.java:618)\n   [junit4]   2>        at org.apache.lucene.search.AssertingIndexSearcher.searc\nh(AssertingIndexSearcher.java:92)\n   [junit4]   2>        at org.apache.lucene.search.IndexSearcher.search(IndexSe\narcher.java:425)\n   [junit4]   2>        at org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._ru\nn(TestGeo3DPointField.java:586)\n   [junit4]   2>        at org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run\n(TestGeo3DPointField.java:520)\n   [junit4]   2>\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField\n-Dtests.method=testRandomTiny -Dtests.seed=D03EF31A709F9117 -Dtests.slow=true -D\ntests.locale=bg -Dtests.timezone=Indian/Kerguelen -Dtests.asserts=true -Dtests.f\nile.encoding=Cp1252\n   [junit4] ERROR   0.62s J0 | TestGeo3DPointField.testRandomTiny <<<\n   [junit4]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExcept\nionError: Captured an uncaught exception in thread: Thread[id=17, name=T3, state\n=RUNNABLE, group=TGRP-TestGeo3DPointField]\n   [junit4]    >        at __randomizedtesting.SeedInfo.seed([D03EF31A709F9117:9\n9792D5C2EBEA9BB]:0)\n   [junit4]    > Caused by: java.lang.AssertionError\n   [junit4]    >        at __randomizedtesting.SeedInfo.seed([D03EF31A709F9117]:\n0)\n   [junit4]    >        at org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.\nscorer(PointInGeo3DShapeQuery.java:105)\n   [junit4]    >        at org.apache.lucene.search.LRUQueryCache$CachingWrapper\nWeight.scorer(LRUQueryCache.java:581)\n   [junit4]    >        at org.apache.lucene.search.Weight.bulkScorer(Weight.jav\na:135)\n   [junit4]    >        at org.apache.lucene.search.AssertingWeight.bulkScorer(A\nssertingWeight.java:69)\n   [junit4]    >        at org.apache.lucene.search.AssertingWeight.bulkScorer(A\nssertingWeight.java:69)\n   [junit4]    >        at org.apache.lucene.search.IndexSearcher.search(IndexSe\narcher.java:618)\n   [junit4]    >        at org.apache.lucene.search.AssertingIndexSearcher.searc\nh(AssertingIndexSearcher.java:92)\n   [junit4]    >        at org.apache.lucene.search.IndexSearcher.search(IndexSe\narcher.java:425)\n   [junit4]    >        at org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._ru\nn(TestGeo3DPointField.java:586)\n   [junit4]    >        at org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run\n(TestGeo3DPointField.java:520)\n   [junit4] IGNOR/A 0.02s J0 | TestGeo3DPointField.testRandomBig\n   [junit4]    > Assumption #1: 'nightly' test group is disabled (@Nightly())\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene53): {}, docValues\n:{}, sim=DefaultSimilarity, locale=bg, timezone=Indian/Kerguelen\n   [junit4]   2> NOTE: Windows 7 6.1 amd64/Oracle Corporation 1.8.0_05 (64-bit)/\ncpus=4,threads=1,free=171382464,total=245366784\n   [junit4]   2> NOTE: All tests run in this JVM: [TestGeo3DPointField]\n\n\n\nStay tuned... "
+        },
+        {
+            "id": "comment-14703521",
+            "author": "Karl Wright",
+            "date": "2015-08-19T18:31:21+0000",
+            "content": "Michael McCandless: This second failure looks like it may be due to rounding error.  The shape is a really tiny geocircle (radius 1.6e-5 radians).  I'll confirm this picture, but I have to ask: what's the minimum resolution that BKD expects to descend to?  because this is pretty small...\n "
+        },
+        {
+            "id": "comment-14703543",
+            "author": "Karl Wright",
+            "date": "2015-08-19T18:42:13+0000",
+            "content": "Hmm, I couldn't reproduce this with a simple test.\nHere's the failure detail:\n\n   [junit4]   2> java.lang.AssertionError:\n   Solid=XYZSolid: {planetmodel=PlanetModel.SPHERE, isWholeWorld=false, minXplane=[A=1.0, B=0.0, C=0.0, D=-0.9999778774751769, side=1.0], maxXplane=[A=1.0, B=0.0, C=0.0, D=-0.9999780900134368, side=-1.0], minYplane=[A=0.0, B=1.0, C=0.0, D=0.002943435994670142, side=1.0], maxYplane=[A=0.0, B=1.0, C=0.0, D=0.0029114063562165494, side=-1.0], minZplane=[A=0.0, B=0.0, C=1.0, D=0.005971010432932473, side=1.0], maxZplane=[A=0.0, B=0.0, C=1.0, D=0.005938981247250581, side=-1.0]};\n   Shape=GeoCircle: {planetmodel=PlanetModel.SPHERE, center=[X=0.9999779838725235, Y=-0.0029274211758186968, Z=-0.0059549958440800015], radius=1.601488279374338E-5(9.175851934781766E-4)}\n\n\n\nHere's the test code I created that passes:\n\n\n    c = new GeoCircle(PlanetModel.SPHERE, -0.00595503104063, -0.00292747726474, 1.601488279374338E-5);\n    xyzb = new XYZBounds();\n    c.getBounds(xyzb);\n    GeoArea area = GeoAreaFactory.makeGeoArea(PlanetModel.SPHERE,\n      xyzb.getMinimumX(), xyzb.getMaximumX(), xyzb.getMinimumY(), xyzb.getMaximumY(), xyzb.getMinimumZ(), xyzb.getMaximumZ());\n    \n    int relationship = area.getRelationship(c);\n    assertTrue(relationship == GeoArea.WITHIN || relationship == GeoArea.OVERLAPS);\n\n\n\nHere's the math I did to get there:\n\n\n>>> Z=-0.0059549958440800015\n>>> Y=-0.0029274211758186968\n>>> X=0.9999779838725235\n>>> print math.asin(Z)\n-0.00595503104063\n>>> print math.atan2(Y,X)\n-0.00292747726474\n>>>\n\n\n "
+        },
+        {
+            "id": "comment-14703637",
+            "author": "Karl Wright",
+            "date": "2015-08-19T19:48:25+0000",
+            "content": "Michael McCandless After some debugging, I increased the value of MINIMUM_RESOLUTION to 5e-12.  This made all tests pass.\n\nIt appears that BKD really drills into potential precision issues in geo3d. "
+        },
+        {
+            "id": "comment-14703646",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T19:56:01+0000",
+            "content": "what's the minimum resolution that BKD expects to descend to?\n\nBKD itself has no resolution limits: it descends to a region that has < N points, at which point it does a linear scan of those points checking if they match the shape.\n\nBut, the encoding we use is limited precision, using 32 bits for each of x, y, z (96 bits total), with range -1.002 to 1.002.  This means a point that goes in, using 3 doubles, will be quantized (pixelated).  However, the test takes this into account: when it's computing the expected value, it does the same pixelation that the doc values encoding did.\n\nSo, even miniscule circles should still work correctly? "
+        },
+        {
+            "id": "comment-14703648",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-19T19:56:38+0000",
+            "content": "Commit 1696657 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696657 ]\n\nLUCENE-6699: fix one bug, add fudge factors, add nocommits "
+        },
+        {
+            "id": "comment-14703652",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T19:57:59+0000",
+            "content": "Karl Wright, woops, I committed the patch before your most recent one... "
+        },
+        {
+            "id": "comment-14703658",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-19T20:02:04+0000",
+            "content": "Commit 1696659 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696659 ]\n\nLUCENE-6699: increase MINIMUM_RESOLUTION "
+        },
+        {
+            "id": "comment-14703659",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T20:02:43+0000",
+            "content": "Karl Wright OK I tried to apply your last patch, skipping dup parts from the previous already committed patch, and committed it.  Can you svn up and make sure it's right?  Thanks. "
+        },
+        {
+            "id": "comment-14703670",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-19T20:12:08+0000",
+            "content": "Commit 1696661 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696661 ]\n\nLUCENE-6699: another nocommit, show details on assert trip "
+        },
+        {
+            "id": "comment-14703672",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T20:12:43+0000",
+            "content": "I'm not a fan of the +/- 2.0 fudge factors \n\nBecause: without the opto, the shape relation checks of smaller and smaller XYZ solids as the BKD tree recurses, were working correctly? "
+        },
+        {
+            "id": "comment-14703675",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T20:14:29+0000",
+            "content": "Hmm, I'm seeing this test failure:\n\n\n[junit4:pickseed] Seed property 'tests.seed' already defined: 27BE02D86F469AAF\n   [junit4] <JUnit4> says \u05e9\u05dc\u05d5\u05dd! Master seed: 27BE02D86F469AAF\n   [junit4] Executing 1 suite with 1 JVM.\n   [junit4] \n   [junit4] Started J0 PID(14081@localhost).\n   [junit4] Suite: org.apache.lucene.bkdtree3d.TestGeo3DPointField\n   [junit4]   2> ?? 19, 2015 5:13:35 ?? com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n   [junit4]   2> WARNING: Uncaught exception in thread: Thread[T1,5,TGRP-TestGeo3DPointField]\n   [junit4]   2> java.lang.AssertionError: got 0\n   [junit4]   2> \tat __randomizedtesting.SeedInfo.seed([27BE02D86F469AAF]:0)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.scorer(PointInGeo3DShapeQuery.java:105)\n   [junit4]   2> \tat org.apache.lucene.search.LRUQueryCache$CachingWrapperWeight.scorer(LRUQueryCache.java:589)\n   [junit4]   2> \tat org.apache.lucene.search.Weight.bulkScorer(Weight.java:135)\n   [junit4]   2> \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]   2> \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]   2> \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:618)\n   [junit4]   2> \tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:92)\n   [junit4]   2> \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:425)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:586)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:520)\n   [junit4]   2> \n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testRandomMedium -Dtests.seed=27BE02D86F469AAF -Dtests.locale=zh -Dtests.timezone=Atlantic/Stanley -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n\n\n\nIt's the assert that the XZYBounds relationship to the shape is either WITHIN or OVERLAPS, but in this case it's returning CONTAINS (shape CONTAINS the bbox).\n\nMaybe the assert is too demanding? "
+        },
+        {
+            "id": "comment-14703694",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-19T20:27:56+0000",
+            "content": "Commit 1696665 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696665 ]\n\nLUCENE-6699: comment out assert (nocommit) remove fudge factors "
+        },
+        {
+            "id": "comment-14703695",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T20:28:26+0000",
+            "content": "OK I commented out the problematic assert and put a nocommit.\n\nI also tested w/o the fudge factors and the test seems to be happy... "
+        },
+        {
+            "id": "comment-14703717",
+            "author": "Karl Wright",
+            "date": "2015-08-19T20:49:20+0000",
+            "content": "Merge looks fine.\n\nThe reason for the \"fudge factor\" in the test was simply to confirm that you would get a WITHIN rather than an OVERLAPS if you expand the bounding box by an amount sufficient to insure there are no overlaps between the shape and the box.  Otherwise according to the (revised) definition of getRelationship(), you could technically get either one. "
+        },
+        {
+            "id": "comment-14703736",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T21:01:45+0000",
+            "content": "OK I will put the fudge factor back and put that explanation on top! "
+        },
+        {
+            "id": "comment-14703740",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-19T21:04:01+0000",
+            "content": "Commit 1696669 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696669 ]\n\nLUCENE-6699: put fudge factor back "
+        },
+        {
+            "id": "comment-14703744",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T21:05:34+0000",
+            "content": "Another failure:\n\n\n   [junit4] Suite: org.apache.lucene.bkdtree3d.TestGeo3DPointField\n   [junit4]   2> \u0441\u0435\u0440\u043f. 20, 2015 1:05:40 AM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n   [junit4]   2> WARNING: Uncaught exception in thread: Thread[T2,5,TGRP-TestGeo3DPointField]\n   [junit4]   2> java.lang.AssertionError: T2: iter=164 id=15842 docID=16827 lat=0.006224927111830945 lon=0.005597367237251763 expected true but got: false deleted?=false\n   [junit4]   2>   point1=[lat=0.006224927111830945, lon=0.005597367237251763], iswithin=true\n   [junit4]   2>   point2=[X=1.0010836083810235, Y=0.005603490759433942, Z=0.006231850560862502], iswithin=true\n   [junit4]   2>   query=PointInGeo3DShapeQuery: field=point:PlanetModel: PlanetModel.WGS84 Shape: GeoCircle: {planetmodel=PlanetModel.WGS84, center=[lat=0.006229478708446979, lon=0.005570196723795424], radius=3.840276763694387E-5(0.0022003165072184694)}\n   [junit4]   2> \tat __randomizedtesting.SeedInfo.seed([7F0E3F7C95B65717]:0)\n   [junit4]   2> \tat org.junit.Assert.fail(Assert.java:93)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:624)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:520)\n   [junit4]   2> \n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testRandomMedium -Dtests.seed=7F0E3F7C95B65717 -Dtests.multiplier=4 -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt.fixed -Dtests.locale=uk -Dtests.timezone=Asia/Dubai -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   6.18s | TestGeo3DPointField.testRandomMedium <<<\n\n\n\nThis may be the \"tiny circle\" case? "
+        },
+        {
+            "id": "comment-14703773",
+            "author": "Karl Wright",
+            "date": "2015-08-19T21:29:40+0000",
+            "content": "No, it's not that.  It may indicate we need an even higher MINIMUM_RESOLUTION value.  I'm looking at it now. "
+        },
+        {
+            "id": "comment-14703808",
+            "author": "Karl Wright",
+            "date": "2015-08-19T21:56:34+0000",
+            "content": "Michael McCandless: This is actually a test problem, although I think you should be the one to fix it.\n\nThe test indexes points using PlanetModel.SPHERE, but then searches for them using PlanetModel.WGS84.  That doesn't work.  You can see the results here:\n\n\n    area = GeoAreaFactory.makeGeoArea(PlanetModel.WGS84,\n      xyzb.getMinimumX(), xyzb.getMaximumX(), xyzb.getMinimumY(), xyzb.getMaximumY(), xyzb.getMinimumZ(), xyzb.getMaximumZ());\n    GeoPoint p2 = new GeoPoint(1.0010836083810235, 0.005603490759433942, 0.006231850560862502);\n    assertTrue(PlanetModel.WGS84.pointOnSurface(p2)); // Fails, because the GeoPoint is not actually on the WGS84 planet surface\n\n\n "
+        },
+        {
+            "id": "comment-14703827",
+            "author": "Michael McCandless",
+            "date": "2015-08-19T22:10:18+0000",
+            "content": "Wait, the test up front (top of verify method) randomly picks a planet model and consistently uses that one for indexing and searching? "
+        },
+        {
+            "id": "comment-14703847",
+            "author": "Karl Wright",
+            "date": "2015-08-19T22:24:58+0000",
+            "content": "So, there are two problems.  One I just fixed, which was that pointOnSurface() was being too strict about accuracy.  But:\n\n\n    p1 = new GeoPoint(PlanetModel.WGS84, 0.006224927111830945, 0.005597367237251763);\n    p2 = new GeoPoint(1.0010836083810235, 0.005603490759433942, 0.006231850560862502);\n    assertTrue(PlanetModel.WGS84.pointOnSurface(p1));\n    assertTrue(PlanetModel.WGS84.pointOnSurface(p2)); // this fails\n\n\n\n... so the packing accuracy is not high enough to guarantee that an XYZSolid constructed from bounds on your shape when applied to an unpacked point will be guaranteed to contain it.  That's problem 1, and it argues for adding some fudge factor to the bounds to account for the lack of full accuracy in the points.  More about that later.\n\nProblem 2 is that even p1 above is not within the XYZSolid object computed from the bounds; in fact it's pretty far out (1e-7 or more).  I have to drill further into why that is; it's likely related to the WGS84 model, but I don't know how yet.  Once again, stay tuned. "
+        },
+        {
+            "id": "comment-14703903",
+            "author": "Karl Wright",
+            "date": "2015-08-19T23:05:57+0000",
+            "content": "Ok, I know what is going on, and it is indeed related to the WGS84 model.  But I have to think this through carefully.  The strategy used to compute the X and Y bounds in XYZBound is subtlely flawed.  Working on this now. "
+        },
+        {
+            "id": "comment-14703979",
+            "author": "Karl Wright",
+            "date": "2015-08-19T23:43:12+0000",
+            "content": "In hopes of clarifying my own thinking, I'm going to lay down what the problem is.\n\nFor the Z bound, pretend that you are looking from the north (or south) pole onto the earth.  There's a plane whose intersection with the earth you are trying to compute the Z bounds for.  From the pole, the earth, no matter how oblate, is a circle in cross-section.  The plane intersects part of that circle.  And here's the important point: if you construct another plane that is perpendicular to the original plane, which also includes the Z axis, that plane must pass directly through the points that have the greatest Z extent for the intersection of the original plane and the earth.  Got that? \n\nAnyway, for the X and Y bounds, I basically just copied that code and instead pretended I was looking up the X axis and up the Y axis, instead of the Z axis.  But if you have an oblate earth, then the cross section from either the X or the Y axis is not a circle, but rather an ellipse.  So a plane that is perpendicular to the original plane passing through (say) the X axis will NOT go through the points that have the greatest X extent for the intersection of the original plane and the earth.  The plane we want to use instead is parallel to that one, but offset by some amount, which I don't yet know how to compute.  And that, in a nutshell, is the problem. "
+        },
+        {
+            "id": "comment-14703980",
+            "author": "Karl Wright",
+            "date": "2015-08-19T23:43:13+0000",
+            "content": "In hopes of clarifying my own thinking, I'm going to lay down what the problem is.\n\nFor the Z bound, pretend that you are looking from the north (or south) pole onto the earth.  There's a plane whose intersection with the earth you are trying to compute the Z bounds for.  From the pole, the earth, no matter how oblate, is a circle in cross-section.  The plane intersects part of that circle.  And here's the important point: if you construct another plane that is perpendicular to the original plane, which also includes the Z axis, that plane must pass directly through the points that have the greatest Z extent for the intersection of the original plane and the earth.  Got that? \n\nAnyway, for the X and Y bounds, I basically just copied that code and instead pretended I was looking up the X axis and up the Y axis, instead of the Z axis.  But if you have an oblate earth, then the cross section from either the X or the Y axis is not a circle, but rather an ellipse.  So a plane that is perpendicular to the original plane passing through (say) the X axis will NOT go through the points that have the greatest X extent for the intersection of the original plane and the earth.  The plane we want to use instead is parallel to that one, but offset by some amount, which I don't yet know how to compute.  And that, in a nutshell, is the problem. "
+        },
+        {
+            "id": "comment-14704015",
+            "author": "Karl Wright",
+            "date": "2015-08-20T00:01:12+0000",
+            "content": "I know how to do it, PROVIDED that it is true that for any plane and any ellipsoid, the intersection of the plane and the ellipsoid is a simple ellipse.  I don't yet know whether this is true, however.\n\nHA.  Yes, it is true: http://www.scirp.org/journal/PaperInformation.aspx?PaperID=24506 "
+        },
+        {
+            "id": "comment-14704084",
+            "author": "Karl Wright",
+            "date": "2015-08-20T01:06:23+0000",
+            "content": "Patch to address WGS84 bounds issue. "
+        },
+        {
+            "id": "comment-14705017",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-20T14:38:13+0000",
+            "content": "Commit 1696797 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696797 ]\n\nLUCENE-6699: fix math for WGS84 PlanetModel "
+        },
+        {
+            "id": "comment-14705838",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-20T21:56:29+0000",
+            "content": "Commit 1696864 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696864 ]\n\nLUCENE-6699: address nocommits "
+        },
+        {
+            "id": "comment-14705843",
+            "author": "Michael McCandless",
+            "date": "2015-08-20T21:59:03+0000",
+            "content": "I removed the remaining nocommits, but after some beasting I hit this failure:\n\n\n   [junit4] Suite: org.apache.lucene.bkdtree3d.TestGeo3DPointField\n   [junit4]   2> Rgp 21, 2015 3:28:32 AM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n   [junit4]   2> WARNING: Uncaught exception in thread: Thread[T0,5,TGRP-TestGeo3DPointField]\n   [junit4]   2> java.lang.AssertionError: expected WITHIN (1) or OVERLAPS (2) but got 0\n   [junit4]   2> \tat __randomizedtesting.SeedInfo.seed([6700D50161C38330]:0)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.scorer(PointInGeo3DShapeQuery.java:105)\n   [junit4]   2> \tat org.apache.lucene.search.LRUQueryCache$CachingWrapperWeight.scorer(LRUQueryCache.java:589)\n   [junit4]   2> \tat org.apache.lucene.search.Weight.bulkScorer(Weight.java:135)\n   [junit4]   2> \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]   2> \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]   2> \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:618)\n   [junit4]   2> \tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:92)\n   [junit4]   2> \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:425)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:586)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:520)\n   [junit4]   2> \n\n\n\nThis is an assert that just re-enabled ... it's a little spooky because it's asserting that the bbox opto is in fact valid, checking that the query shape is either WITHIN or OVERLAPS the bbox cell (which in turn is fully within the fudge-factor'd x,y,z bbox). "
+        },
+        {
+            "id": "comment-14705915",
+            "author": "Karl Wright",
+            "date": "2015-08-20T22:47:31+0000",
+            "content": "Do you happen to have the how-to-reproduce line?  This produces no failure: \"ant -Dtests.seed=6700D50161C38330 -Dtestcase=TestGeo3dPointField test\"\n "
+        },
+        {
+            "id": "comment-14705919",
+            "author": "Michael McCandless",
+            "date": "2015-08-20T22:50:05+0000",
+            "content": "Ugh sorry I meant to include it in the copy/paste:\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testRandomTiny -Dtests.seed=6700D50161C38330 -Dtests.multiplier=5 -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt.fixed -Dtests.locale=lt_LT -Dtests.timezone=Asia/Calcutta -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n\n\n\nIt's interesting it's testRandomTiny: it should be easier to debug! "
+        },
+        {
+            "id": "comment-14705956",
+            "author": "Karl Wright",
+            "date": "2015-08-20T23:18:13+0000",
+            "content": "It looks like a precision error again.  The circle is quite small (radius about 1e-6), and the computed bounds lie just inside the circle's provided edge point (distance, 2e-11).  I'll try increasing MINIMUM_RESOLUTION just a bit more to see if that corrects the problem. "
+        },
+        {
+            "id": "comment-14705967",
+            "author": "Karl Wright",
+            "date": "2015-08-20T23:22:44+0000",
+            "content": "It did correct the problem.  Attached a new patch. "
+        },
+        {
+            "id": "comment-14705978",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-20T23:34:39+0000",
+            "content": "Commit 1696880 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1696880 ]\n\nLUCENE-6699: bump up MINIMUM_RESOLUTION some more "
+        },
+        {
+            "id": "comment-14705982",
+            "author": "Michael McCandless",
+            "date": "2015-08-20T23:41:01+0000",
+            "content": "OK I committed that patch, thanks Karl Wright, but unfortunately I hit another failure:\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testRandomMedium -Dtests.seed=71C652F660067AD3 -Dtests.multiplier=5 -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt.fixed -Dtests.locale=zh_HK -Dtests.timezone=America/Mazatlan -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   9.72s | TestGeo3DPointField.testRandomMedium <<<\n   [junit4]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=14, name=T0, state=RUNNABLE, group=TGRP-TestGeo3DPointField]\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([71C652F660067AD3:CC18655E216319B5]:0)\n   [junit4]    > Caused by: java.lang.AssertionError: expected WITHIN (1) or OVERLAPS (2) but got 0; shape=GeoCircle: {planetmodel=PlanetModel.SPHERE, center=[lat=-0.004282454525970269, lon=-1.6739831367422277E-4], radius=1.959639723134033E-6(1.1227908550176523E-4)}; XYZSolid=XYZSolid: {planetmodel=PlanetModel.SPHERE, isWholeWorld=false, minXplane=[A=1.0, B=0.0, C=0.0, D=-0.999990807894643, side=1.0], maxXplane=[A=1.0, B=0.0, C=0.0, D=-0.9999908246908629, side=-1.0], minYplane=[A=0.0, B=1.0, C=0.0, D=1.693563105447845E-4, side=1.0], maxYplane=[A=0.0, B=1.0, C=0.0, D=1.6543724525666504E-4, side=-1.0], minZplane=[A=0.0, B=0.0, C=1.0, D=0.004284400993353207, side=1.0], maxZplane=[A=0.0, B=0.0, C=1.0, D=0.004280481873941856, side=-1.0]}\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([71C652F660067AD3]:0)\n   [junit4]    > \tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.scorer(PointInGeo3DShapeQuery.java:105)\n   [junit4]    > \tat org.apache.lucene.search.LRUQueryCache$CachingWrapperWeight.scorer(LRUQueryCache.java:589)\n   [junit4]    > \tat org.apache.lucene.search.Weight.bulkScorer(Weight.java:135)\n   [junit4]    > \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]    > \tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:618)\n   [junit4]    > \tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:92)\n   [junit4]    > \tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:425)\n   [junit4]    > \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:586)\n   [junit4]    > \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:520)\n   [junit4]   2> NOTE: test params are: codec=FastDecompressionCompressingStoredFields(storedFieldsFormat=CompressingStoredFieldsFormat(compressionMode=FAST_DECOMPRESSION, chunkSize=26391, maxDocsPerChunk=1, blockSize=992), termVectorsFormat=CompressingTermVectorsFormat(compressionMode=FAST_DECOMPRESSION, chunkSize=26391, blockSize=992)), sim=RandomSimilarityProvider(queryNorm=false,coord=yes): {}, locale=zh_HK, timezone=America/Mazatlan\n   [junit4]   2> NOTE: Linux 3.13.0-46-generic amd64/Oracle Corporation 1.8.0_40 (64-bit)/cpus=8,threads=1,free=333320104,total=449314816\n   [junit4]   2> NOTE: All tests run in this JVM: [TestGeo3DPointField]\n   [junit4] Completed [1/1] in 9.85s, 1 test, 1 error <<< FAILURES!\n\n "
+        },
+        {
+            "id": "comment-14706015",
+            "author": "Karl Wright",
+            "date": "2015-08-21T00:12:25+0000",
+            "content": "Same cause, same fix.\n\nThe circle radius was about 1/6 the previous small value (1e-6), and the corresponding required increase in MINIMUM_RESOLUTION wound up being about 3x (to 6e-11).  There is still 4.5 orders of magnitude between these values.  If the pattern continues, we seem to be converging on a value for MINIMUM_RESOLUTION that is somewhere around 1e-9.\n\nUnfortunately, I've tried MINIMUM_RESOLUTION values around 1e-10 before and other stuff started breaking as a result.  So I really hope this pattern doesn't continue. "
+        },
+        {
+            "id": "comment-14706460",
+            "author": "Karl Wright",
+            "date": "2015-08-21T09:29:29+0000",
+            "content": "Michael McCandless Looking at the source of the actual error, here's how it works.\n\nThe GeoCircle shape constructs its plane using the following code:\n\n\n      // Construct normal plane\n      final Plane normalPlane = Plane.constructNormalizedZPlane(upperPoint, lowerPoint, center);\n      // Construct a sided plane that goes through the two points and whose normal is in the normalPlane.\n      this.circlePlane = SidedPlane.constructNormalizedPerpendicularSidedPlane(center, normalPlane, upperPoint, lowerPoint);\n      if (circlePlane == null)\n        throw new RuntimeException(\"Couldn't construct circle plane.  Cutoff angle = \"+cutoffAngle+\"; upperPoint = \"+upperPoint+\"; lowerPoint = \"+lowerPoint);\n      this.edgePoints = new GeoPoint[]{upperPoint};\n\n\n\nSo, it constructs a plane including the Z axis first, then constructs a plane perpendicular to it.  The edge point of that plane is one of the points it used to construct both the Z plane and the perpendicular plane.  Tests show that the edge point is not quite perfectly on the circle edge, but is close enough to pass isWithin().  (This is expected given the math that has to take place to construct the circle plane.  The error gets larger the smaller the circle is.)\n\nWhen the bounds are computed, another plane intersection is computed.  This adds more error, of a comparable amount.  So we are dealing here with twice the amount of error as usual.\n\nSolutions: I could compute the edge point directly from the vertical plane and the circle plane.  This adds an additional square root and a couple of allocations to the cost of constructing a circle.  Or, I could add in the edge point to the GeoCircle bounds computation.  That's not quite right but would effectively solve the problem forever at little cost.  Finally, we could keep fiddling with MINIMUM_RESOLUTION which technically would also be able to solve the problem at some point.  Which would you prefer?\n\n "
+        },
+        {
+            "id": "comment-14706475",
+            "author": "Karl Wright",
+            "date": "2015-08-21T09:44:42+0000",
+            "content": "Updated patch.  This includes an IllegalArgumentException for a circle which is too small by MINIMUM_RESOLUTION standards.  Also includes a slight hack to insure that GeoCircle bounds includes the edge point for the GeoCircle, "
+        },
+        {
+            "id": "comment-14707313",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-21T19:28:57+0000",
+            "content": "Commit 1697048 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697048 ]\n\nLUCENE-6699: throw IllegalArgExc for too-small GeoCircles; increase MINIMUM_RESOLUTION again "
+        },
+        {
+            "id": "comment-14707412",
+            "author": "Michael McCandless",
+            "date": "2015-08-21T20:28:34+0000",
+            "content": "Another failure:\n\n\n   [junit4] Suite: org.apache.lucene.bkdtree3d.TestGeo3DPointField\n   [junit4]   2> Ogos 21, 2015 8:29:29 PM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n   [junit4]   2> WARNING: Uncaught exception in thread: Thread[T3,5,TGRP-TestGeo3DPointField]\n   [junit4]   2> java.lang.AssertionError: T3: iter=341 id=70337 docID=417 lat=-0.002164069780096702 lon=0.007505617500830066 expected false but got: true deleted?=false\n   [junit4]   2>   point1=[lat=-0.002164069780096702, lon=0.007505617500830066], iswithin=false\n   [junit4]   2>   point2=[X=1.0010882593761607, Y=0.007513926205930265, Z=-0.0021664888729185277], iswithin=false\n   [junit4]   2>   query=PointInGeo3DShapeQuery: field=point:PlanetModel: PlanetModel.WGS84 Shape: GeoCircle: {planetmodel=PlanetModel.WGS84, center=[lat=-0.006450320645814321, lon=0.004660694205115142], radius=0.00489710732634323(0.28058358162206176)}\n   [junit4]   2> \tat __randomizedtesting.SeedInfo.seed([9CF59027DCD28E6D]:0)\n   [junit4]   2> \tat org.junit.Assert.fail(Assert.java:93)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:624)\n   [junit4]   2> \tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:520)\n   [junit4]   2> \n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestGeo3DPointField -Dtests.method=testRandomMedium -Dtests.seed=9CF59027DCD28E6D -Dtests.multiplier=5 -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt.fixed -Dtests.locale=ms -Dtests.timezone=Africa/Nouakchott -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   9.55s | TestGeo3DPointField.testRandomMedium <<<\n   [junit4]    > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=50, name=T3, state=RUNNABLE, group=TGRP-Test\n\n "
+        },
+        {
+            "id": "comment-14707562",
+            "author": "Karl Wright",
+            "date": "2015-08-21T22:23:27+0000",
+            "content": "Michael McCandless: It seems like you drilled down to a point which BKD thought should be in the resultset but which geo3d says should not.  How can this happen?  Specifically, what information from geo3d must be incorrect for this situation to occur? "
+        },
+        {
+            "id": "comment-14707584",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-21T22:46:20+0000",
+            "content": "Commit 1697064 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697064 ]\n\nLUCENE-6699: add assert "
+        },
+        {
+            "id": "comment-14707594",
+            "author": "Michael McCandless",
+            "date": "2015-08-21T22:48:07+0000",
+            "content": "Oh I see, the failure is opposite from before (expected=false but actual=true).\n\nThis can happen if we incorrectly got CELL_INSIDE_SHAPE (GeoArea.CONTAINS from geo3d) when we asked the shape to compare itself to an x,y,z rect.\n\nI added a new assert to confirm this:\n\n\njava.lang.AssertionError\n\tat __randomizedtesting.SeedInfo.seed([9CF59027DCD28E6D]:0)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.addAll(BKD3DTreeReader.java:153)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:191)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:317)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:317)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:293)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:307)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:283)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:317)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:293)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:268)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:258)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:293)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:307)\n\tat org.apache.lucene.bkdtree3d.BKD3DTreeReader.intersect(BKD3DTreeReader.java:115)\n\tat org.apache.lucene.bkdtree3d.PointInGeo3DShapeQuery$1.scorer(PointInGeo3DShapeQuery.java:114)\n\tat org.apache.lucene.search.LRUQueryCache$CachingWrapperWeight.scorer(LRUQueryCache.java:581)\n\tat org.apache.lucene.search.Weight.bulkScorer(Weight.java:135)\n\tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n\tat org.apache.lucene.search.AssertingWeight.bulkScorer(AssertingWeight.java:69)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:618)\n\tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:92)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:425)\n\tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4._run(TestGeo3DPointField.java:586)\n\tat org.apache.lucene.bkdtree3d.TestGeo3DPointField$4.run(TestGeo3DPointField.java:520)\n\n "
+        },
+        {
+            "id": "comment-14707618",
+            "author": "Karl Wright",
+            "date": "2015-08-21T23:03:20+0000",
+            "content": "This is the \"accept\" that is confirming that the shape contains the point:\n\n\n                                           @Override\n                                           public boolean accept(int docID) {\n                                             //System.out.println(\"  accept? docID=\" + docID);\n                                             BytesRef bytes = treeDV.get(docID);\n                                             if (bytes == null) {\n                                               //System.out.println(\"    false (null)\");\n                                               return false;\n                                             }\n\n                                             assert bytes.length == 12;\n                                             double x = Geo3DDocValuesFormat.decodeValue(Geo3DDocValuesFormat.readInt(bytes.bytes, bytes.offset));\n                                             double y = Geo3DDocValuesFormat.decodeValue(Geo3DDocValuesFormat.readInt(bytes.bytes, bytes.offset+4));\n                                             double z = Geo3DDocValuesFormat.decodeValue(Geo3DDocValuesFormat.readInt(bytes.bytes, bytes.offset+8));\n                                             // True if x,y,z is within shape\n                                             //System.out.println(\"    x=\" + x + \" y=\" + y + \" z=\" + z);\n                                             //System.out.println(\"    ret: \" + shape.isWithin(x, y, z));\n\n                                             return shape.isWithin(x, y, z);\n                                           }\n\n\n\n\nThe \"accept\" is apparently returning false when you evaluated the point earlier to be within the XYZ bounds of ... well, what exactly?  What was the actual bit of information in this case from geo3d that is wrong?  Also remember that the point is not exact, because there is imprecision at a level greater than MINIMUM_RESOLUTION, so that it may well be inside the GeoArea but not inside the actual shape, due to rounding issues.  We should figure out a way to determine if that is in fact what is happening. "
+        },
+        {
+            "id": "comment-14707654",
+            "author": "Michael McCandless",
+            "date": "2015-08-21T23:48:03+0000",
+            "content": "OK I extracted some info from the failure (see the attached patch, but it makes tons of output!):\n\nThis is the query it's running:\n\n\nThread[T2,5,TGRP-TestGeo3DPointField]: TEST: iter=342 shape=GeoCircle: {planetmodel=PlanetModel.WGS84, center=[lat=-0.006450320645814321, lon=0.004660694205115142], radius=0.00489710732634323(0.28058358162206176)}\n  using query: PointInGeo3DShapeQuery: field=point:PlanetModel: PlanetModel.WGS84 Shape: GeoCircle: {planetmodel=PlanetModel.WGS84, center=[lat=-0.006450320645814321, lon=0.004660694205115142], radius=0.00489710732634323(0.28058358162206176)}\n\n\n\nThen, while BKD is recursing, it hits a point where this cell is\nsupposedly (incorrectly) fully contained in the query shape:\n\n\nThread[T2,5,TGRP-TestGeo3DPointField]: switch to addAll at cell x=1.0010822580620098 to 1.0010945779732867 y=0.007079167343247293 to 0.007541006774427837 z=-0.0021855011220022575 to -0.001896122718181518\n\n\n\nBut then this docID fails the new assert (is not within the query shape):\n\n\nT2: FAILED: docID=1123\n  accept docID=1123 point: x=1.0010893045436076 y=0.007380935180644008 z=-0.002140671370616495\n\n "
+        },
+        {
+            "id": "comment-14707682",
+            "author": "Karl Wright",
+            "date": "2015-08-22T00:22:30+0000",
+            "content": "Thanks, looking now to see what's happening. "
+        },
+        {
+            "id": "comment-14707734",
+            "author": "Karl Wright",
+            "date": "2015-08-22T01:02:39+0000",
+            "content": "Ok, I wrote this test code to reproduce the problem simply:\n\n\n    // Sixth BKD discovered failure\n    p1 = new GeoPoint(1.0010893045436076,0.007380935180644008,-0.002140671370616495);\n    c = new GeoCircle(PlanetModel.WGS84,-0.006450320645814321,0.004660694205115142,0.00489710732634323);\n    //xyzb = new XYZBounds();\n    //c.getBounds(xyzb);\n    //System.err.println(\"xmin=\"+xyzb.getMinimumX()+\", xmax=\"+xyzb.getMaximumX()+\",ymin=\"+xyzb.getMinimumY()+\", ymax=\"+xyzb.getMaximumY()+\",zmin=\"+xyzb.getMinimumZ()+\", zmax=\"+xyzb.getMaximumZ());\n    //xmin=1.0010356621420726, xmax=1.0011141249179447,ymin=-2.5326643901354566E-4, ymax=0.009584741915757169,zmin=-0.011359874956269283, zmax=-0.0015549504447452225\n    area = GeoAreaFactory.makeGeoArea(PlanetModel.WGS84,1.0010822580620098,1.0010945779732867,0.007079167343247293,0.007541006774427837,-0.0021855011220022575,-0.001896122718181518);\n    assertTrue(!c.isWithin(p1));\n    assertTrue(GeoArea.CONTAINS == area.getRelationship(c));\n    assertTrue(PlanetModel.WGS84.pointOnSurface(p1)); // This fails\n    assertTrue(!area.isWithin(p1)); // This fails\n\n\n\nNote that the bounds for the GeoCircle are in fact outside the XYZsolid that you are searching.  So CONTAINS is not unreasonable.  (I'll make certain of this shortly).  Also note that the point being considered is not technically on the surface, as we discussed.  This has definite effects on the math.  Any GeoArea is defined as being the intersection of the shape with the planet surface, so the behavior of points off that surface are outside the formal geo3d contract. Since xyzsolid has a lot of space that isn't on the surface, it's pretty likely that the point in question is off the surface in a way that allows it to fit inside the xyzsolid but is too far inside to be on the correct side of the circle plane.  When I confirm that the XYZSolid really is within the GeoCircle, by the terms of the GeoArea contract, then we'll know that that is what is going on.\n\nOff-surface (x,y,z) values are not fatal but it is something we have to consider carefully and explicitly compensate for.  The simplest way is to return them, even though they technically fail shape membership, which I think is what your code does with the asserts.\n\nStay tuned. "
+        },
+        {
+            "id": "comment-14707749",
+            "author": "Karl Wright",
+            "date": "2015-08-22T01:14:51+0000",
+            "content": "Ok, Michael McCandless, I've confirmed this picture.\n\nThe XYZ solid's edges of intersection with the planet have no interaction with the circle edge, and are all considered to be within the GeoCircle's area.  So the relationship seems to be correct.\n\nI'll think on this overnight and make a final recommendation in the morning.  Or maybe I better ask you this: if the system behaved exactly as it does now, what do you think the right result would be to return from the GeoPoint query? "
+        },
+        {
+            "id": "comment-14707941",
+            "author": "Karl Wright",
+            "date": "2015-08-22T08:23:23+0000",
+            "content": "Hmm, as a final check, I took the original point from the original failure, which is not adjusted and is therefore on the WGS84 surface.  Unfortunately, that too fails in the same way:\n\n\n    c = new GeoCircle(PlanetModel.WGS84,-0.006450320645814321,0.004660694205115142,0.00489710732634323);\n    //xyzb = new XYZBounds();\n    //c.getBounds(xyzb);\n    //System.err.println(\"xmin=\"+xyzb.getMinimumX()+\", xmax=\"+xyzb.getMaximumX()+\",ymin=\"+xyzb.getMinimumY()+\", ymax=\"+xyzb.getMaximumY()+\",zmin=\"+xyzb.getMinimumZ()+\", zmax=\"+xyzb.getMaximumZ());\n    //xmin=1.0010356621420726, xmax=1.0011141249179447,ymin=-2.5326643901354566E-4, ymax=0.009584741915757169,zmin=-0.011359874956269283, zmax=-0.0015549504447452225\n    area = GeoAreaFactory.makeGeoArea(PlanetModel.WGS84,1.0010822580620098,1.0010945779732867,0.007079167343247293,0.007541006774427837,-0.0021855011220022575,-0.001896122718181518);\n    assertTrue(GeoArea.CONTAINS == area.getRelationship(c));\n    p2 = new GeoPoint(PlanetModel.WGS84,-0.002164069780096702, 0.007505617500830066);\n    assertTrue(PlanetModel.WGS84.pointOnSurface(p2));\n    assertTrue(!c.isWithin(p2));\n    assertTrue(!area.isWithin(p2)); // fails\n\n\n\nSo there is something more subtle going on than I originally thought.  Looking into it now. "
+        },
+        {
+            "id": "comment-14707943",
+            "author": "Michael McCandless",
+            "date": "2015-08-22T08:26:51+0000",
+            "content": "I'm going to open a \"continuation issue\" here!  It takes my browser too long to scroll through the many comments here ... "
+        },
+        {
+            "id": "comment-14707944",
+            "author": "Michael McCandless",
+            "date": "2015-08-22T08:28:55+0000",
+            "content": "OK I opened LUCENE-6759, let's continue discussion there? "
+        },
+        {
+            "id": "comment-14707988",
+            "author": "Karl Wright",
+            "date": "2015-08-22T11:16:51+0000",
+            "content": "Michael McCandless Here's the analysis, so far.\n\nI first enabled evaluation of all four points where the XYZSolid intersected the planet surface.  As you can see, only one of them comes back as being inside the GeoCircle:\n\n\n   [junit4]   2>  Point 1.0010913867774043 0.007079167343247293 -0.0021855011220022575: shape.isWithin? true; minx=9.128715394490783E-6, maxx=-3.191195882434883E-6, miny=0.0, maxy=-4.618394311805439E-4, minz=0.0, maxz=-2.893784038207395E-4\n   [junit4]   2>  Point 1.0010919806760743 0.007079167343247293 -0.001896122718181518: shape.isWithin? false; minx=9.722614064511248E-6, maxx=-2.597297212414418E-6, miny=0.0, maxy=-4.618394311805439E-4, minz=2.893784038207395E-4, maxz=0.0\n   [junit4]   2>  Point 1.001088014365874 0.007541006774427837 -0.0021855011220022575: shape.isWithin? false; minx=5.7563038642349795E-6, maxx=-6.563607412690686E-6, miny=4.618394311805439E-4, maxy=0.0, minz=0.0, maxz=-2.893784038207395E-4\n   [junit4]   2>  Point 1.0010886082665449 0.007541006774427837 -0.001896122718181518: shape.isWithin? false; minx=6.35020453509938E-6, maxx=-5.969706741826286E-6, miny=4.618394311805439E-4, maxy=0.0, minz=2.893784038207395E-4, maxz=0.0\n\n\n\nIf the above is an accurate picture, then there should be intersections between the GeoCircle and two of the edge planes.\n\nminy should intersect:\n\n\n   [junit4]   2>  Point 1.0010913867774043 0.007079167343247293 -0.0021855011220022575: shape.isWithin? true; minx=9.128715394490783E-6, maxx=-3.191195882434883E-6, miny=0.0, maxy=-4.618394311805439E-4, minz=0.0, maxz=-2.893784038207395E-4\n   [junit4]   2>  Point 1.0010919806760743 0.007079167343247293 -0.001896122718181518: shape.isWithin? false; minx=9.722614064511248E-6, maxx=-2.597297212414418E-6, miny=0.0, maxy=-4.618394311805439E-4, minz=2.893784038207395E-4, maxz=0.0\n\n\n\nAnd, minz should intersect:\n\n\n   [junit4]   2>  Point 1.0010913867774043 0.007079167343247293 -0.0021855011220022575: shape.isWithin? true; minx=9.128715394490783E-6, maxx=-3.191195882434883E-6, miny=0.0, maxy=-4.618394311805439E-4, minz=0.0, maxz=-2.893784038207395E-4\n   [junit4]   2>  Point 1.001088014365874 0.007541006774427837 -0.0021855011220022575: shape.isWithin? false; minx=5.7563038642349795E-6, maxx=-6.563607412690686E-6, miny=4.618394311805439E-4, maxy=0.0, minz=0.0, maxz=-2.893784038207395E-4\n\n\n\nThese two intersections are not being detected, and after much careful analysis, I concluded that the reason that they are not being detected is because no intersection actually happens.  Looking at the miny plane:\n\n\n   [junit4]   2> Checking for intersections that should be found...\n   [junit4]   2>  Not identical plane\n   [junit4]   2> Looking for intersection between plane [A=-0.9999680546313309, B=-0.0046605790633783275, C=0.006493744653569968, D=1.0011065916522879, side=-1.0] and plane [A=0.0, B=1.0, C=0.0, D=-0.007079167343247293, side=1.0] within bounds\n   [junit4]   2>  Two points of intersection\n   [junit4]   2>   [X=1.0010359045488204, Y=0.0070791673432472925, Z=-0.010729178478687706] this=(0.0) q=(-8.673617379884035E-19), and [X=1.0010913867758835, Y=0.0070791673432472925, Z=-0.0021855018140558226] this=(0.0) q=(-8.673617379884035E-19)\n\n\n\nTwo points of intersection are detected, but both are outside the X or Z bounds of the XYZSolid, so they do not represent intersection.\n\nSo, how can this be?  Well, the reason for the discrepancy is because the first point of the four mentioned at the top is, in fact, not really inside the GeoCircle.  It is coming up as being inside the GeoCircle only because of the fact that we've increased MINIMUM_RESOLUTION from its original value of 1e-12:\n\n\n   [junit4]   2> circlePlane eval = 2.9731772599461692E-12\n\n\n\nSo the problem is that ONE measure of error (point within GeoCircle) disagrees with another measure of error (intersection points in or out of XYZSolid), leading to an incorrect assessment.\n\nThis is obviously going to be challenging to address.  I may need to introduce two distinct error bounds in order for this logic to be robust.  But I have to think it through carefully. "
+        },
+        {
+            "id": "comment-14707989",
+            "author": "Karl Wright",
+            "date": "2015-08-22T11:17:27+0000",
+            "content": "Ok, I'll move my latest comment over. "
+        },
+        {
+            "id": "comment-14709268",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-24T13:21:11+0000",
+            "content": "Commit 1697386 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697386 ]\n\nLUCENE-6699: MINIMUM_RESOLUTION back to 1e-12 "
+        },
+        {
+            "id": "comment-14709271",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-24T13:23:06+0000",
+            "content": "Commit 1697388 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697388 ]\n\nLUCENE-6699: woops "
+        },
+        {
+            "id": "comment-14709747",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-24T18:05:23+0000",
+            "content": "Commit 1697469 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697469 ]\n\nLUCENE-6699: iterate "
+        },
+        {
+            "id": "comment-14710292",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-24T23:53:57+0000",
+            "content": "Commit 1697517 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697517 ]\n\nLUCENE-6699: more fudge "
+        },
+        {
+            "id": "comment-14712798",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-26T09:29:59+0000",
+            "content": "Commit 1697865 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1697865 ]\n\nLUCENE-6699: comment out assert "
+        },
+        {
+            "id": "comment-14715538",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-26T21:20:39+0000",
+            "content": "Commit 1698004 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698004 ]\n\nLUCENE-6699: increase fudge factor; don't check hits if quantization changed the expected result "
+        },
+        {
+            "id": "comment-14716709",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-27T14:01:18+0000",
+            "content": "Commit 1698157 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698157 ]\n\nLUCENE-6699: too-tiny GeoCircles now throw IllegalArgumentException "
+        },
+        {
+            "id": "comment-14716868",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-27T15:34:09+0000",
+            "content": "Commit 1698186 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698186 ]\n\nLUCENE-6699: ensure the BKD cell is rounded up/down to correctly handle quantization "
+        },
+        {
+            "id": "comment-14717189",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-27T18:04:03+0000",
+            "content": "Commit 1698202 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698202 ]\n\nLUCENE-6699: clip the min/max in the global bbox to fall within the planet model; add nocommit "
+        },
+        {
+            "id": "comment-14717604",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-27T21:56:16+0000",
+            "content": "Commit 1698232 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698232 ]\n\nLUCENE-6699: store planet's max in the index, and validate at search time "
+        },
+        {
+            "id": "comment-14718484",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-28T12:41:52+0000",
+            "content": "Commit 1698321 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698321 ]\n\nLUCENE-6699: fix encode to round instead of truncate to reduce quantization error; fix quantixed bbox decode "
+        },
+        {
+            "id": "comment-14721047",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-29T10:13:05+0000",
+            "content": "Commit 1698454 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698454 ]\n\nLUCENE-6699: add test case "
+        },
+        {
+            "id": "comment-14721048",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-29T10:13:49+0000",
+            "content": "Commit 1698455 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1698455 ]\n\nLUCENE-6699: fix rename "
+        },
+        {
+            "id": "comment-14721138",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-29T15:22:39+0000",
+            "content": "Commit 1700049 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700049 ]\n\nLUCENE-6699: iterate "
+        },
+        {
+            "id": "comment-14721465",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-30T09:45:20+0000",
+            "content": "Commit 1700102 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700102 ]\n\nLUCENE-6699: iterate "
+        },
+        {
+            "id": "comment-14721726",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-30T21:29:34+0000",
+            "content": "Commit 1700165 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700165 ]\n\nLUCENE-6699: randomize other shapes too; fix a nocommit "
+        },
+        {
+            "id": "comment-14723923",
+            "author": "ASF subversion and git services",
+            "date": "2015-08-31T19:39:24+0000",
+            "content": "Commit 1700313 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700313 ]\n\nLUCENE-6699: make encode/decodeValue symmetric "
+        },
+        {
+            "id": "comment-14725080",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-01T09:40:51+0000",
+            "content": "Commit 1700450 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700450 ]\n\nLUCENE-6699: increase bounds fudge factor "
+        },
+        {
+            "id": "comment-14725088",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-01T09:49:28+0000",
+            "content": "Commit 1700457 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700457 ]\n\nLUCENE-6699: only print verbose details of the failing iter "
+        },
+        {
+            "id": "comment-14725095",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-01T09:51:06+0000",
+            "content": "Commit 1700459 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700459 ]\n\nLUCENE-6699: include the shape in the failure message "
+        },
+        {
+            "id": "comment-14725537",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-01T15:16:27+0000",
+            "content": "Commit 1700587 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700587 ]\n\nLUCENE-6699: increase fudge factor further "
+        },
+        {
+            "id": "comment-14727249",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-02T12:29:12+0000",
+            "content": "Commit 1700788 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700788 ]\n\nLUCENE-6699: remove nocommits "
+        },
+        {
+            "id": "comment-14727308",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-02T13:06:19+0000",
+            "content": "Commit 1700800 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700800 ]\n\nLUCENE-6699: merge trunk "
+        },
+        {
+            "id": "comment-14727381",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-02T14:01:03+0000",
+            "content": "Commit 1700820 from Michael McCandless in branch 'dev/branches/lucene6699'\n[ https://svn.apache.org/r1700820 ]\n\nLUCENE-6699: fix precommit "
+        },
+        {
+            "id": "comment-14727923",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-02T19:59:32+0000",
+            "content": "Commit 1700883 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1700883 ]\n\nLUCENE-6699: add geo3d + BKD for fast, accurate earth-surface point-in-shape queries "
+        },
+        {
+            "id": "comment-14727937",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-02T20:09:40+0000",
+            "content": "Commit 1700887 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1700887 ]\n\nLUCENE-6699: add geo3d + BKD for fast, accurate earth-surface point-in-shape queries "
+        },
+        {
+            "id": "comment-14727940",
+            "author": "Michael McCandless",
+            "date": "2015-09-02T20:10:24+0000",
+            "content": "Thanks Karl Wright! "
+        },
+        {
+            "id": "comment-14791817",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-17T09:08:35+0000",
+            "content": "Commit 1703537 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1703537 ]\n\nLUCENE-6699: fix silly test bug "
+        },
+        {
+            "id": "comment-14791820",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-17T09:09:27+0000",
+            "content": "Commit 1703538 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1703538 ]\n\nLUCENE-6699: fix silly test bug "
+        },
+        {
+            "id": "comment-14904650",
+            "author": "Terry Smith",
+            "date": "2015-09-23T15:22:57+0000",
+            "content": "Karl, were you able to find that packing scheme? I'm interested in poking the x,y,z values into a SortedNumericDocValuesField to see how well it would perform. "
+        },
+        {
+            "id": "comment-14904784",
+            "author": "Karl Wright",
+            "date": "2015-09-23T16:42:43+0000",
+            "content": "no time, I'm afraid... "
+        },
+        {
+            "id": "comment-14905040",
+            "author": "Michael McCandless",
+            "date": "2015-09-23T19:02:23+0000",
+            "content": "Terry Smith maybe it's this comment?  https://issues.apache.org/jira/browse/LUCENE-6480?focusedCommentId=14543396&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14543396 "
+        },
+        {
+            "id": "comment-14905063",
+            "author": "Nicholas Knize",
+            "date": "2015-09-23T19:14:42+0000",
+            "content": "Terry Smith I updated the Geo3DPacking code some time ago to avoid the overhead of BitSet and use raw morton bit twiddling. The intent is to use it in LUCENE-6480. Since that issue has stalled a bit I went ahead and attached the standalone class (with benchmarks) to the LUCENE-6480 issue if you're interested in tinkering. "
+        },
+        {
+            "id": "comment-14906465",
+            "author": "Terry Smith",
+            "date": "2015-09-24T15:03:39+0000",
+            "content": "Thanks guys. I was hoping to squeeze those x,y,z values into a 64 bits instead of 96. I'm not a bit twiddler but I'll take a look at Nicholas' patch and see if I can adapt it.\n "
+        },
+        {
+            "id": "comment-14906486",
+            "author": "Nicholas Knize",
+            "date": "2015-09-24T15:20:04+0000",
+            "content": "I started by packing all 3 values into a 64 bit long - in fact those MAGIC numbers are still there (MAGIC[7:12]). The problem with this is precision loss from compressing each value into 21 bits. The decoded values will give, at best, 3 decimal precision accuracy - which is ~110m at the equator. If you're fine with course grain accuracy then copy the BitUtil.\n{interleave | deinterleave}\n methods and use MAGIC[7:12]. The code is much simpler with the accuracy trade-off. "
+        }
+    ]
+}

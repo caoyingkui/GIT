@@ -1,0 +1,191 @@
+{
+    "id": "LUCENE-7258",
+    "title": "Tune DocIdSetBuilder allocation rate",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [
+            "modules/spatial"
+        ],
+        "labels": "",
+        "fix_versions": [
+            "6.1",
+            "7.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "LUCENE-7211 converted IntersectsPrefixTreeQuery to use DocIdSetBuilder, but didn't actually reduce garbage generation for my Solr index.\n\nSince something like 40% of my garbage (by space) is now attributed to DocIdSetBuilder.growBuffer, I charted a few different allocation strategies to see if I could tune things more. \n\nSee here: http://i.imgur.com/7sXLAYv.jpg \nThe jump-then-flatline at the right would be where DocIdSetBuilder gives up and allocates a FixedBitSet for a 100M-doc index. (The 1M-doc index curve/cutoff looked similar)\n\nPerhaps unsurprisingly, the 1/8th growth factor in ArrayUtil.oversize is terrible from an allocation standpoint if you're doing a lot of expansions, and is especially terrible when used to build a short-lived data structure like this one.\nBy the time it goes with the FBS, it's allocated around twice as much memory for the buffer as it would have needed for just the FBS.",
+    "attachments": {
+        "LUCENE-7258-expanding.patch": "https://issues.apache.org/jira/secure/attachment/12804381/LUCENE-7258-expanding.patch",
+        "LUCENE-7258.patch": "https://issues.apache.org/jira/secure/attachment/12804687/LUCENE-7258.patch",
+        "allocation_plot.jpg": "https://issues.apache.org/jira/secure/attachment/12800868/allocation_plot.jpg",
+        "LUCENE-7258-Tune-memory-allocation-rate-for-Intersec.patch": "https://issues.apache.org/jira/secure/attachment/12800864/LUCENE-7258-Tune-memory-allocation-rate-for-Intersec.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15258756",
+            "author": "David Smiley",
+            "date": "2016-04-26T19:31:44+0000",
+            "content": "Wonderful graphs Jeff Wartes!\n\nAny thoughts on this one Adrien Grand?  I think a 2x growth rate makes more sense to me, and FWIW aligns with what java.util.ArrayList does.  org.apache.lucene.util.ArrayUtil.oversize says:\n\n    // asymptotic exponential growth by 1/8th, favors\n    // spending a bit more CPU to not tie up too much wasted\n    // RAM:\n\n\n\nI have had blind faith to simply use ArrayUtil.grow/oversize whenever I need to grow an array but it's shaken now.  I guess it depends.  If the array to be built is temporary, then don't use it \u2013 grow by 2x; but if it may be long-lived then use it. "
+        },
+        {
+            "id": "comment-15258773",
+            "author": "Yonik Seeley",
+            "date": "2016-04-26T19:41:20+0000",
+            "content": "Seems like we should do the same thing that was done for SOLR-8922 - Don't reallocate a single array, keep a list of them.\n\nFor extra credit, one could even try to eliminate the cost of coalescing all of the arrays into a single one by incorporating that step into the first step of the radix sort. "
+        },
+        {
+            "id": "comment-15258834",
+            "author": "Jeff Wartes",
+            "date": "2016-04-26T20:12:18+0000",
+            "content": "The \"eia\" label represents using the ExpandingIntArray approach from SOLR-8922. It suffered somewhat in my plot because I accounted for the fact that when you're done collecting, you need to convert it to a single array for sorting purposes. (if you haven't overflowed into a FBS, anyway, and want to use the usual Sorters.) "
+        },
+        {
+            "id": "comment-15258845",
+            "author": "Jeff Wartes",
+            "date": "2016-04-26T20:20:55+0000",
+            "content": "This patch does the following:\n\n1. Moves the FBS threshold from 1/128th to 1/256th for IntersectsPrefixTreeQuery.\n2. Changes the expansion policy to 2x when used by IntersectsPrefixTreeQuery\n3. Changed the sort algorithm in DocIdSetBuilder (for ALL usages) to InPlaceMergeSorter, since LSBRadixSorter requires allocating a new array of size N.\n4. In order to do #1 & #2, I had to add parameter support for the threshold and expansion policies.\n\nJustifications: \n1. Since Geospatial data is typically non-uniform, a smaller threshold seemed reasonable.\n2. A more aggressive expansion policy results in less wasted allocations, particularly for short-lived data structures.\n3. This one might be controversial since it affects more than just geospatial search, but I thought I'd see what happened if I saved the memory. I also considered TimSort, which has a configurable memory cost, but LUCENE-5140 gave me some pause.  "
+        },
+        {
+            "id": "comment-15258848",
+            "author": "Jeff Wartes",
+            "date": "2016-04-26T20:24:30+0000",
+            "content": "I put this patch on a production node this morning, looks like allocation rate went down about 10%, which I think is pretty good considering only about 15% of my queries even have a geospatial component.\n\nCPU usage has not changed enough for me to notice. "
+        },
+        {
+            "id": "comment-15258876",
+            "author": "Jeff Wartes",
+            "date": "2016-04-26T20:40:17+0000",
+            "content": "Attaching the graph directly. "
+        },
+        {
+            "id": "comment-15258929",
+            "author": "Jeff Wartes",
+            "date": "2016-04-26T21:13:50+0000",
+            "content": "Random aside: I did do one test run where I changed all usages ArrayUtil.oversize to use an expansion of 2x. I recall this increased overall allocations on my test query corpus by about 4%, when compared to the 256th/2x applied to only the IntersectsPrefixTreeQuery. "
+        },
+        {
+            "id": "comment-15259002",
+            "author": "Adrien Grand",
+            "date": "2016-04-26T21:53:26+0000",
+            "content": "Any thoughts on this one Adrien Grand?\n\nGood question, I don't really know.  I think Python uses 9/8 like ArrayUtil and Java uses 1.5 and I heard arguments against growth factors of 2 as they prevent freed memory from being reused since you always need to allocate more than what has been freed so far, but it's not clear to me how it applies to a managed runtime like Java. I think the approach from SOLR-8922 is worth trying too. "
+        },
+        {
+            "id": "comment-15260952",
+            "author": "Jeff Wartes",
+            "date": "2016-04-27T21:11:00+0000",
+            "content": "After 24 hours, I found I could discern a penalty to cpu on my patched node. I removed the change in sort algorithm, and that seems to have resolved it without too significantly changing the allocation savings. "
+        },
+        {
+            "id": "comment-15260960",
+            "author": "Jeff Wartes",
+            "date": "2016-04-27T21:16:13+0000",
+            "content": "I'd be interested in trying TimSort, or something like Yonik Seeley suggested where an ExpandingIntArray-style array of arrays is fed directly into the Radix sort, but I'm not sure I'm going to be able to commit much more time to this for a bit.\n\nThat said, in the process of thinking about this, I do have a few git stashes saved off with sketches for things like using TimSort and using ExpandingIntArray that I could try to clean and post if anyone is interested. \n\nI also have one sketch I started for using a loose pool mechanism to front acquiring a FixedBitSet, but I didn't get deep enough to be able to tell with confidence that a FBS was actually not being used anymore. Things like the public FixedBitSet.getBits() method make it scary, although I'm convinced even a very small pool of large FixedBitSets could be extremely advantageous. There aren't that many in use at any given time, and a large FBS can still be used for a small use-case. If anyone has some pointers around the lifecycle here, I'd love to hear them. "
+        },
+        {
+            "id": "comment-15264201",
+            "author": "Adrien Grand",
+            "date": "2016-04-29T15:35:57+0000",
+            "content": "I played with the scaling factor and the \"poly 5\" geo benchmark by temporarily switching from MatchingPoints to DocIdSetBuilder in LatLonPointInPolygonQuery. I got the following QPS:\n\n\n\n\nscaling factor = 9/8 (like in master)\n48.3\n\n\nscaling factor = 5/4\n49.3\n\n\nscaling factor = 3/2\n50.2\n\n\nscaling factor = 2\n50.9\n\n\nMatchingPoints\n51.7\n\n\n\n\n\nThis gets DocIdSetBuilder closer to the throughput of MatchingPoints in spite of the fact it tries to better deal with the sparse case. Given than wasting space is not a big deal for this class (the data will be trashed once the query finishes running), I would be in favor of moving to a scaling factor of 3/2 or 2.\n\nRegarding reusing fixed bitsets, I think the only way would be to keep state on the index searcher and then have access to the cache in Query.createWeight. But I don't think I would like it: this looks quite dangerous to me as bit sets can take a lot of memory and you need a different cache per thread (if your index has 1B documents, you would need 120MB per thread for a single FixedBitSet, while a single query may need to create several of them). "
+        },
+        {
+            "id": "comment-15264309",
+            "author": "Jeff Wartes",
+            "date": "2016-04-29T16:39:30+0000",
+            "content": "I'm not sure I understand how the dangers of large FBS size would be any different with a pooling mechanism than they are right now. If a query needs several of them, then it needs several of them, whether they're freshly allocated or not. The only real difference I see might be whether that memory exists in the tenured space, rather than thrashing the eden space every time. \n\nI don't think it'd need to be per-thread. I don't mind points of synchronization if they're tight and well understood. Allocation rate by count is generally lower here. One thought:\nhttps://gist.github.com/randomstatistic/87caefdea8435d6af4ad13a3f92d2698\n\nTo anticipate some objections, there are likely lockless data structures you could use, and yes, you might prefer to control size in terms of memory instead of count. I can think of a dozen improvements per minute I spend looking at this. But you get the idea. Anyone anywhere who knows for sure they're done with a FBS can offer it up for reuse, and anyone can potentially get some reuse by just changing their \"new\" to \"request\". \nIf everybody does this, you end up with a fairly steady pool of FBS instances large enough for most uses. If only some places use it, there's no chance of an unbounded leak, you might get some gain, and worst-case you haven't lost much. If nobody uses it, you've lost nothing.\n\nLast I checked, something like a full 50% of (my) allocations by size were FixedBitSets despite a low allocation rate by count, or I wouldn't be harping on the subject. As a matter of principle, I'd gladly pay heap to reduce GC. The fastest search algorithm in the world doesn't help me if I'm stuck waiting for the collector to finish all the time. "
+        },
+        {
+            "id": "comment-15265328",
+            "author": "Adrien Grand",
+            "date": "2016-04-30T14:14:00+0000",
+            "content": "When I said per thread, I did not mean that the pool needs to be per thread, I just wanted to highlight that if you want N concurrent requests to all use this cache, you need a cache of quite a significant size. Sorry for not being encouraging but I worked on similar caches before and I was not happy with the end result: it is sometimes hard to know when an instance can actually be recycled, it is hard to know when the cache should give memory back to the JVM (especially for a library), the fact that you often end up using oversized instances encourages to use paging but then things are slower, etc. Relying on the JVM makes things simpler. "
+        },
+        {
+            "id": "comment-15265590",
+            "author": "David Smiley",
+            "date": "2016-05-01T03:17:07+0000",
+            "content": "It appears to me that caching bitsets is a much easier task than most any other caches I've seen \u2013 there is no key and most (half on average?) bitsets in the cache will be long enough to be re-used by some subsequent lookup.  RE knowing when an instance can be recycled \u2013 if it were in conjunction with the QueryCache, then on eviction the bitset can be put into a bitset cache.  RE knowing when bitsets should be evicted, especially for a library \u2013 make that configurable/disable?  My main concern with such a cache is its overall code impact \u2013 how many places would be touched by it.  Perhaps a lot but maybe not too bad?  And of course for what measurable benefit?  I imagine some of the GC cost of the current situation can be addressed with GC tuning \u2013 say raising the young gen via -Xmn. "
+        },
+        {
+            "id": "comment-15265718",
+            "author": "Robert Muir",
+            "date": "2016-05-01T11:15:53+0000",
+            "content": "I don't think we shoudl pool any bitsets. This is the job for the garbage collector. "
+        },
+        {
+            "id": "comment-15265829",
+            "author": "Jeff Wartes",
+            "date": "2016-05-01T17:07:58+0000",
+            "content": "There are actually three threads going on this ticket right now, there\u2019s the \u201cwhat threshold and expansion to use for geospatial\u201d that I\u2019d originally intended and provided a patch for, there\u2019s the \u201cwhat expansion for DocIdSetBuilder is generically optimal\u201d, and there\u2019s the \u201cFBS is 50% of my allocation rate, can we pool\u201d conversation.\n\nI think the latter is a worthy conversation, and I don\u2019t have a better place for it, so I\u2019m going to continue to respond to the comments along those lines, (with apologies for the book I\u2019m writing here) but I wanted to point out the divergence.\n\nSo, I certainly understand a knee-jerk reaction around using object pools of any kind. Yes, this IS what the JVM is for. It\u2019s easier and simpler and lower maintenance to just use what\u2019s provided. But I could also argue that Arrays.sort has all those same positive attributes and that hasn\u2019t stopped several hand-written sort algorithms get into this codebase. The question is actually whether the easy and simple thing is good enough, or whether the harder thing has a sufficient offsetting benefit. Everyone on this thread is a highly experienced programmer, we all know this.\n\nIn this case, that means the question is actually whether the allocation rate is \u201cgood enough\u201d or if there's a sufficiently offsetting opportunity for improvement, and arguments should ideally come from that analysis. \n\nI can empirically state that for my large Solr index, that GC pause is the single biggest detriment to my 90+th percentile query latency. Put another way, Lucene is fantastically fast, at least when the JVM isn\u2019t otherwise occupied. Because of shard fan-out, a per-shard p90 latency very quickly becomes a p50 latency for queries overall. (Even with mitigations like SOLR-4449) \nI don\u2019t think there\u2019s anything particularly unique to my use-case in anything I just said, except possibly the word \u201clarge\u201d.\n\nAs such, I consider this an opportunity for improvement, so I\u2019ve suggested a mitigation strategy. It clearly has some costs. I\u2019d be delighted to entertain any alternative strategies.\n\nActually, David Smiley did bring up one alternative suggestion for improvement, so let\u2019s talk about -Xmn:\n\nFirst, let\u2019s assume that Lucene\u2019s policy on G1 hasn\u2019t changed, and we\u2019re still talking about ParNew/CMS. Second, with the exception of a few things like cache, most of the allocations in a Solr/Lucene index are very short-lived. So it follows that given a young generation of sufficient size, the tenured generation would actually see very little activity.\n\nThe major disadvantage to just using a huge young generation then is that there aren\u2019t any concurrent young-generation collectors. The bigger it is, the less frequently you need to collect, but the longer the stop-the-world GC pause when you do.\nOn the other end of the scale, a very small young space means shorter pauses, but far more frequent. Since almost all garbage is short-lived, maybe now you're doing young-collections so often that you\u2019ve got the tenured collector doing a bunch of the work cleaning up short-lived objects too. (This can actually be a good thing, since the CMS collector is mostly concurrent)\n\nThere\u2019s some theoretical size that optimizes frequency vs pause for averaged latency. Perhaps even by deliberately allowing some premature overflow into tenured simply because tenured can be collected concurrently. This kind of thing is extremely delicate to tune for though, especially since query rate (and query type distribution) can fluctuate. It\u2019s easy to get it wrong, such that a sudden large-allocation slams past the rate CMS was expecting and triggers a full-heap stop-the-world pause.\n\nI\u2019m focusing on FBS here because: 1. Fifty Percent. 2. These are generally larger objects, so mitigating those allocations seemed like a good way to mitigate unexpected changes in allocation rate and allow more stable tuning.\n\nThere\u2019s probably also at least one Jira issue around looking at object count allocation rate (vs size) since I suspect the single biggest factor in collector pause is the object count. Certainly I can point to objects that get allocated (by count) in orders of magnitude greater frequency than then next highest count. But since I don\u2019t have a good an understanding of the use cases, let alone have any suggestions yet, I\u2019ve left that for another time. "
+        },
+        {
+            "id": "comment-15266473",
+            "author": "Robert Muir",
+            "date": "2016-05-02T12:02:29+0000",
+            "content": "If you have problems from large fixedbitsets, maybe the first thing to address is that top level solr filter cache  "
+        },
+        {
+            "id": "comment-15267176",
+            "author": "Jeff Wartes",
+            "date": "2016-05-02T18:18:16+0000",
+            "content": "Ok, yeah, that\u2019s a reasonable thing to assume. We usually think of it in terms of cpu work, but filter caches would be an equally great way to mitigate allocations. But a cache is really only useful when you\u2019ve got non-uniform query distributions, or enough time-locality at your query rate that your rare queries haven\u2019t faced a cache eviction yet. \n\nI\u2019m indexing address-type data. Not uncommon. I think that if my typical geospatial search were based on some hyper-local phone location, we\u2019d be done talking, since a filter cache would be useless.  \n\nSo maybe we should assume I\u2019m not doing that.\n\nLet\u2019s assume I can get away with something coarse. Let\u2019s assume I can convert all location based queries to the center point of a city. Let\u2019s further assume that I only care about one radius per city. Finally, let\u2019s assume I\u2019m only searching in the US. There are some 40,000 cities in the US, so those assumptions yield 40,000 possible queries. That\u2019s not too bad. \n\nWith a 100M-doc core, I think that\u2019s about 12.5Mb per filter cache entry. It could be less, I think, particularly with the changes in SOLR-8922, but since we\u2019re only going with coarse queries, it\u2019s reasonable to assume there\u2019s going to be a lot of hits. \nI don\u2019t need every city in the cache, of course, so maybe\u2026 5%? That\u2019s only some 25G of heap. \nDoable, especially since it saves allocation size and you could probably trade in more of the eden space. (Although this would make warmup more of a pain) I\u2019d probably have to cross the CompressedOops boundary at 32G of heap to do that too though, so add another 16G to get back to baseline.\n\nFortunately, the top 5% of cities probably maps to more than 5% of queries. More populated cities are also more likely targets for searching in most query corpuses. So assuming it\u2019s the biggest 5% that are in the cache, maybe we can assume a 15% hit rate? 20%?\n\nOk, so now I\u2019ve spent something like 41G of heap, and I\u2019ve reduced allocations by 20%. Is this pretty good?\n\nI suppose it\u2019s worth noting that this also assumes a perfect cache eviction policy, (I\u2019m pretty interested in SOLR-8241) and that there\u2019s no other filter cache pressure. (At the least, I\u2019m using facets - SOLR-8171) "
+        },
+        {
+            "id": "comment-15286369",
+            "author": "Adrien Grand",
+            "date": "2016-05-17T10:22:34+0000",
+            "content": "Out of curiosity, I played with Solr's ExpandingIntArray approach that consists of accumulating buffers of exponentially increasing sizes. In the attached patch, the size of a new buffer is equal to the sum of the sizes of the buffers that have been allocated so far, so in terms of growth rate it is similar to a scaling factor of 2. Since we need to reserve space up-front, I added a protection that resizes the current array rather than adding a new one if it is less than 7/8 full, otherwise it could leave a non negligible amount of wasted space (eg. if you always call grow(remainingNumberOfSlotsInCurrentBuffer + 1) and then only call add() once).\n\nInterestingly it performed significantly better than the current approach, so maybe we should switch to it?\n\n\n\n\nBenchmark\nPoly 5\nBox\n\n\nscaling factor = 9/8 (like in master)\n48.5\n65.6\n\n\nscaling factor = 5/4\n49.2\n67.6\n\n\nscaling factor = 3/2\n50.2\n69.1\n\n\nscaling factor = 2\n50.8\n69.6\n\n\nExpandingIntArray-style\n51.6\n71.0\n\n\nMatchingPoints\n51.8\n71.7\n\n\n\n "
+        },
+        {
+            "id": "comment-15286858",
+            "author": "David Smiley",
+            "date": "2016-05-17T15:36:18+0000",
+            "content": "nit: typo in comment line 96: \"cumulated\" -> \"accumulated\"\n\nIn ensureBufferCapacity, when buffers.isEmpty, I think the first buffer should have a minimum size of 64 (or 32?), not 1.  This will avoid a possible slow start of small buffers when numDocs is 0 or 1. At least I saw this while setting a breakpoint in some spatial tests, seeing the first two buffers both of size one and the 3rd of size two, etc.\nAlso in this method...\n\nif (current.length < current.array.length - (current.array.length >>> 2)) {\n      // current buffer is less than 7/8 full, resize rather than waste space\n\n\nThat calculation is not 7/8, it's 3/4.\n\nIn concat(), it'd be helpful to comment that it not only concatenates but leaves one additional space too.  Also... do you think it might be worth optimizing for the case that there is one buffer that can simply be returned?  If when this happens it tends to be exactly full then maybe when we allocate new buffers we can leave that one additional slot there so that this happens more often.\n\nFor readability sake, can you re-order the methods grow, ensureBufferCapacity, and addBuffer, growBuffer, upgradeToBitSet to be in this sequence (or thereabouts) as that is the sequence of who calls who?  I find it much easier to read code top to bottom than bottom up   Likewise, build() could be defined before the private utility methods it calls. "
+        },
+        {
+            "id": "comment-15287524",
+            "author": "Adrien Grand",
+            "date": "2016-05-17T20:45:15+0000",
+            "content": "Thanks for the catches, I played with many different options and my comments went out of sync with the code. \n\n> In ensureBufferCapacity, when buffers.isEmpty, I think the first buffer should have a minimum size of 64 (or 32?), not 1. This will avoid a possible slow start of small buffers when numDocs is 0 or 1. At least I saw this while setting a breakpoint in some spatial tests, seeing the first two buffers both of size one and the 3rd of size two, etc.\n\nFair enough.\n\n> do you think it might be worth optimizing for the case that there is one buffer that can simply be returned?\n\nGood question. I believe this would only help on small segments, but this sounds easy so maybe we should do it.\n\nI'll do the reorderings. "
+        },
+        {
+            "id": "comment-15289202",
+            "author": "Adrien Grand",
+            "date": "2016-05-18T16:04:12+0000",
+            "content": "David Smiley Here is a new patch that should address your comments. Numbers are the same as those reported in my previous comment. "
+        },
+        {
+            "id": "comment-15289301",
+            "author": "David Smiley",
+            "date": "2016-05-18T16:51:35+0000",
+            "content": "I reviewed the patch... just one issue I see:  concat() now has a comment that it might return a re-used buffer but I don't see that it does?  (or am I wrong?)  Otherwise, looks good. "
+        },
+        {
+            "id": "comment-15290023",
+            "author": "Adrien Grand",
+            "date": "2016-05-18T22:50:19+0000",
+            "content": "David Smiley This is because of the following block of code. If the largest buffer is large enough to hold all docs then we reuse it. I tried to generalize your suggestion to reuse the buffer if there is a single buffer.\n\n\n+    int[] docs = largestBuffer.array;\n+    if (docs.length < totalLength + 1) {\n+      docs = Arrays.copyOf(docs, totalLength + 1);\n+    }\n\n "
+        },
+        {
+            "id": "comment-15290162",
+            "author": "David Smiley",
+            "date": "2016-05-19T00:25:30+0000",
+            "content": "Ooooh, I'm blind sorry ;-P  This is even better than my original idea since the array can be re-used if there is more than one buffer in some circumstances.  Cool.   +1 to commit; nice Adrien! "
+        },
+        {
+            "id": "comment-15296029",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-23T07:28:45+0000",
+            "content": "Commit bcc4e8709e8de3ae9688304be32a2b4b39bc0c03 in lucene-solr's branch refs/heads/branch_6x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bcc4e87 ]\n\nLUCENE-7258: Speed up DocIdSetBuilder allocation. "
+        },
+        {
+            "id": "comment-15296030",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-23T07:28:46+0000",
+            "content": "Commit 052fb97f82862dfa62f0e37f572523ba619be4ea in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=052fb97 ]\n\nLUCENE-7258: Speed up DocIdSetBuilder allocation. "
+        }
+    ]
+}

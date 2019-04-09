@@ -1,0 +1,227 @@
+{
+    "id": "LUCENE-7628",
+    "title": "Add a getMatchingChildren() method to DisjunctionScorer",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "6.5"
+        ]
+    },
+    "description": "This one is a bit convoluted, so bear with me...\n\nThe luwak highlighter works by rewriting queries into their Span-equivalents, and then running them with a special Collector.  At each matching doc, the highlighter gathers all the Spans objects positioned on the current doc and collects their positions using the SpanCollection API.\n\nSome queries can't be translated into Spans.  For those queries that generate Scorers with ChildScorers, like BooleanQuery, we can call .getChildren() on the Scorer and see if any of them are SpanScorers, and for those that aren't we can call .getChildren() again and recurse down.  For each child scorer, we check that it's positioned on the current document, so non-matching subscorers can be skipped.\n\nThis all works correctly except in the case of a DisjunctionScorer where one of the children is a two-phase iterator that has matched its approximation, but not its refinement query.  A SpanScorer in this situation will be correctly positioned on the current document, but its Spans will be in an undefined state, meaning the highlighter will either collect incorrect hits, or it will throw an Exception and prevent hits being collected from other subspans.\n\nWe've tried various ways around this (including forking SpanNearQuery and adding a bunch of slow position checks to it that are used only by the highlighting code), but it turns out that the simplest fix is to add a new method to DisjunctionScorer that only returns the currently matching child Scorers.  It's a bit of a hack, and it won't be used anywhere else, but it's a fairly small and contained hack.",
+    "attachments": {
+        "LUCENE-7628.patch": "https://issues.apache.org/jira/secure/attachment/12847179/LUCENE-7628.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15818451",
+            "date": "2017-01-11T14:17:06+0000",
+            "content": "See also https://github.com/flaxsearch/luwak/issues/120, and https://github.com/flaxsearch/luwak/commit/36c91e8bdd3ab0d07578b76359d1f2a87eb53797 ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15818456",
+            "date": "2017-01-11T14:20:36+0000",
+            "content": "The luwak highlighter works by rewriting queries into their Span-equivalents, and then running them with a special Collector. \n\nSeems like everyone has a highlighter that reinvents the wheel.  What I just posted to the dev list actually asks for pretty much what you described above. Clearly there is a need for some common infrastructure that would \"just\" return highlight regions (which can be then turned into larger passages or otherwise manipulated)? ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-15818467",
+            "date": "2017-01-11T14:25:28+0000",
+            "content": "Well, LUCENE-2878 is still open \n\nSome of the luwak highlighter will probably make it back into core at some point - I think David Smiley is planning on using at least some of it in the UnifiedHighlighter in the future.  In the meantime, it's all open source - help yourself!\n\nhttps://github.com/flaxsearch/luwak/blob/master/luwak/src/main/java/uk/co/flax/luwak/matchers/HighlightingMatcher.java ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15818614",
+            "date": "2017-01-11T15:26:53+0000",
+            "content": "Turns out it's not as simple as just adding the method, because DisjunctionScorer is package-private and so it can't be accessed from the highlighter code.\n\nThere are a couple of options I see:\n\n\tadd getMatchingChildren() to Scorer itself - a fairly minimal change (default implementation just forwards to getChildren()), but increases the Scorer API surface area\n\tmake DisjunctionScorer.getChildren() only return matching children - this is a bigger change, altering current behaviour and adding IOException to the getChildren() signature, although it's still pretty small in terms of the number of changed lines in the codebase.\n\n\n\nAny opinions? ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15819020",
+            "date": "2017-01-11T20:10:14+0000",
+            "content": "This all works correctly except in the case of a DisjunctionScorer where one of the children is a two-phase iterator that has matched its approximation, but not its refinement query. A SpanScorer in this situation will be correctly positioned on the current document, but its Spans will be in an undefined state, meaning the highlighter will either collect incorrect hits, or it will throw an Exception and prevent hits being collected from other subspans.\n\nDoes the highlight code call collect() before nextStartPosition() ?\nThat should be avoided, see the javadocs of Spans.\n\nFor LUCENE-7580 I had a very similar issue, that one computes scores per matching (i.e. to be highlighted) term occurrence.\nThe solution there is to split off DisjunctionSpans from SpanOrQuery and to add these methods:\n\n  public List<Spans> subSpans() {\n    return subSpans;\n  }\n\n  public void extractSubSpansAtCurrentDoc(List<Spans> spansList) {\n    byPositionQueue.extractSpansList(spansList);\n  }\n\n  public Spans getCurrentPositionSpans() {\n    return byPositionQueue.top();\n  }\n\n\n\nWith that in place a highlighter could use SpanOrQuery instead of a BooleanQuery OR, and then the highlighter should be able to do its work.\n\n(Aside: getCurrentPositionSpans() is wrongly named getFirstPositionSpans() at LUCENE-7580, I'll fix that later). ",
+            "author": "Paul Elschot"
+        },
+        {
+            "id": "comment-15819109",
+            "date": "2017-01-11T20:43:38+0000",
+            "content": "You can see the relevant code here:\nhttps://github.com/flaxsearch/luwak/blob/master/luwak/src/main/java/uk/co/flax/luwak/util/SpanExtractor.java\n\nThe problem isn't calling collect() before nextStartPosition(), it's calling nextStartPosition() on a Spans that may not be correctly positioned on a document (even though it's docId() suggests that it is).  We can't use SpanOrQuery, unfortunately, because we're pulling Spans from what may be very complicated and deeply-nested booleans. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15819158",
+            "date": "2017-01-11T21:04:57+0000",
+            "content": "And if there was also something like SpanAndMergeQuery that merges the Spans positions when all of them are present in a document?\n\nThis could have an AndMergeSpans as a subclass of DisjunctionSpans above. ",
+            "author": "Paul Elschot"
+        },
+        {
+            "id": "comment-15819228",
+            "date": "2017-01-11T21:26:25+0000",
+            "content": "I'll answer myself.\n\nWith AND and OR available, i.e. the Spans parallels of ConjunctionScorer and DisjunctionScorer, what would still be needed is the Spans parallel of ReqExclScorer, for NOT at document level.\n\nSomething like ReqExclSpans for a SpanBooleanNotQuery. ",
+            "author": "Paul Elschot"
+        },
+        {
+            "id": "comment-15820675",
+            "date": "2017-01-12T10:24:47+0000",
+            "content": "Here's a patch opting for the first of the two options I describe above.  The change is pretty small - just a default implementation on Scorer, and then specialised methods on DisjunctionScorer and MinShouldMatchSumScorer.  I think this is the best way forward? ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15822361",
+            "date": "2017-01-13T21:20:02+0000",
+            "content": "To continue about using Spans directly for this\n(earlier posted on github, see https://github.com/flaxsearch/luwak/commit/36c91e8bdd3ab0d07578b76359d1f2a87eb53797)\n\nOther than AND and OR in the same field, what is also still needed is dealing with multiple fields.\nFor this we need a Spans that can share its DocIdSetIterator with another Spans.\n\nIirc that is what LUCENE-2878 is about, so I'm finally beginning to understand the real point of that issue, and why it is still open.\n\nMeanwhile we had DocIdSetIterator split off from Searcher (for speed).\nHow about doing something similar for Spans? I think that would leave Spans pretty close to the Positions of LUCENE-2787. The only change in semantics for Spans would be that at least one of the Spans that share a DocIdSetIterator should provide a real position in a document. Maybe we could have sth like MultiFieldSpans for that. ",
+            "author": "Paul Elschot"
+        },
+        {
+            "id": "comment-15822372",
+            "date": "2017-01-13T21:26:08+0000",
+            "content": "Hopefully this is not getting too far off topic.\n\nIn case there is interest in taking DocIdSetIterator out of Spans, please let me know, I have version that passes the lucene tests.\nI don't know whether it speeds up Spans.\nThe split makes a lot of the Spans code more readable. ",
+            "author": "Paul Elschot"
+        },
+        {
+            "id": "comment-15822766",
+            "date": "2017-01-14T09:17:45+0000",
+            "content": "That sounds like an interesting idea, Paul Elschot, but probably for another issue  ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15822947",
+            "date": "2017-01-14T20:48:31+0000",
+            "content": "I'm not sure about this change since it puts more pressure on the Scorer API. For instance if scores are not needed, the Scorer does not need to know about the matching sub clauses, so there could be optimizations based on that, but that change requires that any Scorer be able to return the list of matching sub scorers.\n\nBy the way, the MinShouldMatchSumScorer impl is buggy since this Scorer advances the sub scorers lazily: for instance if minShouldMatch is 2, it will stop advancing sub clauses as soon as 2 matching scorers are found. The only scorers will only be advanced if score() is called. I think that could be called by calling updateFreq() before iterating the matching scorers, like score() does.\n\nI know you marked this new method as experimental, so we could remove this method if that ever becomes a problem. However, I have the feeling that getChildren() exists for the exact same reason that you are now adding getMatchingChildren() so could we remove getChildren() now? Sorry for being annoying but I think it is important to keep the Scorer API small.\n\nCould you also add javadocs that this method may only be called from scorers created though Weight.scorer and not eg. from collectors? Otherwise there will be issues if users try to call this API when bulk scorers are used that pass fake scorers to collectors. We have ToParentBlockJoinCollector that uses getChildren, and it is an issue since it means it cannot work with BS1, which is one of the most commonly used scorers.\n\nCould we revert this change on the 6.4 branch so that we have time to clean this up a bit before exposing it to users? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15823096",
+            "date": "2017-01-15T10:28:58+0000",
+            "content": "I've reverted the change.\n\nTo keep the API the same size, I can try merging the functionality of getChildren() and getMatchingChildren() (my second suggestion here: https://issues.apache.org/jira/browse/LUCENE-7628?focusedCommentId=15818614&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15818614).\n\nOn the issue of bulk scoring, maybe we should add a visitsSubScorers() method to Collector, analogous to needsScores().  Then we can enable bulk-scoring or not depending on the needs of the Collector implementation.  This would be another way to deal with LUCENE-7365. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15823736",
+            "date": "2017-01-16T10:27:21+0000",
+            "content": "I think that would work, but Collector is another API where I'd like to be careful about adding new methods. I think needsScores was very compelling because it enabled significant optimizations as well as merging queries and filters. I think I would need more compelling use-cases to be convinced about adding such a new API on Collector. Out of curiosity, would it work for your use-case if the introspection API was on Weight rather than Scorer? That would work better for me since Weight is not exposed in Collector like Scorer and does not have the same performance requirements. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15823821",
+            "date": "2017-01-16T11:45:44+0000",
+            "content": "I'm not sure how moving the introspection API to Weight would work, though, as we need to check subscorers when the parent scorer is positioned on a specific document. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15824014",
+            "date": "2017-01-16T14:14:18+0000",
+            "content": "I meant something similar to explain, which takes a docID, eg. Collection<Weight> Weight.getMatchingChildren(int docID). ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15824036",
+            "date": "2017-01-16T14:27:55+0000",
+            "content": "Ah, I see what you mean.  That would still work, I think, although it would probably slow down highlighting batches of documents, as we'd have to create a new Scorer tree for every matching doc in the batch whereas now we can reuse them. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15824049",
+            "date": "2017-01-16T14:30:37+0000",
+            "content": "Here's a patch changing getChildren() to only return matching subscorers. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15830268",
+            "date": "2017-01-19T17:08:47+0000",
+            "content": "Adrien Grand are you happy with the patch as it is?  We can look at moving things to Weight in another issue. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15830332",
+            "date": "2017-01-19T17:50:25+0000",
+            "content": "I am still not fond of the change but I guess this is due to the fact that I don't like the current getChildrien() we have in master either. It does not make things worse though. Maybe docs should state that this method is only valid when the scorer is positioned, and AssertingScorer should check it? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15834131",
+            "date": "2017-01-23T09:35:34+0000",
+            "content": "Commit 3c12fadb58574c42efcfa0e44e7603eaa20fc2d4 in lucene-solr's branch refs/heads/branch_6x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3c12fad ]\n\nLUCENE-7628: Scorer.getChildren() returns only matching Scorers ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15834132",
+            "date": "2017-01-23T09:35:35+0000",
+            "content": "Commit 5bdc492c9ca8f866d9827d83a05fbab4b95f5ce9 in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5bdc492 ]\n\nLUCENE-7628: Scorer.getChildren() returns only matching Scorers ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15834136",
+            "date": "2017-01-23T09:37:35+0000",
+            "content": "I added extra javadocs, and a check to AssertingScorer, which also meant changes to TestSubScorerFreqs.  I'll keep thinking on better ways of traversing the Scorer tree. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15834299",
+            "date": "2017-01-23T11:30:17+0000",
+            "content": "Commit 6818de199e0fe54636e13c3148471780a9a63b0f in lucene-solr's branch refs/heads/branch_6x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6818de1 ]\n\nRevert \"LUCENE-7628: Scorer.getChildren() returns only matching Scorers\"\n\nThis reverts commit 3c12fadb58574c42efcfa0e44e7603eaa20fc2d4. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15834300",
+            "date": "2017-01-23T11:30:19+0000",
+            "content": "Commit 94e3460305ae652531fbe55a27158490c55c8f0e in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=94e3460 ]\n\nRevert \"LUCENE-7628: Scorer.getChildren() returns only matching Scorers\"\n\nThis reverts commit 5bdc492c9ca8f866d9827d83a05fbab4b95f5ce9. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15834301",
+            "date": "2017-01-23T11:31:35+0000",
+            "content": "Reopening to fix failures in join and facet modules ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15834308",
+            "date": "2017-01-23T11:39:30+0000",
+            "content": "The facet fix is simple enough (it's just in a test).  ToParentBlockJoinCollector relies on being able to call this method when the Scorer is unpositioned, though, so I think the change isn't going to work.  Back to the drawing board. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15835869",
+            "date": "2017-01-24T08:58:09+0000",
+            "content": "Commit 5bdc492c9ca8f866d9827d83a05fbab4b95f5ce9 in lucene-solr's branch refs/heads/apiv2 from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5bdc492 ]\n\nLUCENE-7628: Scorer.getChildren() returns only matching Scorers ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15835873",
+            "date": "2017-01-24T08:58:15+0000",
+            "content": "Commit 94e3460305ae652531fbe55a27158490c55c8f0e in lucene-solr's branch refs/heads/apiv2 from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=94e3460 ]\n\nRevert \"LUCENE-7628: Scorer.getChildren() returns only matching Scorers\"\n\nThis reverts commit 5bdc492c9ca8f866d9827d83a05fbab4b95f5ce9. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15872061",
+            "date": "2017-02-17T16:26:46+0000",
+            "content": "Now that ToParentBlockJoinCollector is gone, I think I can re-apply this patch for 6.5?  Running tests now. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-15876069",
+            "date": "2017-02-21T14:39:02+0000",
+            "content": "Commit cbe7e87d82a5a64fb8b019b215b2c59814ef5462 in lucene-solr's branch refs/heads/branch_6x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cbe7e87 ]\n\nLUCENE-7628: Scorer.getChildren() returns only matching child scorers ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15876070",
+            "date": "2017-02-21T14:39:05+0000",
+            "content": "Commit ac38872a7916b8df0e218303b439aa4434c1dc52 in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ac38872 ]\n\nLUCENE-7628: Scorer.getChildren() returns only matching child scorers ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15876072",
+            "date": "2017-02-21T14:39:35+0000",
+            "content": "Let's see if it takes this time, shall we? ",
+            "author": "Alan Woodward"
+        }
+    ]
+}

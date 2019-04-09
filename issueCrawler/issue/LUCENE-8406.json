@@ -1,0 +1,67 @@
+{
+    "id": "LUCENE-8406",
+    "title": "Make ByteBufferIndexInput public",
+    "details": {
+        "components": [],
+        "status": "Open",
+        "resolution": "Unresolved",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "labels": "",
+        "priority": "Minor",
+        "type": "Improvement"
+    },
+    "description": "The logic of handling byte buffers splits, their proper closing (cleaner) and all the trickery involved in slicing, cloning and proper exception handling is quite daunting. \n\nWhile ByteBufferIndexInput.newInstance(..) is public, the parent class ByteBufferIndexInput is not. I think we should make the parent class public to allow advanced users to make use of this (complex) piece of code to create IndexInput based on a sequence of ByteBuffers.\n\nOne particular example here is RAMDirectory, which currently uses a custom IndexInput implementation, which in turn reaches to RAMFile's synchronized methods. This is the cause of quite dramatic congestions on multithreaded systems. While we clearly discourage RAMDirectory from being used in production environments, there really is no need for it to be slow. If modified only slightly (to use ByteBuffer-based input), the performance is on par with FSDirectory. Here's a sample log comparing FSDirectory with RAMDirectory and the \"modified\" RAMDirectory making use of the ByteBuffer input:\n\n\n14:26:40 INFO  console: FSDirectory index.\n14:26:41 INFO  console: Opened with 299943 documents.\n14:26:50 INFO  console: Finished: 8.820 s, 240000 matches.\n\n14:26:50 INFO  console: RAMDirectory index.\n14:26:50 INFO  console: Opened with 299943 documents.\n14:28:50 INFO  console: Finished: 2.012 min, 240000 matches.\n\n14:28:50 INFO  console: RAMDirectory2 index (wrapped byte[] buffers).\n14:28:50 INFO  console: Opened with 299943 documents.\n14:29:00 INFO  console: Finished: 9.215 s, 240000 matches.\n\n14:29:00 INFO  console: RAMDirectory2 index (direct memory buffers).\n14:29:00 INFO  console: Opened with 299943 documents.\n14:29:08 INFO  console: Finished: 8.817 s, 240000 matches.\n\n\n\nNote the performance difference is an order of magnitude on this 32-CPU system (2 minutes vs. 9 seconds). The tiny performance difference between the implementation based on direct memory buffers vs. those acquired via ByteBuffer.wrap(byte[]) is due to the fact that direct buffers access their data via unsafe and the wrapped counterpart uses regular java array access (my best guess).",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16546576",
+            "author": "Dawid Weiss",
+            "content": "Forgot about it: the public (experimental?) API would have to include making ByteBufferGuard and BufferCleaner public too (similar situation: public methods, hidden classes). ",
+            "date": "2018-07-17T13:03:28+0000"
+        },
+        {
+            "id": "comment-16546695",
+            "author": "Michael Braun",
+            "content": "Would love to have the performance of RAMDirectory improved if possible - when experimenting with Luwak (https://github.com/flaxsearch/luwak) CC Alan Woodward, there was noticeable performance degradation due to contention at the RAMFile level. Would the need for RAMFile be eliminated entirely with this? ",
+            "date": "2018-07-17T14:29:38+0000"
+        },
+        {
+            "id": "comment-16546729",
+            "author": "Uwe Schindler",
+            "content": "I have no problem in making the class public, if the factory method is correctly documented and take an array of ByteBuffer. The unmapping an mmap logic is part of MMapDirectory and only available internally, so it's not risky to do this. It's also important to document ad add some checks to ensure that the slices need to have power-of-2 sizes (except the last).\n\nBut we should not make the BBGuard public, I think that can be hidden inside? BufferCleaner interface is fine, so somebody can hook in his own impl. ",
+            "date": "2018-07-17T14:51:28+0000"
+        },
+        {
+            "id": "comment-16546734",
+            "author": "Uwe Schindler",
+            "content": "Note the performance difference is an order of magnitude on this 32-CPU system (2 minutes vs. 9 seconds). The tiny performance difference between the implementation based on direct memory buffers vs. those acquired via ByteBuffer.wrap(byte[]) is due to the fact that direct buffers access their data via unsafe and the wrapped counterpart uses regular java array access (my best guess).\n\nShould no longer be visible after Java 9 and enough warmup. Which version did you use? ",
+            "date": "2018-07-17T14:52:50+0000"
+        },
+        {
+            "id": "comment-16547006",
+            "author": "Dawid Weiss",
+            "content": "Thanks for comments. \n\nMy initial experiment with implementing an alternative store for RamDirectory was very local (out of Solr/Lucene codebase) \u2013 I modified RAMOutputStream and the corresponding input (in various ways) so that it assumed write-once mode (much like the index is written). I essentially don't allow concurrent readers of a RamDirectory file \u2013 once the file is written and flushed, it is available for readers, but not before then. \n\nI then looked at modifying this in the codebase and the current complexity of those classes (and the congestion on locking) is a result of how these classes are used in many other places (as temporary buffers, essentially). This would have to be cleaned up first, I think, and there are comments in the code (by Mike) about proliferation of \"writeable byte pool\" classes for which the common functionality should perhaps be extracted and then reused. Namely: PagedBytes, ByteBlockPool,BytesStore ByteArrayDataOutput,GrowableByteArrayDataOutput, RAMIndexInput/Output... Perhaps more. They're not always identical, but there's definitely a recurring pattern. \n\nI'll try to chip at all this slowly, time permitting.\n\nThe initial look at the code also brought the reflection that if we make BBGuard, buffer management and the cleaner interface public but not make the buffer's native cleaner available we will force anyone downstream to reinvent the wheel Uwe has been so patient to figure out (different ways to clean up buffers in different JVM versions). If we do make that MMap's cleaner accessible we open up a lot of internal workings of how Lucene handles this stuff, which isn't good either, so I'm at crossroads here.\n\nPerhaps I can start small by trying to clean up those RAMDirectory streams. It'd be very temping (for me, personally) to have a RAMDirectory that could allocate larger block chunks outside of the heap (in direct memory pools) \u2013 if I can think of making it cleanly within the class then perhaps package-private scope for everything else is fine and one still has the flexibility of working with native buffers without caring about the details. \n\nI'll try to take a look at all this, although the number of references to ramdirectory from pretty much everywhere is sort of scary.\n\n\n ",
+            "date": "2018-07-17T19:20:48+0000"
+        },
+        {
+            "id": "comment-16547014",
+            "author": "Robert Muir",
+            "content": "\nIt'd be very temping (for me, personally) to have a RAMDirectory that could allocate larger block chunks outside of the heap (in direct memory pools)\n\nHow much better would it be than mmapdir over tmpfs? ",
+            "date": "2018-07-17T19:24:33+0000"
+        },
+        {
+            "id": "comment-16547019",
+            "author": "Dawid Weiss",
+            "content": "Unfortunately we have to deal with Windows systems, so it'd have the advantage of working there. We create lots of quick throw-away indexes and syncing to persistent storage for these scenarios hurts. ",
+            "date": "2018-07-17T19:30:11+0000"
+        },
+        {
+            "id": "comment-16547032",
+            "author": "Robert Muir",
+            "content": "Yes but windows has solutions for such things too. I'm just not sure we should jump to writing java code quite yet here. ",
+            "date": "2018-07-17T19:44:47+0000"
+        }
+    ]
+}

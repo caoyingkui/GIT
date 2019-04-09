@@ -83,10 +83,10 @@ public class CommitDependencyAnalyzer {
         Set<String> result = new HashSet<>();
         try {
             for (String file : files) {
-                ClassParser classParser = new ClassParser(gitAnalyzer.getFileFromCommit(commitId, file));
+                ClassParser classParser = new ClassParser().setSourceCode(gitAnalyzer.getFileFromCommit(commitId, file));
                 Set<String> methods = null;
                 if (changed)
-                    methods = classParser.getChangedMethod(gitAnalyzer.getPatch(commitId, null, file), true);
+                    methods = classParser.getChangedMethod(gitAnalyzer.getPatch(commitId, null, file), true).keySet();
                 else
                     methods = classParser.getAllMethodNames();
                 result.addAll(methods);

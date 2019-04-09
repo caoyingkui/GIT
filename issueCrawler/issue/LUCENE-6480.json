@@ -1,0 +1,137 @@
+{
+    "id": "LUCENE-6480",
+    "title": "Extend Simple GeoPointField Type to 3d",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "components": [
+            "modules/spatial"
+        ],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "New Feature"
+    },
+    "description": "LUCENE-6450  proposes a simple GeoPointField type to lucene core. This field uses 64bit encoding of 2 dimensional points to construct sorted term representations of GeoPoints (aka: GeoHashing).\n\nThis feature investigates adding support for encoding 3 dimensional GeoPoints, either by extending GeoPointField to a Geo3DPointField or adding an additional 3d constructor.",
+    "attachments": {
+        "MortonEncoding3D.java": "https://issues.apache.org/jira/secure/attachment/12761955/MortonEncoding3D.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14541850",
+            "author": "Karl Wright",
+            "date": "2015-05-13T12:44:01+0000",
+            "content": "So my idea for an (x,y,z) based geohash is as follows:\n\n\n\tthree bits per split iteration: each splits x,y,z into a smaller range\n\tinitial range for each dimension is -1 to 1, thus size 2.\n\tthe first split determines the sign, and is thus backwards: e.g. -1 <= x < 0 yields bit 0, 0 <= x <= 1 yields bit 1.\n\tsecond bit splits range, e.g. \"00\" means -0.5 <= x < 0.\n\n\n\nQuestions:\n\n\tQ1: how precise is it to fit in a long? A: 64/3 = 21 splits with 1 bit left over.  2/(2^21) = 2^(-20) = 6.07585906982421875 meters\n\tQ2: how to quickly convert to a geocode value?\n    A: need bit manipulation of mantissa and exponent for this; requires further thought (and maybe a hash change)\n\tQ2: how to quickly convert back to usable (x,y,z) from a geocode value?\n    A: first, geo3d has to tolerate imprecision in evaluation.  It does, possibly excepting small GeoCircles.  Otherwise, similar bit manipulation of mantissa and exponent in a double.\n\n\n\nOnce there's a reversible packing method, it's pretty trivial to make use of all geo3d shapes. "
+        },
+        {
+            "id": "comment-14541852",
+            "author": "Karl Wright",
+            "date": "2015-05-13T12:45:02+0000",
+            "content": "I'll attach code snippets for packing and unpacking ASAP, but it may not be until this weekend. "
+        },
+        {
+            "id": "comment-14541933",
+            "author": "Nicholas Knize",
+            "date": "2015-05-13T13:41:45+0000",
+            "content": "Its sounds much like the simple morton interleaving I'm using for the 2D case? But since you're using an extra bit for the 3rd dimension you lose precision in the horizontal direction. We could start w/ that as a phase one? Instead of worrying about the sign bit the values in the 2D case are scaled 0:360, 0:180 and divided into 32 bits per lat/lon (see GeoUtils.java).  Extending to 3D divide 0:360, 0:180, 0:?? by 21 and extend BitUtil.interleave to the 3 value case.  Its super fast since its done by bit twiddling using magic numbers (although the magic numbers will need to be reworked).  The question is the max value of the altitude? The larger the value the less precise, but you could conceivably go as far as 3,300 (km) to cover the earth's atmosphere?  Maybe that's configurable.\n\nAs a phase 2 there has been some work in this area for 3 and 4d hilbert order (still using 64 bit), which will better preserve locality. (I mentioned it in a comment in the previous issue).  Locality is important since it will drive the complexity of the range search and how much the postings list will actually help (e.g. stepping one unit in the 3rd dimension can result in a boundary range that requires post-filtering a significant number of high precision terms).\n\nThe more I think about it, this might be efficiently done using a statically computed lookup table (we'd have to tinker)?  i.e., one hilbert order for the 3d unit cube is 000, 001, 101, 100, 110, 111, 011, 010, and the order of the suboctants at each succeeding level is a permutation of this base unit cube.  For example, the next rotated level (for suboctant 000) gives the binary order:  000 000, 000 010, 000 110, 000 100, 000 101, 000 111, 000 011, 000 001.  There's a paper that describes how to compute the suboctant permutation rather efficiently, and it could be statically computed and represented using 1. base unit ordering, 2. substitution list.  So for level 2, each suboctant ordering is: base order (000, 001, 101, 100, 110, 111, 011, 010), substitution list (2 8) (3 5), (2 8 4) (3 7 5), (2 8 4) (3 7 5), (1 3) (2 4) (5 7) (6 8), (1 3) (2 4) (5 7) (6 8), (1 5 7) (2 4 6), (1 7) (4 6).  Something to think about as an enhancement.  I'll try to find the paper as I've got this worked out in my notebook from some previous work (lol). "
+        },
+        {
+            "id": "comment-14542001",
+            "author": "Karl Wright",
+            "date": "2015-05-13T14:27:47+0000",
+            "content": "The question is the max value of the altitude?\n\nTo clarify, geo3d is not using (lat,lon,altitude) tuples.  When I said (x,y,z) I meant unit sphere (x,y,z), where z = sin(lat), x = cos(lat)cos(lon), y = cos(lat)sin(lon).  The reason you'd want to pack (x,y,z) instead of just (lat,lon) is that computing cosines and sines is quite expensive, so you don't want to be constructing a geo3d.GeoPoint using lat/lon at document scoring time.  Instead you'd want to unpack the (x,y,z) values directly from the Geo3DPointField. The range of all three parameters in this case is -1 to 1, which is how I came up with the packing resolution I did.\n\nLocality is important since it will drive the complexity of the range search and how much the postings list will actually help\n\nThe reason you need (x,y,z) instead of (lat,lon) at scoring time is because geo3d determines whether a point is within the shape using math that requires points to be in that form.  If you do that, then the evaluation of membership is blindingly fast.  The splitting proposal does have locality.\n\n "
+        },
+        {
+            "id": "comment-14542019",
+            "author": "Karl Wright",
+            "date": "2015-05-13T14:38:46+0000",
+            "content": "It also occurs to me that I don't fully understand how you intend to perform a fast search involving geo3d for records that are within a specified geo3d shape.  Perhaps you could clarify in general terms how you would foresee doing that?  I get that you are basically using recursive descent, intersecting with the ordering in the posting list, but then I get fuzzy.  What kind of boolean decisions need to be made?  Is membership of a point within the shape sufficient?  Point me at the technique as written up elsewhere if you like... "
+        },
+        {
+            "id": "comment-14542050",
+            "author": "Nicholas Knize",
+            "date": "2015-05-13T15:01:30+0000",
+            "content": "...when I said (x,y,z) I meant unit sphere (x,y,z).\n\nAh, yes reprojecting would be the right way. So why not just use ECEF then instead of the unit sphere? Its a better approximation of the earth. Or have you tried this and the few extra trig computations impaired performance?  Could try SloppyMath in that case and evaluate the performance/precision trade off?\n\n...you are basically using recursive descent, intersecting with the ordering in the posting list..\n\nNo. Using the terms dictionary and only checking high precision terms for boundary ranges and using the postings list for lower resolution terms completely contained.\n\nIs membership of a point within the shape sufficient?\n\nCore geo search is meant for simple use cases, points only, contains only.  In that case, if a point is contained by a query bbox or polygon it is added to the result set. Anything more advanced than this (e.g., DE9IM) is intended for the shape module. "
+        },
+        {
+            "id": "comment-14542081",
+            "author": "Michael McCandless",
+            "date": "2015-05-13T15:15:48+0000",
+            "content": "I'm not following closely here (yet!) but just wanted to say: we shouldn't feel like we must use at most 8 bytes to encode lat+lon+altitude, since we are indexing into arbitrary byte[] terms in the postings ...\n\nI mean, the fewer bytes the better, but there's not a hard limit of 8. "
+        },
+        {
+            "id": "comment-14542149",
+            "author": "Karl Wright",
+            "date": "2015-05-13T15:58:47+0000",
+            "content": "So why not just use ECEF then instead of the unit sphere?\n\nI presume your question is about geo3D in general.\nThere's quite a bit of math in Geo3D that relies on GeoPoints being on the unit sphere.  For that reason, using the unit sphere, or projecting to it at least, is preferred.  If you are only doing containment of a point, you may not run into some of the more complex Geo3D math, but if you are determining relationships of bounding boxes to shapes, or finding the bounding box of a shape, you can't dodge being on the unit sphere.\n\nOr have you tried this and the few extra trig computations impaired performance?\n\nIf you mean trying to map points on the earth onto the unit sphere, then it was simply unnecessary for our application.  The maximum error you can get, as I stated before, by using a sphere rather than a real earth model is a few meters.  I maintain that doing such a mapping at indexing time is probably straightforward, at some performance expense, but I view this as beyond the bounds of this project.\n\n\n "
+        },
+        {
+            "id": "comment-14542165",
+            "author": "Karl Wright",
+            "date": "2015-05-13T16:04:38+0000",
+            "content": "Depends on the application.  With 64 bits the resolution can be 6.07 meters, which seems probably good enough for most. "
+        },
+        {
+            "id": "comment-14543396",
+            "author": "Karl Wright",
+            "date": "2015-05-14T08:49:38+0000",
+            "content": "Here are (untested) code snippets for converting a single double value to a long and back, such that locality is preserved etc.  In order to use these with x,y,z you would need to use a modified three-part Morton encoding (similar to what was done for GeoPointField) to interleave the bits resulting from the encoding method, and the reverse operation to de-convolve the long into three sets of bits.\n\n\n  public static long toGeoBits(double value) {\n    // Get the bits for the value\n    long lvalue = Double.doubleToLongBits(value);\n    // The exponent will range from 0 to -1023.  Use it to compute the\n    // amount to shift the mantissa.  But shift left one first, so we sign-extend properly.\n    int exponent = (int)((lvalue << 1) >> 53);\n    // Shift the mantissa to the leftmost position and add the hidden bit\n    long mantissa = (lvalue & 0x000FFFFFFFFFFFFFL) << 11;\n    // Special value of zero occurs when exponent == 0 and mantissa == 0.  But a rigorous interpretation\n    // of this value is 2^(-1023), which is close enough to zero for our work, so we do nothing special.\n    long fullMantissa = mantissa | 0x8000000000000000L;\n    // Now, compute the amount to shift the mantissa.  We want the mantissa,\n    // plus the hidden bit, to wind up in the right place.  This will allow room for the sign bit too\n    return (mantissa >>> (1024-exponent)) | ((lvalue & 0x8000000000000000L) ^ 0x8000000000000000L);\n  }\n  \n  protected final static double SHIFT_RIGHT_AMT =\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 *\n    0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5 * 0.5;\n  \n  public static double fromGeoBits(long bits) {\n    // To compute the exponent, we need to count the number of \"0\" bits from the next-to-highest position down to\n    // the first \"1\".  This is not trivial to do without a loop, which would slow us down.  So a better\n    // way to do the job is to just cast from the long to a double, and extract the exponent from\n    // the result.\n    double castedDouble = (double)(bits & 0x7FFFFFFFFFFFFFFFL);\n    // We need to divide by 2^63 to get the number back in range, and set the appropriate sign.\n    castedDouble *= SHIFT_RIGHT_AMT;\n    if ((bits & 0x8000000000000000L) == 0)\n      return -castedDouble;\n    return castedDouble;\n  }\n\n "
+        },
+        {
+            "id": "comment-14544116",
+            "author": "Nicholas Knize",
+            "date": "2015-05-14T17:58:18+0000",
+            "content": "The maximum error you can get, as I stated before, by using a sphere rather than a real earth model is a few meters.\n\nHere's  a good discussion and analysis on the maximum error for a geo point using the sphere over an earth model. tldr: unit sphere can give upwards of 22km depending on the points.\n\nThe latest patch over at LUCENE-6481  adds ecfToLLA and llaToECF methods using the WGS84 datum.  This version uses the non-iterative geodetic to geodesic conversion so it can give upwards of 5m horizontal error and 3m vertical error, but it can be significantly faster than the iterative approach depending on the location on the earth.\n\nAs a next phase improvement to geo3d it might be interesting to compare contrast performance/accuracy using both approaches? "
+        },
+        {
+            "id": "comment-14544180",
+            "author": "Karl Wright",
+            "date": "2015-05-14T18:43:51+0000",
+            "content": "Here's a good discussion and analysis on the maximum error for a geo point using the sphere over an earth model.\n\nThe article discusses error in distance computation.  I'm talking not about measuring distance halfway around the earth, but whether a given point is properly detected to be within a given shape.\n "
+        },
+        {
+            "id": "comment-14544686",
+            "author": "Karl Wright",
+            "date": "2015-05-15T00:47:18+0000",
+            "content": "I looked at the LUCENE-6481 patch and the mapping methods.  Thanks for including them.\n\nIt is not clear how these could be used to modify geo3D, since (as I mentioned before) the math intersects planes with the unit sphere algebraically.  The logic which determines if a point is within a shape is largely robust against differences in altitude, with some exceptions, so as I stated before shape membership is not very sensitive to oblate spheroid vs. true sphere.  There are some exceptions to that, however \u2013 for example, the side edges of paths do not go through the origin, and therefore altitude will matter somewhat.  Also, membership in a GeoCircle is computed as being on the appropriate side of a plane into which the circle is transcribed, which means that it is more sensitive to altitude than any other shape geo3d supports.  Polygons are completely insensitive because their edges all go through the origin.  Bounding boxes are also sensitive, especially when top or bottom latitude is near a pole, for very similar reasons to GeoCircles.\n\nPublic goe3D distance computations are done along GeoPaths and from the centers of GeoCircles.  While GeoCircles can have radii of up to 180 degrees, typical usage is much smaller than that.  The same is true for GeoPath segments, where a kilometer or two would be typical.  There is no distance computation for large area-covering objects like polygons.\n\nI doubt very much that it would be possible to algebraically change geo3D completely to handle an oblate spheroid rather than a sphere.  The places where it breaks mathematically are as follows:\n\n(1) Finding lat/lon bounds of a shape, which requires computing the maximum and minimum latitude and longitude of the intersection of a plane and the unit sphere\n(2) Determining relationships between shapes, which requires intersecting planes with the unit sphere\n(3) Geocircles, because a plane is only an approximation for membership for an oblate spheroid; you really require a warped plane, which is way beyond simple mathematics to compute\n\nPart-way solutions can be found, however, for the distance issue, since distance computation is pretty much completely independent of everything else.  This will, of course, lead to \"nonsense\" answers where a point in a circle has a greater distance to the center in some cases than the circle's radius, but that can't be helped.\n\n "
+        },
+        {
+            "id": "comment-14547123",
+            "author": "Karl Wright",
+            "date": "2015-05-17T10:42:17+0000",
+            "content": "I've looked at this in some detail this weekend.  I've concluded that the algebraic challenges can be met provided that WGS84 can be munged to provide accurate values for (a,b,c) such that x^2/a^2 + y^2/b^2 + z^2/c^2 = 1.  But it is a separate topic and a separate ticket.  See LUCENE-6487. "
+        },
+        {
+            "id": "comment-14579742",
+            "author": "Karl Wright",
+            "date": "2015-06-09T23:24:29+0000",
+            "content": "Nicholas Knize: Now that you've got geo3d with a WGS84 planet model, any interest in this ticket? "
+        },
+        {
+            "id": "comment-14581119",
+            "author": "Nicholas Knize",
+            "date": "2015-06-10T21:31:58+0000",
+            "content": "Karl Wright ++ absolutely.  I think since GeoPointField and BKD are currently in sandbox we're fine to keep Geo3D in its current spatial4j package. But if they graduate to core then we'll also need to refactor Geo3D to core to eliminate module dependencies?  Maybe someone more knowledgeable of lucene-core dependencies can shed some light? Michael McCandless? "
+        },
+        {
+            "id": "comment-14581843",
+            "author": "Karl Wright",
+            "date": "2015-06-11T11:46:57+0000",
+            "content": "Nicholas Knize: The only dependencies of geo3d I am aware of is for some of the tests, which rely on David's spatial4j testing base classes. "
+        },
+        {
+            "id": "comment-14582565",
+            "author": "Michael McCandless",
+            "date": "2015-06-11T21:44:56+0000",
+            "content": "It's great that the only spatial dep for geo3d is the spatial4j testing base class...\n\nWe could move geo3d to sandbox to explore the integration here?  Geo3d is very new (like geopoint/bkd).\n\nI think BKD tree could also work very efficiently with geo3d. "
+        },
+        {
+            "id": "comment-14905053",
+            "author": "Nicholas Knize",
+            "date": "2015-09-23T19:09:42+0000",
+            "content": "This issue will be revisited once all in-flight GeoPointField and BKD issues are resolved.  In the meantime, I am attaching my bit twiddling code that encodes a 3D GeoPoint into a 96 bit encoding scheme for anyone that wants to tinker w/ 3D BKD or GPF.  \n\nA snapshot of the encoding/decoding performance is provided below:\n\nAvg computation: 95.05450009122806 ns  Trials: 285000000  Total time: 27090.532526 ms\nAvg computation: 95.02972751724138 ns  Trials: 290000000  Total time: 27558.62098 ms\nAvg computation: 95.12489473898304 ns  Trials: 295000000  Total time: 28061.843948 ms\nAvg computation: 95.15410407 ns  Trials: 300000000  Total time: 28546.231221 ms\nAvg computation: 95.3290865737705 ns  Trials: 305000000  Total time: 29075.371405 ms\n\n "
+        }
+    ]
+}

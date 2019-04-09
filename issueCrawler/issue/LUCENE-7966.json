@@ -1,0 +1,575 @@
+{
+    "id": "LUCENE-7966",
+    "title": "build mr-jar and use some java 9 methods if available",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [
+            "core/other",
+            "general/build"
+        ],
+        "fix_versions": [
+            "7.3",
+            "master (8.0)"
+        ]
+    },
+    "description": "See background: http://openjdk.java.net/jeps/238\n\nIt would be nice to use some of the newer array methods and range checking methods in java 9 for example, without waiting for lucene 10 or something. If we build an MR-jar, we can start migrating our code to use java 9 methods right now, it will use optimized methods from java 9 when thats available, otherwise fall back to java 8 code.  \n\nThis patch adds:\n\nObjects.checkIndex(int,int)\nObjects.checkFromToIndex(int,int,int)\nObjects.checkFromIndexSize(int,int,int)\nArrays.mismatch(byte[],int,int,byte[],int,int)\nArrays.compareUnsigned(byte[],int,int,byte[],int,int)\nArrays.equal(byte[],int,int,byte[],int,int)\n// did not add char/int/long/short/etc but of course its possible if needed\n\n\n\nIt sets these up in org.apache.lucene.future as 1-1 mappings to java methods. This way, we can simply directly replace call sites with java 9 methods when java 9 is a minimum. Simple 1-1 mappings mean also that we only have to worry about testing that our java 8 fallback methods work.\n\nI found that many of the current byte array methods today are willy-nilly and very lenient for example, passing invalid offsets at times and relying on compare methods not throwing exceptions, etc. I fixed all the instances in core/codecs but have not looked at the problems with AnalyzingSuggester. Also SimpleText still uses a silly method in ArrayUtil in similar crazy way, have not removed that one yet.",
+    "attachments": {
+        "LUCENE-7966.patch": "https://issues.apache.org/jira/secure/attachment/12886578/LUCENE-7966.patch",
+        "LUCENE-7966-7x-backwards.patch": "https://issues.apache.org/jira/secure/attachment/12909763/LUCENE-7966-7x-backwards.patch",
+        "LUCENE-7966-v2.patch": "https://issues.apache.org/jira/secure/attachment/12908838/LUCENE-7966-v2.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16162515",
+            "date": "2017-09-12T05:26:21+0000",
+            "content": "Here's my current patch. Need to look into the AnalyzingSuggester abuse of comparator, but other than that I think its ok as a start. See the TODO's in lucene/core/build.xml related to where to go from here.\n\nAs far as code I did some cleanup and plugged new stuff in some obvious places, but there is a lot more that could be done.\n\nNot sure if I have the time to see it through, i didnt realize how much of our byte[] stuff alone was a mess... ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16162559",
+            "date": "2017-09-12T06:21:01+0000",
+            "content": "Updated patch. I fixed the fallout better (don't encode wasteful bytes for the first term, no bytes need to be written) from detecting out-of-order comparisons in prefix-coding methods, this annoyingly was always related to the empty string: happened with bytesDifference([], [])/sortKeyLength([], []). \n\nTo me it makes sense to detect the malfunction (-1 return from mismatch) rather than just leniently doing something strange for duplicate terms, it may detect bugs. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16162581",
+            "date": "2017-09-12T07:04:49+0000",
+            "content": "Hi Robert,\nthis is wonderful. I am happy that our discussion about this helped. Nice that you used the example on the ANT webpage: https://ant.apache.org/manual/Tasks/jar.html#jep238-example\n\nThe problem is that you currently need Java 9 to compile, too. I'd make it optional. My alternative idea would be: Make a stub clone of the Objects/Arrays classes without code from the JDK and use them as bootclasspath. I can try to work with that. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16162628",
+            "date": "2017-09-12T07:43:42+0000",
+            "content": "+  <!-- TODO: on windows does executable need .exe suffix? -->\n\nNot if you fork=true because then the task is executed via cmd which resolves file extensions automatically. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16162631",
+            "date": "2017-09-12T07:47:42+0000",
+            "content": "Overall, pretty neat and an uncharted territory (I didn't see anybody using this JEP yet!). One thing that we lose here is the verbosity of exception message (field names, doc ids); for example:\n\n-    if (dimension < 0 || dimension >= type.pointDimensionCount()/2) {\n-      throw new IllegalArgumentException(\"dimension request (\" + dimension +\n-          \") out of bounds for field (name=\" + name + \" dimensions=\" + type.pointDimensionCount()/2 + \"). \");\n-    }\n+    FutureObjects.checkIndex(dimension, type.pointDimensionCount()/2);\n\n\n\nBit since these are exceptional cases I don't think they'd be particularly useful for diagnostics unless you can repeat the problem (and then you can add/debug what you like). ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16162647",
+            "date": "2017-09-12T08:14:34+0000",
+            "content": "One thing that we lose here is the verbosity of exception message (field names, doc ids)\n\nYes, but there is a reason to change to the new methods! Robert did not add that to the issue description. I directed him on the weekend during a private chat to the new methods (which was caused by my comment in a former issue with the missing check).\n\nTo make it short: Those methods are highly optimized by Hotspot. In fact they replaced the bounds checks in ByteBuffers and other places throughout the JDK to call those methods instead of hardcoded if/then/else statements. I also talked with R\u00e9mi Forax about it this summer to get more information. He strongly recommends to use the new methods from Objects and Arrays instead of manually crafted if/then/else checks. The reason is: Those methods are intrinsics and are more or less replaced by highly optimized bounds check code. In addition, if you add several levels of bounds checks more magic is happening: a high level method checks bounds and call lower level method, which does bounds checks again (e.g., a ByteBuffer in the JDK), and this lower level method again accesses a Java array (that implcitely does bounds checks, too), - then Hotspot adds all calls of those Objects' index check methods to the internal AST and it can then safely eliminate all of them except one. And if it sees that a variable is unsigned it will also remove negative checks ... and so on. This was done, because they had very hard problems in eliminating those checks everywhere when somebody creates an if statement (there are tons of ways to do the same check with if statements!), the OpenJDK developers argued to use a intrinsic replacement method instead of hardcoded bounds checks with hundreds of variants. By that they only have to optimize a single \"if statement\" and can replace it by assembly code and remove duplicates.\n\nEven shorter: If you use the Objects methods instead of if statements, you can add more safety to your code, as duplicate checks are eliminated. So we can even start to add checks into BytesRef. Or we can remove the stupid try/catch blocks in ByteBufferIndexInput. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16162653",
+            "date": "2017-09-12T08:19:33+0000",
+            "content": "Uwe: I understand the reason for this patch. My point was just that you do lose some verbosity in the exception message, that's all. \n\nAs for performance I wonder what the actual gain will be - I bet you a beer the performance will be within the noise levels on larger tasks.  ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16162696",
+            "date": "2017-09-12T09:04:21+0000",
+            "content": "As for performance I wonder what the actual gain will be - I bet you a beer the performance will be within the noise levels on larger tasks.\n\nOf course, we have to test this how much it gains! We should compare:\n\n\tJava 8 without and with patch\n\tJava 9 without and with patch\n\n\n\nBut the main reason is to make our code \"safer\". We omitted bounds checks at many places, because the overhead was immense (e.g. BytesRef, ByteBufferIndexInput,...) and sometimes not even added asserts. If we make that code safer, it will not be slower in Java 9. So we can say: We still work with Java 8, but you should really use Java 9 for optimal performance.\n\nRobert just started with the important stuff, but there is room for improvements. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16162704",
+            "date": "2017-09-12T09:12:09+0000",
+            "content": "\nI wholeheartedly agree \u2013 it's fascinating stuff and thanks to Robert and you for starting this. \n\nWe should compare:\n\nThose bound checks will cost something \u2013 the fact they're intrinsic methods doesn't mean they're free. There's another dimension to your list: the CPU architecture hotspot generates code for... I didn't look at the code, but those intrinsics will vary depending on what the CPU has to offer. So regardless of easier ideal graph optimizations (which is great!) there will be some assembly injected to make those bound checks work, especially on CPUs with less complex instruction set.\n\nLike I said: very interesting stuff to work on and benchmark! ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16162820",
+            "date": "2017-09-12T11:35:26+0000",
+            "content": "Dawid: i didn't really add new checks in the patch: I converted a bunch of existing checks to the new Objects.checkXXX methods. I think any difference in exception messages is not a big deal, actually i like the consistency and like the newer exception messages (see the unit tests for those: i emulated what java 9 returns in the java 8 methods).\n\nThe only place where there are new \"checks\" is where we use Arrays.compare/equals/mismatch. Those methods are defined in the jdk as safe, of course, and as I mentioned here, the existing comparator/etc methods we have are not very safe. See especially the prefix-coding corner cases I ran into here  \nFor those methods, the hope is that its still net/net drowned out: and hopefully definitely compensated by the fact that these methods no longer go one-byte-at-a-time.\n\nIn all cases none of this stuff should really be a hotspot for lucene. IMO we should be encouraging more safety/checks/reliability, and thats the goal here. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16162905",
+            "date": "2017-09-12T13:12:37+0000",
+            "content": "\nThere's another dimension to your list: the CPU architecture hotspot generates code for... I didn't look at the code, but those intrinsics will vary depending on what the CPU has to offer.\n\nNo there isn't actually, the transformation is platform independent: \n\nhttp://hg.openjdk.java.net/jdk9/jdk9/hotspot/file/b756e7a2ec33/src/share/vm/opto/library_call.cpp#l1160\n\nPlease in the future, lets actually look at the code first, before getting too paranoid about such things. Otherwise we make decisions based on FUD instead of facts and end out with the sloppy array code like we have today  ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16163472",
+            "date": "2017-09-12T18:49:32+0000",
+            "content": "I thought it's an intrinsic reaching all the way down to an inlined assembly (macro), not just ideal graph transformation/ optimization. Apologies for not verifying this. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16163942",
+            "date": "2017-09-13T00:31:40+0000",
+            "content": "I opened LUCENE-7968 for the suggester case failing here, this looks seriously buggy since it has a negative array length, just hidden by the fact BytesRef.compareTo silently returns false today. We should fix it separately. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16164033",
+            "date": "2017-09-13T02:03:44+0000",
+            "content": "Same patch, just folding in the suggester bugfix (LUCENE-7968) so that all tests pass. I think this is good reason to look at CharsRef/IntsRef/LongsRef comparators and so on, maybe we can find more bugs. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16164119",
+            "date": "2017-09-13T03:59:35+0000",
+            "content": "I updated the patch with more cleanups: nuked the older ArrayUtil methods, cleaned up PrefixCodedTerms, cutover CharsRef,IntsRef,LongsRef.\n\nSo this adds compare()/equal() for char[]/int[]/long[]. It also adds mismatch() for char[] to implement the UTF16-in-UTF8-order comparator.\n\nDidnt find any new bugs, so seems like more than enough for now. I will think about how we can do some validation of MRJAR consistency in smoketester/build/something: that's really needed or we can't ensure stuff is correct. And also I will think about Uwe's idea about the bootclasspath hack so maybe folks don't need an actual java9 compiler. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16165319",
+            "date": "2017-09-13T21:33:29+0000",
+            "content": "Updated patch implementing LZ4.commonBytes with mismatch. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16165323",
+            "date": "2017-09-13T21:34:38+0000",
+            "content": "Adrien Grand Maybe you can experiment with the LZ4 change if you get bored, since it was your idea  ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16165331",
+            "date": "2017-09-13T21:36:40+0000",
+            "content": "Adrien also mentioned the change to BytesRef.compareTo might impact building the OrdinalMap (LUCENE-7905), that would be an interesting thing to try to bench as well. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16167969",
+            "date": "2017-09-15T14:54:17+0000",
+            "content": "I did some tests with the Calgary corpus that can be found at http://corpus.canterbury.ac.nz/descriptions/ (lower is better):\n\n\n\n\n File \n Time to compress without patch \n Time to compress with the patch \nDifference \n\n\n bib \n 971702 \n 904173 \n -6.9% \n\n\n book1 \n 7479794 \n 7073712 \n -5.4% \n\n\n book2 \n 4990347 \n 4574486 \n -8.3% \n\n\n geo \n 1600972 \n 1574435 \n -1.7% \n\n\n news \n 3394833 \n 3222113 \n -5.1% \n\n\n obj1 \n 169516 \n 166673 \n -1.7% \n\n\n obj2 \n 1869442 \n 1769302 \n -5.4% \n\n\n paper1 \n 385900 \n 357472 \n -7.4% \n\n\n pic \n 1528354 \n 1314336 \n -14% \n\n\n progc \n 279295 \n 261445 \n -6.4% \n\n\n progl \n 410565 \n376898  \n -8.2% \n\n\n progp \n 245654 \n 222230 \n -9.5% \n\n\n trans \n 517571 \n 470134 \n -9.2% \n\n\n\n\n\nAs expected the improvement is better on files that have long repetitions like source code and the bitmap picture. The speedup is constantly reproducible. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16168265",
+            "date": "2017-09-15T17:55:27+0000",
+            "content": "Adrien, thanks for benchmarking! ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16169293",
+            "date": "2017-09-17T13:23:57+0000",
+            "content": "I tested performance on a large OrdinalMap:\n\n\njava 8 no patch:\n  done init top-level VE state; took 149.411s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 148.977s; 1062.73 MB RAM; 94244084 total unique families\n\njava 8 patch:\n  done init top-level VE state; took 150.789s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 150.509s; 1062.73 MB RAM; 94244084 total unique families\n\njava 9 no patch:\n  done init top-level VE state; took 151.309s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 149.814s; 1062.73 MB RAM; 94244084 total unique families\n\njava 9 patch:\n  done init top-level VE state; took 158.535s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 156.207s; 1062.73 MB RAM; 94244084 total unique families\n\n\n\nI'm running on 7x and the patch had one non-test conflict which was simple to resolve.\n\nI'm not sure what's going on; does the patch even change code related to OrdinalMap?  (I haven't looked closely). ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16169305",
+            "date": "2017-09-17T13:54:14+0000",
+            "content": "\ndoes the patch even change code related to OrdinalMap?\n\nit changes BytesRef.compareTo, which normally isnt that interesting, but its the comparison function used when constructing the ordinal map. Previous comments on LUCENE-7905 suggested that this might be a bottleneck there. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16169324",
+            "date": "2017-09-17T15:30:57+0000",
+            "content": "Mike, is it possible the benchmark didn't warm up here (or maybe something happened with the 7.x backport?). The results are a bit noisy and don't make sense.\n\nWhen I modify the JMH bench here https://richardstartin.com/2017/07/16/new-methods-in-java-9-math-fma-and-arrays-mismatch/ to use shorter strings right above the threshold where the intrinsic kicks in (8, 9, 10), i don't see any regressions. So I don't think it should ever get slower, regardless ofany wierdness about your data: instead maybe just how the bench was done? ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16169476",
+            "date": "2017-09-18T00:10:36+0000",
+            "content": "Hi,\nI took Robert's latest patch, committed it to my Github fork and developed it a bit more: I added a stub generator (that can only be used with Java 9) to generate stub classes that only have the Java 9 signatures, but no private stuff or method bodies. This is done by a groovy script, that can be executed (requires Java 9 as JAVA_HOME): ant generate-java9-stubs. The files generated by this are committed, so nobody needs java 9 to compile lucene. The license should be no problem, as no code is involved. This is mentioned in the README.txt in the folder. The stub classes are compiled with class version of Java 8.\n\nWhen compiling the MR-JAR, the standard Java  compiler is used, but we prepend our stub classes to the bootclasspath of javac. This allows us to compile the MR-JAR file also with Java 8. If Java 9 is detected, we don't add anything to bootclasspath.\n\nThe branch is here: https://github.com/apache/lucene-solr/compare/master...uschindler:jira/LUCENE-7966 ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16169480",
+            "date": "2017-09-18T00:13:08+0000",
+            "content": "This is just my patch on top of Robert's: https://github.com/apache/lucene-solr/commit/e69d77023fbfc60bb0baf16dc5102ab76419cf03 ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16169827",
+            "date": "2017-09-18T10:00:03+0000",
+            "content": "> Mike, is it possible the benchmark didn't warm up here (or maybe something happened with the 7.x backport?). \n\nI'm not sure what happened ... the bench should have been \"hot\": plenty of RAM on the box, and I ran each case twice.  I did also run in a virtual env (EC2), i3.16xlarge instance; maybe a noisy neighbor impacted results?  I don't think we should let this block committing; the change otherwise seems awesome. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16169835",
+            "date": "2017-09-18T10:13:06+0000",
+            "content": "Michael McCandless: A stupid question: Did you do the benchmark on Java 9 using the JAR file? If you did it with the class-files only classpath, it won't use any Java 9 features, so you won't see any speed improvement. MR-JAR files require to use them as JAR files. Just placing the files in META-INF subdirectories of a file-only classpath won't use them! ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16169838",
+            "date": "2017-09-18T10:21:00+0000",
+            "content": "When thinking last night about the whole thing a bit more, I had a cool idea: Currently we use ASM to generate the stub files to compile against (see my Github repo). On top of these stubs we use a \"wrapper class\" that just delegates all methods to the Java 9 one. IMHO, this is not nice for the optimizer (although it can handle that). But the oal.future.FutureObjects/FutureArrays classes just contain the same signatures as their Java 9 variants would contain. So my idea is to use ASM to patch all classes: \n\n\tUse a groovy script that runs on the compiler output, before building the JAR file\n\tLoad class with ASM and use ASM's rewriter functionality to change the classname of all occurences of oal.future.FutureObjects/FutureArrays and replace them by java.util.Objects/Arrays. We can use this utility out of ASM to do this: http://asm.ow2.org/asm50/javadoc/user/org/objectweb/asm/commons/ClassRemapper.html. Whenever a class file contaisn references to FutureXXX classes, we patch it using asm and write it out to META-INF folder as Java 9 variant.\n\tThen package MR jar.\n\n\n\nThe good thing:\n\n\twe don't need stub files to compile with Java 8. We just need the smoke tester to verify the patched class files actually resolves against Java 9 during the Java 9 checks\n\twe have no license issues, because we don't need to generate and commit the stubs. In our source files we solely use oal.future.Objects/Arrays. Adapting to Java 9 is done by constant pool renaming \n\n\n\nWhat do you think? I will try this variant a bit later today. We can use the same approach for other Java 9 classes, too! Maybe this also helps with the issues Mike has seen (I am not happy to have the degelator class). ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16170027",
+            "date": "2017-09-18T13:43:09+0000",
+            "content": "Here is the class remapper: https://paste.apache.org/bAzx\n\nBasically it rewrites all references to oal.future.FutureXxxx to the Java 9 type java.util.Xxxx. All files that contain in the Java 8 code in build/classes/java references to our own FutureXxx classes (the remapper sets remapped=true for those) are saved to in rewritten formto a separate directory build/classes/java9 in parallel to the original and are packaged into the multirelease part of the JAR. All classes that have no references to our FutureXxx backports are kept out.\n\nThis can be done as a general task and may be applied to all Lucene/Solr modules.\n\nI will update my branch later. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16170077",
+            "date": "2017-09-18T14:21:46+0000",
+            "content": "Michael McCandless: A stupid question: Did you do the benchmark on Java 9 using the JAR file? If you did it with the class-files only classpath, it won't use any Java 9 features, so you won't see any speed improvement. MR-JAR files require to use them as JAR files. Just placing the files in META-INF subdirectories of a file-only classpath won't use them!\n\nThat was a great idea Uwe Schindler but alas I was using Lucene via JAR files. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16170377",
+            "date": "2017-09-18T17:44:34+0000",
+            "content": "I implemented by latest idea based again on Robert's patch: https://github.com/apache/lucene-solr/compare/master...uschindler:jira/LUCENE-7966-v2\n\nThis approach is much more clean: We compile against Robert's replacement classes FutureObjects and FutureArrays (that have to contain the same method signatures as the Java 9 original, but we can add a test for this later with smoketester) as usual with Java 8. Before packaging the JAR file we read all class files and patch all FutureObjects/FutureArrays references to refer to the Java 9 class. The patched output is sent to a separate folder build/classes/java9. The JAR file is then packaged to take both variants, placing the patched ones in the Java 9 MultiRelease part.\n\nCurrently only the lucene-core.jar file uses the patched stuff, so stuff outside lucene-core (e.g., codecs) does not yet automatically add Java 9 variants, instead it will use Robert's classes. If this is the way to go, I will move the patcher to the global tools directory and we can apply patching to all JAR files of the distribution. WARNING: We cannot support Maven builds here, Maven always builds a Java8-only JAR file!\n\nMichael McCandless, Adrien Grand: Could you build a lucene-core.jar file with the above branch on Github and do your tests again? The main difference here is that the JAR file no longer contains a delegator class. Instead all class files that were originally compiled with FutureObjects/FutureArrays (for Java 8 support) are patched to directly use the Java 9 Arrays/Objects methods, without using a delegator class. Keep in mind: This currently only support lucene-core.jar, the codecs JAR file is not yet Multirelease with this patch.\n\nWhen building with ant jar inside lucene/core you should see output like this:\n\n     [compile shit...................]\n     [copy] Copying 3 files to C:\\Users\\Uwe Schindler\\Projects\\lucene\\trunk-lusolr1\\lucene\\build\\core\\classes\\java\n\n-mrjar-classes-uptodate:\n\nresolve-groovy:\n[ivy:cachepath] :: resolving dependencies :: org.codehaus.groovy#groovy-all-caller;working\n[ivy:cachepath]         confs: [default]\n[ivy:cachepath]         found org.codehaus.groovy#groovy-all;2.4.8 in public\n[ivy:cachepath] :: resolution report :: resolve 170ms :: artifacts dl 5ms\n        ---------------------------------------------------------------------\n        |                  |            modules            ||   artifacts   |\n        |       conf       | number| search|dwnlded|evicted|| number|dwnlded|\n        ---------------------------------------------------------------------\n        |      default     |   1   |   0   |   0   |   0   ||   1   |   0   |\n        ---------------------------------------------------------------------\n\npatch-mrjar-classes:\n[ivy:cachepath] :: resolving dependencies :: org.ow2.asm#asm-commons-caller;working\n[ivy:cachepath]         confs: [default]\n[ivy:cachepath]         found org.ow2.asm#asm-commons;5.1 in public\n[ivy:cachepath]         found org.ow2.asm#asm-tree;5.1 in public\n[ivy:cachepath]         found org.ow2.asm#asm;5.1 in public\n[ivy:cachepath] :: resolution report :: resolve 701ms :: artifacts dl 8ms\n        ---------------------------------------------------------------------\n        |                  |            modules            ||   artifacts   |\n        |       conf       | number| search|dwnlded|evicted|| number|dwnlded|\n        ---------------------------------------------------------------------\n        |      default     |   3   |   0   |   0   |   0   ||   3   |   0   |\n        ---------------------------------------------------------------------\n   [groovy] Remapped: org/apache/lucene/analysis/tokenattributes/CharTermAttributeImpl\n   [groovy] Remapped: org/apache/lucene/codecs/compressing/LZ4\n   [groovy] Remapped: org/apache/lucene/document/BinaryPoint$2\n   [groovy] Remapped: org/apache/lucene/document/DoubleRange\n   [groovy] Remapped: org/apache/lucene/document/FloatRange\n   [groovy] Remapped: org/apache/lucene/document/IntRange\n   [groovy] Remapped: org/apache/lucene/document/LongRange\n   [groovy] Remapped: org/apache/lucene/index/BitsSlice\n   [groovy] Remapped: org/apache/lucene/index/CodecReader\n   [groovy] Remapped: org/apache/lucene/index/MergeReaderWrapper\n   [groovy] Remapped: org/apache/lucene/search/BooleanScorer$TailPriorityQueue\n   [groovy] Remapped: org/apache/lucene/util/BytesRef\n   [groovy] Remapped: org/apache/lucene/util/BytesRefArray\n   [groovy] Remapped: org/apache/lucene/util/CharsRef$UTF16SortedAsUTF8Comparator\n   [groovy] Remapped: org/apache/lucene/util/CharsRef\n   [groovy] Remapped: org/apache/lucene/util/IntsRef\n   [groovy] Remapped: org/apache/lucene/util/LongsRef\n   [groovy] Remapped: org/apache/lucene/util/StringHelper\n   [groovy] Remapped: org/apache/lucene/util/automaton/Automaton$Builder\n   [groovy] Remapped: org/apache/lucene/util/automaton/Automaton\n   [groovy] Remapped 20 class files for Java 9 to: C:\\Users\\Uwe Schindler\\Projects\\lucene\\trunk-lusolr1\\lucene\\build\\core\\classes\\java9\n    [touch] Creating C:\\Users\\Uwe Schindler\\Projects\\lucene\\trunk-lusolr1\\lucene\\build\\core\\patch-mrjar.stamp\n\njar-core:\n      [jar] Building jar: C:\\Users\\Uwe Schindler\\Projects\\lucene\\trunk-lusolr1\\lucene\\build\\core\\lucene-core-8.0.0-SNAPSHOT.jar\n\njar:\n\nBUILD SUCCESSFUL\nTotal time: 31 seconds\n\n\n\nThis patch also adds uptodate support, so the pathing is only done if the original class files change. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16170382",
+            "date": "2017-09-18T17:47:07+0000",
+            "content": "\nWARNING: We cannot support Maven builds here, Maven always builds a Java8-only JAR file!\n\nWhy exactly is this the case? with my patch maven should work. Maven just uses the jars produced by ant. The smoketester validates they are exactly the same. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16170388",
+            "date": "2017-09-18T17:51:43+0000",
+            "content": "Why exactly is this the case? with my patch maven should work. Maven just uses the jars produced by ant. The smoketester validates they are exactly the same.\n\nMaven works when you build the JAR files for Maven with our ANT targets. What does not work is the pom.xml build generated by sarowes maven build. That one will build JAR files only with the FutureXxx stuff, but no multirelease stuff. Sorry for being imprecise. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16170407",
+            "date": "2017-09-18T18:06:30+0000",
+            "content": "thanks for the clarification. yes, that's no change from my patch.  ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16172047",
+            "date": "2017-09-19T17:23:20+0000",
+            "content": "Thanks Uwe Schindler; I'll retest from your branch! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16174500",
+            "date": "2017-09-21T09:27:59+0000",
+            "content": "I retested w/ Uwe's patch:\n\n\njava 8 w/o uwe's patch\n  done init top-level VE state; took 150.849s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 151.488s; 1062.73 MB RAM; 94244084 total unique families\n\njava 8 w/ uwe's patch\n  done init top-level VE state; took 156.910s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 154.836s; 1062.73 MB RAM; 94244084 total unique families\n\njava 9 w/o uwe's patch\n  done init top-level VE state; took 151.883s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 151.123s; 1062.73 MB RAM; 94244084 total unique families\n\njava 9 w/ uwe's patch\n  done init top-level VE state; took 159.383s; 1062.73 MB RAM; 94244084 total unique families\n  done init top-level VE state; took 156.662s; 1062.73 MB RAM; 94244084 total unique families\n\n\n\nStill not sure what's going on ... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16174510",
+            "date": "2017-09-21T09:44:47+0000",
+            "content": "No idea either! ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16182276",
+            "date": "2017-09-27T09:49:55+0000",
+            "content": "Hi Michael McCandless,\nI did some more testing and did not figure out a bug in the MR jar that could explain this. I did the following:\n\nI created a simple JAVA class file:\n\n\nimport org.apache.lucene.util.BytesRef;\n\npublic class Test {\n  public static void main(String... args) {\n    BytesRef r1 = new BytesRef(new byte[20], 0, 30);\n    BytesRef r2 = new BytesRef(new byte[20], 1, 10);\n    r1.compareTo(r2);\n  }\n}\n\n\n\nOf course this code is buggy, but that was the idea here. If I run this with Java 8, I get following output:\n\n\n$ java -cp lucene-core-8.0.0-SNAPSHOT.jar;. Test\nException in thread \"main\" java.lang.IndexOutOfBoundsException: Range [0, 30) out-of-bounds for length 20\n        at org.apache.lucene.future.FutureArrays.checkFromToIndex(FutureArrays.java:35)\n        at org.apache.lucene.future.FutureArrays.compareUnsigned(FutureArrays.java:62)\n        at org.apache.lucene.util.BytesRef.compareTo(BytesRef.java:165)\n        at Test.main(Test.java:7)\n\n\n\nIf I run the same with Java 9, I get the following output:\n\n\n$ java -cp lucene-core-8.0.0-SNAPSHOT.jar;. Test\nException in thread \"main\" java.lang.ArrayIndexOutOfBoundsException: Array index out of range: 30\n        at java.base/java.util.Arrays.rangeCheck(Arrays.java:122)\n        at java.base/java.util.Arrays.compareUnsigned(Arrays.java:6101)\n        at org.apache.lucene.util.BytesRef.compareTo(BytesRef.java:165)\n        at Test.main(Test.java:7)\n\n\n\nAs we see, BytesRef class is using Java9's native java.util.Arrays class instead our own FutureArrays.\n\nYou can also verify this with javap:\n\n\n$ javap --multi-release 9 -cp lucene-core-8.0.0-SNAPSHOT.jar -p -c org.apache.lucene.util.BytesRef  | grep Arrays\n      34: invokestatic  #76                 // Method java/util/Arrays.equals:([BII[BII)Z\n      34: invokestatic  #136                // Method java/util/Arrays.compareUnsigned:([BII[BII)I\n      26: invokestatic  #143                // Method java/util/Arrays.copyOfRange:([BII)[B\n\n$ javap --multi-release 8 -cp lucene-core-8.0.0-SNAPSHOT.jar -p -c org.apache.lucene.util.BytesRef  | grep Arrays\n      34: invokestatic  #15                 // Method org/apache/lucene/future/FutureArrays.equals:([BII[BII)Z\n      34: invokestatic  #29                 // Method org/apache/lucene/future/FutureArrays.compareUnsigned:([BII[BII)I\n      26: invokestatic  #31                 // Method java/util/Arrays.copyOfRange:([BII)[B\n\n\n\nSo the setup is correct.\n\nCan you maybe also check with the above \"Test\" program that the JAR file you are using behaves correctly?\n\nNevertheless and unrelated to Mike's problems seing an improvement here, we need to improve the whole thing:\n\n\tOur tests are currently always running against our own FutureArrays/FutureObjects variants, because we run tests against the file system based class path and not the JAR file. So Java 9 won't see our patched classes while running tests. I am curretly thinking about how to improve this.\n\tWe should maybe add a smoke tester check using my above \"buggy Test class\" to figure out that our MR JAR works. We should also improve Smoker to use Java 9 in addition to Java 8 (like we did it at Java 7 times).\n\tWe should try check our MR JAR. Currently if you mix up FutureArrays or FutureObjects to have different method signatures, it would fail in Java 9. So we have to ensure the exported methods in our own impls match the original.\n\n\n\nI am still waiting for Adrien Grand to see his benchmark results with the new MR JAR. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16182348",
+            "date": "2017-09-27T10:39:07+0000",
+            "content": "Sorry Uwe, I was on vacation while you pinged me and did not notice you were asking me something. I'll run the benchmark again today or tomorrow. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16182399",
+            "date": "2017-09-27T11:26:04+0000",
+            "content": "No problem! ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16182467",
+            "date": "2017-09-27T12:20:58+0000",
+            "content": "Here are the results:\n\n\n\n\n File \n Time to compress without patch \n Time to compress with the patch \nDifference \n\n\n bib \n 976672 \n 935724 \n -4.2% \n\n\n book1 \n 7487574 \n 7300402 \n -2.5% \n\n\n book2 \n 4999043 \n 4719148 \n -5.6% \n\n\n geo \n 1598629 \n 1648771 \n 3.1% \n\n\n news \n 3398425 \n 3289187 \n -3.2% \n\n\n obj1 \n 169515 \n 167649 \n -1.1% \n\n\n obj2 \n 1873220 \n 1804144 \n -3.7% \n\n\n paper1 \n 386047 \n 364133 \n -5.7% \n\n\n paper2 \n 726156 \n 695761 \n -4.2% \n\n\n paper3 \n 375937 \n 359946 \n -4.3% \n\n\n paper4 \n 111643 \n 108169 \n -3.1% \n\n\n paper5 \n 99465 \n 96254 \n -3.2% \n\n\n paper6 \n 277771 \n 263810 \n -5.0% \n\n\n pic \n 1528434 \n 1324520 \n -13.3% \n\n\n progc \n 279360 \n 265820 \n -4.8% \n\n\n progl \n 411285 \n 385095 \n -6.4% \n\n\n progp \n 246035 \n 226135 \n -8.1% \n\n\n trans \n 517765 \n 485948 \n -6.1% \n\n\n\n\n\nResults are slightly less good than previously but it could well be noise. It's still an improvement compared to master. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16182499",
+            "date": "2017-09-27T12:42:22+0000",
+            "content": "Thanks Adrien! \n\nResults are slightly less good than previously but it could well be noise.\n\nThis can only be noise, because the code we are running is the same as Robert's. I just removed the additional indirection in the Java 9 code path by patching the class files directly.\n\nI hope you are still ready: Can you also run this comparison with Java 8? I assume the current numbers are with Java 9. Just to be sure that our \"emulation layer\" does not slowdown Java 8. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16182501",
+            "date": "2017-09-27T12:43:59+0000",
+            "content": "Sure, let me run that. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16182509",
+            "date": "2017-09-27T12:56:57+0000",
+            "content": "Now with Java 8\n\n\n\n\n File \n Time to compress without patch \n Time to compress with the patch \nDifference \n\n\n bib \n 1033357 \n 1027901 \n -0.5% \n\n\n book1 \n 7906551 \n 7961422 \n +0.7% \n\n\n book2 \n 5335458 \n 5348388 \n +0.2% \n\n\n geo \n 1629253 \n 1644770 \n +1.0% \n\n\n news \n 3569115 \n 3609734 \n +1.1% \n\n\n obj1 \n 176601 \n 178634 \n +1.2% \n\n\n obj2 \n 1970078 \n 1993204 \n +1.2% \n\n\n paper1 \n 412884 \n 409665 \n -0.8% \n\n\n paper2 \n 772086 \n 772052 \n -0.0% \n\n\n paper3 \n 401949 \n 397526 \n -1.1% \n\n\n paper4 \n 118664 \n 117747 \n -0.8% \n\n\n paper5 \n 104995 \n 104855 \n -0.1% \n\n\n paper6 \n 296315 \n 295813 \n -0.2% \n\n\n pic \n 1619648 \n 1698345 \n +4.9% \n\n\n progc \n 299270 \n 298341 \n -0.3% \n\n\n progl \n 440063 \n 443714 \n +0.8% \n\n\n progp \n 265607 \n 266388 \n +0.3% \n\n\n trans \n 554452 \n 555335 \n +0.2% \n\n\n\n\n\nThe slowdown on pic (the most compressible file) is reproducible but other files show very similar performance with and without the patch. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16182649",
+            "date": "2017-09-27T14:29:14+0000",
+            "content": "I keep thinking: is this static replacement of those delegation methods actually visible in performance benchmarks? I'd think once those methods go hot they'd be inlined when their enclosing methods are compiled without a trace of performance degradation? Just wondering. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16183010",
+            "date": "2017-09-27T18:13:29+0000",
+            "content": "Dawid Weiss: The patched class files are actually easier to maintain, as we do not need Java 9 to compile, no duplicate class files in source folder, or some fake Java 9 signature files (with questionable license) on bootclasspath (see my previous branch). This was the main reason to rewrite the class files instead of maintaining multiple source files. It's just a nice side-effect to no longer need the delegation methods. So I personally like the patching approach much more, as it's well tested by the ASM maintainers (we just use their code, no custom impl). It would be horrible if we'd instead require all committers to have both Java 8 and Java 9 installed!\n\nThe question here was just for confirmation and comparison of both approaches, if they have some side effects.\n\nThe slowdown on pic (the most compressible file) is reproducible\n\nAdrien Grand: The one with biggest slowdown on Java 8 is the one with biggest speedup in Java 9. The reason is quite clear: The Java 8 implementation by Robert does more checks than the \"old\" LZ4 implementation (for safety and to be compatible with new Java 9 impl). But on Java 9 the new method used is an intrinsic, so we have a huge perf win! ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16183079",
+            "date": "2017-09-27T18:50:04+0000",
+            "content": "Right, thanks Uwe. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16187782",
+            "date": "2017-10-02T09:05:36+0000",
+            "content": "I had a closer look at the branch and like the patching approach. Should we modify the smoke tester at the same time to enforce that both Java 8 and 9 are tested? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16187994",
+            "date": "2017-10-02T13:13:38+0000",
+            "content": "I had a closer look at the branch and like the patching approach. Should we modify the smoke tester at the same time to enforce that both Java 8 and 9 are tested?\n\nI think so - that was my plan! In general the testing is automatically done. As soon as you start Lucene Demo or Solr with Java 9 it will test the JAR file. But a separate test might be good (like the Exception test I posted before), to see if stack trace looks as expected.\n\nI will work soon on changing the patching mechanism to be globally (not only in root module). I would also like to remove the @Deprecated from the Future classes (because at this time, they are the only way) and instead add @lucene.internal. We should add a separate issue about renoving Future classes, once we swicth to Java 9.\n\nAre there any other tests we should do. I talked with Robert - we both don't understand Mike's findings. I don't trust them unless we have a reproducible benchmark using BytesRefHash and similar. The improvements in LZ4 are phantastic, I would have expected the same from BytesRefHash. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16308486",
+            "date": "2018-01-02T18:42:34+0000",
+            "content": "Sorry for silence on this. I wanted to improve the patch tomorrow.\n\nMichael McCandless:\n\nI retested w/ Uwe's patch:\n\nBy reading the Java mailing lists, I have an idea what could cause Mike's differences: Are you sure that you used the same garbage collector in Java 8 and Java 9? By default Java 9 uses G1GC, which Java 8 uses the good old ParallelGC by default. On the mailinglist jdk-dev there was a discussion that suddenly computing-intensive stuff was significantly slower with Java 9. The reason was the Garbage Collector! So be sure to use the same one (give it explicit on command line). G1GC adds additional barriers and because of them the number of free CPU registers is lowered by 1. This causes some algorithms to behave worse as missing CPU registers don't allow to do everything in the CPU (Dawid Weiss has seen a sigicficant slowdown for some of his code). More than 10% slowdown is possible! This also affects code that has no garbage collection and barriers because of G1. It's just limited resources causing this. Interestingly the person complaining was talking about LZ4 compression: http://openjdk.5641.n7.nabble.com/Reduced-performance-in-Java-9-0-1-vs-8u152-td322825.html\n\nCould you compare Java 8 and Java 9 with same garbage collector? (a) G1GC on both and (b) ParallelGC and/or CMS ?\nUwe ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16345192",
+            "date": "2018-01-30T15:12:58+0000",
+            "content": "I worked today and made the branch on github up to date:\n\n\tIt now applies the classfile patching to all modules, Solr was disabled (not needed there)\n\tIt runs tests in Java 9 with a modified classpath (it puts the patched classes before the main classes), so we can actually also test the patched stuff on Java 9. This \"hack\" just emulates a MR JAR file. It is a really dirty hack, because it only applies this to the main classes. Of course, the tests for our own implementations of Objects/Arrays classes is done in Java 8 and Java 9 using Lucene's code, the hack just enables our unit tests that use the Lucene API to use the native Java 9 classes behind the scenes when executed in Java 9, so our production code is thoroughly tested. There is a new system property of the test framework to (tests.withJava9Patches, defaults to true), so you can disable this and only test our own Objects/Arrays implementations, also on Java 9. To fully fix the\u00a0classpath complexity\u00a0we should think about using the JAR files for testing and not build a classpath with raw class files. But that's time for another issue.\n\n\n\nI will now do some tests with Mike's luceneutils benchmarking tool. I just have to fix it to use the JAR files instead of using plain class files. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16345193",
+            "date": "2018-01-30T15:13:17+0000",
+            "content": "Here is latest patch: https://github.com/apache/lucene-solr/compare/master...uschindler:jira/LUCENE-7966-v2\n\n(it's theoretically ready to commit) ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16347599",
+            "date": "2018-01-31T21:01:41+0000",
+            "content": "Hi,\nI did some comparing benchmarks using Mike's benchmark tool (luceneutil). In general the performance difference between Java 8 and Java 9 is neglectible (more about this in my talk next week in London), if you use the usual Parallel or CMS GC. Some queries tend to be slower on Java 9. I also compared this patch:\n\nJava 9 without patch and with patch:\n\n\n                    Task QPS orig_j9      StdDevQPS patch_j9      StdDev                Pct diff\n                  IntNRQ        5.97      (8.8%)        5.76      (8.4%)   -3.7% ( -19% -   14%)\n                 Prefix3       59.77      (7.3%)       58.59      (7.5%)   -2.0% ( -15% -   13%)\n                Wildcard       18.62      (5.3%)       18.38      (5.9%)   -1.3% ( -11% -   10%)\n            HighSpanNear       13.04      (4.4%)       12.93      (4.9%)   -0.9% (  -9% -    8%)\n             MedSpanNear       11.36      (3.9%)       11.27      (4.3%)   -0.8% (  -8% -    7%)\n                 Respell       51.17      (2.1%)       50.79      (1.6%)   -0.7% (  -4% -    3%)\n                PKLookup      256.20      (5.4%)      255.83      (5.9%)   -0.1% ( -10% -   11%)\n                  Fuzzy1       24.12      (2.8%)       24.09      (2.3%)   -0.1% (  -5% -    5%)\n             LowSpanNear       10.38      (2.1%)       10.37      (2.2%)   -0.1% (  -4% -    4%)\n               MedPhrase       27.76      (1.9%)       27.74      (1.9%)   -0.1% (  -3% -    3%)\n                  Fuzzy2       70.57      (1.8%)       70.59      (1.6%)    0.0% (  -3% -    3%)\n              HighPhrase       14.21      (2.2%)       14.22      (2.4%)    0.1% (  -4% -    4%)\n             AndHighHigh       34.11      (1.2%)       34.15      (0.7%)    0.1% (  -1% -    2%)\n               LowPhrase       15.98      (1.7%)       16.01      (1.6%)    0.2% (  -3% -    3%)\n            OrNotHighLow      531.86      (3.5%)      534.36      (3.3%)    0.5% (  -6% -    7%)\n              AndHighMed      170.44      (1.2%)      171.46      (1.2%)    0.6% (  -1% -    3%)\n            OrNotHighMed      206.78      (1.8%)      208.06      (2.2%)    0.6% (  -3% -    4%)\n               OrHighMed       20.61      (5.2%)       20.76      (4.3%)    0.7% (  -8% -   10%)\n              OrHighHigh       11.07      (5.6%)       11.17      (4.6%)    0.9% (  -8% -   11%)\n           OrHighNotHigh       24.57      (4.0%)       24.80      (4.7%)    0.9% (  -7% -    9%)\n            OrHighNotMed       50.41      (4.0%)       50.88      (5.1%)    0.9% (  -7% -   10%)\n                 LowTerm      202.23      (2.4%)      204.33      (3.4%)    1.0% (  -4% -    7%)\n              AndHighLow      745.13      (3.1%)      753.23      (2.9%)    1.1% (  -4% -    7%)\n           OrNotHighHigh       12.48      (4.1%)       12.63      (5.2%)    1.2% (  -7% -   10%)\n         LowSloppyPhrase        3.79      (5.3%)        3.85      (5.5%)    1.5% (  -8% -   13%)\n        HighSloppyPhrase       10.58      (4.0%)       10.74      (4.3%)    1.5% (  -6% -   10%)\n            OrHighNotLow       18.46      (4.4%)       18.75      (5.3%)    1.6% (  -7% -   11%)\n         MedSloppyPhrase       28.88      (4.4%)       29.35      (4.8%)    1.6% (  -7% -   11%)\n               OrHighLow       15.26      (3.0%)       15.54      (3.0%)    1.9% (  -4% -    8%)\n   HighTermDayOfYearSort       19.83      (6.6%)       20.25      (8.1%)    2.1% ( -11% -   17%)\n                 MedTerm       64.23      (5.0%)       65.64      (7.0%)    2.2% (  -9% -   14%)\n                HighTerm       40.05      (5.4%)       41.02      (7.6%)    2.4% ( -10% -   16%)\n       HighTermMonthSort       87.80     (12.5%)       91.28     (12.3%)    4.0% ( -18% -   32%)\n\n\n\nSo it does not hurt performance, although it adds additional checks that ensure index consistency! Thanks Robert for exploring the parts in code where bounds checks were missing! As you see, especially the \"sorting\" stuff got a slight reproducible improvement (although stddev is still large!). This might be related to optimized bounds checking code when reading docvalues and bytebuffers.\n\nI also compared Java 8 to be safe:\n\n\n                    Task QPS orig_j8      StdDevQPS patch_j8      StdDev                Pct diff\n   HighTermDayOfYearSort       23.65      (9.1%)       22.98      (6.6%)   -2.8% ( -17% -   14%)\n               OrHighMed        9.87      (4.3%)        9.76      (2.9%)   -1.0% (  -7% -    6%)\n              OrHighHigh       11.85      (4.1%)       11.73      (2.8%)   -1.0% (  -7% -    6%)\n             MedSpanNear      149.54      (4.2%)      148.97      (3.7%)   -0.4% (  -7% -    7%)\n        HighSloppyPhrase        0.43      (5.4%)        0.43      (6.1%)    0.0% ( -10% -   12%)\n             LowSpanNear       22.66      (3.3%)       22.70      (2.7%)    0.2% (  -5% -    6%)\n               OrHighLow       27.55      (2.5%)       27.62      (1.8%)    0.2% (  -4% -    4%)\n                 LowTerm      285.27      (0.6%)      286.20      (0.7%)    0.3% (   0% -    1%)\n              AndHighMed      134.26      (2.1%)      134.73      (1.9%)    0.4% (  -3% -    4%)\n                  IntNRQ        5.11      (8.8%)        5.13      (9.0%)    0.4% ( -16% -   20%)\n                  Fuzzy2       33.40      (1.7%)       33.53      (1.4%)    0.4% (  -2% -    3%)\n              AndHighLow      521.74      (3.1%)      524.04      (2.3%)    0.4% (  -4% -    5%)\n             AndHighHigh       37.68      (0.9%)       37.85      (1.0%)    0.4% (  -1% -    2%)\n              HighPhrase        7.25      (1.3%)        7.29      (1.0%)    0.5% (  -1% -    2%)\n                HighTerm       62.16      (1.2%)       62.56      (1.9%)    0.7% (  -2% -    3%)\n            OrNotHighLow      368.52      (3.5%)      371.06      (2.8%)    0.7% (  -5% -    7%)\n                 MedTerm       77.17      (1.2%)       77.76      (1.7%)    0.8% (  -2% -    3%)\n            HighSpanNear        3.94      (4.1%)        3.97      (3.6%)    0.9% (  -6% -    8%)\n                  Fuzzy1      105.41      (1.1%)      106.40      (1.1%)    0.9% (  -1% -    3%)\n                 Respell       43.38      (1.3%)       43.84      (1.6%)    1.1% (  -1% -    4%)\n               MedPhrase       11.16      (0.8%)       11.28      (1.3%)    1.1% (   0% -    3%)\n         MedSloppyPhrase       25.87      (3.2%)       26.15      (2.8%)    1.1% (  -4% -    7%)\n               LowPhrase       20.97      (0.7%)       21.23      (1.0%)    1.2% (   0% -    2%)\n         LowSloppyPhrase       16.09      (2.7%)       16.33      (2.6%)    1.5% (  -3% -    6%)\n                Wildcard       24.83      (3.9%)       25.19      (5.4%)    1.5% (  -7% -   11%)\n                PKLookup      250.76      (5.1%)      254.84      (5.2%)    1.6% (  -8% -   12%)\n                 Prefix3       37.18      (5.3%)       37.79      (6.6%)    1.6% (  -9% -   14%)\n            OrNotHighMed       56.71      (2.1%)       58.04      (4.5%)    2.3% (  -4% -    9%)\n       HighTermMonthSort       77.91      (9.7%)       80.12     (11.2%)    2.8% ( -16% -   26%)\n            OrHighNotLow       35.27      (2.8%)       36.37      (5.1%)    3.1% (  -4% -   11%)\n            OrHighNotMed       17.69      (3.4%)       18.33      (6.0%)    3.6% (  -5% -   13%)\n           OrHighNotHigh        6.01      (3.7%)        6.26      (6.9%)    4.2% (  -6% -   15%)\n           OrNotHighHigh       20.56      (3.1%)       21.41      (6.7%)    4.2% (  -5% -   14%)\n\n\n\nResults are similar. And finally this is the difference between Java 8 unpatched and Java 9 patched:\n\n\n                    Task QPS orig_j8      StdDevQPS patch_j9      StdDev                Pct diff\n        HighSloppyPhrase       14.48      (2.8%)       13.94      (3.3%)   -3.8% (  -9% -    2%)\n         MedSloppyPhrase       18.65      (1.6%)       18.12      (3.8%)   -2.9% (  -8% -    2%)\n                  IntNRQ        5.78      (8.9%)        5.62      (8.9%)   -2.7% ( -18% -   16%)\n         LowSloppyPhrase       69.13      (2.0%)       67.55      (3.0%)   -2.3% (  -7% -    2%)\n       HighTermMonthSort       34.38      (9.9%)       33.87     (12.4%)   -1.5% ( -21% -   23%)\n            HighSpanNear        6.24      (3.1%)        6.15      (4.7%)   -1.5% (  -9% -    6%)\n                Wildcard       14.16      (8.3%)       13.99      (7.7%)   -1.2% ( -15% -   16%)\n             LowSpanNear       65.04      (4.0%)       64.36      (6.0%)   -1.0% ( -10% -    9%)\n                HighTerm       44.52      (5.5%)       44.09      (8.0%)   -1.0% ( -13% -   13%)\n                 MedTerm       65.87      (4.9%)       65.50      (7.2%)   -0.6% ( -12% -   12%)\n           OrHighNotHigh       24.59      (4.3%)       24.48      (4.5%)   -0.5% (  -8% -    8%)\n           OrNotHighHigh       14.63      (4.2%)       14.57      (4.3%)   -0.4% (  -8% -    8%)\n            OrHighNotMed       37.97      (4.6%)       37.81      (5.1%)   -0.4% (  -9% -    9%)\n               LowPhrase       30.58      (1.9%)       30.48      (2.2%)   -0.3% (  -4% -    3%)\n              HighPhrase        2.46      (4.3%)        2.45      (4.3%)   -0.3% (  -8% -    8%)\n               MedPhrase       17.43      (2.0%)       17.38      (2.2%)   -0.3% (  -4% -    4%)\n             MedSpanNear       26.07      (2.4%)       26.00      (3.8%)   -0.2% (  -6% -    6%)\n                 Prefix3       42.61      (7.3%)       42.51      (6.6%)   -0.2% ( -13% -   14%)\n            OrHighNotLow       39.09      (4.7%)       39.06      (4.9%)   -0.1% (  -9% -    9%)\n                 LowTerm      319.58      (2.4%)      319.58      (3.4%)    0.0% (  -5% -    5%)\n               OrHighLow       16.87      (3.6%)       16.89      (4.3%)    0.1% (  -7% -    8%)\n               OrHighMed       11.55      (3.6%)       11.67      (4.6%)    1.0% (  -6% -    9%)\n              OrHighHigh       10.72      (3.7%)       10.83      (4.8%)    1.0% (  -7% -    9%)\n            OrNotHighMed       48.54      (2.5%)       49.13      (2.2%)    1.2% (  -3% -    6%)\n   HighTermDayOfYearSort       37.23      (5.6%)       37.68      (6.9%)    1.2% ( -10% -   14%)\n             AndHighHigh       21.26      (1.1%)       21.59      (1.2%)    1.5% (   0% -    3%)\n                PKLookup      250.34      (5.1%)      255.08      (4.9%)    1.9% (  -7% -   12%)\n                  Fuzzy2       52.75      (2.2%)       53.84      (2.6%)    2.1% (  -2% -    7%)\n                  Fuzzy1       76.52      (1.7%)       78.38      (2.2%)    2.4% (  -1% -    6%)\n              AndHighMed       51.15      (1.1%)       52.44      (0.9%)    2.5% (   0% -    4%)\n            OrNotHighLow      339.27      (1.7%)      348.34      (1.8%)    2.7% (   0% -    6%)\n                 Respell       44.60      (1.8%)       45.84      (2.9%)    2.8% (  -1% -    7%)\n              AndHighLow      575.14      (1.6%)      593.90      (1.4%)    3.3% (   0% -    6%)\n\n\n\nAll tests were done without tiered compilation, Xbatch and Parallel GC. So you can also compare the QPS values between the runs. If you use other garbage collectors the results are dramatically different (more than 10% slowdown with G1GC!).\n\nSo the additional checks have no effect on query performance. I did not do a benchmark of indexing, but according to Adrien's benchmarking done earlier, the most impact is about indexing stored fields of huge size with many repeatable (compressible) contents. E.g., the JSON source field in Elasticsearch should show a significant speedup, especially when you have a lot of content!\n\nI was not able to reproduce a slowdown in BytesRefHash with ParallelGC. In case Mike used the standard GC of Java 9 (G1GC), he might have been affected by the G1GC slowdown bug as mentioned before => Dawid Weiss.\n\nI'd like to use this as a start to migrate to Java 9 at some point, so we can now already use the Java 9 features. After applying this patch, we should check our source code for typical \"bounds checks\" and replace them by (Future)Objects.checkIndex variants anywhere. So please don't add code like if (i >= x and i < y) ... and instead use the checker methods, that are intrinsics in Java 9!\n\nWhat's other's opinion? Adrien Grand, Robert Muir, Michael McCandless, Dawid Weiss ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16347613",
+            "date": "2018-01-31T21:07:18+0000",
+            "content": "FYI, here are my changes to Michael McCandless's lucenebench to use JAR files instead of class files from source checkout. It's not complete, it just works. Please neglect my ignorance for Python: https://paste.apache.org/V5LA\n\nWithout it, you would see a slowdown with Java 9, added by the additional checks! (I tested it) ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16348526",
+            "date": "2018-02-01T12:43:30+0000",
+            "content": "+1! ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16348866",
+            "date": "2018-02-01T16:35:52+0000",
+            "content": "Thanks Adrien Grand! In the meantime a did a small refactoring: Robert placed the Java8 compatible reimplementations in a separate package org.apach.lucene.future, but this was mainly done for the more complex compilation in his approach. I moved the FutureObjects and FutureArray classes to org.apache.lucene.util and updated the javadocs. The package.java class was removed and some parts added to the class documenation. By this change the backports/reimplementations are not so public like before.\n\nI will attach a full patch in a minute. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16348875",
+            "date": "2018-02-01T16:41:21+0000",
+            "content": "Here is the final patch with renamed classes:  LUCENE-7966-v2.patch  ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16350482",
+            "date": "2018-02-02T15:06:15+0000",
+            "content": "+1!\n\n\u00a0\n\nThank you for the detailed tests Uwe Schindler!\u00a0 I hope your talk is recorded so we all can watch it.\n\n\u00a0\n\nAnd you're right about the GC impl \u2013 I did not set it explicitly on the command line when I ran my tests, so the test results are invalid (used G1GC in Java 9). ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16351312",
+            "date": "2018-02-03T08:18:26+0000",
+            "content": "Commit 9c0797d9f47a9c690b24a6649f2c4351f322e8b8 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9c0797d ]\n\nLUCENE-7966: Build Multi-Release JARs to enable usage of optimized intrinsic methods from Java 9 for index bounds checking and array comparison/mismatch ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16351313",
+            "date": "2018-02-03T08:21:04+0000",
+            "content": "I pushed the changes to master. I will wait a bit before I merge to 7.x branch to let Jenkins settle. I hope smoke tester works.\n\nAnyways we should open issues:\n\n\tAdd Smoke Tester with Java 9 (like we did at Java 8/7 times)\n\tAdd a \"TODO issue\" to record all work that needs to be done when we move to Java 9 as minimum: For this issue it would be to disable MR-JAR building and removal of the Java 8 replacements methods.\n\n ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16351692",
+            "date": "2018-02-04T08:53:15+0000",
+            "content": "Commit 05a105a9f76b73b597931894dff392ad44243aa0 in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=05a105a ]\n\nLUCENE-7966: Build Multi-Release JARs to enable usage of optimized intrinsic methods from Java 9 for index bounds checking and array comparison/mismatch ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16351711",
+            "date": "2018-02-04T09:40:29+0000",
+            "content": "I opened LUCENE-8154 (TODOs for Java 9 minimum requirement) and LUCENE-8155 (smoke tester). ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16351776",
+            "date": "2018-02-04T13:12:33+0000",
+            "content": "The change in branch_7x broke anonther codec, because StringHelper.bytesDifference() changed its requirements on the terms passed in.\n\nI revert...\n\nWe should fix the issue and then merge the branch also to 7.x. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16351777",
+            "date": "2018-02-04T13:14:10+0000",
+            "content": "Commit 5f43dce1d06e1f5dcc8c5d306bb89c42e427d00d in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5f43dce ]\n\nRevert \"LUCENE-7966: Build Multi-Release JARs to enable usage of optimized intrinsic methods from Java 9 for index bounds checking and array comparison/mismatch\"\n\nThis reverts commit 05a105a9f76b73b597931894dff392ad44243aa0. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16351778",
+            "date": "2018-02-04T13:17:41+0000",
+            "content": "Master may still have the same issue. So let's bake it longer. In the meantime I will try to write a patch to fix this. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16351780",
+            "date": "2018-02-04T13:22:52+0000",
+            "content": "yes we have to proceed with caution. the problem is the stringhelper change impacts all term dictionaries. but it was broken what they were doing before\u00a0\n\nit is made difficult by some term dictionaries, such as the docvalues ones, which do not kick in unless there are many terms, so testing there is light. We should really review all uses first.\n\nmaybe the change is ok for 7.x too, maybe not. we can decide, but we should first get it in safely for master.\n\n\u00a0 ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16351783",
+            "date": "2018-02-04T13:32:26+0000",
+            "content": "I agree. Let's fix the remaining issue. The CHANGES.txt entry in trunk is still in the 7.x part, but I keep it like that. If we decide to not put it to 7.x or later we can still move. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16355854",
+            "date": "2018-02-07T18:27:20+0000",
+            "content": "Commit 466c1ef4dab4e6da932369a13f587410b6df3203 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=466c1ef ]\n\nLUCENE-8156: Require users to not have ASM on the Ant classpath during build (this is required by LUCENE-7966) ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16356418",
+            "date": "2018-02-08T02:56:30+0000",
+            "content": "The issue with backporting to 7x is that we have to modify terms dictionaries used by ancient backwards compatibility codecs.\n\nFor example, reverse index terms dictionary used by the docvalues format. Its tested \"ok\" at best with the current codec (e.g Lucene70) because that concrete test has explicit nightly tests that use thousands of terms... I'm not sure what the coverage looks like for the older codecs (e.g. Lucene54), but coverage is going to definitely be limited to those exact tests so i would rather avoid messing with them personally. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16356707",
+            "date": "2018-02-08T09:25:17+0000",
+            "content": "Hi Robert,\n\nI agree. My proposal that I am working on: Let's clone the old StringHelper methods to backwards-codecs (something like LegacyStringHelper.bytesDifference\u00a0and sortKeyLength) and change backwards codecs to use them. So it might be slower when reading/writing old indexes, but we are safe!\n\nNew indexes (that use same codecs like master) are fast and do better checks (no failures yet on master). ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356738",
+            "date": "2018-02-08T09:50:27+0000",
+            "content": "Hi Robert,\n\nthe failing codec is the only one that is in backwards-codecs that fails. IMHO, this would not have any impact on real-life codec, because backwards codecs should not be used for indexing (only to read old indexes). Nevertheless, I just copied the StringHelper methods in the directory of this codec.\n\nI did a full grep of StringHelper accross the backwards-codec stuff, no other occurrences. So I think we are safe to fix this single codec. What others did you see that may fail? In the core module it looks like all usages of StringHelper are indentical to master.\n\nUwe ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356740",
+            "date": "2018-02-08T09:54:13+0000",
+            "content": "Here is the patch:  LUCENE-7966-7x-backwards.patch \nFirst cherry pick the main MR-JAR commit and then apply this patch.\n\nThis failing test works after that:\n\nant test  -Dtestcase=TestLucene54DocValuesFormat -Dtests.method=testThreads2 -Dtests.seed=61E04EB48E682E0C -Dtests.multiplier=3 -Dtests.slow=true -Dtests.locale=ar-LY -Dtests.timezone=Asia/Choibalsan -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n\n\n\n(this was the failing test from jenkins - it reproduces, but it depends on the seed) ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356745",
+            "date": "2018-02-08T09:59:40+0000",
+            "content": "IMHO, this would not have any impact on real-life codec, because backwards codecs should not be used for indexing (only to read old indexes)\n\nBeware that some doc-value formats of the backward codecs might still be used for writing because of doc-value updates. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16356753",
+            "date": "2018-02-08T10:04:17+0000",
+            "content": "A small change to patch: I removed the \"public\" from LegacyStringHelper as its only used in one codec. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356755",
+            "date": "2018-02-08T10:06:03+0000",
+            "content": "Adrien: Right. But that's fixed now. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356766",
+            "date": "2018-02-08T10:30:40+0000",
+            "content": "FYI, after this patch:\n\n\nbash-4.3$ pwd\n/cygdrive/c/Users/Uwe Schindler/Projects/lucene/trunk-lusolr1/lucene/backward-codecs\nbash-4.3$ fgrep -R StringHelper *\nsrc/java/org/apache/lucene/codecs/lucene54/LegacyStringHelper.java:abstract class LegacyStringHelper {\nsrc/java/org/apache/lucene/codecs/lucene54/LegacyStringHelper.java:  private LegacyStringHelper() {\nsrc/java/org/apache/lucene/codecs/lucene54/Lucene54DocValuesConsumer.java:          prefixSum += LegacyStringHelper.bytesDifference(previousValue.get(), v);\nsrc/java/org/apache/lucene/codecs/lucene54/Lucene54DocValuesConsumer.java:          int sharedPrefix = Math.min(255, LegacyStringHelper.bytesDifference(lastTerm.get(), v));\nsrc/java/org/apache/lucene/codecs/lucene54/Lucene54DocValuesConsumer.java:        int len = LegacyStringHelper.sortKeyLength(priorTerm.get(), b);\n\n ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356772",
+            "date": "2018-02-08T10:35:07+0000",
+            "content": "I also checked the core stuff in a similar way by searching for the bytesDifference and sortKeyLength methods. Everything is identical to master, no changes or legacy classes using it.\nSo I think we should be fine now. Comments? ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16356806",
+            "date": "2018-02-08T11:01:15+0000",
+            "content": "I ran an extensive beasting on the backwards-codecs: No problems anymore. Previously it failed every second time, especially if you used tests.multiplier=3 or larger - than it failed always. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16357258",
+            "date": "2018-02-08T17:31:37+0000",
+            "content": "Commit f208fb867006932b575e3b6149163b7e81fec41e in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f208fb8 ]\n\nLUCENE-8156: Require users to not have ASM on the Ant classpath during build (this is required by LUCENE-7966) ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16357259",
+            "date": "2018-02-08T17:31:39+0000",
+            "content": "Commit 621f5ece8ce7f47064be347826a637d8987c74a9 in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=621f5ec ]\n\nLUCENE-7966: Build Multi-Release JARs to enable usage of optimized intrinsic methods from Java 9 for index bounds checking and array comparison/mismatch ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16357261",
+            "date": "2018-02-08T17:31:41+0000",
+            "content": "Commit 30c4d6ea35721cd2fc5cc6bd5cdff77766d1f1fc in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=30c4d6e ]\n\nLUCENE-7966: Fix backwards-codecs of 7.x branch to not use StringHelper methods (as they are more picky and may break indexing) ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16357578",
+            "date": "2018-02-08T21:11:36+0000",
+            "content": "Commit 8a370fa900512a48aa460430cb15c92ed3733020 in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8a370fa ]\n\nLUCENE-7966: Add test for legacy version of StringHelper ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359626",
+            "date": "2018-02-10T19:39:19+0000",
+            "content": "Commit bc0d6fb6ed7e00bad8383ee64dbdc3b8a2a8031b in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bc0d6fb ]\n\nLUCENE-7966: Add comment to Maven readme that MR-JAR is not supported and resulting artifacts are not identical to official Ant build ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359627",
+            "date": "2018-02-10T19:40:12+0000",
+            "content": "Commit 5325669d9eaea1277639505b928c69d0b1ee09d1 in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5325669 ]\n\nLUCENE-7966: Add comment to Maven readme that MR-JAR is not supported and resulting artifacts are not identical to official Ant build ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359665",
+            "date": "2018-02-10T23:00:54+0000",
+            "content": "Commit e4bd4330d34a10c4cbbe952475de5bed628f2153 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e4bd433 ]\n\nLUCENE-7966: Improve Solr build to not import Groovy too often (artifacts, distribution,...) ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359666",
+            "date": "2018-02-10T23:01:59+0000",
+            "content": "Commit b14a60ee8de950439578c6f96f1e333a0a40f947 in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b14a60e ]\n\nLUCENE-7966: Improve Solr build to not import Groovy too often (artifacts, distribution,...) ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359667",
+            "date": "2018-02-10T23:04:58+0000",
+            "content": "Commit 627562e6d7a91d80369684d01cc3ef25a3ce587f in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=627562e ]\n\nLUCENE-7966: Revert change that's not needed ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359668",
+            "date": "2018-02-10T23:05:54+0000",
+            "content": "Commit 1b26aae72c8181aeb76e3c3f988c89b8f15982df in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1b26aae ]\n\nLUCENE-7966: Revert change that's not needed ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359673",
+            "date": "2018-02-10T23:38:00+0000",
+            "content": "Commit 9e9ed0d7b11f1f2542a076c76ef91824bb636037 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9e9ed0d ]\n\nLUCENE-7966: More Solr build dependency fixes ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359674",
+            "date": "2018-02-10T23:38:45+0000",
+            "content": "Commit fb29cd5fc25a094b4f8578a2c96066340aa2e060 in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fb29cd5 ]\n\nLUCENE-7966: More Solr build dependency fixes ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16359675",
+            "date": "2018-02-10T23:44:21+0000",
+            "content": "FYI: I added some build improvements in Solr that makes artifact/dist building faster (preload Groovy). I also added a notice to the Maven build readme, so user is informed that the POM-based build is not creating JAR files in same way like Ant's (no MR-JARs).\n\nMaybe this can be improved in the future, but as Maven's support for MR-JARs is non-existent, I leave this for somebody else! ",
+            "author": "Uwe Schindler"
+        }
+    ]
+}

@@ -1,0 +1,75 @@
+{
+    "id": "LUCENE-6065",
+    "title": "remove \"foreign readers\" from merge, fix LeafReader instead.",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "Task"
+    },
+    "description": "Currently, SegmentMerger has supported two classes of citizens being merged:\n\n\tSegmentReader\n\t\"foreign reader\" (e.g. some FilterReader)\n\n\n\nIt does an instanceof check and executes the merge differently. In the SegmentReader case: stored field and term vectors are bulk-merged, norms and docvalues are transferred directly without piling up on the heap, CRC32 verification runs with IO locality of the data being merged, etc. Otherwise, we treat it as a \"foreign\" reader and its slow.\n\nThis is just the low-level, it gets worse as you wrap with more stuff. A great example there is SortingMergePolicy: not only will it have the low-level slowdowns listed above, it will e.g. cache/pile up OrdinalMaps for all string docvalues fields being merged and other silliness that just makes matters worse.\n\nAnother use case is 5.0 users wishing to upgrade from fieldcache to docvalues. This should be possible to implement with a simple incremental transition based on a mergepolicy that uses UninvertingReader. But we shouldnt populate internal fieldcache entries unnecessarily on merge and spike RAM until all those segment cores are released, and other issues like bulk merge of stored fields and not piling up norms should still work: its completely unrelated.\n\nThere are more problems we can fix if we clean this up, checkindex/checkreader can run efficiently where it doesn't need to RAM spike like merging, we can remove the checkIntegrity() method completely from LeafReader, since it can always be accomplished on producers, etc. In general it would be nice to just have one codepath for merging that is as efficient as we can make it, and to support things like index modifications during merge.\n\nI spent a few weeks writing 3 different implementations to fix this (interface, optional abstract class, \"fix LeafReader\"), and the latter is the only one i don't completely hate: I think our APIs should be efficient for indexing as well as search.\n\nSo the proposal is simple, its to instead refactor LeafReader to just require the producer APIs as abstract methods (and FilterReaders should work on that). The search-oriented APIs can just be final methods that defer to those.\n\nSo we would add 5 abstract methods, but implement 10 current methods as final based on those, and then merging would always be efficient.\n\n\n  // new abstract codec-based apis\n  /** \n   * Expert: retrieve thread-private TermVectorsReader\n   * @throws AlreadyClosedException if this reader is closed\n   * @lucene.internal \n   */\n  protected abstract TermVectorsReader getTermVectorsReader();\n\n  /** \n   * Expert: retrieve thread-private StoredFieldsReader\n   * @throws AlreadyClosedException if this reader is closed\n   * @lucene.internal \n   */\n  protected abstract StoredFieldsReader getFieldsReader();\n  \n  /** \n   * Expert: retrieve underlying NormsProducer\n   * @throws AlreadyClosedException if this reader is closed\n   * @lucene.internal \n   */\n  protected abstract NormsProducer getNormsReader();\n  \n  /** \n   * Expert: retrieve underlying DocValuesProducer\n   * @throws AlreadyClosedException if this reader is closed\n   * @lucene.internal \n   */\n  protected abstract DocValuesProducer getDocValuesReader();\n  \n  /** \n   * Expert: retrieve underlying FieldsProducer\n   * @throws AlreadyClosedException if this reader is closed\n   * @lucene.internal  \n   */\n  protected abstract FieldsProducer getPostingsReader();\n\n  // user/search oriented public apis based on the above\n  public final Fields fields();\n  public final void document(int, StoredFieldVisitor);\n  public final Fields getTermVectors(int);\n  public final NumericDocValues getNumericDocValues(String);\n  public final Bits getDocsWithField(String);\n  public final BinaryDocValues getBinaryDocValues(String);\n  public final SortedDocValues getSortedDocValues(String);\n  public final SortedNumericDocValues getSortedNumericDocValues(String);\n  public final SortedSetDocValues getSortedSetDocValues(String);\n  public final NumericDocValues getNormValues(String);",
+    "attachments": {
+        "LUCENE-6065.patch": "https://issues.apache.org/jira/secure/attachment/12682573/LUCENE-6065.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14218334",
+            "author": "Michael McCandless",
+            "date": "2014-11-19T19:14:25+0000",
+            "content": "+1 "
+        },
+        {
+            "id": "comment-14218990",
+            "author": "Robert Muir",
+            "date": "2014-11-20T04:22:12+0000",
+            "content": "Here is my initial patch. I will commit it to the branch and work on converting over all leafreader subclasses.  "
+        },
+        {
+            "id": "comment-14218992",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-20T04:22:42+0000",
+            "content": "Commit 1640670 from Robert Muir in branch 'dev/branches/lucene6065'\n[ https://svn.apache.org/r1640670 ]\n\nLUCENE-6065: current state "
+        },
+        {
+            "id": "comment-14219071",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-20T06:56:00+0000",
+            "content": "Commit 1640691 from Robert Muir in branch 'dev/branches/lucene6065'\n[ https://svn.apache.org/r1640691 ]\n\nLUCENE-6065: reader.fields() never returns null "
+        },
+        {
+            "id": "comment-14219458",
+            "author": "Uwe Schindler",
+            "date": "2014-11-20T15:09:50+0000",
+            "content": "Hi,\nI like the whole idea, one problem I see on my first review is FilterLeafReader2:\n\nCurrently all methods in LeafReader2 are final, and the ones to actually implement are protected - which is fine, I like this very much!!! The filter/delegator pattern used by FilterLeafReader2 can only filter on the protected methods - because all others are final. This may make it impossible to have a subclass of FilterLeafReader2 outside oal.index package, because it may not be able to delegate to protected methods... I am not sure if this is really a problem here, but we had similar issues around MTQ and its rewrite methods in the past. But I think the filtering works, because we actually never delegate to other classes only to other instances... We should investigate with a simple test. Because these are issues prventing users from doing the right thing, just because we never test it with foreign packages.\n\nBut in fact: I would really like to have the LeafReader2 \"impl\" methods protected!!! "
+        },
+        {
+            "id": "comment-14219473",
+            "author": "Robert Muir",
+            "date": "2014-11-20T15:19:23+0000",
+            "content": "My idea for that was, FilterLeafReader2 would implement those as final too actually, and expose explicit methods to wrap say, NormsReader. This is so that getMergeInstance() will automatically \"work\" (fast api by default), and subclasses won't have to wrap in two places.\n\nGiven that filterreaders would use this api, i'm not sure there is a visibility problem with 'protected', since they wouldnt mess with those methods. I am still investigating, first i am trying to cleanup the producer apis themselves (e.g. try to remove nullness and other things) "
+        },
+        {
+            "id": "comment-14219513",
+            "author": "Uwe Schindler",
+            "date": "2014-11-20T15:54:47+0000",
+            "content": "I agree. Actually you wrap something different than those readers. So maybe have some other class that you have on the lower level during merging. One class the holds all those (FooReader implementations on the index view). On the searching side LeafReader is a basic interface without any implementation. So maybe let it be a real java interface implemented by the codec (SegmentReader). But you never pass \"LeafReader\" to the merging api. But making everything that is the real LeafReader interface be a final implementation detail is just wrong.\n\nSo just have a different type of API behind the scenes when merging that you can wrap. And keep LeafReader completely out when merging, just wrap something different. "
+        },
+        {
+            "id": "comment-14219519",
+            "author": "Uwe Schindler",
+            "date": "2014-11-20T15:58:29+0000",
+            "content": "In addition, in Java 8 we have interfaces that can be extended with default methods. Thats exactly what we have here somehow... "
+        },
+        {
+            "id": "comment-14219528",
+            "author": "Uwe Schindler",
+            "date": "2014-11-20T16:06:11+0000",
+            "content": "Maybe i was a little bit too complicated in my explanation, sorry. The main problem I have is: a public search API where all public methods are final and the whole implementation is protected, which is a horror when it comes to delegation pattern used by a Filtering API. This feels like Analyzer, which is unintuitive (Michael McCandless also explained it with the complexity in analysis in his post on the mailing list to make a better lucene)   "
+        }
+    ]
+}

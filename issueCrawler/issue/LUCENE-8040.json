@@ -1,0 +1,123 @@
+{
+    "id": "LUCENE-8040",
+    "title": "Optimize IndexSearcher.collectionStatistics",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Resolved",
+        "type": "Improvement",
+        "components": [
+            "core/search"
+        ],
+        "fix_versions": [
+            "master (8.0)"
+        ]
+    },
+    "description": "IndexSearcher.collectionStatistics(field) can do a fair amount of work because with each invocation it will call MultiFields.getTerms(...).  The effects of this are aggravated for queries with many fields since each field will want statistics, and also aggravated when there are many segments.",
+    "attachments": {
+        "MyBenchmark.java": "https://issues.apache.org/jira/secure/attachment/12897002/MyBenchmark.java",
+        "lucenecollectionStatisticsbench.zip": "https://issues.apache.org/jira/secure/attachment/12896233/lucenecollectionStatisticsbench.zip",
+        "LUCENE-8040.patch": "https://issues.apache.org/jira/secure/attachment/12897099/LUCENE-8040.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16240711",
+            "date": "2017-11-06T18:58:40+0000",
+            "content": "I considered a few alternatives to this today using JMH:\n\n\tCache MultiFields on the IndexSearcher\n\tCompute the CollectionStatics raw, immediately (don't lookup or cache)\n\tAdd a ConcurrentHashMap<String,CollectionStatistics> on the IndexSearcher and compute on demand.\n\n\n\nAttached is the JMH benchmark program.  Between runs I would change line 78 to call out to the impl I wanted to try.  JMH Main method is \"org.openjdk.jmh.Main\" and I used args \"-wi 5 -i 5 -f 1\"\n\nMy annotated results are:\n\nResult \"dsmiley.MyBenchmark.bench\":    IndexSearcher\n  1146.739 \u00b1(99.9%) 280.645 us/op [Average]\n  (min, avg, max) = (1034.410, 1146.739, 1238.123), stdev = 72.883\n  CI (99.9%): [866.094, 1427.385] (assumes normal distribution)\n\nResult \"dsmiley.MyBenchmark.bench\":    cached MultiFields\n  29.556 \u00b1(99.9%) 8.929 us/op [Average]\n  (min, avg, max) = (27.409, 29.556, 33.424), stdev = 2.319\n  CI (99.9%): [20.626, 38.485] (assumes normal distribution)\n\nResult \"dsmiley.MyBenchmark.bench\":    raw compute \n  951.494 \u00b1(99.9%) 182.555 us/op [Average]\n  (min, avg, max) = (904.328, 951.494, 1024.473), stdev = 47.409\n  CI (99.9%): [768.940, 1134.049] (assumes normal distribution)\n\nResult \"dsmiley.MyBenchmark.bench\":   ConcurrentHashMap\n  4.448 \u00b1(99.9%) 1.268 us/op [Average]\n  (min, avg, max) = (4.090, 4.448, 4.860), stdev = 0.329\n  CI (99.9%): [3.180, 5.717] (assumes normal distribution)\n\n\nFor 5 fields:\nraw:               10.716\nConcurrentHashMap:  0.155 us/op\n\n\n\nI think the results are pretty clear that we should go with the ConcurrentHashMap.  \n\nI'm aware my benchmark implementation of this needs some more work.  If an IOException is thrown it should pass through without RuntimeException wrapper.  And if the field doesn't exist, we want to return null. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16240728",
+            "date": "2017-11-06T19:15:30+0000",
+            "content": "I don't think we should add caching to the indexsearcher, as it is supposed to remain lightweight.  Instead of using MultiFields, we should just sum up the stats per segment as a start. This is easier now that the statistics can no longer be -1. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16240867",
+            "date": "2017-11-06T20:52:17+0000",
+            "content": "Also I think as far as lowering the overhead to getting to a field, the better fix is probably in BlockTreeTermsReader. Today getting to a specific field is log N (TreeMap). Maybe it should be HashMap instead. \n\nEither linkedhashmap or separate sorted array can be used for the \"iterator\" functionality, but I think it currently optimizes for the wrong case (iterating fields in order, versus getting to a particular field). ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16240926",
+            "date": "2017-11-06T21:19:51+0000",
+            "content": "RE switching away from TreeMap to HashMap: absolutely!  I've been working on a client project where this was already profiled and optimized to a HashMap in a fork.  Definitely a separate issue, though I can see how the results of that will impact the results here.  I'll file an issue. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16240965",
+            "date": "2017-11-06T21:44:34+0000",
+            "content": "I don't really see it as a separate issue. collectionStatistics() is just looking up the stats from blocktree's maps and summing them up. so if its too slow, then blocktree is the place to fix it.  ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16246946",
+            "date": "2017-11-10T02:47:59+0000",
+            "content": "I updated the benchmark to use a custom FilterDirectoryReader that ultimately has a custom FilterLeafReader that caches the Terms impls into a HashMap.  Then I reran the benchmark with 150 fields, 30 segments:\n\nIndexSearcher MultiFields (current)\n  346.155 \u00b1(99.9%) 57.775 us/op [Average]\n  (min, avg, max) = (334.952, 346.155, 371.996), stdev = 15.004\n  CI (99.9%): [288.380, 403.930] (assumes normal distribution)\n\nRaw compute on demand each time\n  196.271 \u00b1(99.9%) 14.716 us/op [Average]\n  (min, avg, max) = (192.012, 196.271, 201.187), stdev = 3.822\n  CI (99.9%): [181.555, 210.987] (assumes normal distribution)\n\nConcurrentHashMap lazy cache of raw compute\n  4.553 \u00b1(99.9%) 0.245 us/op [Average]\n  (min, avg, max) = (4.465, 4.553, 4.636), stdev = 0.064\n  CI (99.9%): [4.308, 4.799] (assumes normal distribution)\n\n\n\nClearly the ConcurrentHashMap is saving us a lot.\n\nYou say we shouldn't add caching to IndexSearcher.  IndexSearcher contains the QueryCache.  Looking at LRUQueryCache, I think I can safely say that a ConcurrentHashMap is comparatively more lightweight.  Do you disagree? ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16247097",
+            "date": "2017-11-10T06:56:28+0000",
+            "content": "Its not saving a \"lot\". We are talking about microseconds here either way.\n\nIndexSearcher does not contain the querycache. The caching is at the segment level. You just configure it by passing it in there.\n\nBig difference: I'm strongly against caching on index searcher. especially for something that takes microseconds. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16247417",
+            "date": "2017-11-10T12:37:34+0000",
+            "content": "Ok, I'll commit the raw impl then.  It's at least nice to no longer reference MultiFields and hence MultiTerms here. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16247596",
+            "date": "2017-11-10T14:51:11+0000",
+            "content": "Can you please upload a proper patch so it can be reviewed? Note the code needs to be different for master and 7.x ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16247662",
+            "date": "2017-11-10T15:40:53+0000",
+            "content": "LUCENE-8040.patch is the master branch version.\n\nI think the 7x version is simply removing the null return condition when docCount is 0. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16252234",
+            "date": "2017-11-14T21:45:31+0000",
+            "content": "Updated patch to fix a mistake I discovered while investigating some test failures.  I had written =+ instead of += \u2013 nasty!  I've tweaked my IntelliJ inspection settings to alert me to this.\n\nI'll commit later this week if I don't hear further feedback. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16252325",
+            "date": "2017-11-14T21:59:59+0000",
+            "content": "no for 7.x you need to handle -1 case for stats, just like MultiTerms currently does. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16252929",
+            "date": "2017-11-15T04:33:12+0000",
+            "content": "no for 7.x you need to handle -1 case for stats, just like MultiTerms currently does.\n\nOh yeah, thanks for the tip.  So adding support for -1 stats would be pretty annoying here... like this but for all 3:\nInstead of\n\n    docCount += terms.getDocCount()\n\n\nWe have:\n\n   int tmpDC = terms.getDocCount();\n   docCount = tmpDC == -1 ? -1 : docCount + tmpDC;\n\n\nBut even then it's not completely equivalent if the stats are -1 in some segments but not all.  Do you think that matters Robert Muir?  I'm tempted to just not backport to 7x. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16252939",
+            "date": "2017-11-15T04:52:19+0000",
+            "content": "+1 to take the conservative approach and just commit to master: the stats can't be -1 there. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16253476",
+            "date": "2017-11-15T13:57:56+0000",
+            "content": "Commit af2b903f65e4451838fb3e93511329acec30a2a1 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=af2b903 ]\n\nLUCENE-8040: optimize IndexSearcher.collectionStatistics ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16253479",
+            "date": "2017-11-15T14:02:32+0000",
+            "content": "Good. Thanks for the review/feedback! ",
+            "author": "David Smiley"
+        }
+    ]
+}

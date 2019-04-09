@@ -1,0 +1,195 @@
+{
+    "id": "LUCENE-5722",
+    "title": "Speed up MMapDirectory.seek()",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/store"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ]
+    },
+    "description": "For traditional lucene access which is mostly sequential, occasional advance(), I think this method gets drowned out in noise.\n\nBut for access like docvalues, its important. Unfortunately seek() is complex today because of mapping multiple buffers.\n\nHowever, the very common case is that only one map is used for a given clone or slice.\n\nWhen there is the possibility to use only a single mapped buffer, we should instead take advantage of ByteBuffer.slice(), which will adjust the internal mmap address and remove the offset calculation. furthermore we don't need the shift/mask or even the negative check, as they are then all handled with the ByteBuffer api: seek is a one-liner (with try/catch of course to convert exceptions).\n\nThis makes docvalues access 20% faster, I havent tested conjunctions or anyhting like that.",
+    "attachments": {
+        "LUCENE-5722.patch": "https://issues.apache.org/jira/secure/attachment/12647754/LUCENE-5722.patch",
+        "LUCENE-5722-multiseek.patch": "https://issues.apache.org/jira/secure/attachment/12647838/LUCENE-5722-multiseek.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14014538",
+            "author": "Robert Muir",
+            "content": "Patch: warning, its quite ugly but looks correct and seems to do well with tests (all pass).\n\nI see a combined 45% improvement to docvalues performance with this patch and LUCENE-5720.\n\nThe hairy part: it comes from the fact that even if we have a big file (e.g. dv .dat today) with multiple buffers, slice() should be optimal in the case only one is needed to access that region. And I abstracted ByteBufferIndexInput and i guess i'm paying the cost now \n\nOn the other hand this opens up additional things to explore, e.g. maybe we should override readByte/Bytes since its much less code to inline in this case, and maybe we should investigate simply changing directpackedreaders to just require a slice over their data (e.g. getFilePointer == 0) to remove the addition there. ",
+            "date": "2014-05-31T06:26:25+0000"
+        },
+        {
+            "id": "comment-14014929",
+            "author": "Michael McCandless",
+            "content": "+1 to specialize the single buffer case again.\n\nDoes the optimization only kick in when the entire .dat (holding doc values for all fields in this segment) is less than MMapDir's chunk size?  Ie, we don't use IndexInput.slice from our doc values impls today (at least for the default, Lucene45DVF).  We just do .clone(), which in ByteBufferIndexInput is a slice of the whole file.\n\nAlso, if you get unlucky, the .dat could be smallish but span 2 chunks anyway, e.g. if that segment used CFS format, and then specialization doesn't kick in, right? ",
+            "date": "2014-06-01T07:56:23+0000"
+        },
+        {
+            "id": "comment-14014944",
+            "author": "Uwe Schindler",
+            "content": "Also, if you get unlucky, the .dat could be smallish but span 2 chunks anyway, e.g. if that segment used CFS format, and then specialization doesn't kick in, right?\n\nOf course, but on 64 bit operating system the chunk size is 1 GiB, so this will happen more seldom. It is more likely that you have, as discusses, a very big file and its completely mapped. I think we should do the improvement, but not do too much to prevent this multi-case (otheriwse code gets more complicated an error-prone).\n\nIn most cases, for a single segment and one single field the improvement will kick in often enough. This is one reason why Robert said, we should maybe investigate to use slice() for accessing the docvalues of a specific field, instead of a full clone.\n\nThere might be another way to improve this to be a singleton, but it is too hairy: We could do a fresh mapping on the slice. But this would need to also unmap this fresh slice. And in addition, it consumes additional address space. One thing that could be done here: If we know in advance, that we never need the full file, we could mmap only a slice. Maybe we should offer Directory#openInput(filename, offset, length) which could directly optimize for the single buffer case??? [don't kill me about this suggestion, was just an idea].\n\nAbout the patch: I don't like \"singleton\" as term, because its closely related to the pattern \"singleton class instance\". I would rename the single buffer one to \"SingleByteBufferIndexInput\". The method singleton() is fine, I guess, just the class name.\n\nThere is one thing, we might want to add an assert: In the single buffer case, there is the slight chance to not catch an exception, if the cast from the seek offset to int luckily gets into the valid slice area. Maybe we should not add a hard check, but for our own safety while writing the code, we should maybe check that the long offset is <= Integer.MAX_VALUE.\n\nI like the idea of using ByteBuffer.slice(). Unfortunately (I am so unhappy!), we cannot use this for the multi-buffer approach (because this would require then more calculations on clone, which are now optimized to be bitshifts and & only).\n\nAlso Eclipse warns if you call a static method from a subclass (if properly configured). ByteBufferIndexInput.newClonesMap() should not be accessed as MMapIndexInput.newCloneMap()... But thats just cosmetic - although it confused me, too (I hate Java for allowing to access static methods with a different class name, we should maybe make the warning a failure in Eclipse compiler config at least).\n\nIn any case, we might improve the multi-buffer seek, too: if we already know before that we will land in the same buffer - we could maybe do this in a small check at the begining of the seek method: If we hit the same buffer, just do curBuffer.position() and spare out the whole other stuff (which does many assignments and additional checks). I will think about this a bit more... ",
+            "date": "2014-06-01T09:34:33+0000"
+        },
+        {
+            "id": "comment-14014949",
+            "author": "Robert Muir",
+            "content": "Sorry Uwe, we shouldn't add extra conditionals to seek here, its the entire point of the issue!!!!!!!!\n ",
+            "date": "2014-06-01T10:37:17+0000"
+        },
+        {
+            "id": "comment-14014954",
+            "author": "Uwe Schindler",
+            "content": "Sorry Uwe, we shouldn't add extra conditionals to seek here, its the entire point of the issue!!!!!!!!\n\nCan you please quote, what you are referring to? Thanks.\n\nDo you mean that one:\nThere is one thing, we might want to add an assert: In the single buffer case, there is the slight chance to not catch an exception, if the cast from the seek offset to int luckily gets into the valid slice area. Maybe we should not add a hard check, but for our own safety while writing the code, we should maybe check that the long offset is <= Integer.MAX_VALUE.\n\n(this is just an assert to catch bugs while testing, I dont want to add a hard check.)\n\nor that one:\nIn any case, we might improve the multi-buffer seek, too: if we already know before that we will land in the same buffer - we could maybe do this in a small check at the begining of the seek method: If we hit the same buffer, just do curBuffer.position() and spare out the whole other stuff (which does many assignments and additional checks). I will think about this a bit more...\n\nDon't get me wrong, I was just adding ideas. I know what this issue is about, but sometimes one additional check that triggers the \"common case\" is better than having crazy code executed on every call. My idea is basically, we can throw it away:\n\nUnder the assumption that we seek in most cases not accross byte buffers, the overhead of seek could be completely optimized away with one additional check: we may add another \"state\" variable with the (long) start offset of the current buffer (curBufOffset - unfortunately, this is one more state field that we need to maintain). On seek we maybe check that seek's position parameter minus current buffers start offset is positive and less than Integer.MAX_VALUE away - this is one check: (difference&Integer.MAX_VALUE)==difference. If this is the case, we can directly optimize to only call position() on the current buffer. If any Exception happens we fall-through to our dumb seek (because it is not always the EOF case).\n\nInstead of throwing that away because you don't like it, I wanted to do a benchmark. Don't just say: \"this is bullshit\" I try hard to think about an optimization of the cross-buffer seek, too. There must be a way to do this! Maybe you have another idea instead of mine, but please don't tell me that I don't know what I am talking about! In the ideal case I would like to do no checks at all and let ByteBuffer throw exceptions if we seek outside the current buffer. But this is, as far as I know, impossible because of the cast from long to int (it would be nice to have something like the x86 carry-flag (http://en.wikipedia.org/wiki/Carry_flag) in Java, too, so you could detect overflow while casting long->int)..\n\nWe can also maybe move the negative check on the beginning of seek down or do it more intelligent? ",
+            "date": "2014-06-01T11:08:28+0000"
+        },
+        {
+            "id": "comment-14014956",
+            "author": "Robert Muir",
+            "content": "I was just responding to the first comment! I do not really want an assert, as this method Shoukd be considered hot (its the point of the issue) and assert is not free. ",
+            "date": "2014-06-01T11:15:33+0000"
+        },
+        {
+            "id": "comment-14014957",
+            "author": "Robert Muir",
+            "content": "As far as the second idea, of course that's something nice to look into. But I don't think it will ever be simpler than the one buffer case. ",
+            "date": "2014-06-01T11:16:53+0000"
+        },
+        {
+            "id": "comment-14014958",
+            "author": "Uwe Schindler",
+            "content": "I was just responding to the first comment! I do not really want an assert, as this method Shoukd be considered hot (its the point of the issue) and assert is not free.\n\nOK  I just wanted to point out that we have no 100% safety if you seek out of slice for the single buffer case.\n\nI was just afraid that you were complaining about collecting ideas for optimizing the multi-buffer seek (see above). I am not sure if my idea helps or is risky at all, we should just try it out. ",
+            "date": "2014-06-01T11:18:13+0000"
+        },
+        {
+            "id": "comment-14014960",
+            "author": "Uwe Schindler",
+            "content": "But I don't think it will ever be simpler than the one buffer case.\n\nOf course not, but could still help. Of course to simplify benchmarking we should look at both improvements in separate (like temporarily disable the single buffer case while benchmarking). ",
+            "date": "2014-06-01T11:19:27+0000"
+        },
+        {
+            "id": "comment-14015012",
+            "author": "Uwe Schindler",
+            "content": "I looked at the code very long time, also at Roberts patch.\n\nI found out: the subclassing issue can be solved quite easily: We dont need to make ByteBufferIndexInput abstract, the solution would be to pass some \"unmapper\" instance to the constructor that does the unmapping, so freeBuffers does not need to be abstract. In that case we can use ByteBufferIndexInput as concrete class.\n\nThe second thing that is an issue in MultiMmap-Seek is the problem with the offset. The offset is in ByteBufferIndexInput only used in seek and when creating slices/clones. The idea is now, to completely remove the offset from the base class. The base class is useable for the case when offset=0 and multiple buffers are used. The whole chekcs at the beginning of seek() are then useless, because they only apply for the case offset=0. In all other cases we already catch the out-of-bounds cases by AIOOBE and similar.\n\nThe special cases would then be:\n\n\tSingleByteBufferIndexInput extends ByteBufferIndexInput: we can remove the assert, because offset no longer exists in this base class. We always use ByteBuffer.slice here.\n\tThe other special case is offset!=0 for multi-mmap: In that case we have a second concreate subclass, that just overrides seek() to do the offset checks at the beginning and if all is adjusted call super.seek().\n\n\n\nThe cloning/slicing can be done much easier and we just include the offset here.\n\nFurthermore, I made a small improvement to the ByteBufferIndexInput.seek() for the case if seeking happens inside the same buffer. With the optimizations above the whole thing is then mostly a simple position() call on the byte buffer with a few calculations.\n\nI will resort all this stuff an provide a patch! ",
+            "date": "2014-06-01T16:11:53+0000"
+        },
+        {
+            "id": "comment-14015013",
+            "author": "Uwe Schindler",
+            "content": "In addition with my new approach stuff like offset and length will be final variables. On cloing we never call super.clone(), we just create a new instance. By this the code is easier to understand and cloning can get further improvements! ",
+            "date": "2014-06-01T16:14:22+0000"
+        },
+        {
+            "id": "comment-14015078",
+            "author": "Uwe Schindler",
+            "content": "Here is my patch. I also added a new test for slices of slices, so we can be sure that offsets are correctly passed through (this was the hardest part). The workaround is the protected method added t the base class, which is implemented only for the offsets-aware impl.\n\nWhile debugging the stuff and also looking around for the TODO Robert added, I found out what is wrong: The issue is bug LUCENE-5658, which is now understood.\n\nThe main problem was that when calculating the limit of the last buffer in the slice, this blows up for the special case when the slice ends exactly at a chunkSize boundary. So this commit would also fix LUCENE-5658.\n\nNevertheless, I will commit the fix for LUCENE-5658 separately. ",
+            "date": "2014-06-01T20:26:20+0000"
+        },
+        {
+            "id": "comment-14015081",
+            "author": "Uwe Schindler",
+            "content": "Better fix for the limit() problem. ",
+            "date": "2014-06-01T20:43:27+0000"
+        },
+        {
+            "id": "comment-14015104",
+            "author": "Uwe Schindler",
+            "content": "This is a better pathc for creating the slices (split off buildSlice from slice() again). This buildSlice method is overridden in the Offset-aware specialization.\n\nThis is much better than the stupid getOffset() protected method I had before. Also it no longer does useless checks when cloning. ",
+            "date": "2014-06-01T22:10:29+0000"
+        },
+        {
+            "id": "comment-14015117",
+            "author": "Uwe Schindler",
+            "content": "After digging more, I found out that the bug in LUCENE-5658 is not related to that one. The problem was a bug in the offset calculation of the single buffer special case. The test created a slice from a two-buffer input that started at the buffer boundary. The result was a slice with one buffer, so the optimization applied. But Robert's patch was missing to apply the chunkSizeMask, so the offset was still the one from the two buffer case.\n\nThe applied patch also contains the test for LUCENE-5658, which passes of course. I also added a test for the special-case Robert has seen.\n\nThis patch still uses the extra 0-byte buffer at the end. We may improve this to handle this and only use a single-buffer indexinput, but the added complexity in buildSlice is not worth to do it.\n\nI think we can test performance now.\n\nIn addition, there may be another improvement for the default impl's seek. But we should check this separately. I will upload a separate patch tomorrow. ",
+            "date": "2014-06-01T23:25:37+0000"
+        },
+        {
+            "id": "comment-14015119",
+            "author": "Uwe Schindler",
+            "content": "For reference, this is the optimization I had in mind. I don't know if it helps for the multi-buffer case, but may be worth a try.\n\nThe patch may not apply cleanly, its just for demonstartion purposes. ",
+            "date": "2014-06-01T23:28:31+0000"
+        },
+        {
+            "id": "comment-14015375",
+            "author": "Robert Muir",
+            "content": "\nFor reference, this is the optimization I had in mind. I don't know if it helps for the multi-buffer case, but may be worth a try.\n\nThe patch may not apply cleanly, its just for demonstartion purposes.\n\nI tested this with sorting on 1M and 10M wikipedia index: its a consistent 7% improvement. +1 to just commit that one, and lets keep iterating on the more complex refactor! ",
+            "date": "2014-06-02T13:32:22+0000"
+        },
+        {
+            "id": "comment-14015378",
+            "author": "Uwe Schindler",
+            "content": "OK, I will commit that to 4.x and trunk. Then I will upload a new patch for the big refactoring. ",
+            "date": "2014-06-02T13:34:53+0000"
+        },
+        {
+            "id": "comment-14015381",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1599218 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1599218 ]\n\nLUCENE-5722: Speed up MMapDirectory.seek() - first small patch for multi-mmap case ",
+            "date": "2014-06-02T13:35:43+0000"
+        },
+        {
+            "id": "comment-14015382",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1599219 from Uwe Schindler in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1599219 ]\n\nMerged revision(s) 1599218 from lucene/dev/trunk:\nLUCENE-5722: Speed up MMapDirectory.seek() - first small patch for multi-mmap case ",
+            "date": "2014-06-02T13:36:40+0000"
+        },
+        {
+            "id": "comment-14015402",
+            "author": "Uwe Schindler",
+            "content": "New patch for current trunk:\n\n\tRemoved the useless tests which were there for debugging only\n\tFactored out the factory for creating clone instances. For perf tests there are now 2 places to modify:\n\n\n\n\n\tstatic ByteBufferIndexInput newInstance() called from MMapDirectory to create the instance used to return as IndexInput\n\tprotected ByteBufferIndexInput newCloneInstance() called when clones/slices are requested. This one also takes offset into account.\n\n\n\nFor benchmarking we might comment out some parts of those 2 methods. ",
+            "date": "2014-06-02T14:02:23+0000"
+        },
+        {
+            "id": "comment-14015416",
+            "author": "Uwe Schindler",
+            "content": "New patch, last one had a bug (merge problem). ",
+            "date": "2014-06-02T14:21:18+0000"
+        },
+        {
+            "id": "comment-14015457",
+            "author": "Robert Muir",
+            "content": "+1 to current patch, this is just more speed on top of previous improvements today.\n\nWith my sort test, its an additional 7-10% (on top of previous commit which was similar). With a microbenchmark of numericdocvalues the improvement is way more substantial (it seems ~ 25%)\n\nIn order to continue further, after this one is committed I want to exploit this slice API for packed ints, instead of clone()'ing the whole file in DV we just slice() what we need, remove offset adjustments in the packed ints decoder, and actually get more safety (read past EOF if you screw up instead of reading into another fields packed ints or whatever).\n\nIn parallel I will begin work on backporting slice() api to 4.x, its baked for a while and I think is good to go. Ill start on this now. ",
+            "date": "2014-06-02T15:17:11+0000"
+        },
+        {
+            "id": "comment-14015472",
+            "author": "Uwe Schindler",
+            "content": "I will just add some more test to TestMultiMMap so it checks that the correct instances are returned (using instanceof). I just want to be sure, the 2 factory methods are creating the right impl classes for every combination of slices and master indexinputs. ",
+            "date": "2014-06-02T15:48:32+0000"
+        },
+        {
+            "id": "comment-14015565",
+            "author": "Uwe Schindler",
+            "content": "New patch that adds a test which checks the implementations returned after getting IndexInput and cloning/slicing. It asserts on random slices, their size and the chunkSize used.\n\nI will commit this later! ",
+            "date": "2014-06-02T17:01:23+0000"
+        },
+        {
+            "id": "comment-14015604",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1599276 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1599276 ]\n\nLUCENE-5722: Optimize ByteBufferIndexInput#seek() by specializing implementations. This improves random access as used by docvalues codecs if used with MMapDirectory. ",
+            "date": "2014-06-02T17:26:38+0000"
+        },
+        {
+            "id": "comment-14015629",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1599278 from Uwe Schindler in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1599278 ]\n\nMerged revision(s) 1599276 from lucene/dev/trunk:\nLUCENE-5722: Optimize ByteBufferIndexInput#seek() by specializing implementations. This improves random access as used by docvalues codecs if used with MMapDirectory. ",
+            "date": "2014-06-02T17:42:17+0000"
+        },
+        {
+            "id": "comment-14015635",
+            "author": "Uwe Schindler",
+            "content": "Thanks Robert for the quick backport of slicer removal! Also thanks for benchmarking - great work together.\n\nWe can open another issue to maybe specialize the single buffer indexinput more (override readByte() / readBytes()). ",
+            "date": "2014-06-02T17:45:50+0000"
+        }
+    ]
+}

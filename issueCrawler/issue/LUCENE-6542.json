@@ -1,0 +1,165 @@
+{
+    "id": "LUCENE-6542",
+    "title": "FSDirectory throws AccessControlException unless you grant write access to the index",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "5.1",
+        "components": [
+            "core/store"
+        ],
+        "labels": "",
+        "fix_versions": [
+            "5.3",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "Hit this during my attempted upgrade to Lucene 5.1.0. (Yeah, I know 5.2.0 is out, and we'll be using that in production anyway, but the merge takes time.)\n\nVarious tests of ours test Directory stuff against methods which the security policy won't allow tests to write to. Changes in FSDirectory mean that it now demands write access to the directory. 4.10.4 permitted read-only access.",
+    "attachments": {
+        "LUCENE-6542.patch": "https://issues.apache.org/jira/secure/attachment/12742639/LUCENE-6542.patch",
+        "patch.txt": "https://issues.apache.org/jira/secure/attachment/12738754/patch.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14580139",
+            "author": "Trejkaz",
+            "date": "2015-06-10T07:06:22+0000",
+            "content": "Patch guards the Files.createDirectories call with a Files.exists check. Files.exists only demands read access, so it succeeds if you only have read access. "
+        },
+        {
+            "id": "comment-14603358",
+            "author": "Hoss Man",
+            "date": "2015-06-26T18:20:22+0000",
+            "content": "Patch looks fine to me at first glance, but i'm not exactly sure why the createDirectories call was introduced at that point in the code path in the first place.\n\nLooking at the logs, it seems to have been added as part of LUCENE-5945 / r1624784 \u2013 prior to that we only checked for existence and throw an error if it didn't exist or wasn't a directory (not sure if/where it was created automaticaly if it didn't exist)\n\n\n\nTangentially: do we even have a way to write a test for this sort of thing?  can we mock the security manager so that a test could say \"during my setUp method, i want to write a bunch of dirs/files, but during the test method, please trigger a failure if any lucene code asks the security manager for the write access to those files?\" "
+        },
+        {
+            "id": "comment-14603872",
+            "author": "Trejkaz",
+            "date": "2015-06-27T01:13:52+0000",
+            "content": "It works something like this:\n\n\nimport org.junit.After;\nimport org.junit.Before;\nimport org.junit.Test;\n\nimport java.io.FilePermission;\nimport java.nio.file.Files;\nimport java.nio.file.Path;\nimport java.security.Permission;\nimport java.security.Permissions;\n\nimport static org.hamcrest.Matchers.is;\nimport static org.junit.Assert.assertThat;\nimport static org.junit.Assert.fail;\n\npublic class TestSecurity {\n    private Path file;\n    private SecurityManager oldSecurityManager;\n\n    @Test\n    public void test() {\n        assertThat(Files.isReadable(file), is(true));\n        try {\n            Files.isWritable(file);\n            fail(\"Expected SecurityException\");\n        } catch (SecurityException e) {\n            // Expected\n        }\n    }\n\n    @Before\n    public void setUp() throws Exception {\n        file = Files.createTempFile(\"temp\", \".dat\");\n        assertThat(Files.isReadable(file), is(true));\n        assertThat(Files.isWritable(file), is(true));\n\n        oldSecurityManager = System.getSecurityManager();\n        System.setSecurityManager(new CustomSecurityManager());\n    }\n\n    @After\n    public void tearDown() {\n        System.setSecurityManager(oldSecurityManager);\n    }\n\n    private static class CustomSecurityManager extends SecurityManager {\n        Permissions permitted = new Permissions();\n\n        private CustomSecurityManager() {\n            permitted.add(new RuntimePermission(\"setSecurityManager\"));\n            permitted.add(new FilePermission(\"<<ALL FILES>>\", \"read\"));\n        }\n\n        @Override\n        public void checkPermission(Permission permission) {\n            if (!permitted.implies(permission)) {\n                // let super's implementation throw the AccessControlException\n                super.checkPermission(permission);\n            }\n        }\n    }\n}\n\n "
+        },
+        {
+            "id": "comment-14606667",
+            "author": "Hoss Man",
+            "date": "2015-06-29T23:44:06+0000",
+            "content": "\nTrejkaz,\n\nI couldn't really make sense of your \"TestSecurity\" example \u2013 nothing in it seems to be enforcing the \"deny write access\" part of the issue, it's just allowing more things (notably: read access for all files) then the default policy ... at first I thought maybe you were assuming the default policy was automatically going to deny writes, and had just meant \"write\" instead of \"read\" in your FilePermission to start allowing it during the test \u2013 but that didn't match up with the assertions you had, and the exceptions you were expecting from Files.isWritable.\n\nIn any case \u2013 the key to my question wasn't just \"how can any junit test change the SecurityManager\" it was specifically about lucene tests, and whether we already had any helper code for this in the lucene test-framework to aid in this.\n\nI couldn't find any, so i tried to create a test that used a custom SecurityManager after building an index in an FSDirectory.  My hope was that i could get it working, and then refactor the SecurityManager into LuceneTestCase with helper methods to specify Permission objects at runtime that should be used to \"deny\" Permission checks before defaulting to the system configured access policy.\n\nUnfortunately, the results have been confusing.\n\nSome seeds pass as expected \u2013 but also (confusingly) pass even if i revert your suggested changes to FSDirectory....\n\n\nant test  -Dtestcase=TestReadOnlyIndex  -Dtests.seed=32CF43854EF86591 -Dtests.slow=true -Dtests.locale=tr_TR -Dtests.timezone=NST -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n\n\n\nOther seeds fail consistently with strange access errors relating to reading JVM resource bundles \u2013 even though nothing about the custom security manager should be affecting these permissions...\n\n\nant test  -Dtestcase=TestReadOnlyIndex -Dtests.seed=1DF78A66DF6175D3 -Dtests.slow=true -Dtests.locale=es_US -Dtests.timezone=Africa/Johannesburg -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n\n\n\n...\n\n\n   [junit4] Started J0 PID(8937@localhost).\n   [junit4] Suite: org.apache.lucene.index.TestReadOnlyIndex\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestReadOnlyIndex -Dtests.method=testReadOnlyIndex -Dtests.seed=1DF78A66DF6175D3 -Dtests.slow=true -Dtests.locale=es_US -Dtests.timezone=Africa/Johannesburg -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   0.16s | TestReadOnlyIndex.testReadOnlyIndex <<<\n   [junit4]    > Throwable #1: java.lang.BootstrapMethodError: call site initialization exception\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([1DF78A66DF6175D3:A472513897A23BC1]:0)\n   [junit4]    > \tat java.lang.invoke.CallSite.makeSite(CallSite.java:341)\n   [junit4]    > \tat java.lang.invoke.MethodHandleNatives.linkCallSiteImpl(MethodHandleNatives.java:307)\n   [junit4]    > \tat java.lang.invoke.MethodHandleNatives.linkCallSite(MethodHandleNatives.java:297)\n   [junit4]    > \tat org.apache.lucene.store.MMapDirectory.<clinit>(MMapDirectory.java:165)\n   [junit4]    > \tat org.apache.lucene.store.FSDirectory.open(FSDirectory.java:163)\n   [junit4]    > \tat org.apache.lucene.store.FSDirectory.open(FSDirectory.java:157)\n   [junit4]    > \tat org.apache.lucene.index.TestReadOnlyIndex.testReadOnlyIndex(TestReadOnlyIndex.java:82)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]    > Caused by: java.util.MissingResourceException: Can't find bundle for base name sun.util.resources.CurrencyNames, locale es_US\n   [junit4]    > \tat java.util.ResourceBundle.throwMissingResourceException(ResourceBundle.java:1564)\n   [junit4]    > \tat java.util.ResourceBundle.getBundleImpl(ResourceBundle.java:1387)\n   [junit4]    > \tat java.util.ResourceBundle.getBundle(ResourceBundle.java:890)\n   [junit4]    > \tat sun.util.resources.LocaleData$1.run(LocaleData.java:164)\n   [junit4]    > \tat sun.util.resources.LocaleData$1.run(LocaleData.java:160)\n   [junit4]    > \tat java.security.AccessController.doPrivileged(Native Method)\n   [junit4]    > \tat sun.util.resources.LocaleData.getBundle(LocaleData.java:160)\n   [junit4]    > \tat sun.util.resources.LocaleData.getCurrencyNames(LocaleData.java:84)\n   [junit4]    > \tat sun.util.locale.provider.LocaleResources.getCurrencyName(LocaleResources.java:216)\n   [junit4]    > \tat sun.util.locale.provider.CurrencyNameProviderImpl.getString(CurrencyNameProviderImpl.java:122)\n   [junit4]    > \tat sun.util.locale.provider.CurrencyNameProviderImpl.getSymbol(CurrencyNameProviderImpl.java:90)\n   [junit4]    > \tat java.util.Currency$CurrencyNameGetter.getObject(Currency.java:640)\n   [junit4]    > \tat java.util.Currency$CurrencyNameGetter.getObject(Currency.java:625)\n   [junit4]    > \tat sun.util.locale.provider.LocaleServiceProviderPool.getLocalizedObjectImpl(LocaleServiceProviderPool.java:281)\n   [junit4]    > \tat sun.util.locale.provider.LocaleServiceProviderPool.getLocalizedObject(LocaleServiceProviderPool.java:265)\n   [junit4]    > \tat java.util.Currency.getSymbol(Currency.java:505)\n   [junit4]    > \tat java.text.DecimalFormatSymbols.initialize(DecimalFormatSymbols.java:648)\n   [junit4]    > \tat java.text.DecimalFormatSymbols.<init>(DecimalFormatSymbols.java:113)\n   [junit4]    > \tat sun.util.locale.provider.DecimalFormatSymbolsProviderImpl.getInstance(DecimalFormatSymbolsProviderImpl.java:85)\n   [junit4]    > \tat java.text.DecimalFormatSymbols.getInstance(DecimalFormatSymbols.java:180)\n   [junit4]    > \tat java.util.Formatter.getZero(Formatter.java:2283)\n   [junit4]    > \tat java.util.Formatter.<init>(Formatter.java:1892)\n   [junit4]    > \tat java.util.Formatter.<init>(Formatter.java:1914)\n   [junit4]    > \tat java.lang.String.format(String.java:2928)\n   [junit4]    > \tat java.lang.invoke.TypeConvertingMethodAdapter.boxingDescriptor(TypeConvertingMethodAdapter.java:134)\n   [junit4]    > \tat java.lang.invoke.TypeConvertingMethodAdapter.box(TypeConvertingMethodAdapter.java:161)\n   [junit4]    > \tat java.lang.invoke.TypeConvertingMethodAdapter.convertType(TypeConvertingMethodAdapter.java:236)\n   [junit4]    > \tat java.lang.invoke.InnerClassLambdaMetafactory$ForwardingMethodGenerator.generate(InnerClassLambdaMetafactory.java:476)\n   [junit4]    > \tat java.lang.invoke.InnerClassLambdaMetafactory.spinInnerClass(InnerClassLambdaMetafactory.java:288)\n   [junit4]    > \tat java.lang.invoke.InnerClassLambdaMetafactory.buildCallSite(InnerClassLambdaMetafactory.java:194)\n   [junit4]    > \tat java.lang.invoke.LambdaMetafactory.metafactory(LambdaMetafactory.java:304)\n   [junit4]    > \tat java.lang.invoke.CallSite.makeSite(CallSite.java:302)\n   [junit4]    > \t... 42 more\n   [junit4]    > Caused by: java.security.AccessControlException: access denied (\"java.lang.RuntimePermission\" \"accessClassInPackage.sun.util.resources\")\n   [junit4]    > \tat java.security.AccessControlContext.checkPermission(AccessControlContext.java:457)\n   [junit4]    > \tat java.security.AccessController.checkPermission(AccessController.java:884)\n   [junit4]    > \tat java.lang.SecurityManager.checkPermission(SecurityManager.java:549)\n   [junit4]    > \tat org.apache.lucene.index.TestReadOnlyIndex$RestrictiveSecurityManager.checkPermission(TestReadOnlyIndex.java:153)\n   [junit4]    > \tat java.lang.SecurityManager.checkPackageAccess(SecurityManager.java:1564)\n   [junit4]    > \tat sun.misc.Launcher$AppClassLoader.loadClass(Launcher.java:311)\n   [junit4]    > \tat java.lang.ClassLoader.loadClass(ClassLoader.java:357)\n   [junit4]    > \tat java.util.ResourceBundle$RBClassLoader.loadClass(ResourceBundle.java:503)\n   [junit4]    > \tat java.util.ResourceBundle$Control.newBundle(ResourceBundle.java:2640)\n   [junit4]    > \tat java.util.ResourceBundle.loadBundle(ResourceBundle.java:1501)\n   [junit4]    > \tat java.util.ResourceBundle.findBundle(ResourceBundle.java:1465)\n   [junit4]    > \tat java.util.ResourceBundle.findBundle(ResourceBundle.java:1419)\n   [junit4]    > \tat java.util.ResourceBundle.findBundle(ResourceBundle.java:1419)\n   [junit4]    > \tat java.util.ResourceBundle.getBundleImpl(ResourceBundle.java:1361)\n   [junit4]    > \t... 72 more\n   [junit4] OK      0.00s | TestReadOnlyIndex.testSanityCheckSecurityManager\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene53): {fieldname=Lucene50(blocksize=128)}, docValues:{}, sim=RandomSimilarityProvider(queryNorm=true,coord=no): {fieldname=DFR GL2}, locale=es_US, timezone=Africa/Johannesburg\n   [junit4]   2> NOTE: Linux 3.19.0-18-generic amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=4,threads=1,free=207954744,total=249561088\n   [junit4]   2> NOTE: All tests run in this JVM: [TestReadOnlyIndex]\n   [junit4] Completed [1/1] in 0.78s, 2 tests, 1 error <<< FAILURES!\n   [junit4] \n   [junit4] \n   [junit4] Tests with failures:\n   [junit4]   - org.apache.lucene.index.TestReadOnlyIndex.testReadOnlyIndex\n   [junit4] \n   [junit4] \n   [junit4] JVM J0:     0.73 ..     1.74 =     1.01s\n   [junit4] Execution time total: 1.77 sec.\n   [junit4] Tests summary: 1 suite, 2 tests, 1 error\n\n\n\n...from what i can tell, these AccessControlException will happen just by having a Security Manager subclass that overrides checKPermission, even if that override does nothing but delegate to super...\n\n\n@Override\npublic void checkPermission(Permission permission) {\n  // first see if the top level policy allows/prevents\n  super.checkPermission(permission);\n  // now explicitly deny things we're configured to deny\n  // if (deny.implies(permission)) {\n  //   throw new SecurityException(\"explicitly denied by test\");\n  // }\n}\n\n\n\n...so i'm really not sure what's going on here. "
+        },
+        {
+            "id": "comment-14606690",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T00:01:15+0000",
+            "content": "Hi,\nthis was officially documented on the issue converting to NIO.2, but I forget it to add to MIGRATE.txt!\n\nFor correct Java 7 implementation and lock factory correctly working after the change (needs fully resolved absolute path), we have to ensure the directory exists before the FSDirectory ctor returns, other wise race conditions occur! The makeDirectories() enforces this.\n\nPlease don't warp this with Files.exists() because this is not really atomic and not a good check, because in fact we need write access to the directory at a later stage, too - because we call fsync on the directory itsself to ensure commits are written into the directory file itsself.\n\nPlease don't add any crazy semantics to TestSecurityManager: The reason why it does not work for you with this hack is because of the internal backwards compatibility in SecurityManager to handle pre-Java 1.2 (or like that), where SecurityManager did not know about permissions. At that time it used to call checkWrite(), which now delegates in strange ways - they would need VirtualMethod class from Lucene to handle this correctly \n\nI don't see this as a bug: Lucene \"owns\" the directory, so it must be able to create/delete/fsync/whatever it. If the directory is on a read-only FS and you just open DirectoryReader, its perfectly fine if the directory exists (no OS error). It is just FilePermission that complains. "
+        },
+        {
+            "id": "comment-14606696",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T00:04:21+0000",
+            "content": "And your second patch: Please don't do this. This is all not worth a test. It just compromises our security manager. A SecurityManager that allows to override/delete itsself just makes itsself broken.  "
+        },
+        {
+            "id": "comment-14606711",
+            "author": "Robert Muir",
+            "date": "2015-06-30T00:12:49+0000",
+            "content": "Yes, if you really want to do this in a test:\n\nGuideline 9-4 / ACCESS-4: Know how to restrict privileges through doPrivileged\nhttp://www.oracle.com/technetwork/java/seccodeguide-139067.html#9\n "
+        },
+        {
+            "id": "comment-14606718",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T00:20:33+0000",
+            "content": "Good tip!  "
+        },
+        {
+            "id": "comment-14606733",
+            "author": "Hoss Man",
+            "date": "2015-06-30T00:30:06+0000",
+            "content": "Uwe: I'm still not following why my attempts at Runtime control over the allowed FilePermissions don't work, but that may all be moot so let's ignore it for now...\n\nEDIT: ah ... just saw rmuir's reply ... still wrapping my head arround 9-1 and 9-4, but i think i'm getting the gist -not going to worry about it until/unless we decide any of the rest of the objectives below make sense...\n\nI don't see this as a bug: Lucene \"owns\" the directory, so it must be able to create/delete/fsync/whatever it. If the directory is on a read-only FS and you just open DirectoryReader, its perfectly fine if the directory exists (no OS error). It is just FilePermission that complains.\n\n...my main concern is this: For all the same reasons rmuir mentioned / put the effort into LUCENE-6238, we should try to be as restrictive as possible in what Permissions the various Lucene classes require to run.  Testing wit ha \"no writes allowed\" security policy like Trejkaz describes seems like a totally legitimate thing for a user to want to do.  If that's no supported \u2013 then how can/should users like Trejkaz write tests to verify that their usage of lucene will not attempt to write to a (logically) read only index w/o using restrictive FilePermissions in their tests?  \n\nYou say a read only FileSystem will work, and i believe you \u2013 but how can we prove that in a lucene test so that we don't inadvertently add some silly code to IndexReader that writes a file to the index Directory?  Just depending on something like Files.setPosixFilePermissions in the test doesn't really seem like enough \u2013 since the silly code might force the file to be writable first.\n\nSo short of a test that requires you have a prebuilt index on a filesystem that's mounted read only, how do we (or our users) write/run a test to be sure that the \"read only\" code in lucene is truely \"read only\" ? "
+        },
+        {
+            "id": "comment-14606752",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T00:44:36+0000",
+            "content": "I have the test working here. Will post updated patch. "
+        },
+        {
+            "id": "comment-14606775",
+            "author": "Robert Muir",
+            "date": "2015-06-30T01:08:05+0000",
+            "content": "maybe add a helper method, so tests can do something like:\n\nassertNeedsPrivs(new WithPrivs(new FilePermission(\"/foo/bar\", \"read\") {\n  void run() {\n    new MMapDirectory();\n  }\n});\n\n\n\nit could take Permission varargs... since in most cases it should only be 1 or 2 for unit testing. "
+        },
+        {
+            "id": "comment-14606827",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T01:53:17+0000",
+            "content": "Here is the test. I had to f*ck with the last Permission, because to run the code with restricted permissions you need the additional permission, otherwise it runs with no permissions at all  (see javadocs)\n\nI also added a helper method, we may move this to LTC later "
+        },
+        {
+            "id": "comment-14606831",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T01:57:24+0000",
+            "content": "Slightly improved generics in the patch to make the helper method more universal (to move to LTC). "
+        },
+        {
+            "id": "comment-14606850",
+            "author": "Hoss Man",
+            "date": "2015-06-30T02:03:57+0000",
+            "content": "I also added a helper method, we may move this to LTC later\n\n+1\n\nThis patch looks great Uwe, generalizing that method into LTC sounds good to me. "
+        },
+        {
+            "id": "comment-14606851",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T02:05:00+0000",
+            "content": "More neat helper method (Java 8). I will blow this up to ten times its size when backporting to 5.x  "
+        },
+        {
+            "id": "comment-14606852",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T02:07:38+0000",
+            "content": "This patch looks great Uwe, generalizing that method into LTC sounds good to me.\n\nWill look into this tomorrow. Have to sleep now, its already 4 am. The time when Mike McCandless starts coding  "
+        },
+        {
+            "id": "comment-14609208",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T22:48:49+0000",
+            "content": "Moved the runWithLowerPermissions to LTC.\n\nI also fixed the FSDirectory() ctor to do a mich simpler Files.isDirectory() check, because otherwise the basic TestDirectory test fails on Windows (of couse it fails...).\n\nCould somebody with Linux or MacOSX test the patch or state any other complaints with it? "
+        },
+        {
+            "id": "comment-14609225",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T23:02:21+0000",
+            "content": "More tests that we cannot escape our sandbox! "
+        },
+        {
+            "id": "comment-14609263",
+            "author": "Uwe Schindler",
+            "date": "2015-06-30T23:39:45+0000",
+            "content": "After discussion with Hoss Man, I added an assume to the runWithRestrictedPermissions, so it cancels test execution if no security manager is available. Running those tests without a security manager makes no sense, because they would assert nothing (because they have all permissions). "
+        },
+        {
+            "id": "comment-14609304",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-01T00:16:39+0000",
+            "content": "Commit 1688537 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1688537 ]\n\nLUCENE-6542: FSDirectory's ctor now works with security policies or file systems that restrict write access "
+        },
+        {
+            "id": "comment-14609324",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-01T00:28:45+0000",
+            "content": "Commit 1688541 from Uwe Schindler in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1688541 ]\n\nMerged revision(s) 1688537 from lucene/dev/trunk:\nLUCENE-6542: FSDirectory's ctor now works with security policies or file systems that restrict write access "
+        },
+        {
+            "id": "comment-14609326",
+            "author": "Uwe Schindler",
+            "date": "2015-07-01T00:29:31+0000",
+            "content": "Committed and backported the lambdas to Java 7 in branch_5x. "
+        },
+        {
+            "id": "comment-14713337",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-08-26T13:06:28+0000",
+            "content": "Bulk close for 5.3.0 release "
+        }
+    ]
+}

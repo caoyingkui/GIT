@@ -1,0 +1,338 @@
+{
+    "id": "LUCENE-6198",
+    "title": "two phase intersection",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.1",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "Currently some scorers have to do a lot of per-document work to determine if a document is a match. The simplest example is a phrase scorer, but there are others (spans, sloppy phrase, geospatial, etc).\n\nImagine a conjunction with two MUST clauses, one that is a term that matches all odd documents, another that is a phrase matching all even documents. Today this conjunction will be very expensive, because the zig-zag intersection is reading a ton of useless positions.\n\nThe same problem happens with filteredQuery and anything else that acts like a conjunction.",
+    "attachments": {
+        "phrase_intersections.tasks": "https://issues.apache.org/jira/secure/attachment/12698402/phrase_intersections.tasks",
+        "LUCENE-6198.patch": "https://issues.apache.org/jira/secure/attachment/12694192/LUCENE-6198.patch",
+        "LUCENE-6198_move_approximation_to_constructor.patch": "https://issues.apache.org/jira/secure/attachment/12707197/LUCENE-6198_move_approximation_to_constructor.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14289540",
+            "author": "Robert Muir",
+            "date": "2015-01-23T17:16:54+0000",
+            "content": "Here is a hack patch (i really am not totally happy with many things about it) as a prototype.\n\nDISI gets an optional method to return an approximation, meaning it can return false positive matches for intersection, and you must verify its really a match via a separate method.\n\nI only implemented this for conjunctionquery and phrasequery initially. It works across nested conjunctions as well, so its global agreement and will work with filters too if we fix FilteredQuery.\n\nI think we can remove FilteredQuery's execution mode of QUERY_FIRST (for slow filters like geo) if we go with this. Instead such slow filters like geo ones should implement this api, and return a bounding box or whatever as the approximation. If they are so slow they have no approximation, they can return MatchAllDocs as the approximation, and its still better, because it will work within nested clauses, etc. "
+        },
+        {
+            "id": "comment-14289665",
+            "author": "David Smiley",
+            "date": "2015-01-23T18:23:05+0000",
+            "content": "Nice work Rob!\n\nIt seems this issue is a solution to LUCENE-6032 right?\nI took a look at the patch and have a couple comments. I know you called this a \"hack patch\" so that may explain why there are not yet any javadocs on the methods you added to DocIdSetIterator.  The main thing that confuses me about what I see is the separation between TwoPhase & TwoPhaseApproximation despite the comments.  Couldn't TwoPhase.verify return true, and getApproximation return \u2018this\u2019?\n\nBTW, please don't generalize all geo as being slow; there are multiple strategies with performance trade-offs for implementing geo. "
+        },
+        {
+            "id": "comment-14289684",
+            "author": "Robert Muir",
+            "date": "2015-01-23T18:34:37+0000",
+            "content": "\nThe main thing that confuses me about what I see is the separation between TwoPhase & TwoPhaseApproximation despite the comments. Couldn't TwoPhase.verify return true, and getApproximation return \u2018this\u2019?\n\nIt is confusing. TwoPhase does two-phase intersection, it works on approximations, but it is an \"exact\" scorer, e.g. its what is used if you AND(term, phrase). \n\nHowever, its possible you could have nested conjunctions such as AND(term1, AND(term2, phrase)). So ConjunctionScorer itself, supports approximations when any of its subs do. TwoPhaseApproximation is this impl, which defers matches() to the caller.\n\nThis way confirmation is deferred until there is \"global docid\" agreement across the whole query tree. With this patch its only going to work with nested conjunctions, because thats all i implemented it for. Obviously for it to work across the board (means put geo/phrase queries anywhere in query/filter tree at arbitrary places and everything \"works\"), disjunctions and other boolean-like scorers must implement the API too when their subs support approximations.\n\n\nBTW, please don't generalize all geo as being slow; there are multiple strategies with performance trade-offs for implementing geo.\n\nIt was not a stab at geo or anything. phrases are in the same category. It is just another use case where verifying the document is actually a match, is more costly then moving to the next \"possible\" document for the purpose of zig-zag intersection. Exactphrasescorer is a tricky case since its not TOO terribly expensive to verify a match, but still should be a win. thats why i tried to prototyped with it first. "
+        },
+        {
+            "id": "comment-14289696",
+            "author": "Robert Muir",
+            "date": "2015-01-23T18:40:41+0000",
+            "content": "by the way, one way to make this more clear is to probably just make TwoPhase return an anonymous subclass in getApproximation() rather than giving it an explicit name. The way i arranged the code currently is confusing. "
+        },
+        {
+            "id": "comment-14289712",
+            "author": "Robert Muir",
+            "date": "2015-01-23T18:51:56+0000",
+            "content": "\nIt seems this issue is a solution to LUCENE-6032 right?\n\nIt should be. the motivation here is different, its to try to provide general performance improvements. If we decide to do it, then I think we should add support to FilteredQuery/SloppyPhraseQuery/DisjunctionQuery at a minimum, so that proximity is faster overall regardless of where its placed in the query/filter tree. Other things are possible, such as implementing for spans so that they delay reading of positions until there is a match (this would speed up SpanNearQuery just by itself). I am unsure if we can use it to speed MinShouldMatch when there is a filter, maybe thats another interesting one. \n\nBut yes, I think the idea is that \"slow filters\" just need to support the approximation api to work most efficiently regardless of where they are placed. Even if they return MatchAll as an approximation its better than today. Obviously, things like booleanfilter or whatever need to implement this api for that to work. "
+        },
+        {
+            "id": "comment-14289801",
+            "author": "Yonik Seeley",
+            "date": "2015-01-23T19:37:16+0000",
+            "content": "I had thought about this a while ago via adding something like \n\n\ninterface ApproximateDISI {\n  int guessNext();  // returns next doc that has a chance of matching\n  int guessAdvance(int target);  // returns next doc after target that has a chance of matching\n  boolean matches();\n}\n\n\n\nAnd then some scorers could optionally implement ApproximateDISI.\nSo I guess the main diff would come down to \"instanceof ApproximateDISI\" vs \"getApproximation() != null\" ?\nedit: Although I think I do like the increased reuse potential of your way... it's just another DISI. "
+        },
+        {
+            "id": "comment-14289821",
+            "author": "Robert Muir",
+            "date": "2015-01-23T19:45:48+0000",
+            "content": "Yeah I explored many similar things because I hate the API i have. \n\nIn the interface case, its very difficult for \"wrappers\" like constantscorequery. It also means we really have to duplicate logic for e.g. conjunctions, which really, is no big deal, but it becomes tricky when some subs are inexact (say phrases) and others are exact (terms) and needs additional wrappers/abstractions to deal with that.\n\nOther options i tried got tricky, the problem is, I think we really want it to work for Filters too, so things must be at this very low DocIdSetIterator level (versus Scorer, or even DocsEnum where it maybe could be done more intuitively). When looking at changes to DocIdSetIterator, i definitely wanted it to be an optional thing because its so widespread, to minimize impact to the codebase.\n "
+        },
+        {
+            "id": "comment-14289874",
+            "author": "Yonik Seeley",
+            "date": "2015-01-23T20:12:19+0000",
+            "content": "I wonder if there's any way to provide more context so that approximations can be adjusted/tuned.\nAs an example, for an exact phrase match like \"the zoo\", I imagine it would often be a win to just use the docsenum for \"zoo\" as the approximation.  But as a generalization it would seem to matter what else was in the conjunction and how expensive they are. "
+        },
+        {
+            "id": "comment-14289900",
+            "author": "Robert Muir",
+            "date": "2015-01-23T20:24:24+0000",
+            "content": "I think as a rule we should start with this API only being used for intersection, to avoid the slow operations. \n\nIn the case of \"the zoo\" I think the current logic will work fine, because it returns a conjunction as the approximation, which sorts by cost, and will advance zoo (the leader). Its true, it requires advances from \"the\", but its the only way to guarantee you avoid any unnecessary use of positions.\n\nOtherwise, if we just return \"zoo\" termsenum, it might save a little cpu for the approximation intersection, but in many cases can result in more wasted usages of positions because of a higher false positive rate. So I think its currently too risky, without some restructing/context (e.g. the cost of \"the other guy\" we are intersecting and whether this might be worth the effort).\n\nBut yes, i think we could do more in the future, such as using a tiered approach (zoo, the zoo, \"the zoo\") or other possibilities. Mainly for prototyping I wanted something minimal to start and I am worried being too fancy can hurt simple queries if we are not careful. "
+        },
+        {
+            "id": "comment-14289926",
+            "author": "Robert Muir",
+            "date": "2015-01-23T20:38:11+0000",
+            "content": "Yeah in the conjunction case, i think it could have a better approximation, somehow, that early returns from doNext() to allow zigzag to go even faster.\n\nThere is a related TODO in the code, its very difficult to reason about how to optimize this kind of thing at the moment:\n\n// ... better information would be some sort of per-hit \"cost\", which\n// e.g. phrasescorer could supply based on sumTotalTermFreq (avg # positions to read)\n\n "
+        },
+        {
+            "id": "comment-14290024",
+            "author": "Michael McCandless",
+            "date": "2015-01-23T21:37:59+0000",
+            "content": "This will also solve LUCENE-1252 "
+        },
+        {
+            "id": "comment-14290041",
+            "author": "Yonik Seeley",
+            "date": "2015-01-23T21:47:38+0000",
+            "content": "Otherwise, if we just return \"zoo\" termsenum, it might save a little cpu for the approximation intersection, but in many cases can result in more wasted usages of positions\n\nOh, right... it's two phase.  I guess I had some sort of half-baked multi-phase in my head where for (\"a boy\" AND \"the zoo\") would look at the conjunction of zoo and boy and only then look at \"a\" and \"the\" and then after all that look at positions.  I guess that could be accomplished with something like\n\nDocIdSetIterator[] getApproximation()\n\n\nAnd then a phrase query could return one for each term and the top level could sort them all by cost.  This could even allow all approximations to be bubbled up to a higher level to handle nested approximations more efficiently?  Not sure if it's worth the complexity though... it's just random brainstorming.\n "
+        },
+        {
+            "id": "comment-14290078",
+            "author": "Robert Muir",
+            "date": "2015-01-23T22:06:53+0000",
+            "content": "Maybe, but currently the implementation (i added javadocs for some of my approaches, not this one) might have certain needs. ExactPhraseScorer's matches() needs everything is already positioned on the document. It just has to hasFreq() > 0. ConjunctionScorer also has certain invariants about its subs.\n\nWith this patch, the approximation is just a \"view\" of the actual one, so next()/advance()'ing it must also position the parent (e.g. to then call score()). Restricting the API to this \"view\" could be seen as unfriendly, but i found it was the only way to keep good performance: e.g. we only ever really have one docsandpositionsenum, otherwise we read redundant skipdata and read unnecessary positions.\n\nSo I would rather the implementation (PhraseScorer) do any fanciness itself. The current approach is \"bottoms up\" for nested query trees anyway. matches() is \"bubbled down\" and this means its still better to have Conj(A, B, C) than Conj(A, (B, C)) but thats not an issue I am trying to solve here, and it never causes any unnecessary reads of positions, just the same unnecessary advance()'ing being done already. "
+        },
+        {
+            "id": "comment-14290088",
+            "author": "Hoss Man",
+            "date": "2015-01-23T22:13:10+0000",
+            "content": "\nSpitballing...\n\n\nI had thought about this a while ago via adding something like ...\n\nYeah I explored many similar things because I hate the API i have.\n\n...\n\nOther options i tried got tricky, the problem is, I think we really want it to work for Filters too, so things must be at this very low DocIdSetIterator level (versus Scorer, or even DocsEnum where it maybe could be done more intuitively). When looking at changes to DocIdSetIterator, i definitely wanted it to be an optional thing because its so widespread, to minimize impact to the codebase.\n\nIf we were doing pure greenfield API design, w/o any concern for backcompat, and we wanted to support this type of multi-phase intersection support in the Doc iterators, what would we want it to look like?\n\nWould it make sense if instead of docID(), nextDoc(), and advance(int) we DISI looked something like...\n\n\npublic abstract class DocIdSetIterator {\n  public abstract long cost();\n  public abstract int nextCandidateDoc() throws IOException; // nextDoc\n  public abstract int advanceNextCandidateBeyond(int target) throws IOException; // advance\n  public boolean candidateIsMatch() throws IOException {\n    return true;\n  }\n  /** meaningless unless {@link #candidateIsMatch} is true */\n  public abstract int candidateDocID(); // docID\n}\n\n\n\n...and eliminate the need for callers/wrappers to know/care if/when the implementation supports \"aproximations\" \u2013 instead all callers just check candidateIsMatch() and we trust the JVM to optimize that call away when it's a constant.\n\n\nWould that be an API people prefered over the current patch? "
+        },
+        {
+            "id": "comment-14290220",
+            "author": "Robert Muir",
+            "date": "2015-01-23T23:41:30+0000",
+            "content": "\nIf we were doing pure greenfield API design, w/o any concern for backcompat, and we wanted to support this type of multi-phase intersection support in the Doc iterators, what would we want it to look like?\n\nThen it would not be on DocIdSetIterator. I put it there, to be reasonable in a backwards compatible way, to try to make filters fast too. But it does not belong there: so the changes are intended to be minimal and have the least interference with things like postings lists.\n\nI'll be honest: I don't want to wait until 6.0 to fix the performance of proximity queries. And to do things properly IMO, Filter needs to be removed and merged with Query for that to happen. I don't think i can do that easily in 5.x.\n\n\n...and eliminate the need for callers/wrappers to know/care if/when the implementation supports \"aproximations\" \u2013 instead all callers just check candidateIsMatch() and we trust the JVM to optimize that call away when it's a constant.\n\nBut there are several problems here:\n1. the need is actually important. Thats why the two-phase scorer has a separate array holding the ones it must verify: only the approximate ones! What particular compiler optimization did you think should help in that case so that conjunctions don't have performance issues? I develop with the latest 8u40-ea.\n2. it makes things much more difficult for a single java object to support both approximate and exact iteration. Its by far easier to just return something around some underlying structure that already exists (e.g. underlying conjunction of a phrase) and not have to support switching back and forth and so on.\n3. I don't think lucene should have a scoring or iteration apis that are \"approximate by definition\". That is by far too hard to use for the 90% case.  Instead we should have the ability to explicitly \"ask\" for an approximation in special cases. Those are: doing zig-zag intersection, document filtering, etc. "
+        },
+        {
+            "id": "comment-14290525",
+            "author": "Michael McCandless",
+            "date": "2015-01-24T10:17:52+0000",
+            "content": "LUCENE-5460 is also related here. "
+        },
+        {
+            "id": "comment-14290527",
+            "author": "Michael McCandless",
+            "date": "2015-01-24T10:25:38+0000",
+            "content": "Is an approximation itself allowed to have another approximation?  This could solve the +\"the zoo\" +\"the boy\" case, I think ... because \"the zoo\" would rewrite to:\n\n\n  +the +zoo\n  \"the zoo\"\n\n\n\nand then the +the +zoo would rewrite to:\n\n\n  +zoo\n  +the\n\n\n\nThen it's not until there's global agreement about zoo's next doc, that we would even all advance on the?\n\nOr maybe we simply disallow recursive approximations for starters?  I do like that the current patch is a baby step that looks like it can succeed  "
+        },
+        {
+            "id": "comment-14290576",
+            "author": "Robert Muir",
+            "date": "2015-01-24T12:45:00+0000",
+            "content": "\nOr maybe we simply disallow recursive approximations for starters? I do like that the current patch is a baby step that looks like it can succeed\n\nits not clear at all that this complicated stuff you guys propose would even help. \n\nThe current patch passes all tests and i sat alongside luceneutil benchmark making it. Please dont underestimate how annoying it is to change the code in any way without pissing that thing off brutally.\n\nI don't think we should try to do complicated things all at once. At least i won't be the one doing it. Its gotta be realistic: and its gotta have realistic goals. \n\nPlain and simple: speed up the proximity queries. I'm not trying to speed up advance(). Leave that for another issue, plenty of time has been wasted on that before. "
+        },
+        {
+            "id": "comment-14290581",
+            "author": "Robert Muir",
+            "date": "2015-01-24T12:47:55+0000",
+            "content": "The scope can't stay reasonable here: i'm closing the issue.\n\nI want help with the api, i dont want feature creep. Maybe we think of a better simpler one and open a new issue. "
+        },
+        {
+            "id": "comment-14292577",
+            "author": "Mikhail Khludnev",
+            "date": "2015-01-26T23:02:04+0000",
+            "content": "Robert broke my heart twice. So far this thread seems like a pretty graveyard for the whole problem family. Let me add my humble proposal.\n\"verification\" can be achieved by just introducing \"advanceOrAbandon()\" that's can be provided via DISI (ie Scorer) implementing Bits, and redefining get(int):boolean as stateful. \nThus, high cost() scorer, which are plagued by endless loops in advance() can emphasize it by implementing Bits, let's call them slowpoke.\nNow ConjunctionScorer can let least cost scorer to lead the leapfrog intersection of regular scorers, which are not implementing Bits. And those which implements Bits (slowpokes) just confirms the candidate doc by get(), and they don't need to loop!\nSo far it's good. However, when high cost regular scorer (e.g. plain disjunction of stopwords) is intersected with slowpoke (e.g. empty zig-zag conjunction or minShouldMatch pre 4.3). In this case it won't work fine - disjunction proposes almost everything for confirmation, and slowpoke reject all of them. ConjunctionScorer should count such rejections (those are not expensive, btw), and if it happens too many times, it can let slowpoke to lead the leapfrog, by calling nextDoc() on it, and this loop can be reasonable. \nHow does it fit?   "
+        },
+        {
+            "id": "comment-14292687",
+            "author": "Raj Sharma",
+            "date": "2015-01-27T00:10:42+0000",
+            "content": "Why was this closed? Has the concept been abandoned by everyone discussing it? Should this not be consensus? "
+        },
+        {
+            "id": "comment-14292694",
+            "author": "Robert Muir",
+            "date": "2015-01-27T00:15:30+0000",
+            "content": "I already explained why. I was unhappy with the complexity of the API.\n\nHowever, the only suggestions i could get were actually more complicated and more invasive... so seeing i didnt have the time to paint this bikeshed, i closed as wont' fix.\n\nit is not really consensus what i do or do not work on. thats a personal decision and I have already moved on. "
+        },
+        {
+            "id": "comment-14292777",
+            "author": "Raj Sharma",
+            "date": "2015-01-27T01:09:39+0000",
+            "content": "No one forces you to do anything.  Others can still finish this.  Closing the issue is just rude. "
+        },
+        {
+            "id": "comment-14292795",
+            "author": "Robert Muir",
+            "date": "2015-01-27T01:26:14+0000",
+            "content": "Its not rude, my approach didnt \"take\", so we stop wasting time with it.\n\nit appears only more complexity, not less, is wanted. "
+        },
+        {
+            "id": "comment-14292801",
+            "author": "Raj Sharma",
+            "date": "2015-01-27T01:30:26+0000",
+            "content": "I do not see disagreements with your approach, but only discussions.\nIt looks like you were somehow upset by discussions and closed the issue because of that.  Discussions should be a good thing! "
+        },
+        {
+            "id": "comment-14292805",
+            "author": "Ryan Ernst",
+            "date": "2015-01-27T01:33:03+0000",
+            "content": "Raj Sharma If you want to have a discussion about alternate implementations, you are welcome to create a new issue. "
+        },
+        {
+            "id": "comment-14292806",
+            "author": "Robert Muir",
+            "date": "2015-01-27T01:33:11+0000",
+            "content": "Definitely disagreements. 100% of responders came back with additional complexity, rather than suggestions to reduce complexity.\n\nI don't know how to say it nicely, before you start defending one of these discussions, try actually working the code and see what the benchmarks look like. I'm not wasting time on pie-in-the-sky shit that won't work. "
+        },
+        {
+            "id": "comment-14292812",
+            "author": "Raj Sharma",
+            "date": "2015-01-27T01:36:53+0000",
+            "content": "If you want to have a discussion about alternate implementations, you are welcome to create a new issue.\n\nWhat about the implementation in this issue?  Is anyone against it?  Is it vetoed?\nI think this issue should be reopened. "
+        },
+        {
+            "id": "comment-14292827",
+            "author": "Robert Muir",
+            "date": "2015-01-27T01:48:10+0000",
+            "content": "I think i already said, i don't like many things about it when uploading the patch. \n\nIts obviously not a great API, but has other benefits like keeping performance fast, backwards compatibility (without introducing scary bugs into peoples code), can work for both Query+Filter, etc. \n\nIts also unfortunately far easier to suggest more complicated API as a comment, than to suggest actual patches for this issue. Its a shitload of work if you want to implement things efficiently for these scorers and not screw up performance.\n\nI don't want to argue about it, i know the patch i proposed sucks, its like going fishing, this time just didnt catch anything. move on to another lake or another sport instead. "
+        },
+        {
+            "id": "comment-14293808",
+            "author": "Yonik Seeley",
+            "date": "2015-01-27T16:48:58+0000",
+            "content": "Don't worry folks (if you are Solr users), I opened\nhttps://issues.apache.org/jira/browse/SOLR-7044 \nto optimize some of these cases while the right API at the lucene level is being sorted out. "
+        },
+        {
+            "id": "comment-14293815",
+            "author": "Mark Miller",
+            "date": "2015-01-27T16:54:51+0000",
+            "content": "It looks like you were somehow upset by discussions and closed the issue because of that. Discussions should be a good thing!\n\nWelcome to the current state of the Lucene community. "
+        },
+        {
+            "id": "comment-14316288",
+            "author": "Adrien Grand",
+            "date": "2015-02-11T14:46:00+0000",
+            "content": "I'll try to summarize API challenges that have been mentioned or that I can think of:\n\n\n\tshould match confirmation be built-in DocIdSetIterator (ie. adding a matches() method and requiring callers to always verify matches)? While it would work, one issue I have is that it would also make the simple cases such as TermScorer more complicated? So I like having an optional method or marker interface better.\n\n\n\n\n\tideally this would not be intrusive and just an incremental improvement over what we currently have today\n\n\n\n\n\tthis thing cannot be a marker interface, otherwise wrappers like ConstantScoreQuery could not work properly\n\n\n\n\n\twe need to somehow reuse the DocIdSetIterator abstraction for code reuse (approximations cannot be a totally different object)\n\n\n\n\n\tone concern was that it should work well for queries and filters, but since we are slowly merging both, it would probably ok to make it work for queries only (which potentially means that we could expose methods only on Scorer instead of DISI, at least as a start).\n\n\n\n\n\tshould we extend DocIdSetIterator and add a 'matches' method, or have another class that exposes a DocIdSetIterator 'approximation' and a 'matches' method. While the patch on LUCENE-6198 uses option 1, I like the fact that with option 2 we do not extend DocIdSetIterator and more clearly separate the approximation from the confirmation (like the API proposal on SOLR-7044)\n\n\n\n\n\tin a conjunction disi, should there be a way to configure the order in which confirmations should be performed (kind-of similarly to the cost API, by trying to confirm the cheapest instances first)? I think so but I we can probably delay this problem to later?\n\n\n\nHere is a new patch which is very similar to the current one, but with two main differences:\n\n\tthe approximation DISI has been replaced with a TwoPhaseDocIdSetIterator class which exposes an iterator called 'approximation' and a 'boolean matches()' method\n\tapproximation is only exposed on Scorer\n\n "
+        },
+        {
+            "id": "comment-14316568",
+            "author": "Robert Muir",
+            "date": "2015-02-11T17:23:39+0000",
+            "content": "I am +1 for this API because it solves my major complaint with the first stab i took, invasive methods being added to very low level apis.\n\nBut i think, on the implementation we should support approximations of conjunctions like the first patch. I think its important because this way nested conjunctions/filters work and there is not so much performance pressure for users to \"flatten\" things. If we later fix scorers like disjunctionscorer too, then it starts to have bigger benefits because users can e.g. put proximity queries or \"slow filters\" that should be checked last anywhere arbitrarily in the query, and we always do the right thing.  "
+        },
+        {
+            "id": "comment-14316790",
+            "author": "Adrien Grand",
+            "date": "2015-02-11T19:10:47+0000",
+            "content": "New patch that adds two-phase support to ConjunctionScorer. luceneutil seems happy with the patch too:\n\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n              HighPhrase       12.26     (11.3%)       11.89      (5.3%)   -3.0% ( -17% -   15%)\n              AndHighLow      894.95      (9.5%)      874.08      (2.9%)   -2.3% ( -13% -   11%)\n               LowPhrase       18.81      (9.2%)       18.51      (4.8%)   -1.6% ( -14% -   13%)\n                  Fuzzy1       72.76     (12.2%)       71.65      (9.6%)   -1.5% ( -20% -   23%)\n               MedPhrase       54.31     (11.0%)       53.81      (3.2%)   -0.9% ( -13% -   14%)\n                 LowTerm      806.00     (11.9%)      808.20      (4.5%)    0.3% ( -14% -   18%)\n                 Respell       55.89     (10.2%)       56.57      (4.2%)    1.2% ( -11% -   17%)\n            OrNotHighLow     1102.88     (11.4%)     1116.63      (4.3%)    1.2% ( -13% -   19%)\n             LowSpanNear        9.48      (9.5%)        9.61      (4.4%)    1.4% ( -11% -   16%)\n         LowSloppyPhrase       71.86      (8.8%)       72.89      (3.5%)    1.4% (  -9% -   15%)\n         MedSloppyPhrase       29.92     (10.3%)       30.35      (4.2%)    1.4% ( -11% -   17%)\n             MedSpanNear       79.24      (8.6%)       80.39      (3.2%)    1.5% (  -9% -   14%)\n                  IntNRQ       16.81      (9.4%)       17.06      (6.1%)    1.5% ( -12% -   18%)\n        HighSloppyPhrase       23.27     (11.6%)       23.64      (8.1%)    1.6% ( -16% -   24%)\n              OrHighHigh       16.79     (10.6%)       17.08      (7.7%)    1.7% ( -15% -   22%)\n            OrHighNotLow       84.84     (10.3%)       86.32      (3.2%)    1.7% ( -10% -   17%)\n           OrNotHighHigh       56.28      (9.4%)       57.30      (1.9%)    1.8% (  -8% -   14%)\n                HighTerm      123.91     (10.8%)      126.29      (2.8%)    1.9% ( -10% -   17%)\n                 MedTerm      243.44     (11.1%)      248.40      (2.9%)    2.0% ( -10% -   18%)\n                Wildcard       74.84      (9.9%)       76.36      (3.1%)    2.0% (  -9% -   16%)\n           OrHighNotHigh       45.48      (9.9%)       46.47      (1.9%)    2.2% (  -8% -   15%)\n               OrHighLow       79.36     (11.3%)       81.10      (6.5%)    2.2% ( -14% -   22%)\n                 Prefix3       74.29     (10.5%)       75.96      (4.9%)    2.2% ( -11% -   19%)\n            OrHighNotMed       53.37     (10.7%)       54.62      (2.5%)    2.3% (  -9% -   17%)\n                PKLookup      266.92     (10.4%)      273.30      (3.4%)    2.4% ( -10% -   18%)\n            HighSpanNear       19.64     (10.4%)       20.11      (3.0%)    2.4% (  -9% -   17%)\n            OrNotHighMed      167.57     (11.7%)      171.67      (2.4%)    2.4% ( -10% -   18%)\n               OrHighMed       72.90     (12.5%)       74.87      (6.6%)    2.7% ( -14% -   24%)\n                  Fuzzy2       50.70     (13.8%)       52.58      (8.4%)    3.7% ( -16% -   30%)\n              AndHighMed      160.13     (10.1%)      169.60      (3.4%)    5.9% (  -6% -   21%)\n             AndHighHigh       69.49      (8.8%)       74.19      (3.3%)    6.8% (  -4% -   20%)\n\n "
+        },
+        {
+            "id": "comment-14316791",
+            "author": "Adrien Grand",
+            "date": "2015-02-11T19:11:48+0000",
+            "content": "New patch that adds two-phase support to ConjunctionScorer.\n\nBy that I mean that not only ConjunctionScorer can take sub-clauses that supports approximations, but also that in that case it will support approximation too. "
+        },
+        {
+            "id": "comment-14317883",
+            "author": "Adrien Grand",
+            "date": "2015-02-12T09:30:25+0000",
+            "content": "Same patch with some additional javadocs in ConjunctionDISI to better explain how it works.\n\nLet me also try to recap what the patch does:\n\n\n\tExactPhraseScorer returns a conjunctions on its terms as an approximation, and 'matches()' consists of checking positions.\n\n\n\n\n\tConjunctionScorer only returns an approximation if one of the clauses supports approximations. In that case the approximation is the conjunction of the approximations of the underlying clauses, and confirmation consists of calling 'matches()' on all underlying clauses that support approximations.\n\n\n\nSome concrete examples:\n\n\n\t+A +B does not support approximations since term scorer does not expose approximations\n\t\"A B\" (phrase) returns +A +B as an approximation\n\t+ \"A B\" + C returns +(+A +B) +C as an approximation\n\n "
+        },
+        {
+            "id": "comment-14318011",
+            "author": "Adrien Grand",
+            "date": "2015-02-12T11:21:44+0000",
+            "content": "I built some tasks for intersections of phrases with terms and ran luceneutil on it to validate that it does indeed speed up such queries:\n\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                PKLookup      247.13      (2.0%)      248.14      (1.9%)    0.4% (  -3% -    4%)\n     AndMedPhraseLowTerm       13.74      (0.7%)       14.67      (2.8%)    6.7% (   3% -   10%)\n   AndHighPhraseHighTerm        6.03      (0.9%)        6.45      (0.8%)    7.0% (   5% -    8%)\n    AndMedPhraseHighTerm       45.62      (2.6%)       49.62      (1.7%)    8.8% (   4% -   13%)\n     AndMedPhraseMedTerm       49.14      (2.8%)       58.40      (5.7%)   18.8% (  10% -   28%)\n    AndHighPhraseMedTerm       11.81      (1.5%)       15.02      (2.2%)   27.1% (  23% -   31%)\n    AndHighPhraseLowTerm       31.43      (3.5%)       41.39      (6.2%)   31.7% (  21% -   42%)\n\n "
+        },
+        {
+            "id": "comment-14318557",
+            "author": "Robert Muir",
+            "date": "2015-02-12T17:06:03+0000",
+            "content": "Yes, I think thats good to show it has nice speedups for positions queries even in the smallish case (1KB docs). I think if you ran this on the full documents, e.g. wikibig, it would be more dramatic. "
+        },
+        {
+            "id": "comment-14319789",
+            "author": "Adrien Grand",
+            "date": "2015-02-13T09:36:31+0000",
+            "content": "I did some more benchmarking and something that helped was to flatten clauses in ConjunctionDISI. This typically means that + \"A B\"  C is now approximated as +A +B +C instead of (+A +B) +C. (see attached patch)\n\nHere are results on wikibig:\n\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n    AndMedPhraseHighTerm       21.19      (6.1%)       19.98      (2.6%)   -5.7% ( -13% -    3%)\n                PKLookup      334.11      (2.1%)      334.82      (2.2%)    0.2% (  -4% -    4%)\n   AndHighPhraseHighTerm       11.64      (4.1%)       11.83      (2.4%)    1.6% (  -4% -    8%)\n    AndHighPhraseMedTerm       19.19      (2.5%)       21.99      (2.1%)   14.6% (   9% -   19%)\n     AndMedPhraseMedTerm       58.27      (6.3%)       67.53      (6.6%)   15.9% (   2% -   30%)\n    AndHighPhraseLowTerm       35.07      (5.6%)       42.46      (6.1%)   21.1% (   8% -   34%)\n     AndMedPhraseLowTerm       93.39      (8.0%)      128.24     (13.3%)   37.3% (  14% -   63%)\n\n\n\nI was curious about the slow down on AndMedPhraseHighTerm. For instance we have +\"los angeles\" +title. title has a high doc frequency and so \"los angeles\" leas the iteration on trunk, meaning that we check positions on 38591 documents (number of matches of +los +angeles). With the patch, we intersect with title before checking positions, meaning that we only check positions on 30711 documents. It seems to not be low enough compared to 38591 to make the query faster.\n\nHowever, if we take a query from AndMedPhraseLowTerm like +\"los angeles\" +rivers, this time we only check positions on 1238 documents instead of 38591, hence the speedup.\n\nEdit: fixed the explanation which was backwards  "
+        },
+        {
+            "id": "comment-14319845",
+            "author": "Robert Muir",
+            "date": "2015-02-13T10:35:42+0000",
+            "content": "I think this is a bug in the current patch? If you look at my original patch, i took care of this laziness with matches vs verify and explained it in the comments (I know its confusing).\n\nBut i dont think we should have to worry about any flattening. "
+        },
+        {
+            "id": "comment-14320076",
+            "author": "Adrien Grand",
+            "date": "2015-02-13T13:43:57+0000",
+            "content": "In order to make sure that I did not miss anything, I updated Robert's patch to a recent trunk and benchmarked it against my previous patch (the one that does not flatten in ConjunctionDISI) and they perform the same (baseline is Robert's patch, patch is the previous patch):\n\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n     AndMedPhraseLowTerm      213.42     (10.6%)      207.08     (14.3%)   -3.0% ( -25% -   24%)\n    AndHighPhraseMedTerm       18.06      (2.8%)       17.95      (2.8%)   -0.6% (  -6% -    5%)\n    AndHighPhraseLowTerm       44.37      (4.4%)       44.31      (4.2%)   -0.1% (  -8% -    8%)\n   AndHighPhraseHighTerm       11.47      (3.4%)       11.47      (3.5%)    0.1% (  -6% -    7%)\n     AndMedPhraseMedTerm       47.85      (6.1%)       48.28      (5.8%)    0.9% ( -10% -   13%)\n    AndMedPhraseHighTerm       19.58      (3.2%)       19.79      (3.2%)    1.1% (  -5% -    7%)\n\n\n\nSo I think we're good? "
+        },
+        {
+            "id": "comment-14320119",
+            "author": "Robert Muir",
+            "date": "2015-02-13T14:18:17+0000",
+            "content": "Good. I am glad to see it is working. The nested stuff is tricky and hard to think about, thanks for benchmarking.\n\nI am +1 here, i think we should just open up followups to fix other scorers (sloppy phrase, disjunctions, etc) "
+        },
+        {
+            "id": "comment-14320376",
+            "author": "ASF subversion and git services",
+            "date": "2015-02-13T16:47:38+0000",
+            "content": "Commit 1659599 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1659599 ]\n\nLUCENE-6198: Two-phase execution for phrase queries and conjunctions. "
+        },
+        {
+            "id": "comment-14320387",
+            "author": "ASF subversion and git services",
+            "date": "2015-02-13T17:01:04+0000",
+            "content": "Commit 1659601 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1659601 ]\n\nLUCENE-6198: Two-phase execution for phrase queries and conjunctions. "
+        },
+        {
+            "id": "comment-14378276",
+            "author": "David Smiley",
+            "date": "2015-03-24T18:02:46+0000",
+            "content": "Having seen the TwoPhaseIterator in use and coded to its API, I think there is room for streamlining it a bit.  Almost all implementations have an approximation() method that returns a DISI that was already constructed, and the couple that don't are simple constructors to a DISI anyway.  Well then TwoPhaseIterator could take it in its constructor, put it on a field, and then return it from approximation() as a default implementation.\n\nTwoPhaseIterator's javadocs should make a reference to Scorer.asTwoPhaseIterator.\n\nWhy is Scorer.asTwoPhaseIterator on Scorer and not DocIdSetIterator?  It would make this capability more general. "
+        },
+        {
+            "id": "comment-14378353",
+            "author": "Adrien Grand",
+            "date": "2015-03-24T18:44:54+0000",
+            "content": "Well then TwoPhaseIterator could take it in its constructor, put it on a field, and then return it from approximation() as a default implementation.\n\nI'm good with either way. \n\nTwoPhaseIterator's javadocs should make a reference to Scorer.asTwoPhaseIterator.\n\n+1\n\nWhy is Scorer.asTwoPhaseIterator on Scorer and not DocIdSetIterator? It would make this capability more general.\n\nIt was on DocIdSetIterator in Robert's initial patch but we ended up moving it to Scorer only. If we had it on DocIdSetIterator it would allow approximations to have approximations themselves, which I'm not sure how this should be dealt with. Not necessarily a big deal, but putting this API on Scorer only for now was helpful to reduce the complexity. I'm curious if you have ideas to take advantage of approximations in another context than scorers?\n "
+        },
+        {
+            "id": "comment-14378778",
+            "author": "Paul Elschot",
+            "date": "2015-03-24T22:19:52+0000",
+            "content": "I'm curious if you have ideas to take advantage of approximations in another context than scorers?\n\nApproximations are being added to Spans in LUCENE-6308. "
+        },
+        {
+            "id": "comment-14379835",
+            "author": "David Smiley",
+            "date": "2015-03-25T13:08:35+0000",
+            "content": "This patch moves the approximation to a constructor, as I suggested.  It reduces the lines of code wherever a TwoPhaseIterator was defined.  I updated the javadocs too.  I have yet to run precommit & tests, but assuming they check out; does this look committable? "
+        },
+        {
+            "id": "comment-14379919",
+            "author": "Adrien Grand",
+            "date": "2015-03-25T14:24:49+0000",
+            "content": "+1 to this patch "
+        },
+        {
+            "id": "comment-14380261",
+            "author": "ASF subversion and git services",
+            "date": "2015-03-25T17:14:01+0000",
+            "content": "Commit 1669161 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1669161 ]\n\nLUCENE-6198: add approximation constructor to TwoPhaseIterator "
+        },
+        {
+            "id": "comment-14380276",
+            "author": "ASF subversion and git services",
+            "date": "2015-03-25T17:18:23+0000",
+            "content": "Commit 1669165 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1669165 ]\n\nLUCENE-6198: add approximation constructor to TwoPhaseIterator "
+        },
+        {
+            "id": "comment-14495365",
+            "author": "Timothy Potter",
+            "date": "2015-04-15T00:30:48+0000",
+            "content": "Bulk close after 5.1 release "
+        }
+    ]
+}

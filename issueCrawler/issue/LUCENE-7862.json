@@ -1,0 +1,114 @@
+{
+    "id": "LUCENE-7862",
+    "title": "Should BKD cells store their min/max packed values?",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "7.5",
+            "master (8.0)"
+        ]
+    },
+    "description": "The index of the BKD tree already allows to know lower and upper bounds of values in a given dimension. However the actual range of values might be more narrow than what the index tells us, especially if splitting on one dimension reduces the range of values in at least one other dimension. For instance this tends to be the case with range fields: since we enforce that lower bounds are less than upper bounds, splitting on one dimension will also affect the range of values in the other dimension.\n\nSo I'm wondering whether we should store the actual range of values for each dimension in leaf blocks, this will hopefully allow to figure out that either none or all values match in a block without having to check them all.",
+    "attachments": {
+        "LUCENE-7862.patch": "https://issues.apache.org/jira/secure/attachment/12870773/LUCENE-7862.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16032835",
+            "date": "2017-06-01T11:45:38+0000",
+            "content": "Here is the patch I have been playing with. When testing bounding boxes with IndexAndSearchOpenStreetMaps, about 0.2% of the leaf cells that were considered as crossing by the index were either fully matching or not matching at all. This rises to about 3% of leaf cells when running TestIntRangeFieldQueries in spite of the fact that ranges are created randomly. And if I apply the below patch to TestIntRangeQueries in order to make min and max bounds even more correlated,\n\n\ndiff --git a/lucene/core/src/test/org/apache/lucene/search/TestIntRangeFieldQueries.java b/lucene/core/src/test/org/apache/lucene/search/TestIntRangeFieldQueries.java\nindex ecbd55b..92fd2df 100644\n--- a/lucene/core/src/test/org/apache/lucene/search/TestIntRangeFieldQueries.java\n+++ b/lucene/core/src/test/org/apache/lucene/search/TestIntRangeFieldQueries.java\n@@ -61,7 +61,7 @@ public class TestIntRangeFieldQueries extends BaseRangeFieldQueryTestCase {\n     int minV, maxV;\n     for (int d=0; d<dimensions; ++d) {\n       minV = nextIntInternal();\n-      maxV = nextIntInternal();\n+      maxV = minV / 10;\n       min[d] = Math.min(minV, maxV);\n       max[d] = Math.max(minV, maxV);\n     }\n\n\n\nthen this rises to ~15%.  In the end this looks to me like a cheap change to perform better in some worst-case scenarii? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16033186",
+            "date": "2017-06-01T15:47:41+0000",
+            "content": "+1, this is a nice idea.  You effectively \"shrink wrap\" each cell to its true min/max instead of the \"approximate\" value passed down recursively by walking the index.\n\nIt looks like we pay an O(N) price when writing the leaf block with this change, to compute the actual min/max for each dimension in this leaf block, but we could maybe save that cost by having the caller compute these since it's already scanning items to partition the cells as it recurses?  But we can explore that separately ... just an optimization. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16604279",
+            "date": "2018-09-05T11:07:11+0000",
+            "content": "I have been playing with this approach to see if we can make the BKD tree more efficient. I have done some benchmarks that confirm a big boost in performance whenever there is correlation between the dimensions so it is particularly good for ranges. In addition this boost quite a bit the newly introduced approach for indexing shapes in LUCENE-8396.\n\nMaybe we should only ad this extra information to the index when number of dimensions > 1. Here are a few benchmarks:\n\n1) Ranges: Using the data points from GeoBench, the ranges have been created as following:\n\ndouble lat = Double.parseDouble(parts[1]);\ndouble lon = Double.parseDouble(parts[2]);\ndouble latEnd = lat + 0.1 * Math.abs(lon);\ndouble lonEnd = lon + 0.1 * Math.abs(lat);\n\nWhere latitude is used in even dimension and longitude in uneven ones.\n\nIT = Index time (sec)\n FM = Force merge time (sec)\n IS = Index size (GB)\n RH = Reader heap (MB\n\n\n\n\u00a0Approach\n\u00a0Dimensions\nIT Dev\nIT Base\nIT Diff\nIFM Dev\nFM Base\nFM Diff\nIS Dev\nIS Base\nIS Diff\nRH Dev\nRH Base\nIRH Diff\n\n\nranges\n1\n102.7s\n101.5s\n1%\n0.0s\n0.0s\n0%\n0.81\n0.81\n0%\n0.80\n0.80\n-0%\n\n\nranges\n2\n96.0s\n94.4s\n2%\n0.0s\n0.0s\n0%\n1.59\n1.58\n0%\n1.02\n1.03\n-1%\n\n\nranges\n3\n93.1s\n84.6s\n10%\n0.0s\n0.0s\n0%\n2.29\n2.29\n0%\n1.18\n1.01\n17%\n\n\nranges\n4\n101.0s\n91.0s\n11%\n0.0s\n0.0s\n0%\n3.07\n3.05\n0%\n1.04\n1.12\n-7%\n\n\n\n\n\nHS = Hits per second\n QPS= Queries per second\n Hits = Total hits\n\n\n\nApproach\n\u00a0Dimensions\nHS Dev\nHS Base\nHS Diff\nQPS Dev\nQPS Base\nQPS Diff\nHits Dev\nHits Base\nHits Diff\n\n\nranges\n1\n131.17\n116.20\n13%\n10.81\n9.58\n13%\n2730282630\n2730282630\n0%\n\n\nranges\n2\n34.07\n10.83\n215%\n16.93\n5.38\n215%\n452860046\n452860046\n0%\n\n\nranges\n3\n34.41\n3.83\n799%\n17.10\n1.90\n799%\n452860046\n452860046\n0%\n\n\nranges\n4\n26.01\n3.27\n696%\n12.92\n1.62\n696%\n452860046\n452860046\n0%\n. \u00a0\n\n\n\n\n\n\u00a0\n\n3) GeoBench: comparison of Geo benchmark using points (LatLonPoint), geo3d (Geo3DPoint) and shapes (LaLonShape)\n\nIT = Index time (sec)\n FM = Force merge time (sec)\n IS = Index size (GB)\n RH = Reader heap (MB\n\n\n\n\u00a0Approach\nIT Dev\nIT Base\nIT Diff\nIFM Dev\nFM Base\nFM Diff\nIS Dev\nIS Base\nIS Diff\nRH Dev\nRH Base\nIRH Diff\n\n\npoints\n103.3s\n100.0s\n3%\n0.0s\n0.0s\n0%\n0.51\n0.51\n0%\n0.61\n0.61\n0%\n\n\ngeo3d\n105.6s\n102.9s\n3%\n0.0s\n0.0s\n0%\n0.72\n0.72\n0%\n0.62\n0.62\n-0%\n\n\nshapes\n108.3s\n100.6s\n8%\n0.0s\n0.0s\n0%\n1.31\n1.30\n0%\n0.87\n0.87\n-0%\n\n\n\n\n\nHS = Hits per second\n QPS= Queries per second\n Hits = Total hits\n\n\n\nApproach\n\u00a0Shape\nHS Dev\nHS Base\nHS Diff\nQPS Dev\nQPS Base\nQPS Diff\nHits Dev\nHits Base\nHits Diff\n\n\npoints\npolyRussia\n17.19\n17.19\n0%\n4.90\n4.90\n0%\n3508846\n3508846\n0%\n\n\npoints\npolyMedium\n9.51\n9.26\n3%\n116.51\n113.40\n3%\n2693559\n2693559\n0%\n\n\npoints\ndistance\n77.56\n77.33\n0%\n45.57\n45.43\n0%\n382961957\n382961957\n0%\n\n\npoints\nnearest 10\n0.05\n0.05\n-0%\n4651.95\n4664.57\n-0%\n60844404\n60844404\n0%\n\n\npoints\nbox\n81.95\n83.07\n-1%\n83.39\n84.53\n-1%\n221118844\n221118844\n0%\n\n\npoints\npoly 10\n80.37\n79.78\n1%\n50.83\n50.45\n1%\n355809475\n355809475\n0%\n\n\npoints\nsort\n33.25\n31.26\n6%\n33.83\n31.81\n6%\n221118844\n221118844\n0%\n\n\ngeo3d\npolyRussia\n0.51\n0.50\n2%\n0.15\n0.14\n2%\n3508671\n3508671\n0%\n\n\ngeo3d\npolyMedium\n0.42\n0.43\n-0%\n5.20\n5.23\n-0%\n2693545\n2693545\n0%\n\n\ngeo3d\ndistance\n64.36\n63.47\n1%\n37.77\n37.25\n1%\n383371884\n383371884\n0%\n\n\ngeo3d\nbox\n49.29\n51.60\n-4%\n50.15\n52.50\n-4%\n221118844\n221118844\n0%\n\n\ngeo3d\npoly 10\n39.40\n39.43\n-0%\n24.91\n24.93\n-0%\n355855227\n355855227\n0%\n\n\nshapes\npolyRussia\n2.81\n0.31\n819%\n0.80\n0.09\n819%\n3508846\n3508846\n0%\n\n\nshapes\npolyMedium\n0.52\n0.08\n539%\n6.38\n1.00\n539%\n2693559\n2693559\n0%\n\n\nshapes\nbox\n11.07\n1.46\n661%\n11.27\n1.48\n661%\n221118844\n221118844\n0%\n\n\nshapes\npoly 10\n16.83\n1.46\n1052%\n10.64\n0.92\n1052%\n355809475\n355809475\n0%\n\n\n\n\n\n\u00a0 ",
+            "author": "Ignacio Vera"
+        },
+        {
+            "id": "comment-16605853",
+            "date": "2018-09-06T14:39:28+0000",
+            "content": "The improvement in QPS look indeed very significant in some cases! For very little overhead. The patch looks good to me, maybe the System.arraycopy(minPackedValue, 0, maxPackedValue, 0, packedBytesLength) call would benefit from a comment explaining that we are copying common prefixes.\n\nMaybe we should only ad this extra information to the index when number of dimensions > 1\n\n+1 ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16606789",
+            "date": "2018-09-07T07:28:10+0000",
+            "content": "updated patch ",
+            "author": "Ignacio Vera"
+        },
+        {
+            "id": "comment-16607141",
+            "date": "2018-09-07T13:45:41+0000",
+            "content": "+1\u00a0 Not only is it great to have some benchmarks for BKD higher dimensions but its a great boost in performance for very little cost to indexing.\u00a0 ",
+            "author": "Nicholas Knize"
+        },
+        {
+            "id": "comment-16607281",
+            "date": "2018-09-07T15:58:30+0000",
+            "content": "\n\n\n  -1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n -1 \n  test4tests  \n   0m  0s \n  The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   0m 27s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   0m 24s \n  the patch passed  \n\n\n +1 \n  javac  \n   0m 24s \n  the patch passed  \n\n\n +1 \n  Release audit (RAT)  \n   0m 22s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   0m 18s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   0m 18s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n  11m 31s \n  core in the patch passed.  \n\n\n +1 \n  unit  \n   1m 14s \n  sandbox in the patch passed.  \n\n\n  \n   \n  15m 16s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n LUCENE-7862 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12938777/LUCENE-7862.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene1-us-west 4.4.0-130-generic #156~14.04.1-Ubuntu SMP Thu Jun 14 13:51:47 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / 6fbcda6 \n\n\n ant \n version: Apache Ant(TM) version 1.9.3 compiled on July 24 2018 \n\n\n Default Java \n 1.8.0_172 \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-LUCENE-Build/87/testReport/ \n\n\n modules \n C: lucene/core lucene/sandbox U: lucene \n\n\n Console output \n https://builds.apache.org/job/PreCommit-LUCENE-Build/87/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "author": "Lucene/Solr QA"
+        },
+        {
+            "id": "comment-16608056",
+            "date": "2018-09-08T13:59:18+0000",
+            "content": "Commit f406ff91a8912f13a7652a2802084db1c0da5830 in lucene-solr's branch refs/heads/master from iverase\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f406ff9 ]\n\nLUCENE-7862: Store the real bounds of the leaf cells in the BKD index when the number of dimensions is bigger than 1 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16608057",
+            "date": "2018-09-08T13:59:35+0000",
+            "content": "Commit 46a3f1e6f551fd3c4b506f44e8632a310656f828 in lucene-solr's branch refs/heads/branch_7x from iverase\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=46a3f1e ]\n\nLUCENE-7862: Store the real bounds of the leaf cells in the BKD index when the number of dimensions is bigger than 1 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16609483",
+            "date": "2018-09-10T16:42:28+0000",
+            "content": "Wow, these are surprisingly massive speedups in some cases ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16611261",
+            "date": "2018-09-11T21:19:45+0000",
+            "content": "Ignacio Vera, it appears that your CHANGES entry for the 7x and 7_5 branches is listed under 7.5.4 instead of 7.5.0. ",
+            "author": "Jan H\u00f8ydahl"
+        },
+        {
+            "id": "comment-16611642",
+            "date": "2018-09-12T06:16:39+0000",
+            "content": "Commit 0789a77c2590f716fc3cedb247309068c3fc5d85 in lucene-solr's branch refs/heads/branch_7x from iverase\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0789a77 ]\n\nLUCENE-7862:Change entry in NOTES.txt to the right lucene version ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16611644",
+            "date": "2018-09-12T06:17:38+0000",
+            "content": "Commit 7c9b8b4b6167dce9ff6967d88a3a596e041671d6 in lucene-solr's branch refs/heads/branch_7_5 from iverase\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7c9b8b4 ]\n\nLUCENE-7862:Change entry in NOTES.txt to the right lucene version ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16611645",
+            "date": "2018-09-12T06:19:14+0000",
+            "content": "Thanks Jan H\u00f8ydahl! ",
+            "author": "Ignacio Vera"
+        },
+        {
+            "id": "comment-16625692",
+            "date": "2018-09-24T11:38:33+0000",
+            "content": "For reference:\n\nI was doing a bit research about how to further improve performance of the BKD tree and I come across this paper:\n\nhttp://infolab.stanford.edu/~nsample/pubs/samplehaines.pdf\n\nIn point 6 they speak about a performance improvement by doing exactly what was implemented ihere. They put a name to the approach, BOUNDS-OVERLAPS-BALL (BOB) test.\u00a0\n\n\u00a0\n\n\u00a0\n\u00a0 ",
+            "author": "Ignacio Vera"
+        }
+    ]
+}

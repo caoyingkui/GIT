@@ -6,6 +6,12 @@ public class Event {
     public String commitId = "";
     public String commitMessage = "";
 
+    public String newName = "";
+    public String oldName = "";
+
+    public String newFullName = "";
+    public String oldFullName = "";
+
     public String newContent = "";
     public String oldContent = "";
 
@@ -24,6 +30,7 @@ public class Event {
         object.put("issue_description", issueDescription);
         return object;
     }
+
 
     public String toString() {
         return toJSON().toString();

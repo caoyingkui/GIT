@@ -1,0 +1,160 @@
+{
+    "id": "LUCENE-8043",
+    "title": "Attempting to add documents past limit can corrupt index",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "4.10,                                            7.0,                                            master (8.0)",
+        "status": "Closed",
+        "type": "Bug",
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [
+            "7.1.1",
+            "7.2",
+            "master (8.0)"
+        ]
+    },
+    "description": "The IndexWriter check for too many documents does not always work, resulting in going over the limit.  Once this happens, Lucene refuses to open the index and throws a CorruptIndexException: Too many documents.\n\nThis appears to affect all versions of Lucene/Solr (the check was first implemented in LUCENE-5843 in v4.9.1/4.10 and we've seen this manifest in 4.10)",
+    "attachments": {
+        "YCS_IndexTest7a.java": "https://issues.apache.org/jira/secure/attachment/12900019/YCS_IndexTest7a.java",
+        "LUCENE-8043.patch": "https://issues.apache.org/jira/secure/attachment/12896467/LUCENE-8043.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16242507",
+            "date": "2017-11-07T17:49:20+0000",
+            "content": "Here's a little test program that can sometimes reproduce it.\nIt's harder with trunk than with 4.10, but still happens.\nIt may have something do do with deletion accounting (and maybe deletes being deducted before merges are actually finished), but that may not explain all of the types of failures I see. ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16242531",
+            "date": "2017-11-07T17:56:39+0000",
+            "content": "At first I thought it might be more of a transient issue with reopen using the IW and seeing intermediate state that could be over the limit.  It was often the case that one could get exceptions about too many docs, but then after merges were finished and the IW was closed, we would be back under the limit.  But not always.  Sometimes we are still over the limit after all threads have been stopped and we've called commit and close on the IndexWriter.  Below is a stack trace of that case:\n\n\nDONE: time in sec:6 Docs indexed:20000 ramBytesUsed: sizeInBytes:220160\nFAIL: unexpected exception:\norg.apache.lucene.index.CorruptIndexException: Too many documents: an index cannot exceed 10000 but readers have total maxDoc=10010 (resource=BufferedChecksumIndexInput(RAMInputStream(name=segments_4)))\n\tat org.apache.lucene.index.SegmentInfos.readCommit(SegmentInfos.java:399)\n\tat org.apache.lucene.index.SegmentInfos.readCommit(SegmentInfos.java:288)\n\tat org.apache.lucene.index.StandardDirectoryReader$1.doBody(StandardDirectoryReader.java:59)\n\tat org.apache.lucene.index.StandardDirectoryReader$1.doBody(StandardDirectoryReader.java:56)\n\tat org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:667)\n\tat org.apache.lucene.index.StandardDirectoryReader.open(StandardDirectoryReader.java:79)\n\tat org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:63)\n\tat YCS_IndexTest7.main(YCS_IndexTest7.java:262)\n\n ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16269209",
+            "date": "2017-11-28T18:28:59+0000",
+            "content": "I can reproduce this but I'm not familiar enough with IndexWriter to understand what causes this. At first I thought thay maybe this was due to the fact the we were giving back documents to early after merges, but actually we do that after updating the list of segment infos, so that looks ok to me. Yet this doesn't prevent the list of segment infos from reaching more that MAX_DOCS documents in IndexWriter.publishFlushedSegment during the test. Simon Willnauer or Michael McCandless Do you know why this may occur?\n\nI wanted to look at the IW info stream to better understand what is happening but unfortunately this probably slows down things enough to prevent the issue from reproducing. It reproduces with assertions enabled (-ea), but no assertion breaks. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16270441",
+            "date": "2017-11-29T09:05:45+0000",
+            "content": "Adrien Grand I can look later at this and try to reproduce it. ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16271767",
+            "date": "2017-11-29T23:25:44+0000",
+            "content": "Adrien Grand Yonik Seeley Michael McCandless I think I found the issue. It seems like we try to drop the same segment reader from the reader pool multiple times during applying deletes which I am not 100% sure is expected or not. Yet, due to that we also reduce the counter for that segment multiple times. With this patch I can run the test 1k times without a failure. I am happy to provide a patch for it but I wonder if this is an expected state? Michael McCandless can you tell.\n\n\ndiff --git a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java\nindex 7f47e42d45..586a294915 100644\n--- a/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java\n+++ b/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java\n@@ -551,13 +551,15 @@ public class IndexWriter implements Closeable, TwoPhaseCommit, Accountable {\n       return true;\n     }\n \n-    public synchronized void drop(SegmentCommitInfo info) throws IOException {\n+    public synchronized boolean drop(SegmentCommitInfo info) throws IOException {\n       final ReadersAndUpdates rld = readerMap.get(info);\n       if (rld != null) {\n         assert info == rld.info;\n         readerMap.remove(info);\n         rld.dropReaders();\n+        return true;\n       }\n+      return false;\n     }\n \n     public synchronized long ramBytesUsed() {\n@@ -1616,10 +1618,9 @@ public class IndexWriter implements Closeable, TwoPhaseCommit, Accountable {\n     // segment, we leave it in the readerPool; the\n     // merge will skip merging it and will then drop\n     // it once it's done:\n-    if (mergingSegments.contains(info) == false) {\n+    if (mergingSegments.contains(info) == false && readerPool.drop(info)) {\n       segmentInfos.remove(info);\n       pendingNumDocs.addAndGet(-info.info.maxDoc());\n-      readerPool.drop(info);\n     }\n   }\n ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16271782",
+            "date": "2017-11-29T23:32:18+0000",
+            "content": "Wow, nice find Simon Willnauer!  It is normal for drop to be called more than once, I think, so I think your fix is the right approach!  Thanks. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16271874",
+            "date": "2017-11-30T00:23:45+0000",
+            "content": "I had worked on tracking this down for a bit before I got pulled off onto something else...\nI remember adding the boolean to drop() just as this patch does, but when using that I only put the conditional around the pendingNumDocs decrement (in multiple places).  Perhaps that's why it didn't work to fix the issue for me...\nedit: Actually, it looks like it was SegmentInfos.remove(SegmentCommitInfo) was part of my attempted fix:\n\n-  public void remove(SegmentCommitInfo si) {\n-    segments.remove(si);\n+  public boolean remove(SegmentCommitInfo si) {\n+    return segments.remove(si);\n   }\n\n\n\nI also exposed pendingNumDocs for testing reasons and then tested it against expected values, and was able to get tests that reliably failed after a handful of updates.  I'll try digging that up and see if it passes with this patch. ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16272010",
+            "date": "2017-11-30T01:52:25+0000",
+            "content": "Turns out the test code that failed with a small amount of updates, even after my attempted fix, was for 4.10.3 / 4.10.4\nI forward-ported that code to master and things no longer fail... so I think this patch is good for recent Lucene versions. Thanks! ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16272238",
+            "date": "2017-11-30T06:49:22+0000",
+            "content": "Turns out the test code that failed with a small amount of updates, even after my attempted fix, was for 4.10.3 / 4.10.4\nI forward-ported that code to master and things no longer fail... so I think this patch is good for recent Lucene versions. Thanks!\n\nYonik Seeley do you have a test case I can use to verify the patch going forward? Can you share it? I will also try to turn your reproduction into a testcase but maybe we should push the fix first to not be in the way of a release, WDYT? ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16272722",
+            "date": "2017-11-30T14:26:07+0000",
+            "content": "The test code is just a modification of the previous code I was using.\nI didn't think that test code would reproduce the issue for lucene-master, but I reverted all my other changes to IW, and it does reproduce (w/o your patch)!  Uploaded YCS_IndexTest7a.java\n\nThis can often reproduce in as little as 4 documents indexed in 2 threads for me.\n\n########## STARTING INDEXING RUN 0  IW.pendingNumDocs=0\n########## IW.pendingNumDocs=2\nABOUT TO CALL commit\nREADER: reader.maxDoc=2 IW.pendingNumDocs=2\n########## STARTING INDEXING RUN 1  IW.pendingNumDocs=2\n########## IW.pendingNumDocs=0\nABOUT TO CALL commit\nREADER: reader.maxDoc=2 IW.pendingNumDocs=0\nERROR!!!!!!!!!!!!!!!!!!: reader.maxDoc=2 IW.pendingNumDocs=0\nAfter sleep,commit,close reader.maxDoc=2 IW.pendingNumDocs=0\n\n\n\nStill needs to be turned into a proper unit test, preferably w/o any sleeps. ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16273541",
+            "date": "2017-11-30T21:54:38+0000",
+            "content": "folks, I have a test that reliably reproduces the issue every time and very quickly. It also trips an assertion in the IW that I had to change since I think it's not guaranteed especially with the setup I am running in the test. Michael McCandless can you take a look. ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16273711",
+            "date": "2017-12-01T00:18:24+0000",
+            "content": "Wow, what an evil test   +1 to the patch; thanks @simonw and Yonik Seeley! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16274251",
+            "date": "2017-12-01T11:02:32+0000",
+            "content": "Michael McCandless thanks for the review. I did run into some issue with tests and had do add some more logic around when to drop the docs. I also added an assertion in IW that pendingNumDocs and maxNumDocs is consistent when we close the IW. can you look one more time to make sure it's safe. I ran tests and it looked terrible, failures all over the place. I spent quite some time to get the accounting right now. I think it looks good now but I could use some help beasting / reviewing it.   ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16274259",
+            "date": "2017-12-01T11:07:51+0000",
+            "content": "Thanks Simon Willnauer; I'll look and beast the patch. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16274268",
+            "date": "2017-12-01T11:14:10+0000",
+            "content": "uups I think I attached the wrong patch Michael McCandless here is the right one  ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16274607",
+            "date": "2017-12-01T16:42:31+0000",
+            "content": "Thanks Simon Willnauer; I love the new assert, and the patch looks correct to me.\n\nI beasted all Lucene tests 33 times and hit this failure, twice:\n\n\nant test -Dtestcase=TestIndexWriter -Dtestmethod=testThreadInterruptDeadlock -Dtests.seed=55197CA38E8C827B\n\njava.lang.AssertionError: pendingNumDocs 0 != 11 totalMaxDoc\n        at org.apache.lucene.index.IndexWriter.shutdown(IndexWriter.java:1277)\n        at org.apache.lucene.index.IndexWriter.close(IndexWriter.java:1319)\n        at org.apache.lucene.index.TestIndexWriter$IndexerThreadInterrupt.run(TestIndexWriter.java:902)\n\n\n\nBut it does not reproduce for me.\n\nI hit two other unrelated failures; look like Similarity issues ... I'll open separate issues for those. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16276462",
+            "date": "2017-12-04T08:54:23+0000",
+            "content": "hey Michael McCandless thanks for your help on the testing end! I move the assert to an even more exercised and critical place and tracked down all failures including the one in TestIndexWriter#testThreadInterruptDeadlock. I think it looks much better now. This was way more broken than we originally thought it is ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16277397",
+            "date": "2017-12-04T20:02:39+0000",
+            "content": "+1 to the patch!  Phew that was tricky; thanks @simonw.\n\nI beasted all Lucene tests 113X times and only hit 3 failures from LUCENE-8073.\n\n+1 to push! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16277472",
+            "date": "2017-12-04T20:49:47+0000",
+            "content": "Commit b7d8731bbf2a9278c22efa5a7fb43285236c90ba in lucene-solr's branch refs/heads/master from Simon Willnauer\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b7d8731 ]\n\nLUCENE-8043: Fix document accounting in IndexWriter\n\nThe IndexWriter check for too many documents does not always work, resulting in\ngoing over the limit. Once this happens, Lucene refuses to open the index and\nthrows a CorruptIndexException: Too many documents.\nThis change also fixes document accounting if the index writer hits an aborting\nexception and/or the writer is rolled back. Pending document counts are now consistent\nwith the latest SegmentInfos once the writer has been rolled back. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16277489",
+            "date": "2017-12-04T20:59:42+0000",
+            "content": "Commit 0bc07bc02a2bb5253f85bbca97041c76e4509f5f in lucene-solr's branch refs/heads/branch_7x from Simon Willnauer\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0bc07bc ]\n\nLUCENE-8043: Fix document accounting in IndexWriter\n\nThe IndexWriter check for too many documents does not always work, resulting in\ngoing over the limit. Once this happens, Lucene refuses to open the index and\nthrows a CorruptIndexException: Too many documents.\nThis change also fixes document accounting if the index writer hits an aborting\nexception and/or the writer is rolled back. Pending document counts are now consistent\nwith the latest SegmentInfos once the writer has been rolled back. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16277490",
+            "date": "2017-12-04T21:01:23+0000",
+            "content": "Commit 65a716911f35c304ae9da6d4ebb865509787548e in lucene-solr's branch refs/heads/branch_7_1 from Simon Willnauer\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=65a7169 ]\n\nLUCENE-8043: Fix document accounting in IndexWriter\n\nThe IndexWriter check for too many documents does not always work, resulting in\ngoing over the limit. Once this happens, Lucene refuses to open the index and\nthrows a CorruptIndexException: Too many documents.\nThis change also fixes document accounting if the index writer hits an aborting\nexception and/or the writer is rolled back. Pending document counts are now consistent\nwith the latest SegmentInfos once the writer has been rolled back. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16277491",
+            "date": "2017-12-04T21:03:22+0000",
+            "content": "fixed! thanks Yonik Seeley Michael McCandless Adrien Grand ",
+            "author": "Simon Willnauer"
+        }
+    ]
+}

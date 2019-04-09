@@ -1,0 +1,114 @@
+{
+    "id": "LUCENE-6062",
+    "title": "Index corruption from numeric DV updates",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "I hit this while working on on LUCENE-6005: when cutting over TestNumericDocValuesUpdates to the new Document2 API, I accidentally enabled additional docValues in the test, and this this:\n\n\nThere was 1 failure:\n1) testUpdateSegmentWithNoDocValues(org.apache.lucene.index.TestNumericDocValuesUpdates)\njava.io.FileNotFoundException: _1_Asserting_0.dvm in dir=RAMDirectory@259847e5 lockFactory=org.apache.lucene.store.SingleInstanceLockFactory@30981eab\n\tat __randomizedtesting.SeedInfo.seed([0:7C88A439A551C47D]:0)\n\tat org.apache.lucene.store.MockDirectoryWrapper.openInput(MockDirectoryWrapper.java:645)\n\tat org.apache.lucene.store.Directory.openChecksumInput(Directory.java:110)\n\tat org.apache.lucene.codecs.lucene50.Lucene50DocValuesProducer.<init>(Lucene50DocValuesProducer.java:130)\n\tat org.apache.lucene.codecs.lucene50.Lucene50DocValuesFormat.fieldsProducer(Lucene50DocValuesFormat.java:182)\n\tat org.apache.lucene.codecs.asserting.AssertingDocValuesFormat.fieldsProducer(AssertingDocValuesFormat.java:66)\n\tat org.apache.lucene.codecs.perfield.PerFieldDocValuesFormat$FieldsReader.<init>(PerFieldDocValuesFormat.java:267)\n\tat org.apache.lucene.codecs.perfield.PerFieldDocValuesFormat.fieldsProducer(PerFieldDocValuesFormat.java:357)\n\tat org.apache.lucene.index.SegmentDocValues.newDocValuesProducer(SegmentDocValues.java:51)\n\tat org.apache.lucene.index.SegmentDocValues.getDocValuesProducer(SegmentDocValues.java:68)\n\tat org.apache.lucene.index.SegmentDocValuesProducer.<init>(SegmentDocValuesProducer.java:63)\n\tat org.apache.lucene.index.SegmentReader.initDocValuesProducer(SegmentReader.java:167)\n\tat org.apache.lucene.index.SegmentReader.<init>(SegmentReader.java:109)\n\tat org.apache.lucene.index.StandardDirectoryReader$1.doBody(StandardDirectoryReader.java:58)\n\tat org.apache.lucene.index.StandardDirectoryReader$1.doBody(StandardDirectoryReader.java:50)\n\tat org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:556)\n\tat org.apache.lucene.index.StandardDirectoryReader.open(StandardDirectoryReader.java:50)\n\tat org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:63)\n\tat org.apache.lucene.index.TestNumericDocValuesUpdates.testUpdateSegmentWithNoDocValues(TestNumericDocValuesUpdates.java:769)\n\n\n\nA one-line change to the existing test (on trunk) causes this corruption:\n\n\nIndex: lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java\n===================================================================\n--- lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java\t(revision 1639580)\n+++ lucene/core/src/test/org/apache/lucene/index/TestNumericDocValuesUpdates.java\t(working copy)\n@@ -750,6 +750,7 @@\n     // second segment with no NDV\n     doc = new Document();\n     doc.add(new StringField(\"id\", \"doc1\", Store.NO));\n+    doc.add(new NumericDocValuesField(\"foo\", 3));\n     writer.addDocument(doc);\n     doc = new Document();\n     doc.add(new StringField(\"id\", \"doc2\", Store.NO)); // document that isn't updated\n\n\n\nFor some reason, the base doc values for the 2nd segment is not being written, but clearly should have (to hold field \"foo\")... I'm not sure why.",
+    "attachments": {
+        "LUCENE-6062.patch": "https://issues.apache.org/jira/secure/attachment/12681978/LUCENE-6062.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14212023",
+            "author": "Michael McCandless",
+            "date": "2014-11-14T09:01:40+0000",
+            "content": "I haven't tried but I think it's likely this affects binary DV updates as well. "
+        },
+        {
+            "id": "comment-14213617",
+            "author": "Shai Erera",
+            "date": "2014-11-15T14:14:01+0000",
+            "content": "I found the problem. With your change to the test, you created the following scenario: update a non-existing NDV field in a segment with other NDV fields (note that without this change, the test ensures that you can update a non-existing NDV fields in a segment without any other NDV fields).\n\nWhat happens is that in this code of SegmentDocValuesProducer:\n\n\n          if (baseProducer == null) {\n            // the base producer gets all the fields, so the Codec can validate properly\n            baseProducer = segDocValues.getDocValuesProducer(docValuesGen, si, IOContext.READ, dir, dvFormat, fieldInfos);\n            dvGens.add(docValuesGen);\n            dvProducers.add(baseProducer);\n          }\n\n\n\nWe pass all the fieldInfos, which now also contain an FI for 'ndv'. But that field was never written to the base segment file (the .cfs), and so it cannot be found there...\n\nNot yet sure how to resolve it. We pass all the FIS because e.g. Lucene50DVP verifies that every field it encounters in the metadata file has a matching entry in the given FieldInfos (to check for index corruption). So we cannot just pass only the FIs with dvGen=-1. On the other hand, we do have a case here where the base .cfs never had an instance of that field ... it's like we need to know in which 'gen' a DV field was introduced. Then we can pass to baseProducer all the FIs whose startGen==-1... "
+        },
+        {
+            "id": "comment-14213752",
+            "author": "Shai Erera",
+            "date": "2014-11-15T20:27:05+0000",
+            "content": "To prove this is the problem, I added this to PerFieldDVF.FieldsReader ctor (line 256):\n\n\n            if (readState.segmentInfo.name.equals(\"_1\") && fieldName.equals(\"ndv\") && fi.getDocValuesGen() == 1 && readState.fieldInfos.size() > 1) {\n              continue;\n            }\n\n\n\nAnd the test passes. So e.g. if we tracked startDVGen for each field, we'd know in segment _1 that 'ndv' only appeared in gen=1, and therefore not pass it at all to baseProducer. But that causes a format change, which I hope to avoid if possible (especially as it doesn't solve the issue for existing indexes, though I think this is an extreme case for somebody to have run into). "
+        },
+        {
+            "id": "comment-14215072",
+            "author": "Robert Muir",
+            "date": "2014-11-17T19:53:55+0000",
+            "content": "I think its a little simpler... here is a patch.\n\nWe should always pass these producers the same metadata at read that their corresponding consumer saw at write.  "
+        },
+        {
+            "id": "comment-14216429",
+            "author": "Robert Muir",
+            "date": "2014-11-18T17:04:27+0000",
+            "content": "Updated patch with a dedicated test (keeping the old one as it was). The logic is the same as the first patch, but i tried to clarify better what is going on. Additionally, i removed some extraneous parameters in some of the related methods. "
+        },
+        {
+            "id": "comment-14216742",
+            "author": "Michael McCandless",
+            "date": "2014-11-18T20:27:43+0000",
+            "content": "+1 "
+        },
+        {
+            "id": "comment-14217273",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-19T02:09:27+0000",
+            "content": "Commit 1640464 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1640464 ]\n\nLUCENE-6062: throw exception instead of doing nothing, when sorting/grouping etc on misconfigured field "
+        },
+        {
+            "id": "comment-14217309",
+            "author": "Robert Muir",
+            "date": "2014-11-19T02:42:31+0000",
+            "content": "I will first go back to 5.x, then see if the test fails in 4.x, and how feasible it is to backport.\n\nThe code differs significantly here so the problem may have been recently introduced. "
+        },
+        {
+            "id": "comment-14217328",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-19T03:08:35+0000",
+            "content": "Commit 1640471 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1640471 ]\n\nLUCENE-6062: pass correct fieldinfos to dv producer when the segment has updates "
+        },
+        {
+            "id": "comment-14217335",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-19T03:18:59+0000",
+            "content": "Commit 1640472 from Robert Muir in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1640472 ]\n\nLUCENE-6062: pass correct fieldinfos to dv producer when the segment has updates "
+        },
+        {
+            "id": "comment-14217338",
+            "author": "Robert Muir",
+            "date": "2014-11-19T03:24:42+0000",
+            "content": "The bug affects 4.10.x, but the fix would not be easy. On 5.0 fieldinfos handling has been simplified considerably around here, making it easy to pass the correct ones to producers.\n\nI think this is too much risk to backport. "
+        },
+        {
+            "id": "comment-14217341",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-19T03:27:36+0000",
+            "content": "Commit 1640473 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1640473 ]\n\nLUCENE-6062: add CHANGES for bugfix "
+        },
+        {
+            "id": "comment-14217342",
+            "author": "ASF subversion and git services",
+            "date": "2014-11-19T03:28:01+0000",
+            "content": "Commit 1640474 from Robert Muir in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1640474 ]\n\nLUCENE-6062: add CHANGES for bugfix "
+        },
+        {
+            "id": "comment-14217555",
+            "author": "Shai Erera",
+            "date": "2014-11-19T07:32:57+0000",
+            "content": "Thanks Rob for committing this. Patch looks good. Sorry for the late response. "
+        },
+        {
+            "id": "comment-14332966",
+            "author": "Anshum Gupta",
+            "date": "2015-02-23T05:02:51+0000",
+            "content": "Bulk close after 5.0 release. "
+        }
+    ]
+}

@@ -1,0 +1,93 @@
+{
+    "id": "LUCENE-5579",
+    "title": "Spatial, enhance RPT to differentiate confirmed from non-confirmed hits, then validate with SDV",
+    "details": {
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "modules/spatial"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.2"
+        ]
+    },
+    "description": "If a cell is within the query shape (doesn't straddle the edge), then you can be sure that all documents it matches are a confirmed hit. But if some documents are only on the edge cells, then those documents could be validated against SerializedDVStrategy for precise spatial search. This should be much faster than using RPT and SerializedDVStrategy independently on the same search, particularly when a lot of documents match.\n\nPerhaps this'll be a new RPT subclass, or maybe an optional configuration of RPT.  This issue is just for the Intersects predicate, which will apply to Disjoint.  Until resolved in other issues, the other predicates can be handled in a naive/slow way by creating a filter that combines RPT's filter and SerializedDVStrategy's filter using BitsFilteredDocIdSet.\n\nOne thing I'm not sure of is how to expose to Lucene-spatial users the underlying functionality such that they can put other query/filters in-between RPT and the SerializedDVStrategy.  Maybe that'll be done by simply ensuring the predicate filters have this capability and are public.\n\nIt would be ideal to implement this capability after the PrefixTree term encoding is modified to differentiate edge leaf-cells from non-edge leaf cells. This distinction will allow the code here to make more confirmed matches.",
+    "attachments": {
+        "LUCENE-5579_SPT_leaf_covered.patch": "https://issues.apache.org/jira/secure/attachment/12704805/LUCENE-5579_SPT_leaf_covered.patch",
+        "LUCENE-5579_CompositeSpatialStrategy.patch": "https://issues.apache.org/jira/secure/attachment/12705128/LUCENE-5579_CompositeSpatialStrategy.patch",
+        "spatial.alg": "https://issues.apache.org/jira/secure/attachment/12723499/spatial.alg"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14363425",
+            "author": "David Smiley",
+            "content": "This first patch is the first step / phase, which differentiates \"covered\" leaf cells (cells that were within the indexed shape) from other cells which are approximated leaf cells.  The next phase will be augmenting the Intersects filter and possibly others to collect exact hits in conjunction with the fuzzy hits.\n\nDuring the benchmarking I learned some interesting things:\n\n\tQuad tree is 50% of the size of Geohash!  This observation is for non-point data, since that's what's relevant to all this hit-confirmation business / leaf cells.  For point data, it'd be the other way around.\n\tLeaf pruning shaves 45%!  So much for my plans to phase that out \u2013 it's key.\n\tDifferentiating leaf types (Covered vs Approximated) add 4%.\n\tA more restrained leaf pruning that doesn't prune covered leaves larger than those at the target/detail level yields 36% shaving (not as good as 45% \u2013 expected).  That is... we're adding these covered leaf bytes to subsequently make exact results checking better so we don't want to be too liberal in removing them.  There's a trade-off here.\n\n\n\nThe attached patch includes some refactoring to share common logic between Contains & AVPTF (the base of Within, Intersects, and heatmap).  I need to add a configurable flag to indicate if leaves should be differentiated in the first place, since you might not want that, and another flag to adjust how much pruning of the covered leaves happens.  Both flags should be safe to change without any re-indexing; it could be changed whenever. Obviously if you don't have the covered leaf differentiation then you won't get the full benefit later when we have exact match collection, just partial. ",
+            "date": "2015-03-16T16:22:06+0000"
+        },
+        {
+            "id": "comment-14365608",
+            "author": "David Smiley",
+            "content": "I moved the leaf cell differentiation to its own issue where it belongs \u2013 LUCENE-6362.\n\nThe attached patch addresses the two-phase index + verify requirement in one new \"CompositeStrategy\" so that we can get speed + accuracy and with convenience made possible by Lucene 5.1's low-level TwoPhaseIterator.  I'm not married to the name; I'm not sure what to call it.  This patch contains two Query implementations \u2013 one specifically for optimizing the Intersects predicate which uniquely retains a DocIdSet of \"exact\" (aka pre-confirmed) hits separate from the approximate set overall.  The other one is more generic but must verify every hit by looking up the geometry and applying the predicate.\n\nThere are a lot of TODO comments and I haven't tested it thoroughly to my liking yet.  So it's not done, but it does seem to work.\n\nI did some benchmarking but had to stop as I can't spend more time on this right now.  I'm puzzled why I don't see any performance improvements using the optimized Intersects predicate.  I debugged it and observed that the benchmark setup I have doesn't seem to be yielding any exact/confirmed hits, oddly enough.  Yet the testing I have does show this happens.  So maybe it's a benchmark config bug, or who knows.\n\nThe patch includes a refactoring to make org.apache.lucene.search.ConstantScoreWeight public instead of package level.  It's very general & useful.  I think a similar thing could be done with a constant scoring Scorer.  ",
+            "date": "2015-03-17T17:35:44+0000"
+        },
+        {
+            "id": "comment-14395531",
+            "author": "David Smiley",
+            "content": "I fixed a bug (some unfinished code I overlooked) and I finally see the performance numbers I've been expecting to see.  With the new approx/exact differentiated Intersects predicate, the benchmarked queries were ~83% faster compared to without.  YMMV a ton.  These shapes were all geodetic circles; which do have some trig but I bet a polygon, esp. a non-trivial polygon, should see more improvement.  This test used distErrPct=0.2 which will yield a tiny index & fast indexing but super-approximated shapes (very blocky looking).  By using distErrPct=0.1, the relative improvement became 100% (2x) since more detail allows more hits to be in the \"exact\" bucket.  The index increased in size 93% though.  Note even at 0.1, this index is about 1/4th the size of the default RPT configuration.\n\nNow I need to wrap up the TODOs; including test a bit more.  Maybe re-think the name of this thing; although CompositeSpatialStrategy ain't bad.  Perhaps this could all go right into SerializedDVStrategy and then make this index portion being added here optional?  On the other hand... SerializedDVStrategy is but one specific way (BinaryDocValues) to retrieve the shape.  Granted we don't have any alternative similar nor do I plan to come up with one.  Or this code could go into RPT, so that you could optionally add the precision of the serialized geometry if you so choose.  Hmmm. ",
+            "date": "2015-04-04T04:36:29+0000"
+        },
+        {
+            "id": "comment-14482295",
+            "author": "David Smiley",
+            "content": "This is the latest patch, along with a benchmark .alg file (which depends on LUCENE-6399 to make a comparison in one run).  For whatever reason, I'm only seeing a 40% increase in speed now; I'm not sure what changed in the benchmark or recent trunk changes.  Again, YMMV a ton.\n\n\n\tAdded missing equals/hashcode, and fixed our QueryEqualsHashCodeTest to actually work   (note assertNotSame() does NOT call .equals).\n\tAdded support for most predicates to CompositeSpatialStrategy.  I left Disjoint as a TODO; it could be implemented using DocValues.getDocsWithField, but I don't see it as worth bothering with right now.\n\tAdded optimized path for when all hits are exact \u2013 no geometries need double-checking.\n\tPulled out the inner Query instances to live in the \"composite\" package, so that they might be used by users who want to build with these constructs.\n\n\n\nAdrien Grand In this patch I added a method to BitDocIdSet.Builder:\n\n    /**\n     * Is this builder definitely empty?  If so, {@link #build()} will return null.  This is usually the same as\n     * simply being empty but if this builder was constructed with the {@code full} option or if an iterator was passed\n     * that iterated over no documents, then we're not sure.\n     */\n    public boolean isDefinitelyEmpty() {\n      return sparseSet == null && denseSet == null;\n    }\n\n\nCool?  Another non-spatial change in this patch is making ConstantScoreWeight public, not package-local.  Should be be @lucene.experimental or @lucene.internal?  It seems generic enough.\n\nAt this point I think it's ready to commit.  I haven't cared enough about where the code should live to bother changing it from it's current form as an independent SpatialStrategy. ",
+            "date": "2015-04-07T00:35:44+0000"
+        },
+        {
+            "id": "comment-14490125",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672727 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1672727 ]\n\nLUCENE-5579: BitDocIdSet.Builder.isDefinitelyEmpty() ",
+            "date": "2015-04-10T18:57:24+0000"
+        },
+        {
+            "id": "comment-14490137",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672729 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672729 ]\n\nLUCENE-5579: BitDocIdSet.Builder.isDefinitelyEmpty() ",
+            "date": "2015-04-10T19:00:47+0000"
+        },
+        {
+            "id": "comment-14490144",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672730 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1672730 ]\n\nLUCENE-5579: ConstantScoreWeight is now public\nbut marked @lucene.internal ",
+            "date": "2015-04-10T19:04:38+0000"
+        },
+        {
+            "id": "comment-14490174",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672731 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672731 ]\n\nLUCENE-5579: ConstantScoreWeight is now public\nbut marked @lucene.internal ",
+            "date": "2015-04-10T19:15:39+0000"
+        },
+        {
+            "id": "comment-14490251",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672736 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1672736 ]\n\nLUCENE-5579: CompositeSpatialStrategy (RPT + SDV) with optimized Intersect ",
+            "date": "2015-04-10T19:51:59+0000"
+        },
+        {
+            "id": "comment-14490264",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672740 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672740 ]\n\nLUCENE-5579: CompositeSpatialStrategy (RPT + SDV) with optimized Intersect ",
+            "date": "2015-04-10T19:57:38+0000"
+        },
+        {
+            "id": "comment-14586784",
+            "author": "Anshum Gupta",
+            "content": "Bulk close for 5.2.0. ",
+            "date": "2015-06-15T21:42:30+0000"
+        }
+    ]
+}

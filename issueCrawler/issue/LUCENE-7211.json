@@ -1,0 +1,67 @@
+{
+    "id": "LUCENE-7211",
+    "title": "Spatial RPT Intersects should use DocIdSetBuilder to save memory/GC",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [
+            "modules/spatial"
+        ],
+        "labels": "",
+        "fix_versions": [
+            "6.1"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "I\u2019ve been continuing some analysis into JVM garbage sources in my Solr index. (5.4, 86M docs/core, 56k 99.9th percentile hit count with my query corpus)\n\nAfter applying SOLR-8922, I find my biggest source of garbage by a literal order of magnitude (by size) is the long[] allocated by FixedBitSet. From the backtraces, it appears the biggest source of FixBitSet creation in my case (by two orders of magnitude) is my use of queries that involve geospatial filtering.\n\nSpecifically, IntersectsPrefixTreeQuery.getDocIdSet, here:\nhttps://github.com/apache/lucene-solr/blob/569b6ca9ca439ee82734622f35f6b6342c0e9228/lucene/spatial-extras/src/java/org/apache/lucene/spatial/prefix/IntersectsPrefixTreeQuery.java#L60\n\nHas this been considered for optimization? I can think of a few paths:\n\n1. Persistent Object pools - FixedBitSet size is allocated based on maxDoc, which presumably changes less frequently than queries are issued. If an existing FixedBitSet were not available from a pool, the worst case (create a new one) would be no worse than the current behavior. The complication would be enforcement around when to return the object to the pool, but it looks like this has some lifecycle hooks already.\n2. I note that a thing called a SparseFixedBitSet already exists, and puts considerable effort into allocating smaller chunks only as necessary. Is this not usable for this purpose? How significant is the performance difference?\n\nI'd be happy to spend some time on a patch, but I was hoping for a little more data around the current choices before choosing an approach.",
+    "attachments": {
+        "SOLR-8944-Use-DocIdSetBuilder-instead-of-FixedBitSet.patch": "https://issues.apache.org/jira/secure/attachment/12798348/SOLR-8944-Use-DocIdSetBuilder-instead-of-FixedBitSet.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15226561",
+            "author": "David Smiley",
+            "date": "2016-04-05T16:20:51+0000",
+            "content": "What should be done is to enhance this query (and most other predicates) to use DocIdSetBuilder. File an issue if you wish to pursue it; it'd be easy I think.  In LUCENE-6645 some performance testing of some new spatial approaches wasdone that also needed to build up a BitSet, and it was shown that SparseFixedBitSet caused a significant performance hit.  DocIdSetBuilder has an internal sparse sorted array mode which is used when the number of docs is less than 1/128th of the total docs in a segment.\n\nI hope that helps enough and we can stop there.  I don't like the idea of adding complexity to re-use FixedBitSets.  Instead... perhaps more could be done to enhance the cache-ability of your spatial queries.  I've thought of perhaps using TermQueryPrefixTreeStrategy with a very coarse/approximate and thus more cacheable filter, although with a non-cached Solr post-filter using perhaps LatLonType.  LatLonType can be slow, but using projected space (2D) instead of surface-of-sphere might help a lot if your data isn't world-wide. "
+        },
+        {
+            "id": "comment-15226709",
+            "author": "Jeff Wartes",
+            "date": "2016-04-05T17:25:26+0000",
+            "content": "It was an easy test, so I tried simply using a SparseFixedBitSet instead. That only bought me about a 5% overall reduction in allocation rate. (Again, this is after applying SOLR-8922) \nSince I don't have any data on the performance impact (cpu/latency) of SparseFixedBitSet vs FixedBitSet, the relatively low difference in allocation rate makes it feel like an object pool approach might be worth the extra work. "
+        },
+        {
+            "id": "comment-15226948",
+            "author": "Jeff Wartes",
+            "date": "2016-04-05T19:14:42+0000",
+            "content": "I hadn't refreshed and didn't see this comment before I added mine, but thanks for the info, I appreciate the references and context. I'll take a look at what would be involved with DocIdSetBuilder.\n\nI also feel like I should mention though, that class will be the third case of a hardcoded magic fraction of maxDoc I've come across in the context of investigating allocations this last week. It might be worth considering whether the gyrations around avoiding the creation of these BitSets is more or less complicated than managing a pool would be. "
+        },
+        {
+            "id": "comment-15237826",
+            "author": "Jeff Wartes",
+            "date": "2016-04-12T19:36:31+0000",
+            "content": "David Smiley's suggestion was almost too trivial a change to create a patch for, but here it is. This was against 5.4. The path of the class has changed in master, but the contents have not, so the patch should apply there too. "
+        },
+        {
+            "id": "comment-15237853",
+            "author": "Jeff Wartes",
+            "date": "2016-04-12T19:56:22+0000",
+            "content": "Results from applying this patch were quite positive, but for more subtle reasons than I'd expected.\n\nTo my surprise, the quantity of garbage generated (by size) over my test run was mostly unchanged, as was the frequency of collections. However, the garbage collector (ParNew) seemed to have a much easier time with what was being generated. Avg GC pause went down 45%, and max GC pause for the run was cut in half. \n\nI'm not sure I can even speculate on what makes for easier work within ParNew.\n\nFrom an allocation rate standpoint, I'm guessing that my test run sits near the edge of where the DocIdSetBuilder's buffer remains efficient from an allocation size perspective. Naively that looks like about a hit rate threshold of 25%, but suspect it's a lot more complicated than that, since DocIdSetBuilder grows the buffer in 1/8th increments and throws away the old allocations, which generates more garbage. (By contrast, SOLR-8922 uses 1/64 as the threshold instead of 1/128, but allocates additional space in 2x increments, and doesn't throw away what's already been allocated)\n\nLooking at some before/after memory snapshots, the allocation size attributed to long[] in FixedBitSet is indeed down, but mostly replaced by lots of int[] allocations attributed to DocIdSetBuilder.growBuffer, as we might expect given that overall allocation size didn't change much.\n\nIn general, this is a desirable enough patch for my index that I'd be willing to move it into a Lucene issue just on it's face, but it still feels like there is some room for improvement. I suppose I should have made this a Lucene issue in the first place, but given that I'm running with and testing with Solr I wasn't sure how that fit.\n "
+        },
+        {
+            "id": "comment-15238609",
+            "author": "David Smiley",
+            "date": "2016-04-13T04:48:24+0000",
+            "content": "Thanks Jeff, particularly for sharing your benchmark results. "
+        },
+        {
+            "id": "comment-15239349",
+            "author": "ASF subversion and git services",
+            "date": "2016-04-13T14:39:50+0000",
+            "content": "Commit f7f64c21722e739bc7cc9fbd62c2275ef6340fc1 in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f7f64c2 ]\n\nLUCENE-7211: Use DocIdSetBuilder instead of FixedBitSet in spatial RPT intersects predicate. "
+        }
+    ]
+}

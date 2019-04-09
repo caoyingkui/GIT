@@ -17,10 +17,11 @@ import org.eclipse.jgit.treewalk.filter.PathFilter;
 import org.eclipse.jgit.util.io.DisabledOutputStream;
 import util.WriterTool;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 
 public class GitAnalyzer {
@@ -31,9 +32,19 @@ public class GitAnalyzer {
     private ObjectId firstCommit = null;
 
     public GitAnalyzer(String filePath){
-
         try {
             git = Git.open(new File(filePath));
+            repository = git.getRepository();
+            getFirstCommit();
+        }catch (IOException e){
+            e.printStackTrace();
+        }
+    }
+
+    public GitAnalyzer(){
+        try {
+            git = Git.open(new File("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr"));
+            //git = Git.open(new File("C:\\Users\\oliver\\Desktop\\firefox-browser-architecture"));
             repository = git.getRepository();
             getFirstCommit();
         }catch (IOException e){
@@ -294,14 +305,20 @@ public class GitAnalyzer {
         return patch;
     }
 
-    public Patch getPatch(String oldFile, String newFile){
-        Patch patch = new Patch();
+    public EditList getEditList(String oldFile, String newFile) {
         RawText file1 = new RawText(oldFile.getBytes());
         RawText file2 = new RawText(newFile.getBytes());
 
         EditList diffList= new EditList();
         diffList.addAll(new HistogramDiff().diff(RawTextComparator.DEFAULT, file1, file2));
+        return diffList;
+    }
 
+    public Patch getPatch(String oldFile, String newFile){
+        Patch patch = new Patch();
+        EditList diffList= getEditList(oldFile, newFile);
+        RawText file1 = new RawText(oldFile.getBytes());
+        RawText file2 = new RawText(newFile.getBytes());
 
         try {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -315,20 +332,46 @@ public class GitAnalyzer {
         return patch;
     }
 
-    public static void main(String[] args){
+    /**
+     * 从commitMsg中获取issueID
+     * @param commitMsg 某次commit中的message
+     * @return commitMsg包含的issueId列表
+     */
+    public static List<String> findIssueId(String commitMsg){
+        List<String> result = new ArrayList<>();
+        Pattern pattern = Pattern.compile("(SOLR-[0-9]+)|(LUCENE-[0-9]+)");
+        java.util.regex.Matcher matcher = pattern.matcher(commitMsg);
+        while(matcher.find()){
+            result.add(matcher.group(0));
+        }
+        return result;
+    }
+
+    public static void main(String[] args) throws Exception{
 
         //GitAnalyzer poi_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\poi");
         //poi_analyzer.start();
-
         GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
         RevCommit comdmit = lucene_analyzer.getCommit("HEAD");
         List<RevCommit> commits = lucene_analyzer.getCommits();
+        BufferedWriter writer = new BufferedWriter(new FileWriter(new File("file.txt")));
+        int yes = 0, no = 0;
         for (RevCommit commit: commits) {
+            writer.write(commit.getId().toString() + "\n");
+            //System.out.println(comdmit.getId());
             String msg = commit.getShortMessage();
-            if(msg.contains("SOLR-12759")){
-                System.out.println(msg);
+            //Pattern pattern = Pattern.compile("SOLR-([0-9]+)|LUCENE-([0-9]+)");
+            Pattern pattern = Pattern.compile("jboss");
+            Matcher matcher = pattern.matcher(msg.toLowerCase());
+            if (matcher.find()) {
+                System.out.println(commit.toString());
+                yes ++;
+            } else {
+
+                no ++;
             }
         }
+        System.out.println(yes + " " + no);
         /*GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
         ClassFile classFile = new ClassFile(lucene_analyzer);
         List<String> files = lucene_analyzer.getAllFiles("HEAD", ".java");

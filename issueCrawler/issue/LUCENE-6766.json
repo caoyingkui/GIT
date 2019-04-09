@@ -1,0 +1,264 @@
+{
+    "id": "LUCENE-6766",
+    "title": "Make index sorting a first-class citizen",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "priority": "Minor",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "Today index sorting is a very expert feature. You need to use a custom merge policy, custom collectors, etc. I would like to explore making it a first-class citizen so that:\n\n\tthe sort order could be configured on IndexWriterConfig\n\tsegments would record the sort order that was used to write them\n\tIndexSearcher could automatically early terminate when computing top docs on a sort order that is a prefix of the sort order of a segment (and if the user is not interested in totalHits).",
+    "attachments": {
+        "LUCENE-6766.patch": "https://issues.apache.org/jira/secure/attachment/12762374/LUCENE-6766.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14717454",
+            "author": "Michael McCandless",
+            "date": "2015-08-27T20:23:16+0000",
+            "content": "+1 "
+        },
+        {
+            "id": "comment-14907985",
+            "author": "Adrien Grand",
+            "date": "2015-09-25T12:47:22+0000",
+            "content": "Here is a first prototype that:\n\n\tmoves sorting logic from misc to core\n\tremoves SortingMergePolicy\n\tadds an \"indexSort\" parameter to IndexWriterConfig and SegmentInfo, with null meaning that the index order is unspecified\n\tSimpleTextCodec (de)serializes this indexOrder parameter, other codecs ignore it for now\n\trefactors a bit the doc ID remapping logic in IndexWriter when there have been deletions while some segments were being merged\n\n\n\nOpen question: how should we serialize the SortField objects? Should we have a fixed list of supported SortField parameters or should we allow SortField parameters to serialize themselves?\n\nThere are lots of things we could do on the search side, but for now I'd like to focus on the indexing side and making sure the sort order of segments is easily accessible. "
+        },
+        {
+            "id": "comment-15020548",
+            "author": "Elliott Bradshaw",
+            "date": "2015-11-21T16:03:30+0000",
+            "content": "This would be great!\n\n+1 "
+        },
+        {
+            "id": "comment-15255371",
+            "author": "Michael McCandless",
+            "date": "2016-04-23T20:05:28+0000",
+            "content": "This looks like a great patch!  Probably we can make SortingLeafReader private?\n\nI think it's OK to restrict the allowed SortField that we need to support and serialize/deserialize?\n\nCan we fix IW to insist on open that the incoming index sort matches whatever the current index has (if the current index exists)?\n\nSince this patch, we moved SlowCompositeReaderWrapper out of core ... I wonder if we can 1) fix flush to also write new segments in correct sort order, and 2) fix default merge implementation to look at sort order?  Merging should be an efficient merge sort (vs. what SortingLeafReader on top of SlowCompositeReaderWrapper does today). "
+        },
+        {
+            "id": "comment-15255384",
+            "author": "Adrien Grand",
+            "date": "2016-04-23T21:06:32+0000",
+            "content": "I think a challenge to sorting flushed segments is how we write stored fields and term vectors directly to the directory at index time. We should somehow buffer them in memory and sort on flush when a non-default sort order is configured? Or do you see an easier way?\n\nI agree merge sorting feels like the right approach to this problem. The reason why I used SlowCompositeReaderWrapper in the first place was that merging can be quite tricky and using SlowCompositeReaderWrapper allowed me to reuse the existing merging logic of all codec components. But it is likely less efficient like you said.\n "
+        },
+        {
+            "id": "comment-15255402",
+            "author": "Michael McCandless",
+            "date": "2016-04-23T22:21:28+0000",
+            "content": "I think a challenge to sorting flushed segments is how we write stored fields and term vectors directly to the directory at index time. We should somehow buffer them in memory and sort on flush when a non-default sort order is configured? Or do you see an easier way?\n\nHmm tricky.  Yeah, we could buffer in heap if IWC.indexSort is set, or ... we could just write as we do today, but then ask the codec for a stored fields (and term vectors) reader to do the sorting at flush time.\n\nOr we separate \"sorting on flushed segments\" out for the future, keeping SortingLeafReader, since the rest of this is already plenty hard, and focus here on making merging more efficient (don't use SlowCompositeReaderWrapper?  I think it would mean fixing the default merge impls ... today they all assume they concatenate each segments document sequentially (mapping around deletions) but with indexSort in use, they just need to merge sort instead.  Maybe we can abstract \"concat vs merge sort\" away so that all default merge impls could re-use it ... seems like it could be fairly clean maybe.  "
+        },
+        {
+            "id": "comment-15257807",
+            "author": "Michael McCandless",
+            "date": "2016-04-26T09:22:12+0000",
+            "content": "Maybe we can abstract \"concat vs merge sort\" away\n\nI'm exploring this and it looks like it may be a promising baby step, hopefully letting us stop using SlowCompositeReaderWrapper for index sorting... "
+        },
+        {
+            "id": "comment-15258000",
+            "author": "Adrien Grand",
+            "date": "2016-04-26T12:35:37+0000",
+            "content": "Please let me know if you need help! "
+        },
+        {
+            "id": "comment-15274734",
+            "author": "Michael McCandless",
+            "date": "2016-05-06T21:14:00+0000",
+            "content": "I've been slowly iterating here and pushing changes to https://github.com/mikemccand/lucene-solr/tree/index_sort\n\nThere are tons of nocommits, but tests do pass, including index sorting tests (though they still need improving).\n\nSome details:\n\n\n\tI added a new DocIDMerger helper class, and the default merge impls use this to abstract away how to iterate the documents from the N sub-readers, whether they are simply concatenated or merge-sorted.  I think this should be quite a bit more efficient than what SortingMergePolicy does today, but it does add some increase in code complexity, which I think is OK/contained.\n\n\n\n\n\tSlowCompositeReader is no longer used for index sorting\n\n\n\n\n\tPoints now work fine w/ index sorting\n\n\n\n\n\tCheckIndex verifies the claimed per-segment index sort is in fact true\n\n\n\n\n\tIW gets angry if you open an existing index with a different index sort\n\n\n\n\n\tOnly simple sort types are allowed; no CUSTOM, SCORE or REWRITEABLE\n\n\n\n\n\tI made a new Lucene62Codec, with a new Lucene62SegmentInfoFormat that supports index sorting.\n\n\n\n\n\tI added LeafReader.getIndexSort so apps can check if a given segment was sorted\n\n\n\n\n\tI disable bulk merge optos when index sorting is present\n\n\n\nIW flush still does not sort, and so at merge time we wrap such segments with SortingLeafReader.  This is quite ugly, that an index can have some segments sorted and some not sorted.  E.g. it means IW's check for whether the new index sort matches the existing one, is just best effort ... but this is already an enormous change so\nI think we really have to look into \"sort on flush\" (which is hairy by itself) later, separately "
+        },
+        {
+            "id": "comment-15274898",
+            "author": "Michael McCandless",
+            "date": "2016-05-06T23:20:11+0000",
+            "content": "Here's the current patch (generated from diffSources.py)... "
+        },
+        {
+            "id": "comment-15274915",
+            "author": "Michael McCandless",
+            "date": "2016-05-06T23:31:19+0000",
+            "content": "And here's the same patch on github: https://github.com/apache/lucene-solr/compare/master...mikemccand:index_sort?expand=1 "
+        },
+        {
+            "id": "comment-15276107",
+            "author": "Adrien Grand",
+            "date": "2016-05-09T08:34:15+0000",
+            "content": "This looks great!\n\n\nit does add some increase in code complexity, which I think is OK/contained.\n\nAgreed. The only thing I am slightly worried about is how all optimized bulk mergers need to opt out if a sort order is configured. I am wondering if our base consumer classes should have two merge methods so that you would not have to check the sort order when overriding the method for regular merges? This is just an idea, it has drawbacks too since there would not be a single entry point to merging anymore and we would need another method in our API, but I'm suggesting it anyway hoping that it might give somebody a better idea. \n\nbut this is already an enormous change so I think we really have to look into \"sort on flush\" (which is hairy by itself) later, separately\n\n+1\n\n\n+// nocommit if index time sorting is in use, don't try to bulk merge ... later we can make crazy bulk merger that looks for long runs from\n+// one sub?\n\n\n\nMaybe this one could be made a simple TODO. I think it is totally fine if index sorting always bypasses optimized bulk mergers, at least for now? Since we are still pulling a merge instance, it should not be too bad (no worse than merging across different codecs)?\n\n\n // nocommit in the unsorted case, this should map correctly, e.g. apply per segment docBase\n\n\n\nThis seems to already be the case based on the code?\n\n\n// nocommit isn't liveDocs redundant?  docMap returns -1 for us?\n\n\n\n+1 I think it would be easier if this part of the code only used the docMap.\n\n\n// nocommit is it sub's job to skip deleted docs?\n\n\n\nI think it is since there is no mapped doc ID for deleted docs?\n\n\n  // nocommit doesn't support index sorting?  or sorts must be the same?\n  public void addIndexes(Directory... dirs) throws IOException {\n\n\n\nCan we do like the nocommit on addIndexes(CodecReader...) suggests and just make sure that we cannot end up with segments that have different sort orders in the index?\n\n\n// nocommit what about MergedReaderWrapper in here?\n\n\n\nI think we should still wrap with MergedReaderWrapper? This will help stored fields if two documents from the same block are read consecutively (which could likely happen if the order in which docs are indexed is somehow correlated to the index sort, like if sorting by timestamp)?\n\n\n+    Sort indexSort = null;\n+\n     // build FieldInfos and fieldToReader map:\n     for (final LeafReader reader : this.parallelReaders) {\n+      if (indexSort == null) {\n+        indexSort = reader.getIndexSort();\n+      } else if (indexSort.equals(reader.getIndexSort()) == false) {\n+        throw new IllegalArgumentException(\"cannot combine LeafReaders that have different index sorts: saw both sort=\" + indexSort + \" and \" + reader.getIndexSort());\n+      }\n\n\n\nI think this is buggy since it ignores null sorts at the beginning of the list but not at the end, so the same list of readers may or may not raise an exception depending on the order in which readers are provided?\n\n\n// nocommit does search time \"do the right thing\" automatically when segment is sorted?\n\n\n\nAgreed it should. I see you also left nocommits about moving the early-terminating collectors from misc to core, but leveraging index sorting at search time looks like a big task to me so maybe we should defer it to a follow-up issue like sorting on flush?\n\n\n// nocommit just do assertReaderEquals, don't use @BeforeClass, etc.?\n\n\n\n+1!\n\n\n--- trunk/lucene/misc/src/java/org/apache/lucene/search/BlockJoinComparatorSource.java  2016-02-16 11:18:34.753021816 -0500\n+++ indexsort/lucene/misc/src/java/org/apache/lucene/search/BlockJoinComparatorSource.java      2016-05-06 19:17:29.893848515 -0400\n@@ -20,13 +20,14 @@\n\n+// nocommit what to do here?\n\n\n\nLet's remove it for now and later see whether this is something that could be added back?\n\n\n+    @Override\n+    public int nextDoc() {\n+      try {\n+        return postings.nextDoc();\n+      } catch (IOException ioe) {\n+        throw new RuntimeException(ioe);\n+      }\n+    }\n\n\n\nShould DocIdMerger.Sub.nextDoc throw an IOException? "
+        },
+        {
+            "id": "comment-15277866",
+            "author": "Michael McCandless",
+            "date": "2016-05-10T09:41:38+0000",
+            "content": "Thanks Adrien Grand!\n\nI folded in most of your feedback, except:\n\nThe only thing I am slightly worried about is how all optimized bulk mergers need to opt out if a sort order is configured. I am wondering if our base consumer classes should have two merge methods so that you would not have to check the sort order when overriding the method for regular merges? This is just an idea, it has drawbacks too since there would not be a single entry point to merging anymore and we would need another method in our API, but I'm suggesting it anyway hoping that it might give somebody a better idea.\n\nI think it's OK to keep a single merge method?  This merge method\nalready must deal with wild per-segment variabilities, e.g. different\nfields across segments, some have deletions some don't, etc., so I\ndon't think we need to single out \"has an index sort\" into a separate\nmethod?\n\nAlso, implementing merge methods is really an uber-expert thing to\ndo, so such devs should be up to the task of handling an incoming\nindex sort, I think.\n\nI think this is buggy since it ignores null sorts at the beginning of the list but not at the end,\n\nNice catch!  I added test showing the bug, and then fixed it (pushed).\n\nLet's remove it for now and later see whether this is something that could be added back?\n\nOK I did that.  I think at least there is a simple solution for doc-block\nusers: just index a doc values field with the \"id\" for each block, and\nthen sort on that.\n\nbut leveraging index sorting at search time looks like a big task to me so maybe we should defer it to a follow-up issue like sorting on flush?\n\nI did move the early terminating to core, and I do think going forward\nwe should make it easier to use this ... it should somehow be the\ndefault, and not a \"make your own Collector\" situation ...\n\nAs Rob has pointed out, even today (before promoting index sorting)\nwe could early-terminate in cases where the query is sorting on\nindex order, such as collecting first N hits for a filter.\n\nBut I agree we should do this separately.  I will open follow-on issues\nfor \"can we sort on flush too\" and \"searching should take advantage\nof index sort by default\".\n\nShould DocIdMerger.Sub.nextDoc throw an IOException?\n\nI tried this out, but it started to sprawl: the doc values all wrap\n`DocIdMerger` under a java `Iterator` which cannot throw `IOException`\n... I could move the `try/except` up there, but there are many places\nI'd have to move this to, so leaving it where it is seemed like the\nlesser evil. "
+        },
+        {
+            "id": "comment-15277869",
+            "author": "Michael McCandless",
+            "date": "2016-05-10T09:47:58+0000",
+            "content": "I think this is ready ... here's the current patch against master.\n\nI still need to run \"first do no harm\" indexing performance tests to\nmake sure there is not too much of a hit when indexing without an\nindex sort.\n\nI don't plan to rush this in for 6.1 ... I'll commit to master, and\nafter we release 6.1 (Soon I think?: so many geo improvements!), I\nplan to backport for 6.2. "
+        },
+        {
+            "id": "comment-15279810",
+            "author": "Michael McCandless",
+            "date": "2016-05-11T08:51:26+0000",
+            "content": "I tested master vs patch indexing performance on luceneutil's \"wikimedium10m\" docs.  I ran indexing 5 times each.  This is just a \"first do no harm test\", i.e. in both cases I'm indexing without an index sort.\n\nI use SMS, and frequent flushing, so this is a very merge-heavy benchmark.\n\nMaster:\n\n\n/l/logs/before0.log:Indexer: finished (675550 msec)\n/l/logs/before1.log:Indexer: finished (671058 msec)\n/l/logs/before2.log:Indexer: finished (683297 msec)\n/l/logs/before3.log:Indexer: finished (670856 msec)\n/l/logs/before4.log:Indexer: finished (671516 msec)\n\n\n\nPatch:\n\n\n/l/logs/after0.log:Indexer: finished (673302 msec)\n/l/logs/after1.log:Indexer: finished (674855 msec)\n/l/logs/after2.log:Indexer: finished (679655 msec)\n/l/logs/after3.log:Indexer: finished (680151 msec)\n/l/logs/after4.log:Indexer: finished (681921 msec)\n\n\n\nNet/net I think any performance hit is very small, well within measurement noise. "
+        },
+        {
+            "id": "comment-15279829",
+            "author": "Adrien Grand",
+            "date": "2016-05-11T09:07:32+0000",
+            "content": "+1 "
+        },
+        {
+            "id": "comment-15280234",
+            "author": "Michael McCandless",
+            "date": "2016-05-11T14:39:36+0000",
+            "content": "I tried sorting with the 10M wikipedia index.\n\nSort by last-modified-date:\n\n\n  Indexer: indexing done (900389 msec); total 10000000 docs\n  Indexer: force merge done (took 134020 msec)\n\n\n\nSort by title:\n\n\n  Indexer: indexing done (907923 msec); total 10000000 docs\n  Indexer: force merge done (took 135041 msec)\n\n\n\nvs. no sorting:\n\n\n  Indexer: indexing done (702761 msec); total 10000000 docs\n  Indexer: force merge done (took 65726 msec)\n\n\n\nIndex size was about the same in all cases, ~3.1 GB.\n\nI also confirmed CheckIndex verifies the sorted indices are OK (it checks the sort order).\n\nSo ~28% slower with sorting overall... but this uses a single thread, SerialMergeScheduler, and small IW buffer, so it's very merge-heavy. "
+        },
+        {
+            "id": "comment-15282588",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:47+0000",
+            "content": "Commit 87690f8b13b1def6c822ba36a42e4cb6939ab4c2 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=87690f8 ]\n\nLUCENE-6766: add another random test case; move early terminating collector to core "
+        },
+        {
+            "id": "comment-15282589",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:48+0000",
+            "content": "Commit fa37241e784e0479da1637f863e07f1d909f40a9 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fa37241 ]\n\nLUCENE-6766: add deletions to random test "
+        },
+        {
+            "id": "comment-15282590",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:49+0000",
+            "content": "Commit 1e82c13184621f6cefac35f8d10d8fe74d2a356c in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1e82c13 ]\n\nLUCENE-6766: resolve remaining nocommits; add more IW infoStream logging during merge "
+        },
+        {
+            "id": "comment-15282591",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:51+0000",
+            "content": "Commit 8361de87becd64c8b217313877b996ac20167856 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8361de8 ]\n\nLUCENE-6766: fix parallel reader's detection of conflicting index sort "
+        },
+        {
+            "id": "comment-15282592",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:52+0000",
+            "content": "Commit e3ecc6a5361948c28679c7ac76161f167824e514 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e3ecc6a ]\n\nLUCENE-6766: merge master "
+        },
+        {
+            "id": "comment-15282593",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:53+0000",
+            "content": "Commit e283271aaf6da3033156f36b421d3241b5499d4e in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e283271 ]\n\nLUCENE-6766: more IW.infoStream logging around sorting; fix test bug "
+        },
+        {
+            "id": "comment-15282594",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:54+0000",
+            "content": "Commit 5fb7413ccb9c690d3a59d7227b3cb194943290ef in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5fb7413 ]\n\nLUCENE-6766: remove leftover sop "
+        },
+        {
+            "id": "comment-15282595",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:55+0000",
+            "content": "Commit 3cde9eb3d027b273a3c136e9eb284ae18f1824fe in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3cde9eb ]\n\nLUCENE-6766: keep SortingMergePolicy for solr back-compat; fix Solr tests; fix precommit failures "
+        },
+        {
+            "id": "comment-15282596",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:56+0000",
+            "content": "Commit d715210467a4907ca34e7f0fe1a438908737894f in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d715210 ]\n\nLUCENE-6766: merged "
+        },
+        {
+            "id": "comment-15282597",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-13T10:04:58+0000",
+            "content": "Commit 9d5b834b09d4ff23e89755e5d1af407a2bd96c16 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9d5b834 ]\n\nLUCENE-6766: put Placeholder back so javadocs are OK; deprecate Lucene60Codec "
+        },
+        {
+            "id": "comment-15282602",
+            "author": "Michael McCandless",
+            "date": "2016-05-13T10:11:34+0000",
+            "content": "I pushed this to master ... I will hold off on backporting to 6.x until we release 6.1, giving it time to bake.\n\nI'll go open a bunch of followon issues now. "
+        },
+        {
+            "id": "comment-15325917",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:20+0000",
+            "content": "Commit c26bb87140eacbcdfa6c083a10714af275fe4ab6 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c26bb87 ]\n\nLUCENE-6766: simplify test case "
+        },
+        {
+            "id": "comment-15325918",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:21+0000",
+            "content": "Commit 3010ffacafd5cc371f4d62413105294d0df37450 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3010ffa ]\n\nLUCENE-6766: add another random test case; move early terminating collector to core "
+        },
+        {
+            "id": "comment-15325919",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:23+0000",
+            "content": "Commit a4722befb3f878faa0a5ee9752ae21070c771cf2 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a4722be ]\n\nLUCENE-6766: add deletions to random test "
+        },
+        {
+            "id": "comment-15325920",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:24+0000",
+            "content": "Commit 2703b827bf2316e8d39025666ed5f1d42ed70d64 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2703b82 ]\n\nLUCENE-6766: resolve remaining nocommits; add more IW infoStream logging during merge "
+        },
+        {
+            "id": "comment-15325921",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:26+0000",
+            "content": "Commit 4740056f0987aef4eb727332d7ce9770964543c2 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4740056 ]\n\nLUCENE-6766: fix parallel reader's detection of conflicting index sort "
+        },
+        {
+            "id": "comment-15325922",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:27+0000",
+            "content": "Commit 0dd65f6130dbcb1a9caae7963fed246c1068ebe0 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0dd65f6 ]\n\nLUCENE-6766: more IW.infoStream logging around sorting; fix test bug "
+        },
+        {
+            "id": "comment-15325923",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:28+0000",
+            "content": "Commit 2f6cdea9a9ec3bb62cf0d111768969c2a6275276 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2f6cdea ]\n\nLUCENE-6766: remove leftover sop "
+        },
+        {
+            "id": "comment-15325924",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:29+0000",
+            "content": "Commit a3270ac6e64012ec0a5b6864cdfcf190a1a36346 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a3270ac ]\n\nLUCENE-6766: keep SortingMergePolicy for solr back-compat; fix Solr tests; fix precommit failures "
+        },
+        {
+            "id": "comment-15325925",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:49:31+0000",
+            "content": "Commit ea26dd5855ec45dcdaa385dd240a6ef91aa1c4d9 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ea26dd5 ]\n\nLUCENE-6766: finish 6.x backport "
+        },
+        {
+            "id": "comment-15325926",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-11T15:51:00+0000",
+            "content": "Commit 8bd27977dd993d4443be359a6f7ec92c7f012247 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8bd2797 ]\n\nLUCENE-6766: add changes "
+        },
+        {
+            "id": "comment-15325928",
+            "author": "Michael McCandless",
+            "date": "2016-06-11T15:51:20+0000",
+            "content": "I backported to 6.x "
+        },
+        {
+            "id": "comment-15439001",
+            "author": "Michael McCandless",
+            "date": "2016-08-26T13:59:38+0000",
+            "content": "Bulk close resolved issues after 6.2.0 release. "
+        }
+    ]
+}

@@ -1,0 +1,174 @@
+{
+    "id": "LUCENE-5738",
+    "title": "NativeLock is release if Lock is closed after obtain failed",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [],
+        "affect_versions": "4.8.1",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.9",
+            "6.0"
+        ]
+    },
+    "description": "if you obtain the NativeFSLock and try to obtain it again in the same JVM and close if if it fails another process will be able to obtain it. This is pretty trappy though. If you execute the main class twice the problem becomes pretty obvious.\n\n\nimport org.apache.lucene.store.Lock;\nimport org.apache.lucene.store.NativeFSLockFactory;\n\nimport java.io.File;\nimport java.io.IOException;\n\npublic class TestLock {\n public static void main(String[] foo) throws IOException, InterruptedException {\n        NativeFSLockFactory lockFactory = new NativeFSLockFactory(new File(\"/tmp\"));\n        Lock lock = lockFactory.makeLock(\"LOCK\");\n        if (lock.obtain()) {\n            System.out.println(\"OBTAINED\");\n        } else {\n            lock.close();\n            System.out.println(\"FAILED\");\n        }\n        // try it again and close it if it fails\n        lock = lockFactory.makeLock(\"LOCK\"); // <<<<==== this is a new lock\n        if (lock.obtain()) {\n            System.out.println(\"OBTAINED AGAIN\");\n        } else {\n            lock.close(); // <<<<==== this releases the lock we obtained\n            System.out.println(\"FAILED on Second\");\n        }\n        Thread.sleep(Integer.MAX_VALUE);\n    }\n}",
+    "attachments": {
+        "LUCENE-5738.patch": "https://issues.apache.org/jira/secure/attachment/12648611/LUCENE-5738.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14018948",
+            "author": "Simon Willnauer",
+            "content": "Ok this gets more funky... I modified the test since it is not exactly what I was seeing....\n\n public static void main(String[] foo) throws IOException, InterruptedException {\n        NativeFSLockFactory lockFactory = new NativeFSLockFactory(new File(\"/tmp\"));\n        Lock lock = lockFactory.makeLock(\"LOCK\");\n        if (lock.obtain()) {\n            System.out.println(\"OBTAINED\");\n        } else {\n            System.out.println(\"FAILED\");\n        }\n\n        lock = lockFactory.makeLock(\"LOCK\");   // <<<<==== this is a new lock\n        // here when we call obtain we run into an OverlappingFileLockException\n        // this exception closes the file channel and that causes the\n        // internal file lock table to be invalidated. This essentially releases the W lock of the first descriptor\n        if (lock.obtain()) {\n            System.out.println(\"OBTAINED AGAIN\");\n        } else {\n            System.out.println(\"FAILED on Second\");\n        }\n        Thread.sleep(Integer.MAX_VALUE);\n    }\n\n\n\nit seems that the FileChannel release all locks if it is closed.. There is some funky code in FileChannelImpl.java I would't be suprised if it has bugs ",
+            "date": "2014-06-05T16:49:42+0000"
+        },
+        {
+            "id": "comment-14018987",
+            "author": "Michael McCandless",
+            "content": "Simple (non-Lucene) Java test repros the issue:\n\n\nimport java.io.File;\nimport java.io.IOException;\n\nimport java.nio.channels.FileChannel;\nimport java.nio.channels.FileLock;\n\nimport java.nio.channels.OverlappingFileLockException;\nimport java.nio.file.StandardOpenOption;\n\npublic class TestLock {\n    public static void obtain() throws Exception {\n        File path = new File(\"/tmp/LOCK\");\n        FileChannel channel = FileChannel.open(path.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);\n        System.out.println(\"got channel \" + channel);\n        FileLock lock = null;\n        try {\n            lock = channel.tryLock();\n        } catch (IOException | OverlappingFileLockException e) {\n            // failed to get lock\n        } finally {\n            if (lock == null) {\n                System.out.println(\"FAILED\");\n                channel.close();\n             } else {\n                System.out.println(\"SUCCESS\");\n            }\n        }\n    }\n\n    public static void main(String[] foo) throws Exception {\n        obtain();\n        obtain();\n        Thread.sleep(Integer.MAX_VALUE);\n    }\n}\n\n ",
+            "date": "2014-06-05T17:20:29+0000"
+        },
+        {
+            "id": "comment-14018988",
+            "author": "Michael McCandless",
+            "content": "Uwe Schindler I think the JVM is still buggy here, and we need that hacky static map back maybe? ",
+            "date": "2014-06-05T17:21:38+0000"
+        },
+        {
+            "id": "comment-14018990",
+            "author": "Michael McCandless",
+            "content": "Also it's really too bad our tests didn't detect this. ",
+            "date": "2014-06-05T17:22:01+0000"
+        },
+        {
+            "id": "comment-14019319",
+            "author": "Uwe Schindler",
+            "content": "Uwe Schindler I think the JVM is still buggy here, and we need that hacky static map back maybe?\n\nThe static map was there to not obtain the lock 2 times from the same JVM. It could help to redo this, but I am not yet sure, what the real bug is. Does this also release the lock of another process? If yes, its a problem of the O/S. ",
+            "date": "2014-06-05T21:41:40+0000"
+        },
+        {
+            "id": "comment-14019395",
+            "author": "Michael McCandless",
+            "content": "Somehow, the 2nd channel.close releases the first lock obtained in the same process.\n\nI.e., if you start that test program you'll see it print SUCCESS then FAILED, and while it's still running go run it again in another window, and that 2nd process also prints SUCCESS then FAILED. ",
+            "date": "2014-06-05T23:15:13+0000"
+        },
+        {
+            "id": "comment-14019411",
+            "author": "Richard Boulton",
+            "content": "I believe that Java's NativeFSLock uses fcntl on Linux.  Unfortunately, the semantics of fcntl are consistent with the behaviour described above.\n\nSpecifically:\n\n\n\ta process has first to open a file descriptor to obtain a lock with fcntl\n\twhen that file descriptor is closed, the lock is released\n\thowever, the lock is also released if any file descriptor on the same underlying file is closed by the same process as is holding the lock.  (I'm not certain of the behaviour when file handles are passed to other processes, either explicitly or by forking.)\n\tthe lock is not released, however, if a different process opens and then closes a file descriptor on the file.\n\n\n\nSo, there are two approaches I know of to get the semantics you probably want (ie, that the only way the lock is closed is if the process holding it exits, or the lock is explicitly closed).\n\n 1: make sure files which are locked aren't opened multiple times while locked.  This probably needs some process-wide state to track which files have locks held on them.  This is, of course, awkward for\na library, since you don't have control over code in the same process which isn't part of the library.\n 2: fork a subprocess to hold the lock open.  This is expensive, but is the approach we took with Xapian.  I'm not sure it would be workable if you lock things at all frequently, though. ",
+            "date": "2014-06-05T23:42:01+0000"
+        },
+        {
+            "id": "comment-14019417",
+            "author": "Richard Boulton",
+            "content": "In case it wasn't clear in my previous comment, the problem is that when you try to obtain a lock on a file already locked by the same process, you open and then close a second file descriptor on the file, and when that file descriptor is closed, the lock is removed by the OS.\n\nNote this from the FileLock documentation (http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/java/nio/channels/FileLock.java#28 )\n\n\"On some systems, closing a channel releases all locks held by the Java virtual machine on the underlying file regardless of whether the locks were acquired via that channel or via another channel open on the same file. It is strongly recommended that, within a program, a unique channel be used to acquire all locks on any given file.\" ",
+            "date": "2014-06-05T23:46:55+0000"
+        },
+        {
+            "id": "comment-14019421",
+            "author": "Hoss Man",
+            "content": "Somehow, the 2nd channel.close releases the first lock obtained in the same process.\n\nIsn't this a valid aspect of the API as documented?\n\nhttp://docs.oracle.com/javase/7/docs/api/java/nio/channels/FileLock.html\n\n\nOn some systems, closing a channel releases all locks held by the Java virtual machine on the underlying file regardless of whether the locks were acquired via that channel or via another channel open on the same file. It is strongly recommended that, within a program, a unique channel be used to acquire all locks on any given file.  ",
+            "date": "2014-06-05T23:51:27+0000"
+        },
+        {
+            "id": "comment-14019632",
+            "author": "Simon Willnauer",
+            "content": "Isn't this a valid aspect of the API as documented?\nwell IMO that is not what is happening. Yes, the lock is released such that another process can acquire it but the same process can't and that is what makes this trappy and inconsistent IMO. However I think we have to bring back the static map to this and ramp up the tests otherwise this is too trappy ",
+            "date": "2014-06-06T07:14:49+0000"
+        },
+        {
+            "id": "comment-14019633",
+            "author": "Uwe Schindler",
+            "content": "Hi,\n\nin that case, with the help of Robert Muir, we should re-add the process-wide static map of already aquired locks and check against it before aquiring a new lock.\n\nRichard Boulton: Java file handles never escape from the local process. We have only 2 use-cases:\n\n\tA single process must prevent access to the same index. This is the issue here and can be solved by re-adding the static map of locks.\n\tAnother process must prevent access to the same index: This is currently no issue, because it cannot release the lock of other process.\n\n ",
+            "date": "2014-06-06T07:18:51+0000"
+        },
+        {
+            "id": "comment-14019637",
+            "author": "Uwe Schindler",
+            "content": "well IMO that is not what is happening. \n\nIt is waht is happening. The close() of the file handle is releasing the lock of the other file handle in the same process. This has nothing to do with the problem of the lock aquire failing, its just whats documented. So a single process should never try to aquire the lock multiple times through filesystem. We should only use the native lock between processes, for the single process case we should use the map. ",
+            "date": "2014-06-06T07:24:15+0000"
+        },
+        {
+            "id": "comment-14019642",
+            "author": "Uwe Schindler",
+            "content": "Also it's really too bad our tests didn't detect this.\n\nThe new test, we added in Lucene 4.7, cannot ctahc this, because it only tests that locking between processes work. But we should add the failing test above to a conventional unit test. It can be done with one process, i.e. a single unit test:\n\n\tAquire the lock\n\tTry to aquire the lock a second time\n\tclosae the failed lock\n\ttry to aquire the lock a thrid time -> it should still not work\n\trelaease the master lock\n\ttry to aquire again -> should now work\n\n ",
+            "date": "2014-06-06T07:35:57+0000"
+        },
+        {
+            "id": "comment-14019659",
+            "author": "Simon Willnauer",
+            "content": "It is waht is happening. The close() of the file handle is releasing the lock of the other file handle in the same process. This has nothing to do with the problem of the lock aquire failing, its just whats documented. So a single process should never try to aquire the lock multiple times through filesystem. We should only use the native lock between processes, for the single process case we should use the map.\n\nno you are not reading it right... what I am saying is that:\n\n\n\tobtain lock\n\ttry again from same process, (this fails & closes the channel & release the nativ lock on the FS)\n\ttry again from same process (this fails again while another process can succeed)\n\n\n\nthis is a problem here since it seems that the JVM prevents itself from obtaining it twice. That is what I am arguing about and we can't detect this with a unittest in a single process. ",
+            "date": "2014-06-06T07:59:40+0000"
+        },
+        {
+            "id": "comment-14019663",
+            "author": "Simon Willnauer",
+            "content": "here is a patch that adds a more elegant static map and fixed the stress test to fail without the map. It now passes but we should stress it a bit more and run it for a while. ",
+            "date": "2014-06-06T08:04:36+0000"
+        },
+        {
+            "id": "comment-14019675",
+            "author": "Michael McCandless",
+            "content": "+1, patch looks good\n\nI wouldn't use the world elegant: this is an annoying JDK trap that we have to work around!\n\nYou changed the test to also sometimes try to acquire the lock (in the same process) when it already has the lock, and assert that 2nd acquire failed.  With the bug, this would release the first lock the process had acquired, allowing the 2nd process to illegally obtain the lock, and then the server fails.\n\nCan you rename LOCK_MARKERS to LOCK_HELD (and clearMarkedLock to clearHeldLock) to make it clear that's the purpose of the map?  Also the indent of clearMarkedLock is off. ",
+            "date": "2014-06-06T08:43:07+0000"
+        },
+        {
+            "id": "comment-14019686",
+            "author": "Simon Willnauer",
+            "content": "updated patch including CHANGES.TXT entry. ",
+            "date": "2014-06-06T08:51:07+0000"
+        },
+        {
+            "id": "comment-14019688",
+            "author": "Michael McCandless",
+            "content": "+1, looks great.  Thanks Simon! ",
+            "date": "2014-06-06T08:53:42+0000"
+        },
+        {
+            "id": "comment-14019689",
+            "author": "Uwe Schindler",
+            "content": "Hi Simon,\n\nlooks good. Sorry for confusing responses. The issue is, as you say, the combination of 2 issues, of which one is a real bug in the JDK:\n\n\tThe lock is released if you call close on any FileChannel\n\tThe JDK bug where we cannot requaire the lock in the same JVM, because the JVM \"thinks\" its still held, but it isnt, so another process can get it.\n\n\n\nAbout the patch:\nI like it, much simplier than before Robert's cleanup. One small thing: In Java 7 we should use IOUtils only if required, for the use case here (the finally block) we can use a cool \"trick\". The pros for doing it like that is, that no Exceptions may be supressed, the are recorded:\n\nReplace:\n\n} finally {\n  if (obtained == false) { // not successful - clear up and move out\n    clearMarkedLock(path);\n    final FileChannel toClose = channel;\n    channel = null;\n    IOUtils.closeWhileHandlingException(toClose);\n  }\n}\n\n\n\nby\n\n\n} finally {\n  if (obtained == false) { // not successful - clear up and move out\n    try (FileChannel toClose = channel) {\n      clearMarkedLock(path);\n      channel = null;\n    }\n  }\n}\n\n\n\nI will look into the LockStressTest, but for now it looks fine.\n\nYou can run the stress tester for very long time using some system properties (like running it the whole night). ",
+            "date": "2014-06-06T08:54:42+0000"
+        },
+        {
+            "id": "comment-14019690",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1600827 from Simon Willnauer in branch 'dev/trunk'\n[ https://svn.apache.org/r1600827 ]\n\nLUCENE-5738: Ensure NativeFSLock prevents opening the file channel twice if lock is held ",
+            "date": "2014-06-06T08:55:35+0000"
+        },
+        {
+            "id": "comment-14019701",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1600831 from Simon Willnauer in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1600831 ]\n\nLUCENE-5738: Ensure NativeFSLock prevents opening the file channel twice if lock is held ",
+            "date": "2014-06-06T09:09:07+0000"
+        },
+        {
+            "id": "comment-14019702",
+            "author": "Simon Willnauer",
+            "content": "committed to 4x and trunk ",
+            "date": "2014-06-06T09:11:37+0000"
+        },
+        {
+            "id": "comment-14019704",
+            "author": "Uwe Schindler",
+            "content": "Commit was a little bit too fast for me... But no problem at all, was just a comment to not use IOUtils if not really needed. The code pattern I posted before is from official Oracle JDK code (used like that now at many places). It is somehow a \"misuse\" of try-with-resources, but very elegant. ",
+            "date": "2014-06-06T09:13:21+0000"
+        },
+        {
+            "id": "comment-14019706",
+            "author": "Simon Willnauer",
+            "content": "I saw your comment. I didn't want to change the RT behaviour with respect to closing the channel in this issue. I think it's fine to convert places in a different issue. ",
+            "date": "2014-06-06T09:22:19+0000"
+        },
+        {
+            "id": "comment-14019707",
+            "author": "Uwe Schindler",
+            "content": "Wanted to note: Had the LockVerify test running with ant test-lock-factory -Dlockverify.count=500000 running for an hour on Windows, works. ",
+            "date": "2014-06-06T09:25:57+0000"
+        }
+    ]
+}

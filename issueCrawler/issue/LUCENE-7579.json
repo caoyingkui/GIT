@@ -1,0 +1,226 @@
+{
+    "id": "LUCENE-7579",
+    "title": "Sorting on flushed segment",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Bug",
+        "components": [],
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ]
+    },
+    "description": "Today flushed segments built by an index writer with an index sort specified are not sorted. The merge is responsible of sorting these segments potentially with others that are already sorted (resulted from another merge). \nI'd like to investigate the cost of sorting the segment directly during the flush. This could make the merge faster since they are some cheap optimizations that can be done only if all segments to be merged are sorted.\n For instance the merge of the points could use the bulk merge instead of rebuilding the points from scratch.\nI made a small prototype which sort the segment on flush here:\nhttps://github.com/apache/lucene-solr/compare/master...jimczi:flush_sort\n\nThe idea is simple, for points, norms, docvalues and terms I use the SortingLeafReader implementation to translate the values that we have in RAM in a sorted enumeration for the writers.\nFor stored fields I use a two pass scheme where the documents are first written to disk unsorted and then copied to another file with the correct sorting. I use the same stored field format for the two steps and just remove the file produced by the first pass at the end of the process.\nThis prototype has no implementation for index sorting that use term vectors yet. I'll add this later if the tests are good enough.\nSpeaking of testing, I tried this branch on Michael McCandless benchmark scripts and compared master with index sorting against my branch with index sorting on flush. I tried with sparsetaxis and wikipedia and the first results are weird. When I use the SerialScheduler and only one thread to write the docs,  index sorting on flush is slower. But when I use two threads the sorting on flush is much faster even with the SerialScheduler. I'll continue to run the tests in order to be able to share something more meaningful.\n\nThe tests are passing except one about concurrent DV updates. I don't know this part at all so I did not fix the test yet. I don't even know if we can make it work with index sorting .\n\n Michael McCandless I would love to have your feedback about the prototype. Could you please take a look ? I am sure there are plenty of bugs, ... but I think it's a good start to evaluate the feasibility of this feature.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15712572",
+            "date": "2016-12-01T17:42:17+0000",
+            "content": "I ran the test from a clean state and I can see a nice improvement with the sparsetaxis use case. \n\nI use https://github.com/mikemccand/luceneutil/blob/master/src/python/sparsetaxis/runBenchmark.py and compare two checkouts of Lucene, one with my branch and the other with master.\nFor the master branch I have:\n\n838.0 sec:  20.0 M docs;  23.9 K docs/sec\n\n\n\n... vs the branch with the flush sort:\n\n 612.2 sec:  20.0 M docs;  32.7 K docs/sec\n\n\n\nI reproduce the same diff on each run \n\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15713678",
+            "date": "2016-12-02T01:40:14+0000",
+            "content": "Thanks Jim Ferenczi, I also see comparable speedups on the taxis benchmark.  I'll have a look at the change!  It looks like a doozie  ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15722610",
+            "date": "2016-12-05T15:58:01+0000",
+            "content": "This is a nice approach!  Basically, the codec remains unaware index\nsorting is happening, which is a the right way to do it.  Instead, the\nindexing chain takes care of it.  And to build the doc comparators you take\nadvantage of the in-heap buffered doc values.\n\nI like that to sort stored fields, you are still just using the codec\nAPIs, writing to temp files, then using the codec to read the stored\nfields back for sorting.\n\nI also like how you were able to re-use the SortingXXX from\nSortingLeafReader.  Later on we can maybe optimize some of these;\ne.g. SortingFields and CachedXXXDVs should be able to take\nadvantage of the fact that the things they are sorting are all already\nin heap (the indexing buffer), the way you did with\nMutableSortingPointValues (cool).\n\nCan we rename freezed to frozen in BinaryDocValuesWriter?\nBut: why would freezed ever be true when we call flush?\nShouldn't it only be called once, even in the sorting case?\n\nI think the 6.x back port here is going to be especially tricky \n\nCan we block creating a SortingLeafReader now (make its\nconstructor private)?  We only now ever use its inner classes I think?\nAnd it is a dangerous class in the first place...  if we can do that,\nmaybe we rename it SortingCodecUtils or something, just for its\ninner classes.\n\nDo any of the exceptions tests for IndexWriter get angry?  Seems like\nif we hit an IOException e.g. during the renaming that\nSortingStoredFieldsConsumer.flush does we may leave undeleted\nfiles?  Hmm or perhaps IW takes care of that by wrapping the directory\nitself...\n\nCan't you just pass sortMap::newToOld directly (method reference)\ninstead of making the lambda here?:\n\n\n      writer.sort(state.segmentInfo.maxDoc(), mergeReader, state.fieldInfos,\n          (docID) -> (sortMap.newToOld(docID)));\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15723545",
+            "date": "2016-12-05T22:20:43+0000",
+            "content": "Thanks Mike, \n\n\nCan we rename freezed to frozen in BinaryDocValuesWriter?\nBut: why would freezed ever be true when we call flush?\nShouldn't it only be called once, even in the sorting case?\n\nThis is a leftover that is not needed. The naming was wrong  and it's useless so I removed it.\n\n\nI also like how you were able to re-use the SortingXXX from\nSortingLeafReader. Later on we can maybe optimize some of these;\ne.g. SortingFields and CachedXXXDVs should be able to take\nadvantage of the fact that the things they are sorting are all already\nin heap (the indexing buffer), the way you did with\nMutableSortingPointValues (cool).\n\nTotally agree, we can revisit later and see if we can optimize memory. I think it's already an optim vs master in terms of memory usage since we only \"sort\" the segment to be flushed instead of all \"unsorted\" segments during the merge.\n\n\nCan we block creating a SortingLeafReader now (make its\nconstructor private)? We only now ever use its inner classes I think?\nAnd it is a dangerous class in the first place... if we can do that,\nmaybe we rename it SortingCodecUtils or something, just for its\ninner classes.\n\nWe still need to wrap unsorted segments during the merge for BWC so SortingLeafReader should remain. I have no idea when we can remove it since indices on older versions should still be compatible with this new one ?\n\n\n\nDo any of the exceptions tests for IndexWriter get angry? Seems like\nif we hit an IOException e.g. during the renaming that\nSortingStoredFieldsConsumer.flush does we may leave undeleted\nfiles? Hmm or perhaps IW takes care of that by wrapping the directory\nitself...\n\nHonestly I have no idea. I will dig.\n\n\nCan't you just pass sortMap::newToOld directly (method reference)\ninstead of making the lambda here?:\n\nIndeed, thanks.\n\n\nI think the 6.x back port here is going to be especially tricky \n\nI bet but as it is the main part is done by reusing SortingLeafReader inner classes that exist in 6.x. \n\nI've also removed a nocommit in the AssertingLiveDocsFormat that now checks live docs even when they are sorted.\n\n\n\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15744895",
+            "date": "2016-12-13T11:09:13+0000",
+            "content": "I pushed another iteration to https://github.com/apache/lucene-solr/compare/master...jimczi:flush_sort\n\nI cleaned up the nocommit and added the implementation for sorting term vectors.\n\n\nDo any of the exceptions tests for IndexWriter get angry? Seems like\nif we hit an IOException e.g. during the renaming that\nSortingStoredFieldsConsumer.flush does we may leave undeleted\nfiles? Hmm or perhaps IW takes care of that by wrapping the directory\nitself...\n\nI added an abort method on the StoredFieldsWriter which deletes the remaining temporary files and did the same for the SortingTermVectorsConsumer.\n\nMichael McCandless can you take a look ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15745571",
+            "date": "2016-12-13T16:35:09+0000",
+            "content": "Thanks Jim Ferenczi, I'll have a look. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15749502",
+            "date": "2016-12-14T21:15:37+0000",
+            "content": "We still need to wrap unsorted segments during the merge for BWC so SortingLeafReader should remain.\n\nOK I agree, oh well \n\nThe latest squashed commit looks great; it passes tests and precommit for me.  I'll test with sparse taxis benchmark too, but this looks ready!\n\nI noticed you also optimized merging of stored fields in the sorted case, when field infos are congruent (common), by permuting the docIDs to the sort, but simply bulk-copying the already serialized bytes.\n\nI'll wait a day or so before committing to give others a chance to review; it's a large change.\n\nI think we should push first to master, and let that bake some, and in the mean time work out the challenging 6.x back port? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15749534",
+            "date": "2016-12-14T21:25:54+0000",
+            "content": "Wow, this patch brings the \"sparse sorted\" indexing time down from 448.5 seconds on master as a few days ago, to 299.8 seconds, a 33% speedup!  Nice. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15750937",
+            "date": "2016-12-15T09:51:16+0000",
+            "content": "\nWe still need to wrap unsorted segments during the merge for BWC so SortingLeafReader should remain.\n\nWe can still rewrite it to a SortingCodecReader and remove the SlowCodecReaderWrapper but that's another issue \n\n\nI think we should push first to master, and let that bake some, and in the mean time work out the challenging 6.x back port?\n\nAgreed. I'll create a branch for the back port in my repo.\n\n\nI'll wait a day or so before committing to give others a chance to review; it's a large change.\n\nThat's awesome Michael McCandless ! Thanks for the review and testing.\n\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15751527",
+            "date": "2016-12-15T14:36:43+0000",
+            "content": "Some questions/comments:\n\n\tCompressingStoredFieldsWriter.sort should always have a CompressingStoredFieldsReader as an input, since the codec cannot change in the middle of the flush, so I think we should be able to skip the instanceof check?\n\tIt would personally help me to have comments eg. in MergeState.maybeSortReaders that the indexSort==null case may only happen for bwc reasons. Maybe we should also assert that if index sorting is configured, then the non-sorted segments can only have 6.2 or 6.3 as a version.\n\n\n\nThanks for working on this change! ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15753913",
+            "date": "2016-12-16T09:22:28+0000",
+            "content": "\nCompressingStoredFieldsWriter.sort should always have a CompressingStoredFieldsReader as an input, since the codec cannot change in the middle of the flush, so I think we should be able to skip the instanceof check?\n\nThat's true for the only call we make to this new API but since it's public it could be call with a different fields reader in another use case ? I am not happy that I had to add this new public API in the StoredFieldsReader but it's the only way to make this optimized for the compressing case. \n\n\nIt would personally help me to have comments eg. in MergeState.maybeSortReaders that the indexSort==null case may only happen for bwc reasons. Maybe we should also assert that if index sorting is configured, then the non-sorted segments can only have 6.2 or 6.3 as a version\n\nAgreed, I'll add an assert for the non-sorted case. I'll also add a comment to make it clear that index==null is handled for BWC reason in maybeSortReader.\n\nThanks for having a look Adrien Grand\n\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15753957",
+            "date": "2016-12-16T09:45:31+0000",
+            "content": "I am not happy that I had to add this new public API in the StoredFieldsReader but it's the only way to make this optimized for the compressing case. \n\nI was thinking about it too and I suspect the optimization does not bring much in the case that blocks contain multiple documents (ie. small docs) since I would expect the fact that sorting the stored fields format keeps decompressing blocks of 16KB for every single document to be the bottleneck? Maybe we should not try to reuse the codec's stored fields format for the temporary stored fields and rather do the buffering in memory or on disk with a custom format that has faster random-access? I would expect it to be faster in many cases, and would allow to get rid of this new API? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15753993",
+            "date": "2016-12-16T10:01:39+0000",
+            "content": "This new API is maybe a premature optim that should not be part of this change. What about removing the API and rollback to a non optimized copy that \"visits\" each doc and copy it like the StoredFieldsReader is doing? This way the function would be private on the StoredFieldsConsumer. We can still add the optimization you're describing later but it can be confusing if the writes of the index writer are not compressed the same way than the other writes for stored fields ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15754026",
+            "date": "2016-12-16T10:17:01+0000",
+            "content": "+1 ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15760882",
+            "date": "2016-12-19T11:08:21+0000",
+            "content": "I pushed another commit that removes the specialized API for sorting a StoredFieldsWriter. This is now done directly in the StoredFieldsConsumer with a custom CopyVisitor (copied from MergeVisitor).\nI've also added some asserts that check if unsorted segments were built from version prior to Lucene 7.0. We'll need to change the assert when this gets backported to 6.x. I could not add the assert on maybeSortReaders because IndexWriter.addIndexes uses the merge to add indices that could be unsorted. I don't know if this should be allowed or not but we can revisit this later. Other than that I think it's ready !\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15763808",
+            "date": "2016-12-20T09:58:06+0000",
+            "content": "Thanks, the diff looks good to me!\n\nIndexWriter.addIndexes uses the merge to add indices that could be unsorted\n\nI think we should look into forbidding that (in a different issue). ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15763859",
+            "date": "2016-12-20T10:21:05+0000",
+            "content": "Patch looks great to me!\n\nI think (later, separate issue) we could use a more naive stored fields (and term vectors) format for the temp files written at flush ... a format that does no compression, just writes bytes to disk, maybe has simple in-memory array pointing to offset in the file for each document ... this format would be package private to oal.index.  Later!  This patch is great, progress not perfection.\n\nI think we should look into forbidding that (in a different issue).\n\n+1\n\nI'll merge this soon to master so we can get it baking ... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15763899",
+            "date": "2016-12-20T10:43:17+0000",
+            "content": "I think (later, separate issue) we could use a more naive stored fields (and term vectors) format for the temp files written at flush ... a format that does no compression, just writes bytes to disk, maybe has simple in-memory array pointing to offset in the file for each document ...\n\n+1 ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15764001",
+            "date": "2016-12-20T11:40:00+0000",
+            "content": "Thanks Adrien Grand and Michael McCandless ! ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15764010",
+            "date": "2016-12-20T11:45:24+0000",
+            "content": "Commit 4ccb9fbd2bbc3afd075aa4bc2b6118f845ea4726 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4ccb9fb ]\n\nLUCENE-7579: sort segments at flush too ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15764013",
+            "date": "2016-12-20T11:46:17+0000",
+            "content": "Thank you Jim Ferenczi!  I just pushed your last (squashed) commits to master ... let's let it bake for a while.  Maybe you can work on the 6.x back port in the meantime  ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15764205",
+            "date": "2016-12-20T13:24:09+0000",
+            "content": "\nMaybe you can work on the 6.x back port in the meantime \n\nI am on it ! ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15764963",
+            "date": "2016-12-20T19:02:01+0000",
+            "content": "Wow this change gave a big jump in indexing throughput when index sorting is used: https://home.apache.org/~mikemccand/lucenebench/sparseResults.html#index_throughput\n\nYou can see the flush time went up but the merge time went way down. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15780577",
+            "date": "2016-12-27T15:11:38+0000",
+            "content": "I have a candidate branch for the backport in 6.x:\nhttps://github.com/apache/lucene-solr/compare/branch_6x...jimczi:flush_sort_6x?expand=1\n\nI had to adapt the code to use the random access DocValues so it's more a rewrite than a back port.\n\nAdrien Grand Michael McCandless could you please take a look ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15780873",
+            "date": "2016-12-27T17:42:46+0000",
+            "content": "Thanks Jim, I just had a look. It looks good overall, this backport makes me realize how much better master is by taking doc values APIs in its consumers rather than iterables of numbers or BytesRefs!\n\n\tIn NumericDocValuesWriter and SortedNumericDocValuesWriter, I think it'd be cleaner to set finalValues in finish than in flush\n\tDo we really need the count method on LongSelector? On a related note, it seems to me that we could save some copy-pasting by extracting the logic to get a long value from a given doc id? Right now for all sort fields we duplicate the logic that first checks docsWithField to return the missing value twice.\n\tOrdSelector looks unused\n\n\n\nI know we let it through on master, but now that I look at them again, I don't like the catch Trowable blocks we have around abort(), can get rid of them? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15781152",
+            "date": "2016-12-27T19:56:56+0000",
+            "content": "Thanks @jpountz !\nI pushed another iteration that hopefully addresses your comments. \nfinalValues are now set in finish rather than in flush or getDocComparator.\nThe LongSelector has been replaced by a LongToIntFunction and the duplicated code is removed.\nI've also removed the catch Throwable when we abort the stored fields consumer. ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15825856",
+            "date": "2017-01-17T11:06:14+0000",
+            "content": "Michael McCandless I think the branch for the backport in the 6x branch is ready:\nhttps://github.com/apache/lucene-solr/compare/branch_6x...jimczi:flush_sort_6x?expand=1\nCan you take a look ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15825907",
+            "date": "2017-01-17T11:33:34+0000",
+            "content": "Oh yes I will have a look!  Sorry for the delay!  And since 6.4 is now branched we should push this to 6.x for future 6.5. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15825920",
+            "date": "2017-01-17T11:47:03+0000",
+            "content": "Thanks Mike ! Yes branch_6.x: 6.5 is the target. ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15825926",
+            "date": "2017-01-17T11:50:32+0000",
+            "content": "this backport makes me realize how much better master is by taking doc values APIs in its consumers rather than iterables of numbers or BytesRefs!\n\n++\n\nI know we let it through on master, but now that I look at them again, I don't like the catch Trowable blocks we have around abort(), can get rid of them?\n\nLet's be sure to fix this (and other feedback here) in master too?\n\nCan you upgrade this assert in IndexWriter.java to instead throw a CorruptIndexException?\n\n\n+        } else if (segmentIndexSort == null) {\n+          // Flushed segments are not sorted if they were built with a version prior to 6.4.0\n+          assert info.info.getVersion().onOrAfter(Version.LUCENE_6_4_0) == false;\n\n\n\nMaybe that's overly paranoid, but I want to make sure we can safely assume this going forward: no segment should even be unsorted if you are using an index sort.\n\nIn SortingLeafReader.java a small typo (fo BWC -> for BWC):\n\n\n* {@link Sort}. This is package private and is only used by Lucene fo BWC when it needs to merge\n\n\n\nOtherwise this looks great!  It's a big change ... let's push it for jenkins to chew on!  Thank you Jim Ferenczi. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15825928",
+            "date": "2017-01-17T11:50:54+0000",
+            "content": "I've modified the version check for sorted segments \n\nonOrAfter(Version.LUCENE_6_5_0)\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15826001",
+            "date": "2017-01-17T13:00:31+0000",
+            "content": "Commit 7d96f9f7981dbadda837b5b2cacc3855d19f71aa in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7d96f9f ]\n\nLUCENE-7579: sort segments at flush too\n\nSegments are now also sorted during flush, and merging\non a sorted index is substantially faster by using some of the same\nbulk merge optimizations that non-sorted merging uses ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15826002",
+            "date": "2017-01-17T13:00:32+0000",
+            "content": "Commit 8f5b5a393d94500e6c7a8beff54e010c45c3b0e3 in lucene-solr's branch refs/heads/branch_6x from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8f5b5a3 ]\n\nLUCENE-7579: sort segments at flush too\n\nSegments are now also sorted during flush, and merging\non a sorted index is substantially faster by using some of the same\nbulk merge optimizations that non-sorted merging uses\n\n(cherry picked from commit 4ccb9fb) ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15826148",
+            "date": "2017-01-17T14:41:55+0000",
+            "content": "Commit d73e3fb05c917739bcf0899171a024897d1b0269 in lucene-solr's branch refs/heads/branch_6x from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d73e3fb ]\n\nLUCENE-7579: fix 6.x backport compilation errors ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

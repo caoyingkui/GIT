@@ -1,0 +1,151 @@
+{
+    "id": "LUCENE-6229",
+    "title": "Remove Scorer.getChildren?",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Minor",
+        "status": "Open",
+        "type": "Improvement"
+    },
+    "description": "This API is used in a single place in our code base: ToParentBlockJoinCollector. In addition, the usage is a bit buggy given that using this API from a collector only works if setScorer is called with an actual Scorer (and not eg. FakeScorer or BooleanScorer like you would get in disjunctions) so it needs a custom IndexSearcher that does not use the BulkScorer API.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14312899",
+            "author": "Michael McCandless",
+            "date": "2015-02-09T21:20:32+0000",
+            "content": "LUCENE-2590 was the original motivation for this API, so that per-hit an app could see which sub-clauses matched.\n\nBut it has not really been used much as far as I can tell, and it has just caused hassle over time, so +1 to remove. "
+        },
+        {
+            "id": "comment-14313722",
+            "author": "Stefan Pohl",
+            "date": "2015-02-10T07:10:41+0000",
+            "content": "Hi Adrian, Mike,\nthanks for your recent efforts in cleaning up with many outstanding refactorings.\n\nI'm using this functionality in analytics/debugging contexts where it's not necessary to have best possible performance (e.g. using BooleanScorer).\nLUCENE-2590 doesn't seems to be a feature that you would assume Lucene to use internally, and I doubt many actual users of this functionality track JIRA and would speak up here.\n\nCould this functionality be provided in a different way that doesn't have the problems you want to address here? E.g. could users hint the search to require this functionality (needClauses?), which in turn leads to not using optimized implementations that cannot (easily) provide this information? "
+        },
+        {
+            "id": "comment-14313800",
+            "author": "Adrien Grand",
+            "date": "2015-02-10T08:23:14+0000",
+            "content": "Could this functionality be provided in a different way that doesn't have the problems you want to address here? E.g. could users hint the search to require this functionality (needClauses?), which in turn leads to not using optimized implementations that cannot (easily) provide this information?\n\nI'm not sure I would like an additional parameter. In the join module, we worked around the fact that boolean queries do not always expose getChildren() by creating a dedicated IndexSearcher impl that always uses scorers instead of bulk scorers (ToParentBlockJoinIndexSearcher in lucene/join). Maybe this thing could be moved to a more general-purpose like lucene/misc and we could document that this is the way to go if you want to have access to information about child scorers from a collector, at the cost of some potential slow down? "
+        },
+        {
+            "id": "comment-14314219",
+            "author": "Terry Smith",
+            "date": "2015-02-10T14:20:15+0000",
+            "content": "Like Stefan, I'm also using this functionality to access child scorers on a per document basis. Currently for some custom query enhancements and a custom drill sideways implementation.\n\nLike Adrien, I've also had to wrap queries in a custom NonBulkScoringQuery to force doc-at-a-time scoring.\n\nIt'd be great to simplify this workflow as I've been calling Scorer.freq() to position all the child scorers (from a BooleanQuery) and as of the 5.1 nightly builds am needing to call Scorer.score() instead for positioning due to changes in MinShouldMatchSumScorer.\n\nI'd love to have a way to not only get the child scorers but be confident that they were all correctly positioned. "
+        },
+        {
+            "id": "comment-14314234",
+            "author": "Adrien Grand",
+            "date": "2015-02-10T14:32:41+0000",
+            "content": "It'd be great to simplify this workflow as I've been calling Scorer.freq() to position all the child scorers (from a BooleanQuery) and as of the 5.1 nightly builds am needing to call Scorer.score() instead for positioning due to changes in MinShouldMatchSumScorer.\n\nThis is weird, both freq() and score() should position all sub scorers the same way with MinShouldMatchSumScorer. What do your query and collector look like? "
+        },
+        {
+            "id": "comment-14314299",
+            "author": "Adrien Grand",
+            "date": "2015-02-10T15:17:42+0000",
+            "content": "OK, I think I understand. The new MinShouldMatchSumScorer advances sub scorers lazily until freq() or score() is called. I believe you are wrapping this min-should-match query into another query that does not propagate calls to freq() (like another boolean query?).\n\nNote that you can work-around the issue by calling freq() on sub-scorers as well, but I wouldn't consider it a bug. This is exactly the kind of things that worries me about this API: there are assumptions that are made about this API that nothing else relies upon. And I think the min-should-match query is a good example: we know that there is a match as soon as we found minShouldMatch matching clauses. Forcefully trying to advance ALL clauses to the matching doc would be wasteful, which is why this scorer only does it when it is required, ie. when freq() or score() are called.\n\nI think one acceptable middle ground would be to:\n\n\thide getChildren from the scorer that is passed to LeafCollector to remove the trap of calling getChildren on a scorer that does not support it (LUCENE-6228)\n\tadd a new IndexSearcher specializating that only uses scorers (not bulk scorers). Collectors called through this indexSearcher could cast the scorer that is passed in order to have access to children.\n\n\n\nStefan, Terry: what do you think? "
+        },
+        {
+            "id": "comment-14314361",
+            "author": "Terry Smith",
+            "date": "2015-02-10T15:47:53+0000",
+            "content": "freq() vs score()\n\nI think the lazy positioning in MinShouldMatchSumScorer is misbehaving.\n\nDrop these three methods into TestBooleanMinShouldMatch.java to see.\n\n    public void testMinNrShouldMatchFreq() throws Exception {\n      BooleanQuery q = new BooleanQuery();\n      q.add(new TermQuery(new Term(\"data\", \"1\")), Occur.SHOULD);\n      q.add(new TermQuery(new Term(\"data\", \"2\")), Occur.SHOULD);\n      q.add(new TermQuery(new Term(\"data\", \"3\")), Occur.SHOULD);\n      q.add(new TermQuery(new Term(\"id\", \"0\")), Occur.MUST);\n      q.setMinimumNumberShouldMatch(2);\n      verifyNrHits(q, 1);\n      s.search(q, new SimpleCollector() {\n        private Scorer scorer;\n        private Collection<Scorer> leafScorers;\n        @Override\n        public void setScorer(Scorer scorer) throws IOException {\n          this.scorer = scorer;\n          this.leafScorers = leafScorers(new ArrayList<Scorer>(), scorer);\n          assertEquals(4, leafScorers.size());\n        }\n\n        @Override\n        public void collect(int doc) throws IOException {\n          assertEquals(0, doc);\n          scorer.freq(); // position leaf scorers\n          for (Scorer leafScorer : leafScorers) {\n            assertEquals(0, leafScorer.docID());\n          }\n        }\n      });\n    }\n\n    public void testMinNrShouldMatchScore() throws Exception {\n      BooleanQuery q = new BooleanQuery();\n      q.add(new TermQuery(new Term(\"data\", \"1\")), Occur.SHOULD);\n      q.add(new TermQuery(new Term(\"data\", \"2\")), Occur.SHOULD);\n      q.add(new TermQuery(new Term(\"data\", \"3\")), Occur.SHOULD);\n      q.add(new TermQuery(new Term(\"id\", \"0\")), Occur.MUST);\n      q.setMinimumNumberShouldMatch(2);\n      verifyNrHits(q, 1);\n      s.search(q, new SimpleCollector() {\n        private Scorer scorer;\n        private Collection<Scorer> leafScorers;\n        @Override\n        public void setScorer(Scorer scorer) throws IOException {\n          this.scorer = scorer;\n          this.leafScorers = leafScorers(new ArrayList<Scorer>(), scorer);\n          assertEquals(4, leafScorers.size());\n        }\n\n        @Override\n        public void collect(int doc) throws IOException {\n          assertEquals(0, doc);\n          scorer.score(); // position leaf scorers\n          for (Scorer leafScorer : leafScorers) {\n            assertEquals(0, leafScorer.docID());\n          }\n        }\n      });\n    }\n\n    private static Collection<Scorer> leafScorers(Collection<Scorer> target, Scorer scorer) {\n      Collection<ChildScorer> childScorers = scorer.getChildren();\n      if (childScorers.isEmpty()) {\n        target.add(scorer);\n      } else {\n        for (ChildScorer childScorer : childScorers) {\n          leafScorers(target, childScorer.child);\n        }\n      }\n      return target;\n    }\n\n\n\nHere the one that uses freq() to position the sub scorers fails but the one that uses score() succeeds.\n\nmiddle ground\n\nI have Scorer constructors, Weight.scorer(), Weight.explain() and Collectors all calling Scorer.getChildren(). But when using my custom Collectors I'm careful to wrap the Query in a custom NonBulkScoringQuery that prevents bulk scoring to work around the trap. The NonBulkScoringQuery I mention is a simple delegating Query that allows Weight.bulkScorer() to use it's default implementation instead of allowing the wrapped Query to override it.\n\nI like removing the trap for bulk scoring queries, it's really subtle and it took me a while to diagnose the first time I hit it.\n\nHaving a separate entry point into IndexSearcher to achieve doc-at-a-time scoring that supports getChildren() would be awesome. I'm not so hot on having to cast the collector, do you think there could be a way to preserve type safety here? "
+        },
+        {
+            "id": "comment-14318272",
+            "author": "Terry Smith",
+            "date": "2015-02-12T14:32:49+0000",
+            "content": "Adrien Grand - I'm going to split the freq() vs score() thing into a separate ticket so it doesn't hijack this one. I intend to take the unit test I previously pasted and extend it to create some randomized BooleanQuerys to try and locate possibly broken edge cases and give a safety blanket for future refactoring.\n\nI'll make these assumptions, shout out if they are incorrect.\n\nFor a BooleanQuery I should be able to perform doc-at-a-time scoring, meaning that in a Collector or Scorer I can\n\n1. Find all Scorers from the child clauses of the BooleanQuery\n2. Have those Scorers be positioned for me by calling score() or freq() "
+        },
+        {
+            "id": "comment-14318279",
+            "author": "Uwe Schindler",
+            "date": "2015-02-12T14:35:30+0000",
+            "content": "I had/have 2 customers using that... But I don't think it is really in wide use. "
+        },
+        {
+            "id": "comment-14318287",
+            "author": "Robert Muir",
+            "date": "2015-02-12T14:40:42+0000",
+            "content": "I dont think this is guaranteed. Lets be clear about how this went down.\n\nThe functionality was added on LUCENE-2590, but was hardcoded to only work with booleanscorer.  Just look at the patch, you dont have to believe me. There was also a lot of inconsistencies regarding various scorers. For example issues like LUCENE-2686.\n\nBut we didnt slow down our core functionality, instead we waited until there was a way to clean this stuff up non-intrusively. I added the getChildren API to more scorers and fixed lots of bugs like this in issues like LUCENE-3505.\n\nHowever, this api is always best effort. The one and only purpose of scorers is to score hits. If someone can make disjunctionscorer 5% faster, and completely break this getChildren API, I will be +1. "
+        },
+        {
+            "id": "comment-14318298",
+            "author": "Uwe Schindler",
+            "date": "2015-02-12T14:49:27+0000",
+            "content": "I agree,\nactually only one of my customers really used this. And at the time they did this, the API was already not perfect, and as Robert said - incomplete and not guaranteed to work (Lucene 3 times) - e.g. it only worked if bulk scoring was not enabled (the customer just passed correct booleans to weight, so it thought that it was not top-level query). The API was really cool in Lucene 4+, but I was never using it for real use cases.\n\nThe other (current) customer split ther query up already before the scorer was invoved (they are interested in counts on sub querys) - so removal is not an issue. The code used was actually written by Simon Willnauer, I just inherited it  "
+        },
+        {
+            "id": "comment-14324686",
+            "author": "Terry Smith",
+            "date": "2015-02-17T19:04:33+0000",
+            "content": "Robert Muir Thanks for the backstory. I've been trying to wrap my head around where Lucene is going and this kind of information really helps.\n\nIt sounds like both Robert Muir and Uwe Schindler agree that Scorer.getChildren() is not an API that Lucene should support. Reading between the lines, this implies to me that scoring is moving to a bulk-only approach, which will bring great performance gains.\n\nA best effort implementation of Scorer.getChildren() would be something that I'd be uncomfortable adding features on top of, although it could be useful for debugging. Unfortunately this is a showstopper for me as I rely on Scorer.getChildren() for some critical features, and need to do some serious thinking to figure out if I can formulate an alternative approach. "
+        },
+        {
+            "id": "comment-14324759",
+            "author": "Robert Muir",
+            "date": "2015-02-17T19:44:03+0000",
+            "content": "I think a lot of the problem i have with the current API is that it is so undefined, for example when getChildren() or freq() are allowed to be called.\n\nIn some cases like ReqOptSumScorer, we can work around the issue partially, but it makes code more confusing (it calls score() in its freq(), which might invoke a deferred advance() on the optional part). And it doesn't really fix the issue, if you navigate to the \"leaf\" nodes you will find the optional ones positioned on the wrong docID often. I think the optimization in this case is simple and effective, so it would be a shame to limit our performance because of this API.\n\nOn the other hand, I like the idea of being able to navigate the scorers tree, at least for debugging. If the API was completely \"transparent\" it would still meet that use case. So the main question is, what are the other important use cases? Do they justify limiting our performance or completely specializing potentially many scorers to support, or is there a more restrictive API that would still work. "
+        },
+        {
+            "id": "comment-14329069",
+            "author": "Terry Smith",
+            "date": "2015-02-20T15:42:23+0000",
+            "content": "I\u2019ll summarize this as two options:\n\n\n\tRemove getChildren() as it complicates the code hurting the ability to maintain it and make performance enhancements.\n\tMake getChildren() a more well defined API that gives you the ability to retrieve child scorers that are correctly positioned.\n\n\n\nYou are looking for data to backup option 2 to determine if this is an API that is worth fixing/keeping.\n\nHere are the use cases that I have:\n\n\n\tCustom scoring of a BooleanQuery. A query that wraps any BooleanQuery which it uses for recall but supplies it\u2019s own scoring algorithm to aggregate the scores from the original clauses.\n\tCustom DrillSidewaysQuery. A query that can use the sideways scorers for precision instead of just recall.\n\tRecursive DrillSidewaysQuery (not implemented, tricky). A query that could perform DrillSideways for union or in a nested fashion.\n\tAuxillary metadata. An enhancement that can augment the current recall (boolean match) and precision (float score) for a document in the search pipeline to add extra information that can be used from Query and FunctionValue instances (collected via a custom Collector) and supported by a custom SortField.\n\n\n\nThese can be categorized into two camps:\n\n\n\tUsing an existing Query (typically BooleanQuery) to find matches but providing some combination of\n\t\n\t\tcustom scoring that isn\u2019t compatible with the Similarity API.\n\t\tcustom recall (think DrillSideways)\n\t\n\t\n\tAdding extra information to the search pipeline that can be\n\t\n\t\tgenerated by leaf queries and value sources\n\t\taggregated by composing queries (BooleanQuery, DisjunctionMaxQuery, etc)\n\t\tsurvive wrapping queries and value sources that don\u2019t know about it\n\t\tcollected and sorted on\n\t\n\t\n\n\n\nHope this helps. "
+        },
+        {
+            "id": "comment-14329082",
+            "author": "Robert Muir",
+            "date": "2015-02-20T15:54:45+0000",
+            "content": "I don't understand why we quickly threw out the third option i presented: just let getChildren() be completely transparent about where scorers are positioned, it reflects reality and means it will not infringe on the actual query performance. This still allows it to be used at least for debugging.\n\nIf we insist that it returns correctly positioned scorers, then honestly i don't think it will ever happen. It will stay half-broken and undefined like today instead. The performance cost is far too high, and specializing scors via an option is too expensive in terms of maintenance. We already have a hard enough time with the scorers we have. \n\nFor extremely expert use cases like using getChildren() to \"subclass\" a query, there are other alternatives, considering the code is open source, like just forking that query or whatever. At some point, something is just expert enough where that is the correct solution to the problem. "
+        },
+        {
+            "id": "comment-14329108",
+            "author": "Adrien Grand",
+            "date": "2015-02-20T16:11:36+0000",
+            "content": "just let getChildren() be completely transparent about where scorers are positioned\n\nI agree this is the only reasonable definition of getChildren that we could have if we want to keep it, otherwise it puts too many constraints on the scorers. "
+        },
+        {
+            "id": "comment-14334937",
+            "author": "Terry Smith",
+            "date": "2015-02-24T14:40:15+0000",
+            "content": "Robert Muir Sorry for excluding that scenario, it wasn't intentional.\n\nIf you all decide to keep getChildren(), then I'd love to get the contract described so people know what to expect.\n\nI think these statements are correct:\n\n\n\tScorer.getChildren() returns the immediate child scorers\n\tA returned scorer may be\n\t\n\t\tunpositioned (never had next() or advance() called on it)\n\t\tpositioned on a valid document that is before, on, or after the current document\n\t\texhausted and thus positioned at NO_MORE_DOCS\n\t\n\t\n\tYou MUST NOT call next() or advance() on the returned scorers yourself\n\n\n\nAnd have these questions:\n\n\n\tCan I walk the returned scorers to get to all non-null leaf scorers?\n\tCan I position the returned scorers on the current document by calling freq(), score() or something else?\n\n\n\n "
+        },
+        {
+            "id": "comment-14334956",
+            "author": "Robert Muir",
+            "date": "2015-02-24T14:58:12+0000",
+            "content": "\nCan I position the returned scorers on the current document by calling freq(), score() or something else?\n\nNo: this positioning is the whole problem here! "
+        },
+        {
+            "id": "comment-14335022",
+            "author": "Terry Smith",
+            "date": "2015-02-24T15:47:34+0000",
+            "content": "Understood.\n\nIf you end up keeping getChildren(), how do you feel about making it well defined by capturing these constraints in the Javadoc?\n "
+        },
+        {
+            "id": "comment-15018531",
+            "author": "Karl Wright",
+            "date": "2015-11-20T18:58:32+0000",
+            "content": "We're using getChildren() solely for inspection purposes, so I'd be very sad if this capability went away.  If it does go away, FWIW we use this to figure out which clause(s) of a BooleanQuery a document comes from, so we'd need equivalent functionality at that point.\n\nThanks! "
+        },
+        {
+            "id": "comment-15018538",
+            "author": "Adrien Grand",
+            "date": "2015-11-20T19:02:08+0000",
+            "content": "Couldn't you do it by evaluating each clause on the top hits? "
+        },
+        {
+            "id": "comment-15020732",
+            "author": "Mikhail Khludnev",
+            "date": "2015-11-21T22:25:54+0000",
+            "content": "Adrien Grand our custom logic also extensively uses getChildren() we analyze hits across all hits, not only top ones. \nIt somehow similar to LUCENE-1999 http://lucene.472066.n3.nabble.com/Highlighting-catering-for-all-query-types-td572693.html  \nSurely. We have to deal with suppressing term-at-time scorer, and sub-scorers positioning. It lacks of design beauty but it works while we have getChildren().     "
+        }
+    ]
+}

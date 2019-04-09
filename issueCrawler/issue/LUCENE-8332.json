@@ -1,0 +1,103 @@
+{
+    "id": "LUCENE-8332",
+    "title": "New ConcatenateGraphFilter (move/rename CompletionTokenStream)",
+    "details": {
+        "components": [
+            "modules/analysis"
+        ],
+        "status": "Closed",
+        "resolution": "Fixed",
+        "fix_versions": [
+            "7.4"
+        ],
+        "affect_versions": "None",
+        "labels": "",
+        "priority": "Major",
+        "type": "New Feature"
+    },
+    "description": "Lets move and rename the CompletionTokenStream in the suggest module into the analysis module renamed as ConcatenateGraphFilter. See comments in LUCENE-8323 leading to this idea. Such a TokenStream (or TokenFilter?) has several uses:\n\n\tfor the suggest module\n\tby the SolrTextTagger for NER/ERD use cases \u2013 SOLR-12376\n\tfor doing complete match search efficiently\n\n\n\nIt will need a factory \u2013 a TokenFilterFactory, even though we don't have a TokenFilter based subclass of TokenStream.\n\nIt appears there is no back-compat concern in it suddenly disappearing from the suggest module as it's marked experimental and it only seems to be public now perhaps due to some technicality (it has package level constructors).",
+    "attachments": {
+        "LUCENE-8332.patch": "https://issues.apache.org/jira/secure/attachment/12926127/LUCENE-8332.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16490210",
+            "author": "David Smiley",
+            "content": "It's a TokenStream because it consumes the entire input in the first call to incrementToken (which invokes input.reset(), input.end(), input.close())\nIs that policy documented anywhere? \u00a0FingerprintFilter behaves similarly yet is a TokenFilter. \u00a0So I'm thinking that ConcatenateGraphFilter has a nice ring to it \n\nI'm working on it; I can post a patch or GitHub PR when done; sometime Friday I expect. ",
+            "date": "2018-05-25T04:24:27+0000"
+        },
+        {
+            "id": "comment-16491312",
+            "author": "David Smiley",
+            "content": "See GitHub PR. \u00a0comments welcome!\n\n\n\tMade it a TokenFilter.\n\tMove some package accessible constants from CompletionAnalyzer to public ones on the moved TokenStream class.\n\tRenamed SEP_LABEL => SEP_CHAR and made it of type char, not an int. This seems more natural/clear to me and it removed some now needless casting in tests. I'm tempted to make this char configurable but I suppose it's value doesn't really matter.\n\tChanged position increment handling of this filter to be stacked instead of consecutive. I think this just makes sense for what's going on. This affected some test assertions but otherwise it shouldn't matter for its practical uses. Changing this also revealed a bug...\n\tclearAttributes() was being called before toAutomaton() consumed the input but this left the attribute state dirty; a test failed on me relating to offset ordering for this reason. I moved toAutomaton to occur in reset() and now that's a non-issue. This is also a slight optimization since clearAttributes() need not be called if finiteStrings.next() returns false (thus clearAttributes() was being called one too many times per stream).\n\tadded captureState and restoreState for end(). Though I do wonder if we actually need to anything in end(); based on my reading of TokenStreamToAutomaton end of stream calculations, the automaton contains the final token state already; so perhaps end() ought to do nothing? When I tried that, the state machine of the tests complained I didn't propagate end() \u2013 but this didn't account for the fact that end() was in fact called earlier via reset() since the tokenStream is consumed there. Any way, at least what's in this patch is no worse than what was before, I think.\n\tin reset(), removed needless hasAttribute() guard around getAttribute()\n\tThere are nocommits surrounding about the configuration aspects of the filter being public so that org.apache.lucene.search.suggest.document.ContextSuggestField#wrapTokenStream can access it. IMO this seems quirky... it'd be nice to remove the need to access it. But I suppose just adding some getters to the filter is innocent enough.\n\tThe setPayload feature of this filter is debatable. Arguably this ought to be done by a standalone TokenFilter or be done in some internal way to the NRT suggester. I marked the setter lucene.internal.\n\tadded testWithStopword which found a bug...\n\tBug: TokenStreamToAutomaton does not handle trailing stop words correctly when preservePositionIncrements==false\n\n ",
+            "date": "2018-05-25T21:59:10+0000"
+        },
+        {
+            "id": "comment-16491501",
+            "author": "David Smiley",
+            "content": "I had TestRandomChains go at it and it uncovered a couple things.\n\norg.apache.lucene.analysis.BaseTokenStreamTestCase#checkResetException has two checks:\n\n\tensures incrementToken() fails if reset() wasn't first called. \u00a0This was pretty straight-forward to fix by adding an IllegalStateException throw at the start in ConcatenateGraphFilter.incrementToken.\n\tensures if you forgot to close(), that trying to get the tokenStream again fails. \u00a0This one is tricky. \u00a0ConcatenateGraphFilter.reset() will consume the whole tokenStream including closing it... and it's hard to disagree with that. \u00a0It calls toAutomaton which does this, and there are even some callers of this toAutomaton method in the NRTSuggester which is assuming it's going to be closed. \u00a0I think adding some closed flag isn't enough since when Analyzer.tokenStream() is called we want it to fail but all that does is set the reader (which throws if it wasn't closed). \u00a0I could make\u00a0 toAutomaton not close the input but then the callers need to deal with that; I'm not which path to go or if I'm missing something. \u00a0Or maybe just punt and have TestRandomChains ignore as it's a bit too pedantic here?\n\n ",
+            "date": "2018-05-26T04:11:33+0000"
+        },
+        {
+            "id": "comment-16492904",
+            "author": "David Smiley",
+            "content": "Oh I wanted to mention one thing; perhaps just here though I could put in the docs.\n\nAn alternative approach to this tagger might be to use the SynonymGraphFilter (with other steps/configuration),\n which has a lot of similarities with the Tagger's algorithm. \u00a0I've heard of others that have done this (Dice.com?), and before I created the tagger I thought about this approach too. \u00a0There are some issues/barriers to \"just\" using the synonym filter::\n\n\tif the filter finds multiple overlapping matches, it only returns one without any control over its choice.  (compare to the STT's \"overlaps\" param with several choices and it's pluggable)\n\tthe filter doesn't hold any metadata; it's just a set of names.  Though you could use synonyms to map to an ID that you then lookup in something else (e.g. some DB or Solr index).\n\tthe synonym filter must re-construct its FST on startup each time; customizations are necessary to load an existing one from disk.\n\tyou have to arrange for any text processing/analysis (e.g. tokenization rules or phonetic filters) of the dictionary to create synonym entries.  With the STT this is all configurable in a standard way like any text field.\n\tand of course you'd have to glue it all together somehow.\n\n ",
+            "date": "2018-05-28T19:50:11+0000"
+        },
+        {
+            "id": "comment-16498323",
+            "author": "David Smiley",
+            "content": "Final patch from the GitHub PR. \u00a0Thanks Jim Ferenczi for your reviewing. I did make one change: \u00a0I removed the bug fix to TokenStreamToAutomaton as it deserved its own issue \u2013 LUCENE-8344. \u00a0I commented out the trailing stopword in\u00a0org.apache.lucene.analysis.miscellaneous.TestConcatenateGraphFilter#testWithStopword so this test wouldn't fail, leaving a reference to the other JIRA.\n\nIt's kinda a shame the Git history may be less than ideal on ConcatenateGraphFilter since CompletionTokenStream will stay in a gutted form that delegates to it. \u00a0I could commit the new CTS in a second commit (first commit would be broken), and push the two together at once to ASF git servers. \u00a0Probably not worth the hassle though.\n\n\u00a0 ",
+            "date": "2018-06-01T17:45:12+0000"
+        },
+        {
+            "id": "comment-16498554",
+            "author": "David Smiley",
+            "content": "After running tests, I realized I needed to make some tweaks to end() and close() to delegate properly. \u00a0I love the rigorousness of TestFactories.java and the underlying BaseTokenStreamTestCase\u00a0  ",
+            "date": "2018-06-01T20:50:21+0000"
+        },
+        {
+            "id": "comment-16498605",
+            "author": "David Smiley",
+            "content": "Precommit now passes. \u00a0I needed more javadocs on CompletionTokenStream. ",
+            "date": "2018-06-01T21:36:01+0000"
+        },
+        {
+            "id": "comment-16499167",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  -1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 7 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   1m  5s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n -1 \n  compile  \n   0m 22s \n  suggest in the patch failed.  \n\n\n -1 \n  javac  \n   0m 22s \n  suggest in the patch failed.  \n\n\n +1 \n  Release audit (RAT)  \n   0m 41s \n  Release audit (RAT) rat-sources passed  \n\n\n -1 \n  Release audit (RAT)  \n   0m  5s \n  suggest in the patch failed.  \n\n\n -1 \n  Check forbidden APIs  \n   0m 41s \n  Check forbidden APIs check-forbidden-apis failed  \n\n\n -1 \n  Validate source patterns  \n   0m 41s \n  Check forbidden APIs check-forbidden-apis failed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n   7m 47s \n  common in the patch passed.  \n\n\n -1 \n  unit  \n   0m 12s \n  suggest in the patch failed.  \n\n\n  \n   \n  12m 31s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n LUCENE-8332 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12926180/LUCENE-8332.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene1-us-west 3.13.0-88-generic #135-Ubuntu SMP Wed Jun 8 21:10:42 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / 3dc4fa1 \n\n\n ant \n version: Apache Ant(TM) version 1.9.3 compiled on April 8 2014 \n\n\n Default Java \n 1.8.0_172 \n\n\n compile \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/artifact/out/patch-compile-lucene_suggest.txt \n\n\n javac \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/artifact/out/patch-compile-lucene_suggest.txt \n\n\n Release audit (RAT) \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/artifact/out/patch-compile-lucene_suggest.txt \n\n\n Check forbidden APIs \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/artifact/out/patch-check-forbidden-apis-lucene.txt \n\n\n Validate source patterns \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/artifact/out/patch-check-forbidden-apis-lucene.txt \n\n\n unit \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/artifact/out/patch-unit-lucene_suggest.txt \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/testReport/ \n\n\n modules \n C: lucene/analysis/common lucene/suggest U: lucene \n\n\n Console output \n https://builds.apache.org/job/PreCommit-LUCENE-Build/24/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "date": "2018-06-02T20:03:57+0000"
+        },
+        {
+            "id": "comment-16499180",
+            "author": "David Smiley",
+            "content": "This Yetus/QA report doesn't make sense to me.  The QA build failed, apparently due to some compilation issue:\n\n    [javac] Compiling 35 source files to /x1/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/lucene/build/suggest/classes/test\n    [javac] /x1/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/lucene/suggest/src/test/org/apache/lucene/search/suggest/document/CompletionTokenStreamTest.java:34: error: class TestConcatenateGraphFilter is public, should be declared in a file named TestConcatenateGraphFilter.java\n    [javac] public class TestConcatenateGraphFilter extends BaseTokenStreamTestCase {\n    [javac]        ^\n\nBut the patch renames CompletionTokenStreamTest.java to TestConcatenateGraphFilter.java (and manually inspecting the patch reflects this) so I don't see out this came to be.  I hate to bother you Steve Rowe but if you have any tips on diagnosing puzzling Yetus build failures then I'd appreciate it.\n\nI intend on committing the patch Monday, BTW. ",
+            "date": "2018-06-02T20:40:57+0000"
+        },
+        {
+            "id": "comment-16500280",
+            "author": "Steve Rowe",
+            "content": "I hate to bother you Steve Rowe but if you have any tips on diagnosing puzzling Yetus build failures then I'd appreciate it.\n\nThe patch looks like it was produced by IntelliJ, which appears not to be compatible with some git tooling.  Perhaps just regen using git diff? ",
+            "date": "2018-06-04T14:20:39+0000"
+        },
+        {
+            "id": "comment-16501229",
+            "author": "ASF subversion and git services",
+            "content": "Commit f9f5e837450e082ae7e1a82a0693760af7485a1b in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f9f5e83 ]\n\nLUCENE-8332: New ConcatenateGraphFilter (from CompletionTokenStream).\n\n\tAdded a test for FingerprintFilter and clarified FF's end condition.\n\n ",
+            "date": "2018-06-05T03:07:46+0000"
+        },
+        {
+            "id": "comment-16501239",
+            "author": "ASF subversion and git services",
+            "content": "Commit 9b61121ffb65d59f49429aba99b1c1b641ddb3c6 in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9b61121 ]\n\nLUCENE-8332: New ConcatenateGraphFilter (from CompletionTokenStream).\n\n\tAdded a test for FingerprintFilter and clarified FF's end condition.\n\n\n\n(cherry picked from commit f9f5e83) ",
+            "date": "2018-06-05T03:19:14+0000"
+        },
+        {
+            "id": "comment-16501249",
+            "author": "David Smiley",
+            "content": "That theory makes sense Steve; thanks.  I'll try that next time perhaps.  Unfortunately it's a bit awkward for me to use the native git diff because I use IntelliJ changelists extensively (different WIP/issues) and these different named modifications lists aren't known by git.  I could commit for the sole purpose of using a git command to only then roll back but... yeah. ",
+            "date": "2018-06-05T03:33:13+0000"
+        }
+    ]
+}

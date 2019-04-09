@@ -1,0 +1,137 @@
+{
+    "id": "LUCENE-5460",
+    "title": "Allow driving a query by sparse filters",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/search"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": []
+    },
+    "description": "Today if a filter is very sparse we execute the query in sort of a leap-frog manner between the query and filter. If the query is very expensive to compute, and/or matching few docs only too, calling scorer.advance(doc) just to discover the doc it landed on isn't accepted by the filter, is a waste of time. Since Filter is always the \"final ruler\", I wonder if we had something like boolean DISI.advanceExact(doc) we could use it instead, in some cases.\n\nThere are many combinations in which I think we'd want to use/not-use this API, and they depend on: Filter's complexity, Filter.cost(), Scorer.cost(), query complexity (span-near, many clauses) etc.\n\nI open an issue so we can discuss. DISI.advanceExact(doc) is just a preliminary proposal, to get an API we could experiment with. The default implementation should be fairly easy and straightforward, and we could override where we can offer a more optimized imp.",
+    "attachments": {
+        "TestSlowQuery.java": "https://issues.apache.org/jira/secure/attachment/12631479/TestSlowQuery.java"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13906949",
+            "author": "Robert Muir",
+            "content": "i dont see the need to add any new APIs here, certiainly not confusing ones to DISI.\n\nThe infrastructure for all this already exists (conjunctionscorer, cost(), etc). There is no need to add anything else. if you have such a slow query, ensure its cost calculation is relevant. ",
+            "date": "2014-02-20T13:30:46+0000"
+        },
+        {
+            "id": "comment-13906956",
+            "author": "Shai Erera",
+            "content": "You mean that if the filter is wrapped as ConstantScoreQuery and AND'd w/ the rest of the query, then ConjunctionScorer will probably pick it as the lead (assuming its cost is implemented properly) and therefore will execute a cheaper leapfrog? I can test it.\n\nDo you think there's any reason to e.g. fold such logic into IndexSearcher.search, so it's done automatically by wrapping the Filter and using ConjunctionScorer? ",
+            "date": "2014-02-20T13:41:38+0000"
+        },
+        {
+            "id": "comment-13906961",
+            "author": "Robert Muir",
+            "content": "The issue could be that FilteredQuery does not have this logic? ",
+            "date": "2014-02-20T13:54:27+0000"
+        },
+        {
+            "id": "comment-13907009",
+            "author": "Shai Erera",
+            "content": "There is a TODO in FilteredQuery.RandomAccessFilterStrategy.useRandomAccess() to use filter.cost() instead of the heuristic to return true if the first filtered doc is < 100. Do you mean that? RandomAccess is the default FilterStrategy, but the app can pass LEAP_FROG_FILTER_FIRST_STRATEGY to FilteredQuery. ",
+            "date": "2014-02-20T14:42:51+0000"
+        },
+        {
+            "id": "comment-13907044",
+            "author": "Robert Muir",
+            "content": "Not that TODO: and I would remove that TODO myself.\n\nThat TODO is about whether to pass the filter down as Bits, and its based on sparsity.\n\nThe problem here is the two strategies (LEAP_FROG_FILTER_FIRST_STRATEGY, LEAP_FROG_QUERY_FIRST_STRATEGY). We should provide a way that determines this based on cost(). Perhaps it could simply be AUTO_STRATEGY or something like that (similar to multitermquery), still giving explicit control if users want to bypass the heuristics. ",
+            "date": "2014-02-20T15:05:53+0000"
+        },
+        {
+            "id": "comment-13907046",
+            "author": "Robert Muir",
+            "content": "Hmm i guess RandomAccessFilterStrategy is basically already the \"auto\"? I think this one just needs the integrate cost(). ",
+            "date": "2014-02-20T15:07:33+0000"
+        },
+        {
+            "id": "comment-13907521",
+            "author": "Michael McCandless",
+            "content": "I think the particular case that advanceExact (or something like it) would speed up is a costly query matching many documents, and a Filter also matching many documents, where that Filter cannot be random-access but is \"relatively\" lost cost at iteration (e.g. a TermFilter).\n\nIn this case, today, we do the leap-frog thing, and ask the query's scorer to .advance, which is essentially a .advanceExact and then a .nextDoc, but that .nextDoc is wasted cost because with a separate .advanceExact we could avoid that.\n\nIt's not clear how often this really arises in practice.  Do most apps cache all their filters, like Solr does?  In which case the filter will likely be random access (provide Bits) and would (if estimated density is > 1%) be pushed \"down low\". ",
+            "date": "2014-02-20T21:24:25+0000"
+        },
+        {
+            "id": "comment-13907532",
+            "author": "Robert Muir",
+            "content": "I dont think advanceExact solves anything. I think the root cause is things like queries doing too much work during intersection. There is an ancient issue about this that Paul opened, i'd rather see us solve the real problem than mudd up our APIs with hacks.\n\nadvanceExact just saves a next(), but in the case of e.g. a costly phrasequery it still means you are doing \"stupid unnecessary stuff\" during intersection (like looking at positions). Fixing the real problem would be much faster than advanceExact. ",
+            "date": "2014-02-20T21:32:22+0000"
+        },
+        {
+            "id": "comment-13907562",
+            "author": "Paul Elschot",
+            "content": "LUCENE-1252 I suppose? ",
+            "date": "2014-02-20T21:46:49+0000"
+        },
+        {
+            "id": "comment-13907600",
+            "author": "Robert Muir",
+            "content": "Thats it! i have not thought through an API for this yet, but i think we need some way to do a \"quick check\" (maybe a separate DISI) that e.g. a scorer can return, so conjunctionscorer/filteredquery can use for the \"intersection\" piece... and then somehow \"confirm\" with the more expensive stuff only after all subs have met the \"quick check\". And we want to do it in such a way that its not intrusive or slow anything down... ",
+            "date": "2014-02-20T22:07:19+0000"
+        },
+        {
+            "id": "comment-13908860",
+            "author": "Mikhail Khludnev",
+            "content": "Robert Muir what about extending LEAP_FROG_FILTER_FIRST_STRATEGY with the following semantics:\n\n\tthe heavy query's scorer is expected to have \"quick check\" advance&nextDoc() impls;\n\tthen, filter checks score()!=0 (or any other magic number) and here \"the hard check\" is happen,\n\tif the returned score is 0.0 \"advanceExact\" is considered as failed, and filter makes a spin with advancing the query.\n\n\n\nI think it's considerable retelling of 'advanceExact' with zero API impact, and keeping this hack for advanced usages for a while. ",
+            "date": "2014-02-21T21:52:57+0000"
+        },
+        {
+            "id": "comment-13909364",
+            "author": "Robert Muir",
+            "content": "That would have considerable api impact. Today its assumed that nextDoc/advance are \"correct\" and lots of code assumes this.\n\nI'm unwilling to let our APIs go to trash for the stuff on this issue: I know it will make a lot of people unhappy, but someone has to prevent them from going crazy. Performance is just not the most important thing. ",
+            "date": "2014-02-22T13:16:02+0000"
+        },
+        {
+            "id": "comment-13909410",
+            "author": "David Smiley",
+            "content": "+1 Rob.  I very much agree it would be quite confusing to complicate the definition of these existing methods in this way. ",
+            "date": "2014-02-22T15:29:32+0000"
+        },
+        {
+            "id": "comment-13914139",
+            "author": "Mikhail Khludnev",
+            "content": "Robert Muir,David Smiley,\nI didn't propose score check as a general solution.\nafter thinking for few days I scratch the prototype. see attach ",
+            "date": "2014-02-27T06:51:00+0000"
+        },
+        {
+            "id": "comment-13914201",
+            "author": "Mikhail Khludnev",
+            "content": "see TestSlowQuery.java attached.\n\nSampleSlowQuery verifies documents by checking stored field in SlowQueryScorer.confirm(int)\n\nthe key thing is to prohibit advance, just because it is inefficient per se:\n\nSlowQueryScorer.advance(int) {\nthrow new UnsupportedOperationException(this + \" doesn't support advancing\");\n}\n\n\n\nso far, nothing special. The tricky thing is to handle filtering. I propose to make FilteredQuery.rewrite() aware about such 'slow' queries. see SlowQuery.rewriteFilteredQuery(IndexReader, FilteredQuery)\n\nFilteredQuery(SlowQuery(coreQuery)) => SlowQuery(FilteredQuery(coreQuery))\n\nI suppose we can introduce such sort of 'slow' queries in Lucene, make FilteredQuery.rewrite aware about them, as well as BooleanQuery.rewrite (I can provide the prototype, if you wish to look at). \n\n ",
+            "date": "2014-02-27T08:13:29+0000"
+        },
+        {
+            "id": "comment-13917837",
+            "author": "Mikhail Khludnev",
+            "content": "Shai Erera how does the attached TestSlowQuery.java align with your problem? ",
+            "date": "2014-03-03T08:30:41+0000"
+        },
+        {
+            "id": "comment-13926048",
+            "author": "Mikhail Khludnev",
+            "content": "LUCENE-5495 \nReally, this is all one giant hack/workaround, because Lucene is unable to properly/generally handle the \"post filter\" use case (something Solr has had for some time). I think we should fix that; i.e., we need some way for a Filter to express that 1) it's random-access (supports Bits), and 2) it's very costly. \n\nMichael McCandless let me disturb you with SampleSlowQuery attached, which : \n\n\timplements post-filtering by SlowQueryScorer.confirm(int)\n\tcan be random-access, however, it's not my favor case, I'd like to post-filter observing state of underlying leap-frogging scorers\n\tallows to handle custom ranking case as well.\n\n\n\nI your feedback is much appreciated! Thanks ",
+            "date": "2014-03-10T18:58:35+0000"
+        },
+        {
+            "id": "comment-13951302",
+            "author": "Mikhail Khludnev",
+            "content": "Colleagues,\nWould you mind if I ask you to review the proposal attached? I suppose it can be beneficial as a new Lucene ability. Please look at it! ",
+            "date": "2014-03-28T20:02:30+0000"
+        },
+        {
+            "id": "comment-14323105",
+            "author": "Adrien Grand",
+            "content": "LUCENE-6198 provides a similar solution to what was suggested on this issue (maybe even a bit more generic). ",
+            "date": "2015-02-16T18:19:01+0000"
+        }
+    ]
+}

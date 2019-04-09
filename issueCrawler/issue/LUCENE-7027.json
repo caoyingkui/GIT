@@ -1,0 +1,144 @@
+{
+    "id": "LUCENE-7027",
+    "title": "NumericTermAttribute throws IAE after NumericTokenStream is exhausted",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "5.5,                                            6.0",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.5",
+            "6.0"
+        ],
+        "priority": "Blocker",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "This small test:\n\n\n  public void testCloneFullPrecisionToken() throws Exception {\n    FieldType fieldType = new FieldType(IntField.TYPE_NOT_STORED);\n    fieldType.setNumericPrecisionStep(Integer.MAX_VALUE);\n    Field field = new IntField(\"field\", 17, fieldType);\n    TokenStream tokenStream = new CachingTokenFilter(field.tokenStream(null, null));\n    assertTrue(tokenStream.incrementToken());\n  }\n\n\n\nhits this unexpected exception:\n\n\nThere was 1 failure:\n1) testCloneFullPrecisionToken(org.apache.lucene.analysis.TestNumericTokenStream)\njava.lang.IllegalArgumentException: Illegal shift value, must be 0..31; got shift=2147483647\n\tat __randomizedtesting.SeedInfo.seed([2E1E93EF810CB5F7:EF1304A849574BC7]:0)\n\tat org.apache.lucene.util.NumericUtils.intToPrefixCodedBytes(NumericUtils.java:175)\n\tat org.apache.lucene.util.NumericUtils.intToPrefixCoded(NumericUtils.java:133)\n\tat org.apache.lucene.analysis.NumericTokenStream$NumericTermAttributeImpl.getBytesRef(NumericTokenStream.java:165)\n\tat org.apache.lucene.analysis.NumericTokenStream$NumericTermAttributeImpl.clone(NumericTokenStream.java:217)\n\tat org.apache.lucene.analysis.NumericTokenStream$NumericTermAttributeImpl.clone(NumericTokenStream.java:148)\n\tat org.apache.lucene.util.AttributeSource$State.clone(AttributeSource.java:55)\n\tat org.apache.lucene.util.AttributeSource.captureState(AttributeSource.java:288)\n\tat org.apache.lucene.analysis.CachingTokenFilter.fillCache(CachingTokenFilter.java:96)\n\tat org.apache.lucene.analysis.CachingTokenFilter.incrementToken(CachingTokenFilter.java:70)\n\tat org.apache.lucene.analysis.TestNumericTokenStream.testCloneFullPrecisionToken(TestNumericTokenStream.java:138)\n\n\n\nbecause CachingTokenFilter expects that it can captureState after calling end but NumericTokenStream gets angry about this.",
+    "attachments": {
+        "LUCENE-7027-master.patch": "https://issues.apache.org/jira/secure/attachment/12787748/LUCENE-7027-master.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15145420",
+            "author": "Michael McCandless",
+            "date": "2016-02-12T22:21:57+0000",
+            "content": "This is the Elasticsearch issue where we are hitting this: https://github.com/elastic/elasticsearch/pull/16643\n\nThanks to Lee Hinman for uncovering this! "
+        },
+        {
+            "id": "comment-15145434",
+            "author": "Uwe Schindler",
+            "date": "2016-02-12T22:27:46+0000",
+            "content": "CachingTokenFilter is a cool test. I can try to fix this. NumericTokenStream was originally thought as an implementation detail only called from DocumentsWriter, never wrapped by any filters \n\nI am sure, I can fix this. "
+        },
+        {
+            "id": "comment-15145448",
+            "author": "Uwe Schindler",
+            "date": "2016-02-12T22:36:37+0000",
+            "content": "The issue here is: After the tokenstream is exhausted (which is the case when you call end()), the attribute cannot be cloned anymore, because the call to getBytesRef() fails with IllegalArgument (which is a bug). We should work around that and just return empty bytesRef or like that. "
+        },
+        {
+            "id": "comment-15145470",
+            "author": "Uwe Schindler",
+            "date": "2016-02-12T22:46:30+0000",
+            "content": "Alternative test that fails:\n\n\n  public void testCaptureStateAfterExhausted() throws Exception {\n    try (LegacyNumericTokenStream stream=new LegacyNumericTokenStream().setIntValue(ivalue)) {\n      stream.reset();\n      while (stream.incrementToken());\n      stream.captureState();\n      stream.end();\n      stream.captureState();\n    }\n  }\n\n\n\n(this one does not use CachingTokenFilter, which is not part of Lucene core). "
+        },
+        {
+            "id": "comment-15145482",
+            "author": "Uwe Schindler",
+            "date": "2016-02-12T22:51:03+0000",
+            "content": "Patch for master. I am not sure if this affects performance because we have the extra check on getBytes(). "
+        },
+        {
+            "id": "comment-15145540",
+            "author": "Uwe Schindler",
+            "date": "2016-02-12T23:24:24+0000",
+            "content": "The cause is known and the issue reported here is just some broken usage of NumericTokenStream in user code that looks totally broken anyways, I tend to not fix it and I'd simply close this bug as won't fix. \n\nNumericTokenStream shouldn't have been public from the beginning... I have no idea why Elasticsearch uses the class at all! NRQ's field is just implemented as a TokenStream to allow DocumentsWriter to consume it, but it should have been hidden from beginning behind NumericField. Solr does not use it anymore - we removed it a while ago.\n\nIn addition, NumericTokenStream was never written to be wrapped by TokenFilters  "
+        },
+        {
+            "id": "comment-15145917",
+            "author": "Michael McCandless",
+            "date": "2016-02-13T10:22:05+0000",
+            "content": "The cause is known and the issue reported here is just some broken usage of NumericTokenStream in user code that looks totally broken anyways,\n\nHmm, I don't think this usage is broken?  The public TokenStream API has a contract and the public NumericTokenStream fails to implement it properly \n\nOr maybe you are saying one can never call captureState after calling end?  But then how does one hang onto the \"final\" offset and posInc?  And if so, I guess we should fix  MockTokenizer to enforce this?  Yet, CachingTokenFilter is doing exactly this, so maybe the bug is there?\n\nOur analysis APIs are way too complex!  They are like a 747 cockpit. We can't even agree on which buttons you are allowed to press, when.\n\nI have no idea why Elasticsearch uses the class at all!\n\nWell, Elasticsearch's simple query parser is just trying to create the right \"equals\" query from the incoming text, for a numeric field.  Here's the query:\n\n\n{\"simple_query_string\":{\"query\":\"123\",\"fields\":[\"foo\",\"bar\"]}}\n\n\n\nIt does this today by using the appropriate tokenizer given the field type, and for numerics that's supposed to be NumericTokenStream.  But then we hit this bug, seen in ES originally at https://github.com/elastic/elasticsearch/issues/16577\n\nYes, ES can work around this bug if we leave Lucene buggy, which is exactly what that PR is doing, by \"special casing\" numerics by explicitly creating a TermQuery using the full precision numeric term, instead of trusting its type-specific tokenizer to work correctly.\n\nBecause of the corner case and possible performance corner cases, I'd tend to close this as won't fix. \n\nHmm I think correctness trumps performance? "
+        },
+        {
+            "id": "comment-15145918",
+            "author": "Uwe Schindler",
+            "date": "2016-02-13T10:29:58+0000",
+            "content": "I have no problem committing the given patch. It allows to get an empty token attribute after the tokenstream is exhausted. It is the only correct way to fix it.\n\nI just mentioned this here to think about it (if we really need this). Bt I agree with you: \n\nHmm I think correctness trumps performance?\n\n\n\nOr maybe you are saying one can never call captureState after calling end? But then how does one hang onto the \"final\" offset and posInc? And if so, I guess we should fix MockTokenizer to enforce this? Yet, CachingTokenFilter is doing exactly this, so maybe the bug is there?\n\nThat must be allowed, otherwise the whole thing like caching won't work. In addition, it is not only captueState that's broken, every thing done with TermAttribute leads to the IllegalArgEx, So it is not the tokenstream thats buggy its just the attribute implementation (and this is what the bug is fixing).\n\nWell, Elasticsearch's simple query parser is just trying to create the right \"equals\" query from the incoming text, for a numeric field.\n\nOK, I was not aware of that. The problem is that the query parser uses the CachingTokenFilter, I assume. right? "
+        },
+        {
+            "id": "comment-15145921",
+            "author": "Uwe Schindler",
+            "date": "2016-02-13T10:48:52+0000",
+            "content": "OK, I will commit this to \"master\". Should I backport to 5.5? I can backport to branch_5x, but thats useless if we don't put it into 5.5. I will just add another test to verify that also restoreState works  "
+        },
+        {
+            "id": "comment-15145933",
+            "author": "Uwe Schindler",
+            "date": "2016-02-13T11:27:22+0000",
+            "content": "New patch with more tests (especially cloning) "
+        },
+        {
+            "id": "comment-15145936",
+            "author": "Uwe Schindler",
+            "date": "2016-02-13T11:40:00+0000",
+            "content": "Improved test to use random value throughout whole suite (unrelated to this issue, but still good thing to do). "
+        },
+        {
+            "id": "comment-15146002",
+            "author": "Michael McCandless",
+            "date": "2016-02-13T14:45:38+0000",
+            "content": "Thanks Uwe Schindler!  Patch looks good to me!\n\nThe problem is that the query parser uses the CachingTokenFilter, I assume. right?\n\nYeah ... it's SimpleQueryParser.java in ES, and it seems to be poached maybe from AnalyzerQueryNodeProcessor.java in Lucene's flexible query parser, where it needs to make two passes over the tokens the tokenizer created from the text, I think?\n\nShould I backport to 5.5? \n\n+1, I'll mark this blocker for 5.5, and cancel the current RC1 and respin.\n\nThanks Uwe Schindler! "
+        },
+        {
+            "id": "comment-15146059",
+            "author": "ASF subversion and git services",
+            "date": "2016-02-13T17:03:12+0000",
+            "content": "Commit 42ae21cb9ae36dde4d5ffda16e06976b369b95e4 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=42ae21c ]\n\nLUCENE-7027: Fixed NumericTermAttribute to not throw IllegalArgumentException after NumericTokenStream was exhausted "
+        },
+        {
+            "id": "comment-15146064",
+            "author": "ASF subversion and git services",
+            "date": "2016-02-13T17:13:50+0000",
+            "content": "Commit 7abc0c6de6ae51f0b3b805c8d9d83185e78bff69 in lucene-solr's branch refs/heads/branch_5x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7abc0c6 ]\n\nLUCENE-7027: Fixed NumericTermAttribute to not throw IllegalArgumentException after NumericTokenStream was exhausted\n\n\n\tConflicts:\n\tlucene/core/src/java/org/apache/lucene/analysis/NumericTokenStream.java\n\tlucene/core/src/test/org/apache/lucene/analysis/TestNumericTokenStream.java\n\n "
+        },
+        {
+            "id": "comment-15146065",
+            "author": "ASF subversion and git services",
+            "date": "2016-02-13T17:15:16+0000",
+            "content": "Commit d83f57901f38334c103678b985cf875a9ef51013 in lucene-solr's branch refs/heads/branch_5_5 from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d83f579 ]\n\nLUCENE-7027: Fixed NumericTermAttribute to not throw IllegalArgumentException after NumericTokenStream was exhausted\n\n\n\tConflicts:\n\tlucene/core/src/java/org/apache/lucene/analysis/NumericTokenStream.java\n\tlucene/core/src/test/org/apache/lucene/analysis/TestNumericTokenStream.java\n\n "
+        },
+        {
+            "id": "comment-15146068",
+            "author": "Uwe Schindler",
+            "date": "2016-02-13T17:16:53+0000",
+            "content": "Thanks Mike & Lee! "
+        },
+        {
+            "id": "comment-15146081",
+            "author": "ASF subversion and git services",
+            "date": "2016-02-13T17:39:04+0000",
+            "content": "Commit 40f15765ba7605d1b5f3897fc3f97f2848635d77 in lucene-solr's branch refs/heads/branch_5_5 from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=40f1576 ]\n\nLUCENE-7027: Fix accidental deprecation of test "
+        },
+        {
+            "id": "comment-15146083",
+            "author": "ASF subversion and git services",
+            "date": "2016-02-13T17:39:32+0000",
+            "content": "Commit aaa05e20e789afca2ebc8443b248d512318cd201 in lucene-solr's branch refs/heads/branch_5x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=aaa05e2 ]\n\nLUCENE-7027: Fix accidental deprecation of test "
+        },
+        {
+            "id": "comment-15146190",
+            "author": "Michael McCandless",
+            "date": "2016-02-13T21:10:02+0000",
+            "content": "Thanks Uwe Schindler! "
+        },
+        {
+            "id": "comment-15146214",
+            "author": "Lee Hinman",
+            "date": "2016-02-13T21:49:56+0000",
+            "content": "Thanks Uwe Schindler! "
+        }
+    ]
+}

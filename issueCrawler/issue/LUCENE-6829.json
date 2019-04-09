@@ -1,0 +1,113 @@
+{
+    "id": "LUCENE-6829",
+    "title": "OfflineSorter should use Directory API",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Resolved",
+        "type": "Improvement"
+    },
+    "description": "I think this is a blocker for LUCENE-6825, because the block KD-tree makes heavy use of OfflineSorter and we don't want to fill up tmp space ...\n\nThis should be a straightforward cutover, but there are some challenges, e.g. the test was failing because virus checker blocked deleting of files.",
+    "attachments": {
+        "LUCENE-6829.patch": "https://issues.apache.org/jira/secure/attachment/12765227/LUCENE-6829.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14945570",
+            "author": "Michael McCandless",
+            "date": "2015-10-06T18:58:31+0000",
+            "content": "Initial very, very rough patch ... only lucene core compiles/tests, I still need to cutover all places that use OfflineSorter.\n\nTestOfflineSorter seems to pass, but I sidestepped the virus checker issue.\n\nIt becomes the callers job to pass in a \"temp file prefix\" from which the OfflineSorter will generate its own temp file names. "
+        },
+        {
+            "id": "comment-14949080",
+            "author": "Michael McCandless",
+            "date": "2015-10-08T18:15:07+0000",
+            "content": "New patch.  Tests pass, but I don't like the hacks I had to resort to,\nto have things carefully compute \"safe\" (write once) temp file names.\nThere are bugs in those parts (I put nocommits).\n\nI think to fix this more safely we need to add a new required\n(abstract) method to Directory:\n\n\npublic abstract IndexOutput createTempOutput(String prefix, String suffix);\n\n\n\nThis way it's not the caller's (difficult) job of properly recursively\ncarving up the namespace.\n\nSecond, this is an API break for things that secretly used\nOfflineSorter (suggesters, Hunspell Dictionary, etc.), but I think\nthis is good because it makes it clear to the caller that disk space\nis going to be used by this method and lets the call control where, vs\nrunning the risk of e.g. filling up your tmp partition.\n\nSome things still wanted access to \"the default temp dir\", so I moved\nit from OfflineSorter to IOUtils, and kept the test infra initializing\nthat to the mock fs wrapped version.  Hmm I think maybe it's just\nHunspell, maybe I can remove that from IOUtils and just put it\n(privately) in Hunspell.  I think ideally nothing in Lucene should be\nsecretly using /tmp anymore.\n\nI also think somehow we should extend the \"retry the file delete\" that\nIW/IFD provides \"down\" to things like OfflineSorter so that virus\ncheckers won't cause exceptions (this was Rob's idea!) but I think we\nshould postpone until later, so I just sidestep the issue by having\ntests disable the virus checker.  This change is already big enough. "
+        },
+        {
+            "id": "comment-14949598",
+            "author": "Robert Muir",
+            "date": "2015-10-08T23:23:38+0000",
+            "content": "\nSecond, this is an API break for things that secretly used\nOfflineSorter (suggesters, Hunspell Dictionary, etc.), but I think\nthis is good because it makes it clear to the caller that disk space\nis going to be used by this method and lets the call control where, vs\nrunning the risk of e.g. filling up your tmp partition.\n\nSome things still wanted access to \"the default temp dir\", so I moved\nit from OfflineSorter to IOUtils, and kept the test infra initializing\nthat to the mock fs wrapped version. Hmm I think maybe it's just\nHunspell, maybe I can remove that from IOUtils and just put it\n(privately) in Hunspell. I think ideally nothing in Lucene should be\nsecretly using /tmp anymore.\n\nYeah, +1 for fixing that, I think the break is ok. It was a trap before.\n\n\nI also think somehow we should extend the \"retry the file delete\" that\nIW/IFD provides \"down\" to things like OfflineSorter\n\nIts more than that right? (with the current patch) Its also inflateGens too? \n\nLooks like something went horribly wrong with the formatting of TestRandomChains?\n\n\nI think to fix this more safely we need to add a new required\n(abstract) method to Directory:\n\nSo would FSDirectory implement this with the obvious Files.createTempFile() ? That would be my vote. I guess some could argue its no longer technically write-once, since methods like that rely on the atomicity of creating a (zero-byte) file, but we are just going to append to that file after, once. And its a separate method, solely as a temporary file facility, so I think this is how it should be implemented? Deserves some thought I guess either way. "
+        },
+        {
+            "id": "comment-14949608",
+            "author": "Robert Muir",
+            "date": "2015-10-08T23:31:24+0000",
+            "content": "and we always have the option of our own simple \"temp file logic\" that just uses StandardOpenOption.CREATE_NEW to ensure its really unique. I think i like this better...I don't think we have to worry about crazy security concerns like someone guessing what the filename will be. And really we should be opening all files with that flag anyway, its just that we don't yet today because files aren't always write-once in exceptional cases. "
+        },
+        {
+            "id": "comment-14949983",
+            "author": "Dawid Weiss",
+            "date": "2015-10-09T06:49:30+0000",
+            "content": "StandardOpenOption.CREATE_NEW\n\nOh, I like this! "
+        },
+        {
+            "id": "comment-14952902",
+            "author": "Michael McCandless",
+            "date": "2015-10-12T10:25:15+0000",
+            "content": "New patch, I think it's closer:\n\n\n\tThe default temp dir logic is now private to Hunspell\n\n\n\n\n\tI added Directory.createTempOutput, and also added IndexOutput.getName (so\n    you can ask what temp name was picked).  I use a seed'd random\n    instance to generate the name candidates, retrying until I get one\n    that didn't already exist.\n\n\n\n\n\tSimplified the OfflineSorter API: the sort method now owns\n    creating a temp file (sorted), and then returns its name\n\n\n\n\n\tFixed the formatting disaster from TestRandomChains (I blame emacs)\n\n\n\n\n\tI cutover to TrackingDirectory in OfflineSorter to manage\n    \"deleting temp files on exception\", and simply the\n    try/finally/success horror show\n\n\n\n\n\tI changed TrackingDiretoryWrapper.getCreatedFiles to make a clone\n    first (it had a TODO about it, and I also hit a cryptic\n    ConcurrentModificationExc because it didn't clone), and I added an\n    explicit clearCreatedFiles, used by IW\n\n "
+        },
+        {
+            "id": "comment-14953795",
+            "author": "Michael McCandless",
+            "date": "2015-10-12T21:42:04+0000",
+            "content": "New patch, I think it's close.\n\nI made a few simplifications, removed the StandardOpenOption.TRUNCATE_EXISTING (that seems silly to use also with CREATE_NEW), and got precommit passing.  Tests seem to pass (at least once).\n\nI'm hoping to commit this soon: LUCENE-6825 is blocked on it ... "
+        },
+        {
+            "id": "comment-14954520",
+            "author": "Dawid Weiss",
+            "date": "2015-10-13T07:02:48+0000",
+            "content": "This is a large patch and I only scanned it briefly. It looks good to me. I don't know how to avoid the virus checker special case (requiring odd hacks in the code to disable it).\n\nAlso, blocks like this one:\n\n+      Path tempPath = Files.createTempDirectory(Dictionary.getDefaultTempDir(), \"Hunspell\");\n+      boolean success = false;\n+      try (Directory tempDir = FSDirectory.open(tempPath)) {\n+        this.dictionary = new Dictionary(tempDir, \"hunspell\", affix, dictionaries, ignoreCase);\n+        success = true;\n+      } finally {\n+        // tempPath (directory) should be empty at this point:\n+        if (success) {\n+          Files.delete(tempPath);\n+        } else {\n+          IOUtils.deleteFilesIgnoringExceptions(tempPath);\n+        }\n+      }\n\n\n\nIs there any reason why we shouldn't just let the regular exception suppression be used here? I know it'd reverse the precedence, but at least you'd get the full picture (temp. file couldn't be deleted too). Isn't this a leftover pattern from before 1.7 days?\n\nSo, to be clear, why isn't the above just:\n\n+      Path tempPath = Files.createTempDirectory(Dictionary.getDefaultTempDir(), \"Hunspell\");\n+      try (Directory tempDir = FSDirectory.open(tempPath)) {\n+        this.dictionary = new Dictionary(tempDir, \"hunspell\", affix, dictionaries, ignoreCase);\n+      } finally {\n+         Files.delete(tempPath); // will fail if tempPath has any files in it, suppressing any exception.\n+      }\n\n "
+        },
+        {
+            "id": "comment-14954738",
+            "author": "Michael McCandless",
+            "date": "2015-10-13T10:03:54+0000",
+            "content": "So, to be clear, why isn't the above just:\n\nWoops: on exception I had wanted that code block to recursively remove the temp dir, and any files under it, because the temp dir is likely not empty on exception.\n\nBut the patch does not do that, because IOUtils.deleteFilesIgnoringExceptions will not recursively delete.  I think I need to change it to your new version, but use IOUtils.rm instead? "
+        },
+        {
+            "id": "comment-14954742",
+            "author": "Dawid Weiss",
+            "date": "2015-10-13T10:07:26+0000",
+            "content": "There was something odd about it.  I think IOUtils.rm sounds good \u2013 we always attempt to remove the temp. stuff. If we can't do it for some reason, we should fail explicitly. Otherwise you'd have temp files piling up without any visible reason? "
+        },
+        {
+            "id": "comment-14954759",
+            "author": "Michael McCandless",
+            "date": "2015-10-13T10:18:52+0000",
+            "content": "Otherwise you'd have temp files piling up without any visible reason?\n\nExactly! "
+        },
+        {
+            "id": "comment-14958600",
+            "author": "ASF subversion and git services",
+            "date": "2015-10-15T09:58:20+0000",
+            "content": "Commit 1708760 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1708760 ]\n\nLUCENE-6829: OfflineSorter now uses Directory API; add Directory.createTempOutput and IndexOutput.getName "
+        },
+        {
+            "id": "comment-14962734",
+            "author": "Steve Rowe",
+            "date": "2015-10-19T01:23:00+0000",
+            "content": "My Jenkins found a nightly seed that causes TestStressIndexing..testStressIndexAndSearching() to fail nearly 100% of the time:\n\n\n[junit4] Suite: org.apache.lucene.index.TestStressIndexing\n   [junit4]   1> Thread[Thread-66,5,TGRP-TestStressIndexing]: exc\n   [junit4]   1> java.lang.NullPointerException\n   [junit4]   1> \tat java.util.ComparableTimSort.countRunAndMakeAscending(ComparableTimSort.java:317)\n   [junit4]   1> \tat java.util.ComparableTimSort.sort(ComparableTimSort.java:198)\n   [junit4]   1> \tat java.util.Arrays.sort(Arrays.java:1246)\n   [junit4]   1> \tat org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:653)\n   [junit4]   1> \tat org.apache.lucene.index.StandardDirectoryReader.open(StandardDirectoryReader.java:73)\n   [junit4]   1> \tat org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:63)\n   [junit4]   1> \tat org.apache.lucene.index.TestStressIndexing$SearcherThread.doWork(TestStressIndexing.java:106)\n   [junit4]   1> \tat org.apache.lucene.index.TestStressIndexing$TimedThread.run(TestStressIndexing.java:48)\n   [junit4]   1> Thread[Thread-65,5,TGRP-TestStressIndexing]: exc\n   [junit4]   1> java.lang.NullPointerException\n   [junit4]   1> \tat java.util.ComparableTimSort.binarySort(ComparableTimSort.java:258)\n   [junit4]   1> \tat java.util.ComparableTimSort.sort(ComparableTimSort.java:203)\n   [junit4]   1> \tat java.util.Arrays.sort(Arrays.java:1246)\n   [junit4]   1> \tat org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:653)\n   [junit4]   1> \tat org.apache.lucene.index.StandardDirectoryReader.open(StandardDirectoryReader.java:73)\n   [junit4]   1> \tat org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:63)\n   [junit4]   1> \tat org.apache.lucene.index.TestStressIndexing$SearcherThread.doWork(TestStressIndexing.java:106)\n   [junit4]   1> \tat org.apache.lucene.index.TestStressIndexing$TimedThread.run(TestStressIndexing.java:48)\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestStressIndexing -Dtests.method=testStressIndexAndSearching -Dtests.seed=98FCDFF6002C97E1 -Dtests.nightly=true -Dtests.slow=true -Dtests.locale=tr -Dtests.timezone=Indian/Comoro -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] FAILURE 0.12s J3 | TestStressIndexing.testStressIndexAndSearching <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([98FCDFF6002C97E1:7F95878F4DC6F61D]:0)\n   [junit4]    > \tat org.apache.lucene.index.TestStressIndexing.runStressTest(TestStressIndexing.java:155)\n   [junit4]    > \tat org.apache.lucene.index.TestStressIndexing.testStressIndexAndSearching(TestStressIndexing.java:172)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene53): {contents=PostingsFormat(name=Memory doPackFST= false), id=TestBloomFilteredLucenePostings(BloomFilteringPostingsFormat(Lucene50(blocksize=128)))}, docValues:{}, sim=ClassicSimilarity, locale=tr, timezone=Indian/Comoro\n   [junit4]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=1,free=573503112,total=1469054976\n   [junit4]   2> NOTE: All tests run in this JVM: [TestNumericRangeQuery32, TestMmapDirectory, TestSpans, TestIndexWriterDelete, TestIndexReaderClose, TestSearchForDuplicates, TestStringHelper, TestPackedInts, TestControlledRealTimeReopenThread, TestDirectory, TestMinimize, TestNamedSPILoader, TestLucene50SegmentInfoFormat, TestStressIndexing]\n\n\n\nI put a debug println in SegmentInfos.FindSegmentsFile.run() and found that RAMDirectory.listAll() can sometimes produce null entries.  Michael McCandless, looks like your commit to RAMDirector.listAll() on this issue is the problem:\n\n\n@@ -111,10 +111,7 @@\n     // and do not synchronize or anything stronger. it's great for testing!\n     // NOTE: fileMap.keySet().toArray(new String[0]) is broken in non Sun JDKs,\n     // and the code below is resilient to map changes during the array population.\n-    Set<String> fileNames = fileMap.keySet();\n-    List<String> names = new ArrayList<>(fileNames.size());\n-    for (String name : fileNames) names.add(name);\n-    return names.toArray(new String[names.size()]);\n+    return fileMap.keySet().toArray(new String[fileMap.size()]);\n   }\n\n\n\nI'm guessing that an inconsistency between fileMap.size() and fileMap.keySet() will cause this issue - if the number of entries goes down inbetween these calls then trailing entries in the resulting array will be null. "
+        },
+        {
+            "id": "comment-14962819",
+            "author": "Steve Rowe",
+            "date": "2015-10-19T04:23:57+0000",
+            "content": "Another test failure my Jenkins found with the same root cause, only reproduces 8/100 iters for me:\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestIndexWriterCommit -Dtests.method=testPrepareCommitRollback -Dtests.seed=98FCDFF6002C97E1 -Dtests.nightly=true -Dtests.slow=true -Dtests.linedocsfile=/home/jenkins/lucene-data/e\nnwiki.random.lines.txt -Dtests.locale=is -Dtests.timezone=Australia/Sydney -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] ERROR   0.32s | TestIndexWriterCommit.testPrepareCommitRollback <<<\n   [junit4]    > Throwable #1: java.lang.NullPointerException\n   [junit4]    >        at __randomizedtesting.SeedInfo.seed([98FCDFF6002C97E1:94F93159522F894E]:0)\n   [junit4]    >        at java.util.ComparableTimSort.binarySort(ComparableTimSort.java:258)\n   [junit4]    >        at java.util.ComparableTimSort.sort(ComparableTimSort.java:203)\n   [junit4]    >        at java.util.Arrays.sort(Arrays.java:1246)\n   [junit4]    >        at org.apache.lucene.index.SegmentInfos$FindSegmentsFile.run(SegmentInfos.java:660)\n   [junit4]    >        at org.apache.lucene.index.StandardDirectoryReader.open(StandardDirectoryReader.java:73)\n   [junit4]    >        at org.apache.lucene.index.DirectoryReader.open(DirectoryReader.java:63)\n   [junit4]    >        at org.apache.lucene.index.TestIndexWriterCommit.testPrepareCommitRollback(TestIndexWriterCommit.java:599)\n   [junit4]    >        at java.lang.Thread.run(Thread.java:745)\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene53): {content=Lucene50(blocksize=128)}, docValues:{}, sim=RandomSimilarityProvider(queryNorm=true,coord=crazy): {content=DFR I(ne)3(800.0)}, locale=is, timezone=Australia/Sydney\n   [junit4]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=1,free=401791056,total=514850816\n   [junit4]   2> NOTE: All tests run in this JVM: [TestIndexWriterCommit]\n\n "
+        },
+        {
+            "id": "comment-14963100",
+            "author": "Michael McCandless",
+            "date": "2015-10-19T10:05:41+0000",
+            "content": "Michael McCandless, looks like your commit to RAMDirector.listAll() on this issue is the problem:\n\nSigh, sorry Steve Rowe and thanks for digging/fixing.  Tricky concurrency... "
+        }
+    ]
+}

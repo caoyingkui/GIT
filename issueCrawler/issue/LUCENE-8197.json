@@ -1,0 +1,174 @@
+{
+    "id": "LUCENE-8197",
+    "title": "Make top-k queries fast when static scoring signals are incorporated into the score",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "7.4",
+            "master (8.0)"
+        ]
+    },
+    "description": "Block-max WAND (LUCENE-8135) and some earlier issues made Lucene faster at computing the top-k matches of boolean queries.\n\nIt is quite frequent that users want to improve ranking and end up scoring with a formula that could look like bm25_score + w * log(alpha + pagerank) (w and alpha being constants, and pagerank being a per-document field value). You could do this with doc values and FunctionScoreQuery but unfortunately this will remove the ability to optimize top-k queries since the scoring formula becomes opaque to Lucene.\n\nI'd like to add a new field that allows to store such scoring signals as term frequencies, and new queries that could produce log(alpha + pagerank) as a score. Then implementing the above formula can be done by boosting this query with a boost equal to w and adding this boosted query as a SHOULD clause of a BooleanQuery. This would give Lucene the ability to compute top-k hits faster, especially but not only if the index is sorted by decreasing pagerank.",
+    "attachments": {
+        "LUCENE-8197.patch": "https://issues.apache.org/jira/secure/attachment/12913633/LUCENE-8197.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16391587",
+            "date": "2018-03-08T17:38:42+0000",
+            "content": "Here is a patch which is mostly based on the experiments from \"Relevance Weighting for Query Independent Evidence\" by N. Craswell, S. Robertson, H. Zaragoza and M. Taylor where they study how best to combine pagerank, url length, click distance and indegree with a BM25 score. The patch implements the 3 functions that are mentioned in the paper: log(a + pagerank), pagerank / (k + pagerank) and pagerank a / (k a + pagerank a).\n\nThe paper mentions use of k / (k + x) and k a / (k a + x a) instead for features that should be inversely correlated with the score (eg. url length and click distance). I didn't implement them directly but it is possible to do it on top of existing API by indexing 1/urllength or 1/clickdistance since k / (k + x) = (1/x) / (1/x + 1/k). We need things that are positively correlated with the score internally anyway since skip lists record the top term frequencies, not the least ones.\n\nThe API takes floats but ignores the 15 trailing bits, which means they have only 9 significant bits (8 explicit + 1 implicit) in practice. This is probably enough and allows to make sure postings only need 16 bits to encode term frequencies. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16391623",
+            "date": "2018-03-08T17:51:38+0000",
+            "content": "Great! nit on the naming: I think we should avoid abbreviations like SigmQuery myself in apis. Better to spell it out.\n\nHow does the user pass in the idf weight w? I agree the user can wrap the query with some boost, but thats not necessarily intuitive, shouldn't the field's static methods take it explicitly as a parameter? I think it would help since e.g. in the log case you'd have both relevant parameters in one place which makes it easier to approach. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16391636",
+            "date": "2018-03-08T18:00:55+0000",
+            "content": "Also i would personally maybe move the guards (IllegalArgumentExceptionChecks) out of the private sim-scorers and into the public methods? I guess it doesnt matter where the checks are, but I do think @throws or similar documentation should be helpful here. When a user is faced with such a parameter they should understand what it means and what the valid range is. It applies to w as well, which is why i would prefer it not be up to the user to do as a boost. This one should really be 0..43 (more or less) right? ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16391740",
+            "date": "2018-03-08T19:04:13+0000",
+            "content": "Good points, I applied your ideas. I made boosts required to be less than or equal to 64. The reasoning is that if the IDF is a log, index statistics are longs and you wouldn't use less than base 2 for the log so that should be a reasonable upper bound for query-dependent scores. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16392146",
+            "date": "2018-03-09T00:12:34+0000",
+            "content": "Looks much better, a few more notes on the javadocs:\n\n\n\tSome of the documented ranges appear as [1, +Infty[. I think the ending bracket is a typo? Also should we say +Inf or +Infinity just to make it clear? I think the former is consistent with java but the latter is definitely explicit. I think the abbreviated form Infty is to be avoided.\n\tFor the arguments w and a, I think we should have @param javadocs for these? They could explain for example that w is the \"feature importance\" like IDF and that a is the scaling factor for frequency values?\n\tMaybe consider the parameter names here. I'm not sure they are as well-known/ubiquitous as bm25 k1/b parameters. For example in the log case they could be weight and scale... I could go either way on this though.\n\n\n\nIn general just thinking little tweaks can go a long way for users here. Love that the api is minimal and everything is in one place. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16392154",
+            "date": "2018-03-09T00:18:00+0000",
+            "content": "Also i'm not sure what the explanation currently looks like (looks like it will just return the total value without \"breaking it down\"), but we may want to open a followup to improve that if its the case.  ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16392579",
+            "date": "2018-03-09T08:34:22+0000",
+            "content": "Nice Adrien.  I looked at the patch a bit late and one thing caught my attention - hashCode uses class's hashCode in the mix. If there are any associative containers those objects are stored in then this will cause non-repeatable ordering in those containers from run to run (Class.hashCode just goes up to Object.hashCode). If making class part of the hash is required then getClass().getName().hashCode() is constant from run to run. Or omit it entirely? ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16393050",
+            "date": "2018-03-09T15:58:24+0000",
+            "content": "If there are any associative containers those objects are stored in then this will cause non-repeatable ordering in those containers from run to run (Class.hashCode just goes up to Object.hashCode).\n\nWow \u2013 yeah nice observation.  Maybe we should make Class.hashCode on the forbidden APIs? ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16393059",
+            "date": "2018-03-09T16:04:13+0000",
+            "content": "We could. Sometimes it is useful, but most of the time I think it's an accidental mistake (well... semi-mistake). ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16393078",
+            "date": "2018-03-09T16:22:27+0000",
+            "content": "Thank Robert and Dawid for having a look, I folded feedback in:\n\n\tFixed brackets. I've used ]a,b[ for my entire scholarship to mean open intervals but that seems to be only a thing in France and I'm not fully converted to parenthesis yet. \n\tI renamed arguments in javadocs, but not in formulas to keep explanations easy to read: a-> scalingFactor for the log function, k -> pivot for the satu and sigm functions and a -> exp for the sigm function. If you can think of better names, I'm open to suggestions.\n\tAdded javadocs for these params\n\tMade the explanation break down.\n\tRemoved Class.hashCode() usage\n\n\n\nI've also been exploring the idea of making it easier to use and added two utility methods:\n\n\tOne takes a cutover document frequency and computes an approximation of the IDF for terms that have such a frequency in field that is searched. This allows to do something like: if the query term is very specific (freq << x) then the query-dependent score should dominate the final score as it matters more, but on the other hand if the query term is very general (freq >> x) then the feature score should dominate.\n\tAnother one computes the geometric mean (which is the only metric we can compute with index stats) of the indexed features for usage as the pivot value in the satu function. I expect it to be good enough to get started.\n\n\n\nBoth these utility methods combined mean that you can start using the satu function in a way that shouldn't be too wrong. I added an example how to do it in the class-level javadocs. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16393358",
+            "date": "2018-03-09T18:44:07+0000",
+            "content": "I'm confused about the first method, why wouldn't it simply take featureName as an argument and use actual term statistics from the index? ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16394631",
+            "date": "2018-03-11T20:23:02+0000",
+            "content": "I don't think index statistics on this feature are especially meaningful? Say all documents have a 'pagerank' value, the idf would be 0 or very close to 0? Am I missing something? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16394664",
+            "date": "2018-03-11T21:33:13+0000",
+            "content": "Well it seems strange what its doing: using avgTF across all features. With the index statistics it could know this for a particular feature (e.g. based on feature's totalTermFreq). ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16394668",
+            "date": "2018-03-11T21:48:29+0000",
+            "content": "FWIW: the computePivotFeatureValue helper makes perfect sense to me. Its just computeSensibleWeight that has me really confused. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16394670",
+            "date": "2018-03-11T21:52:12+0000",
+            "content": "Actually it doesn't compute avgTf on the field that stores features but on the field that is searched with full-text queries. For instance if you have two fields 'body' (TextField) and 'features' (FeatureField), it tries to use a weight for the query on 'features' that is eg. the IDF that a term that exists in 1% (the 'cutoverFreq' parameter) of documents in 'body' would have. My goal was to try to pick up a value that would make sure that the score contribution that comes from features would have an impact on ranking but without dictating ranking all the time either. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16401397",
+            "date": "2018-03-16T02:35:12+0000",
+            "content": "But that sounds like a more general field-weighting issue. I think we should keep the concepts separate. The FeatureField should try to help you fill out its parameters, i mean ideally the api is just as simple as possible, but its a per-field thing. Shouldn't we just let the user continue to still tune field weights for now with boosts? We can always try to separately improve the cross-field situation better, regardless of nontextual stuff.\n\nMy only suggestion for this issue is to try to reduce the amount of per-field parameters as much as we can, so the user can use the thing as easily as possible. Otherwise its hard if we don't give defaults and they have to maximize some multivariable equation across all their fields to even approach the thing. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16401403",
+            "date": "2018-03-16T02:45:17+0000",
+            "content": "and just to be clear, i dont want to hide the formula. user should be in control of parameters weight/scaling factor so the formula is transparent. but they can always add a boost so can the default weight be something uber-simple? As far as scaling factor, well you already have a simple default for the two-parameter case, but for the 1-parameter case is there anything we can do that is simple? its a log either way, so we are a far cry from the previous crazy stuff with lucene's sqrt()  \n\njust brainstorming to make it really easy to get the query integrated into various query parsers and stuff, but still be clear to people who really give a crap. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16401972",
+            "date": "2018-03-16T14:32:38+0000",
+            "content": "Thanks for the feedback. I removed the cross-field logic and made the default weight equal to 1, which should be fine if the term weight looks like a log(1+x).  ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16406129",
+            "date": "2018-03-20T10:57:45+0000",
+            "content": "Commit 70cc7b68783b313a845996dac9e28c3ea6ad61e3 in lucene-solr's branch refs/heads/branch_7x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=70cc7b6 ]\n\nLUCENE-8197: Efficient integration of static scoring factors. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16406130",
+            "date": "2018-03-20T10:57:46+0000",
+            "content": "Commit 710993435f365fce44a60b7c498ce6af8327f92c in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7109934 ]\n\nLUCENE-8197: Efficient integration of static scoring factors. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16406244",
+            "date": "2018-03-20T12:21:49+0000",
+            "content": "Pushed. I opened LUCENE-8218 as a follow-up to discuss default weights. Thanks for helping me iterate on this Robert Muir. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16406300",
+            "date": "2018-03-20T13:14:03+0000",
+            "content": "The CHANGES.txt mention this issue as LUCENE-8097 instead of 8197 ",
+            "author": "Shalin Shekhar Mangar"
+        },
+        {
+            "id": "comment-16406327",
+            "date": "2018-03-20T13:30:56+0000",
+            "content": "Thanks for catching Shalin Shekhar Mangar. I just fixed it. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16406328",
+            "date": "2018-03-20T13:30:59+0000",
+            "content": "Commit c4a8c8dd7b5f29ac28767bb3ff323ec61bfc826c in lucene-solr's branch refs/heads/branch_7x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c4a8c8d ]\n\nLUCENE-8197: Fix CHANGES entry. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16406329",
+            "date": "2018-03-20T13:31:00+0000",
+            "content": "Commit 04120273f843457d6702e7faf5a245f4a45fe479 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0412027 ]\n\nLUCENE-8197: Fix CHANGES entry. ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

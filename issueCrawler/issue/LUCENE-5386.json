@@ -1,0 +1,67 @@
+{
+    "id": "LUCENE-5386",
+    "title": "Make Tokenizers deliver their final offsets",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "fix_versions": []
+    },
+    "description": "Tokenizers must have an implementation of #end() in which they set up the final offset. Currently, nothing enforces this. end() has a useful implementation in TokenStream, so just making it abstract is not attractive.\n\nProposal: add\n\n  abstract int finalOffset(); \n\nto tokenizer, and then make\n\n    void end() \n{\n        super.end();\n        int fo = finalOffset();\n       offsetAttr.setOffsets(fo, fo);\n   }\n\nor something to that effect.\n\nOther alternative to be considered depending on how this looks.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13863377",
+            "author": "Robert Muir",
+            "content": "its more than just offsets that must be handled in end() though, also position increments, and maybe other things depending. ",
+            "date": "2014-01-06T20:35:52+0000"
+        },
+        {
+            "id": "comment-13863521",
+            "author": "Benson Margulies",
+            "content": "How about, then:\n\n Tokenizer:\n\n     abstract void tokenizerEnd();\n\n     final void end() \n{\n       super.end();\n       tokenizerEnd();\n    }\n\n? ",
+            "date": "2014-01-06T22:31:27+0000"
+        },
+        {
+            "id": "comment-13863550",
+            "author": "Robert Muir",
+            "content": "I'm just gonna throw out a crazier idea for kicks:\n\nJust revisiting what this final offset is: its nothing more than the number of characters read (adjusted by any charfilters), so if i have a multivalued field that say, ends with a space, the last space is not lost.\n\nIts really sad a tokenizer should have to implement this final offset stuff at all: its worth thinking if the base Tokenizer class could do this automatically (e.g. wrap the Reader in a FilterReader and just track it + impl it by default).\n\nThe only classes that would really need to implement anything would be ones that do \"crazy\" stuff (e.g. dont consume the entire Reader), and such filters (LimitXXX) already have a consumeAllTokens to ensure they can be well-behaved today.\n\njust an idea. ",
+            "date": "2014-01-06T22:43:55+0000"
+        },
+        {
+            "id": "comment-13863570",
+            "author": "Benson Margulies",
+            "content": "Can you help me with how this relates to your previous remark about attributes other than Offset? What other attributes would get manipulated and how?  ",
+            "date": "2014-01-06T22:48:35+0000"
+        },
+        {
+            "id": "comment-13863584",
+            "author": "Robert Muir",
+            "content": "I don't have a clear idea how it can relate, just some vague thoughts at the moment.\n\nThe other most common attribute that is manipulated is position increments, take a look at StandardTokenizer.end() for an example (when it removes a too-long token), and FilteringTokenFilter.end() (subclass for StopFilter & co).\n\n\n  @Override\n  public final void end() throws IOException {\n    super.end();\n    // set final offset\n    int finalOffset = correctOffset(scanner.yychar() + scanner.yylength());\n    offsetAtt.setOffset(finalOffset, finalOffset);\n    // adjust any skipped tokens\n    posIncrAtt.setPositionIncrement(posIncrAtt.getPositionIncrement()+skippedPositions);\n  }\n\n\n\notherwise skipped tokens at the end of a multi-valued field get lost forever. As far as other attributes, i guess it depends what they do (e.g. they could be some custom one where some end() logic makes sense too). But it would be good if we could make the basics easier, while still allowing crazy custom classes to do whatever they need.\n\nAs far as how to tie this in and make it simpler? I'm not sure. One idea would be a TokenizerBase that takes care of these two things or maybe even some other things (e.g. provides a skipToken() method for subclasses to call and implements final position adjustments, and wraps the reader + implements final offset). Sucks to add a new class though, but its one idea. Making a tokenizer is really hard. One that is easier to subclass but cant do 100% of the crazy possibilities could be a nice balance: experts could still subclass Tokenizer directly. ",
+            "date": "2014-01-06T23:00:47+0000"
+        },
+        {
+            "id": "comment-13867437",
+            "author": "Benson Margulies",
+            "content": "Let me try to restate the above in my own words to make sure I understand it.\n\nAt #end(), all the pieces of an analysis chain are responsible for putting the attributes into a consistent state that reflects the end of the input. TokenStream itself takes care of PositionIncrementAttribute. Only the Tokenizer can take care of OffsetAttribute, but it's easy to forget \u2013 and if there are other interesting things going on, a Tokenizer or anything else may have other work to do. \n\nSo Rob's thoughts above are to make Tokenizer or a derivative track the final offset, which is simple, and have protocol to keep PositionIncrement in line given the possibility of skipped tokens. To avoid loading up the 'Tokenizer' class with too much stuff that someone might want to do for themselves, add an intermediate class for this and let Tokenizer proper be lean.\n\nI'll get organized to sketch some code. ",
+            "date": "2014-01-10T02:29:59+0000"
+        },
+        {
+            "id": "comment-13867446",
+            "author": "Robert Muir",
+            "content": "\nTokenStream itself takes care of PositionIncrementAttribute. \n\nWell it doesnt really \"take care\" at all. any tokenizer/tokenfilter that \"removes\" tokens and has the concept of \"holes\" (e.g. stopflter, or standardtokenizer when it drops a too-long token), has to provide that inforamtion here or its lost forever.\n\nLets make a concrete example: pages of a book. lets say each one is a value in a multi-valued field.\n\npage1 ends with \"the quick brown fox jumps over the\"\nand then page2 starts with \"lazy dog.\"\n\nas you know, internally both \"values\" are each independently analyzed but basically concatenated together in indexwriter, with analyzer.getPositionIncrementGap() [default=0] in between.\n\nin this case, phrase queries will not work correctly for this sentence, unless the analyzer propagates that 'the' was removed in end(), so the position increment is increased against \"lazy\".\n\nOnly the guy who removed that token (e.g. stopfilter) knows this, so it must provide it in end().\n\n\nBut yeah, i agree with your assessment, I think we want the tokenizer class to be very simple and just be \"tokenstream that works on reader\". We want it to be very flexible. On the other hand it sucks for simple typical use cases (e.g. the ones that happen 99% of the time) to be so difficult, when I think honestly most tokenizers are gonna worry about just offsets and positions in end(). \n\nSo a compromise to make easy things easy and still leave sophisticate things possible is to provide some subclass, even if its \"limited\" in some ways that it can't do all the crazy stuff. But if it can make the ordinary use-cases that happen 99% of the time easier, I think it would be really helpful. Its at least a good step in the right direction that won't hurt anyone. ",
+            "date": "2014-01-10T02:44:36+0000"
+        },
+        {
+            "id": "comment-13867448",
+            "author": "Robert Muir",
+            "content": "Here's sorta a parallel that Uwe did along the same lines for TokenFilters to solve another issue:\n\nIts tricky to remove tokens. Sure we want to provide infinite flexibility to move tokens around, but 99% of people just want to remove them based on some simple criteria. So he added FilteringTokenFilter, and it just exposes a simple api:\n\n\n  /** Override this method and return if the current input token should be returned by {@link #incrementToken}. */\n  protected abstract boolean accept() throws IOException;\n\n\n\nthe base class takes care of actually tracking all the positions and removing and end() and all that. Subclasses like StopFilter, TypeTokenFilter, etc are much simpler and don't have to deal with that crazy stuff, they just have the \"logic\" of what they want to remove (e.g. one-liners in most cases).\n\nIf someone doesnt like that API, they can always just subclass TokenFilter directly. But so far, all the removers are using it \n\nI think basically there is probably a similar opportunity here. ",
+            "date": "2014-01-10T02:51:23+0000"
+        }
+    ]
+}

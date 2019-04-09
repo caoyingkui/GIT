@@ -1,0 +1,529 @@
+{
+    "id": "LUCENE-8374",
+    "title": "Reduce reads for sparse DocValues",
+    "details": {
+        "components": [
+            "core/codecs"
+        ],
+        "status": "Resolved",
+        "resolution": "Won't Fix",
+        "fix_versions": [],
+        "affect_versions": "7.5,                                            master (8.0)",
+        "labels": "",
+        "priority": "Major",
+        "type": "Improvement"
+    },
+    "description": "The Lucene70DocValuesProducer has the internal classes SparseNumericDocValues and BaseSortedSetDocValues (sparse code path), which again uses IndexedDISI to handle the docID -> value-ordinal lookup. The value-ordinal is the index of the docID assuming an abstract tightly packed monotonically increasing list of docIDs: If the docIDs with corresponding values are [0, 4, 1432], their value-ordinals will be [0, 1, 2].\nOuter blocks\n\nThe lookup structure of IndexedDISI consists of blocks of 2^16 values (65536), where each block can be either ALL, DENSE (2^12 to 2^16 values) or SPARSE (< 2^12 values ~= 6%). Consequently blocks vary quite a lot in size and ordinal resolving strategy.\n\nWhen a sparse Numeric DocValue is needed, the code first locates the block containing the wanted docID flag. It does so by iterating blocks one-by-one until it reaches the needed one, where each iteration requires a lookup in the underlying IndexSlice. For a common memory mapped index, this translates to either a cached request or a read operation. If a segment has 6M documents, worst-case is 91 lookups. In our web archive, our segments has ~300M values: A worst-case of 4577 lookups!\n\nOne obvious solution is to use a lookup-table for blocks: A long[]-array with an entry for each block. For 6M documents, that is < 1KB and would allow for direct jumping (a single lookup) in all instances. Unfortunately this lookup-table cannot be generated upfront when the writing of values is purely streaming. It can be appended to the end of the stream before it is closed, but without knowing the position of the lookup-table the reader cannot seek to it.\n\nOne strategy for creating such a lookup-table would be to generate it during reads and cache it for next lookup. This does not fit directly into how IndexedDISI currently works (it is created anew for each invocation), but could probably be added with a little work. An advantage to this is that this does not change the underlying format and thus could be used with existing indexes.\nThe lookup structure inside each block\n\nIf ALL of the 2^16 values are defined, the structure is empty and the ordinal is simply the requested docID with some modulo and multiply math. Nothing to improve there.\n\nIf the block is DENSE (2^12 to 2^16 values are defined), a bitmap is used and the number of set bits up to the wanted index (the docID modulo the block origo) are counted. That bitmap is a long[1024], meaning that worst case is to lookup and count all set bits for 1024 longs!\n\nOne known solution to this is to use a [rank structure|https://en.wikipedia.org/wiki/Succinct_data_structure]. I [implemented it|https://github.com/tokee/lucene-solr/blob/solr5894/solr/core/src/java/org/apache/solr/search/sparse/count/plane/RankCache.java] for a related project and with that (), the rank-overhead for a DENSE block would be long[32] and would ensure a maximum of 9 lookups. It is not trivial to build the rank-structure and caching it (assuming all blocks are dense) for 6M documents would require 22 KB (3.17% overhead). It would be far better to generate the rank-structure at index time and store it immediately before the bitset (this is possible with streaming as each block is fully resolved before flushing), but of course that would require a change to the codec.\n\nIf SPARSE (< 2^12 values ~= 6%) are defined, the docIDs are simply in the form of a list. As a comment in the code suggests, a binary search through these would be faster, although that would mean seeking backwards. If that is not acceptable, I don't have any immediate idea for avoiding the full iteration.\n\nI propose implementing query-time caching of both block-jumps and inner-block lookups for DENSE (using rank) as first improvement and an index-time DENSE-rank structure for future improvement. As query-time caching is likely to be too costly for rapidly-changing indexes, it should probably be an opt-in in solrconfig.xml.\nSome real-world observations\n\nThis analysis was triggered by massive (10x) slowdown problems with both simple querying and large exports from our webarchive index after upgrading from Solr 4.10 to 7.3.1. The query-matching itself takes \u00bd-2 seconds, but returning the top-10 documents takes 5-20 seconds (~50 non-stored DocValues fields), up from \u00bd-2 seconds in total from Solr 4.10 (more of a mix of stored vs. DocValues, so might not be directly comparable).\n\nMeasuring with VisualVM points to NIOFSIndexInput.readInternal as the hotspot.\u00a0 We ran some tests with simple queries on a single 307,171,504 document segment with different single-value DocValued fields in the fl and got\n\n\u00a0\n\n\n\nField\nType\nDocs with value\nDocs w/ val %\nSpeed in docs/sec\n\n\nurl\nString\n307,171,504\n100%\n12,500\n\n\ncontent_type_ext\nString\n224,375,378\n73%\n360\n\n\nauthor\nString\n1,506,365\n0.5%\n1,100\n\n\ncrawl_date\nDatePoint\n307,171,498\n~100%\n90\n\n\ncontent_text_length\nIntPoint\n285,800,212\n93%\n410\n\n\ncontent_length\nIntPoint\n307,016,816\n99.9%\n100\n\n\ncrawl_year\nIntPoint\n307,171,498\n~100%\n14,500\n\n\nlast_modified\nDatePoint\n6,835,065\n2.2%\n570\n\n\nsource_file_offset\nLongPoint\n307,171,504\n100%\n28,000\n\n\n\n\n\n\u00a0Note how both url and source_file_offset are very fast and also has a value for all documents. Contrary to this, content_type_ext is very slow and crawl_date is extremely slow and as they both have nearly all documents, I presume they are using IndexedDISI#DENSE. last_modified is also quite slow and presumably uses IndexedDISI#SPARSE.\n\nThe only mystery is crawl_year which is also present in nearly all documents, but is very fast. I have no explanation for that one yet.\n\nI hope to take a stab at this around August 2018, but no promises.",
+    "attachments": {
+        "image-2018-10-24-07-30-06-663.png": "https://issues.apache.org/jira/secure/attachment/12945412/image-2018-10-24-07-30-06-663.png",
+        "image-2018-10-24-07-30-56-962.png": "https://issues.apache.org/jira/secure/attachment/12945413/image-2018-10-24-07-30-56-962.png",
+        "LUCENE-8374_part_1.patch": "https://issues.apache.org/jira/secure/attachment/12949503/LUCENE-8374_part_1.patch",
+        "start-2018-10-24-1_snapshot___Users_tim_Snapshots__-_YourKit_Java_Profiler_2017_02-b75_-_64-bit.png": "https://issues.apache.org/jira/secure/attachment/12945415/start-2018-10-24-1_snapshot___Users_tim_Snapshots__-_YourKit_Java_Profiler_2017_02-b75_-_64-bit.png",
+        "LUCENE-8374_branch_7_3.patch.20181005": "https://issues.apache.org/jira/secure/attachment/12944958/LUCENE-8374_branch_7_3.patch.20181005",
+        "LUCENE-8374_branch_7_5.patch": "https://issues.apache.org/jira/secure/attachment/12944957/LUCENE-8374_branch_7_5.patch",
+        "single_vehicle_logs.txt": "https://issues.apache.org/jira/secure/attachment/12945846/single_vehicle_logs.txt",
+        "LUCENE-8374.patch": "https://issues.apache.org/jira/secure/attachment/12930500/LUCENE-8374.patch",
+        "entire_index_logs.txt": "https://issues.apache.org/jira/secure/attachment/12945847/entire_index_logs.txt",
+        "LUCENE-8374_branch_7_4.patch": "https://issues.apache.org/jira/secure/attachment/12935512/LUCENE-8374_branch_7_4.patch",
+        "LUCENE-8374_part_3.patch": "https://issues.apache.org/jira/secure/attachment/12949501/LUCENE-8374_part_3.patch",
+        "LUCENE-8374_part_4.patch": "https://issues.apache.org/jira/secure/attachment/12949500/LUCENE-8374_part_4.patch",
+        "LUCENE-8374_branch_7_3.patch": "https://issues.apache.org/jira/secure/attachment/12935513/LUCENE-8374_branch_7_3.patch",
+        "LUCENE-8374_part_2.patch": "https://issues.apache.org/jira/secure/attachment/12949502/LUCENE-8374_part_2.patch",
+        "start-2018-10-24_snapshot___Users_tim_Snapshots__-_YourKit_Java_Profiler_2017_02-b75_-_64-bit.png": "https://issues.apache.org/jira/secure/attachment/12945414/start-2018-10-24_snapshot___Users_tim_Snapshots__-_YourKit_Java_Profiler_2017_02-b75_-_64-bit.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16525177",
+            "author": "Adrien Grand",
+            "content": "Thanks for opening this one Toke Eskildsen. I agree that the current encoding is not great, it was mostly a minor evolution from the previous dense format in order for things to work not too bad with sparse data, we should probably re-think it entirely. I know Robert suggested we should try to encode things more like postings, eg. with skip data.\n\nUnfortunately this lookup-table cannot be generated upfront when the writing of values is purely streaming\n\nSince this lookup table would be loaded into memory, we would typically write it into the meta file (extension: dvm) rather than into the data file (extension: dvd) so I don't think it would be an issue in practice.\n\nIt would be far better to generate the rank-structure at index time and store it immediately before the bitset (this is possible with streaming as each block is fully resolved before flushing), but of course that would require a change to the codec.\n\n+1 FWIW I don't have any objections to modifying the current format for doc values, I think it's much needed. Happy to help if you need guidance.\n ",
+            "date": "2018-06-27T15:01:43+0000"
+        },
+        {
+            "id": "comment-16525300",
+            "author": "Toke Eskildsen",
+            "content": "Thank you for the suggestions, Adrien Grand. I am not at home in this part of the code base, so guidance is much appreciated. I will look into how postings work.\n\nPutting the block-index in the separate meta file sounds like the right solution. What about also putting the rank structure in there too? That way the existing data file would keep its format and if a setup chooses not to use the lookup structures (time will show if that makes sense for any setups), its inactive existence will not affect disk caching of the data file. One downside I see is that it would require all the rank structures to be kept in-memory instead of being temporarily loaded as part of accessing a DENSE block.\n\nOn the other hand, offloading the support structures to the meta file ties very well into a two-stage approach where the first stage is query-time improvement for version 7 and the second is a codec-change for version 8. I must admit to having a selfish reason for trying to get version 7 to perform better: Our index takes 50 CPU-years / 3 realtime months to regenerate, so we would like not to do so.\n\nWhat is the contract for the slicer? Is seeking strictly forward, so that a binary search for SPARSE can only be done by loading the full block temporarily onto the heap? It would be nice to also have an improvement for SPARSE, if possible. ",
+            "date": "2018-06-27T17:06:52+0000"
+        },
+        {
+            "id": "comment-16527640",
+            "author": "Adrien Grand",
+            "content": "What about also putting the rank structure in there too?\n\nIn general the rule is that if you plan to have something in memory all the time then it should go to the meta file, and otherwise to the data file. We just need to be careful to not load too much stuff in memory in order to keep the index memory-efficient. Holding the block index in memory (one long every 65k docs) might be reasonable. I'm less sure about the long[32], though if I understand things correctly, having it in memory wouldn't help much compared to putting it at the beginning of the DENSE blocks and loading it only when we know we'll need at least one doc from this block.\n\nFor what it's worth, the codec API makes it very easy to deal with backward compatibility, so there would be no problem with completely changing the default doc-value format in a minor release. It doesn't have to wait for 8.0.\n\nWhat is the contract for the slicer?\n\nIt may seek to any legal offset (positive and less than the file length), doesn't need to be strictly forward, could be backward. ",
+            "date": "2018-06-29T13:33:50+0000"
+        },
+        {
+            "id": "comment-16527663",
+            "author": "David Smiley",
+            "content": "Welcome back to Lucene dev Toke Eskildsen  ",
+            "date": "2018-06-29T14:05:08+0000"
+        },
+        {
+            "id": "comment-16527681",
+            "author": "Toke Eskildsen",
+            "content": "Putting the rank-structure with the data would have the benefit that they would only be stored for the DENSE blocks: Putting it in meta would mean either unused entries for non-DENSE blocks or some sort of sparse representation, adding yet another complicated layer. And yes, if the rank is always used (which would be my guess), there would probably be very little performance difference between having it in-memory or together with the data that needs to be read anyway.\n\nAs for the rank structure itself, it is trade-off between space and lookups.\n\n\tA common structure is to have 1 rank-entry (a long) for each 2048 bits (1/32 overhead): The first 32 bits in the rank is the offset, followed by 3*10 bits for the bit-counts for the first 3*512 bits in the 2048 bits. With 8 longs in a 512 bit chunk, this means a worst-case of 8 count-bits-in-longs.\n\tThe 2048 bit structure is quite nice from a binary exponential point of view, but for this case it is not optimal as we know that there is a maximum of 65535 set bits, so only 16 bits are needed for the offset-part, not 32. Another choice might be 16 + 5*9 bits every 1576 bits (1/24 overhead) with a worst-case of 4 count-bits-in-longs.\n\tOr it could be 16 + 4*10 bits every 2560 bits (1/40 overhead) with a worst-case of 8 count-bits-in-longs (same as the first, just with slightly less overhead).\n\tOr maybe 16 + 4*11 bits every 5120 bits (1/80) overhead with a worst-case of 16 count-bits-in-longs.\n\n\n\nFrom an overhead/performance perspective, the 2560 bit version looks good to me. Unfortunately it does not align well with 65536 bits, so it's a bit messy compared to the very clean 2048 bit one. ...I am probably over-thinking it here. The difference between iterative and rank-based lookups is hopefully be apparent either way.\nFor what it's worth, the codec API makes it very easy to deal with backward compatibility, so there would be no problem with completely changing the default doc-value format in a minor release. It doesn't have to wait for 8.0.\nThis surprises me. A bit of a dangerous thing, is is not? No temporarily switching back to a known stable sub-version of Solr if a new release within the same major version turns out to have severe problems. ",
+            "date": "2018-06-29T14:26:27+0000"
+        },
+        {
+            "id": "comment-16527685",
+            "author": "Toke Eskildsen",
+            "content": "David Smiley thank you. Let's hope my activeness sticks this time. Why I have been inactive is probably not suitable for Jira  ",
+            "date": "2018-06-29T14:30:22+0000"
+        },
+        {
+            "id": "comment-16527935",
+            "author": "Adrien Grand",
+            "content": "No temporarily switching back to a known stable sub-version of Solr if a new release within the same major version turns out to have severe problems.\n\nThis is something that is not guaranteed today, and we actually broke this on many minor releases.  ",
+            "date": "2018-06-29T16:48:54+0000"
+        },
+        {
+            "id": "comment-16534605",
+            "author": "Toke Eskildsen",
+            "content": "Proof of concept\n\nAn unforeseen slump in firefighting at work means that I found time for this issue.\n\nI implemented the block-lookup structure and the DENSE rank cache for Solr trunk (see attached patch). The patch also seems to apply cleanly to Solr 7.3.1. It uses a singleton to hold the caches, spams stdout with stats on cache creation and in general integreates poorly, but cashing-wise it should work well enough.\n\nThe implementation does not use a sparse structure to hold the rank cache, making its size linear to the number of documents. Using a sparse representation, this overhead can be near-linear to the number of DENSE blocks instead. Extending to change the index format would automatically make the rank representation linear to the number of DENSE blocks.\n\nIt forcibly enables itself for most IndexedDISI-usages by Lucene70DocValuesProducer, meaning that this patch is query-time only: See the stdout-log for the first-lookup-after-segment-open cache-building time overhead.\nImplications\n\nLooking up DocValues is (of course) used throughout Lucene/Solr, so I would expect the impact - if any - to be visible across a range of functions. Requesting large result sets with fields that are stored as DocValues is our prime point of hurt, but I guess that stats, facets & exports can also benefit.\n\nThe perfect fit for this patch is an index with large (millions of documents) segments with fields that are mostly DENSE (defined for < 100% and > 6% of all documents).\nReal-world observations\n\nI re-ran the test from the JIRA-description and got the improvements below. I must stress that our setup is special with a segment of 300M documents, and that the fields with the largest improvements are DENSE, so for nearly everyone else, the benefits will be much lower. I will of course run tests on other indexes later, but I prioritized getting a patch out.\n\n\u00a0\n\n\n\nField\nType\nDocs with value\nDocs w/ val %\nVanilla speed in docs/sec\nCached speed in docs/sec\ncached/ vanilla\n\n\nurl\nString\n307,171,504\n100%\n12,500\n20,000\n160%\n\n\ncontent_type_ext\nString\n224,375,378\n73%\n360\n14,000\n3800%\n\n\nauthor\nString\n1,506,365\n0.5%\n1,100\n25,000\n2200%\n\n\ncrawl_date\nDatePoint\n307,171,498\n~100%\n90\n90\n100%\n\n\ncontent_text_length\nIntPoint\n285,800,212\n93%\n410\n22,000\n5300%\n\n\ncontent_length\nIntPoint\n307,016,816\n99.9%\n100\n90\n90%\n\n\ncrawl_year\nIntPoint\n307,171,498\n~100%\n14,500\n30,000\n200%\n\n\nlast_modified\nDatePoint\n6,835,065\n2.2%\n570\n30,000\n5200%\n\n\nsource_file_offset\nLongPoint\n307,171,504\n100%\n28,000\n28,000\n100%\n\n\n\n\n\nIt is a mystery to me why crawl_date and content_length did not improve, especially considering that content_text_length is so equal to content_length. I will dig further into that.\n\nOne of the benefits of direct jumping to blocks & inside blocks is that the disk-cache is not stressed by the intermediate steps. This makes synthetic tests even worse than usual. Nevertheless, there is a performance probe skeleton to play with at TestIndexedDISI.testCacheSpeed.\n\nKick the tires and let me know your thoughts. Non-responsiveness by me will probably be due to vacation. ",
+            "date": "2018-07-06T09:13:08+0000"
+        },
+        {
+            "id": "comment-16578321",
+            "author": "Toke Eskildsen",
+            "content": "I investigated further and found out that our fields crawl_date and content_length were both DENSE as well as represented as \"blocks of different bits per value\" (see Lucene70DocValuesProducer.java for details). It turns out that the same principle with iteration is used as in IndexedDISI, so it was possible to apply a variation of the same solution; namely jump tables.\n\nThe old retrieval speed for these values were 100 doc/s. With the jump tables applied this increased to 30K docs/s, bringing all our fields up to Solr 4 speed again. Again: We use segments with 300M docs - a 300x speed-up will not be a common case.\n\nI have updated the patch and added the temporary test TestDocValues#testNumericRetrievalSpeed which demonstrates how retrieval speed for\u00a0 DENSE longs of varying bits per value goes down as index size goes up and how it is largely unaffected when using jump tables. An interesting observation here is that without the jump tables, merging an index down to 1 segment means that retrieval of DV-fields becomes slower.\n\nThe current patch is still search-time only. The Lucene70 codec packs the content really well & with minimal memory overhead and as the jump-tables can be represented as data in the segment files with (qualified guess) minimal search-performance overhead, it seems possible to arrive at a solution that is both space-efficient & fast for large segments.\n\nThe patch applies to Lucene/Solr 8 and the caching is enabled per default. It can be used directly, although it does spam stdout. The switch IndexedDISICacheFactory.DEBUG controls the spamming. ",
+            "date": "2018-08-13T14:10:33+0000"
+        },
+        {
+            "id": "comment-16579548",
+            "author": "Toke Eskildsen",
+            "content": "Patch backported to 7.4, for anyone who wants to try it there. ",
+            "date": "2018-08-14T09:44:36+0000"
+        },
+        {
+            "id": "comment-16579549",
+            "author": "Toke Eskildsen",
+            "content": "Patch backported to 7.3, for anyone who wants to try it there. ",
+            "date": "2018-08-14T09:45:02+0000"
+        },
+        {
+            "id": "comment-16579877",
+            "author": "Toke Eskildsen",
+            "content": "The patch implements the jump list suggested in LUCENE-7589. ",
+            "date": "2018-08-14T14:25:59+0000"
+        },
+        {
+            "id": "comment-16583016",
+            "author": "Toke Eskildsen",
+            "content": "The master-patch is now updated with sparse representation of the DENSE rank-data (the number of indirections is getting pretty high here - I wonder if some shortcutting is possible?). This means all the caching structures are now compact and a check against one of our web archive shards gave these statistics:\n\nIndex: 890G / 307M docs\nFields: Total=59 (blocks: ALL=107374, SPARSE=33427, DENSE=111803, EMPTY=5119), vBPV(long)=4\nOverhead: 33198KB, 12 seconds start up\n\nI expect to run some comparative tests on our full web archive pretty soon, but the results will mostly be relevant for other people with large (100GB+) segments. Due to reasons it is not easy for me to run tests on our lesser-scale indexes, but I'll see if I can figure out a way. ",
+            "date": "2018-08-16T20:17:59+0000"
+        },
+        {
+            "id": "comment-16591452",
+            "author": "Adrien Grand",
+            "content": "The above numbers are very impressive! Do you have a sense of how much is contributed by the lookup table for block offsets, and how much is contributed by the additional rank data-structure for DENSE blocks?\n\nThe current patch is still search-time only. The Lucene70 codec packs the content really well & with minimal memory overhead and as the jump-tables can be represented as data in the segment files with (qualified guess) minimal search-performance overhead, it seems possible to arrive at a solution that is both space-efficient & fast for large segments.\n\n+1 to compute these data-structures at index time and have little search-time memory overhead. That should come for free for the rank data-structure of DENSE blocks which we should be able to encode in the header of DENSE blocks. Regarding the lookup table, I guess we'll need to turn it into a skip list, but that shouldn't be a major problem either? ",
+            "date": "2018-08-24T10:30:57+0000"
+        },
+        {
+            "id": "comment-16593536",
+            "author": "Toke Eskildsen",
+            "content": "My previous stats script was slightly off. I isolated the block / DENSE-structures and got\n\nIndex: 890GB / 51 fields / 307M docs\n{{ Blocks: Total 238971 (blocks: ALL=102693, SPARSE=28739, DENSE=102421, EMPTY=5118) / 1866KB}}\n{{ DENSE-Rank: 28118KB (raw DENSE data: 102421*8KB = 819368KB)}}\n{{ BPV(long): 7 / 654KB}}\n{{ Total: 30653KB, 13 seconds start up}}\n\nDENSE is by far the biggest consumer of cache-space in our setup. Interestingly enough, the vBPV-caching was the ones that gave us by far the biggest benefit, for the few long fields that we have.\n\nI looked at skip lists, both in the MultiLevelSkipListWriter and [on Wikipedia|https://en.wikipedia.org/wiki/Skip_list.] As I understand it they are essentially a rank+select implementation that allows for varying-size skips and works well with a linked list that can be modified. The varying-size and mutability does not seem to be used/relevant for Lucene.\n\nWhat I don't really understand is the benefit of skip list's multi-level approach in this case. How would a skip list be better than the current direct-lookup in the array of longs representing offset+bitcount? If the point is to save further memory, the block-offsets could be stated for every 4th block or so, just as the skip lists does. But the current overhead of 2MB for a rather large segment does not seem problematic to me and it does mean that 0 superfluous blocks needs to be seeked.\n\nNew point: I would very much like to make this issue two-step.\n\nAs the performance regression gets worse linear with segment size, it seems plausible that the people that will benefit the most from the patch are also people where a full re-index is not trivial. From my point of view, search-time caching should be present for present segments, independently of codec-changes to future segments. The current patch needs polishing, but is functionwise ready and does exactly this.\n\nAs the search-time cache is non-destructive, rolling this as step 1 would be a conservative update with easy rollback. Step 2 is of course to change the codec to embed the caching structures, if they prove their worth. ",
+            "date": "2018-08-27T11:36:10+0000"
+        },
+        {
+            "id": "comment-16593539",
+            "author": "Toke Eskildsen",
+            "content": "The logic for selecting sparse representation when packing the DENSE structure was switched, resulting in needless memory overhead. Fixed with latest patch. ",
+            "date": "2018-08-27T11:38:36+0000"
+        },
+        {
+            "id": "comment-16593547",
+            "author": "Toke Eskildsen",
+            "content": "Some independent verification/debunking of this performance issue would be highly appreciated.\n\nThe patch speeds up DocValues-retrieval and the larger the segments, the more the benefit. An index with 50M+ documents, using DocValues when returning documents (preferably with one or more int/long/date-fields), would be ideal. Checking that it does not hurt performance for smaller indexes also seems important.\n\nI'll port the patch to any Lucene/Solr 7.x-version if it helps. ",
+            "date": "2018-08-27T11:45:30+0000"
+        },
+        {
+            "id": "comment-16593644",
+            "author": "Adrien Grand",
+            "content": "Indeed I mentioned skip lists because this is the natural implementation for a forward-only iterator as it requires very little memory. You are right though that given the size of the blocks, memory usage of a long[] is reasonable in spite of the linear dependency on maxDoc, especially if we only index every N-th block.\n\nit seems plausible that the people that will benefit the most from the patch are also people where a full re-index is not trivial\n\nReindexing is not necessary, users can use IndexUpgrader if they want to upgrade to the latest index formats. I'd rather work directly on a new doc values format with faster advancing.\n\nChecking that it does not hurt performance for smaller indexes also seems important.\n\nI'm curious about the impact on faceting or sorting on the entire index too. Since this patch adds more conditions to speed up advancing by large intervals, I'd expect it to also slow down usage patterns that consume most documents a bit? Hopefully by very little. ",
+            "date": "2018-08-27T13:25:48+0000"
+        },
+        {
+            "id": "comment-16594728",
+            "author": "Toke Eskildsen",
+            "content": "Regarding overhead:\n\nThe advance/advanceExact for blocks in IndexedDISI still has the old check for whether the current block is the right one: https://github.com/tokee/lucene-solr/blob/lucene8374/lucene/core/src/java/org/apache/lucene/codecs/lucene70/IndexedDISI.java#L176-L219 The difference between skipping to the next block using the old blockEnd and skipping by looking up the offset in the long[] is tiny, but I guess the case \"the wanted block is the block immediately after the current one\" could be micro-optimized.\n\nadvanceWithinBlock and advanceExactWithinBlock are only modified for DENSE. It always involves a call to rankSkip. Looking at the code, I see that it stupidly does not take advantage of the current IndexedDISI-state and always does the somewhat costly rank-calculations and seek, even when it would be faster to just go ahead the old way. I will fix that. Thanks for bringing it to my attention.\n\nThe variable bits per value (vBPV) structures used by numerics are equivalent to the DISI-blocks: If the current vBPV-block is the right one, there is no overhead. Getting a subsequent vBPV-block offset is a simple lookup in a long[]. As with DISI-blocks it could be optimized for the vBPB-block following immediately and it might be worth it if the offset-cache is read from index data and not form memory. It is a very simple optimization, so I'll just do it.\n\nI'll think about search-time vs. index-time a bit and come back to you on that. ",
+            "date": "2018-08-28T09:07:40+0000"
+        },
+        {
+            "id": "comment-16599209",
+            "author": "Toke Eskildsen",
+            "content": "Added patch against master with the performance optimization for sequential access discussed earlier in this JIRA. The patch also fixes a critical bug for Lucene70NormsProducer in the previous patch, where the IndexedDISICache could in some cases be shared between fields. ",
+            "date": "2018-08-31T19:45:29+0000"
+        },
+        {
+            "id": "comment-16609164",
+            "author": "Toke Eskildsen",
+            "content": "Fixes edge-case bug when the last 16384 values for a numeric DocValues-field all had value 0. Adds a temporary Solr-hack for easy toggling of lucene-8374 caches for easy performance comparisons.\n\nThe caches to use can be controlled by adding lucene8374=<caches> to the Solr REST-calls, where <caches> is all, some or none of [norm, block, dense, vbpv, debug], e.g. ...select?q=foo&wt=json&lucene8374=block,debug. They can (of course) also be controlled when using Lucene directly through the class IndexedDISICacheFactory. ",
+            "date": "2018-09-10T13:14:08+0000"
+        },
+        {
+            "id": "comment-16655457",
+            "author": "Tim Underwood",
+            "content": "I just tested this out and am seeing a really good Solr faceting performance increase!\u00a0 One of the facet heavy queries that I've been using for testing on\u00a0SOLR-12878 and\u00a0SOLR-12882 went from ~88 queries per second to ~190 queries per second!\n\n\u00a0\n\nIndex Stats:\n\nTotal Docs:\u00a083,846,867 (~1 million parent docs and the rest are child documents)\n\nIndex Size (on disk): 30.53 GB\n\n\u00a0\n\nQuery Stats:\n\nThe query I'm using performs JSON facets against the child documents on 41 IntPoint fields that makes up one of the queries used to generate this page:\u00a0 https://www.opticatonline.com/search?bv=18220&region=usa\u00a0. The facets are shown on the left side of the page.\u00a0 The \"Part Type\" (single valued) and \"Assembly Group\" (multi-valued) are populated for every document.\u00a0 The \"Linkage Criteria\" make up the rest of the 41 fields and are sparsely populated with data (if at all).\n\nI can share more details if interested.\n\n\u00a0\n\nWhen I get a chance I'll test this on my other large index that has less overall documents (8 million total) but they are all densely populated with multi-valued string fields that are used for faceting. ",
+            "date": "2018-10-18T15:48:33+0000"
+        },
+        {
+            "id": "comment-16658705",
+            "author": "Toke Eskildsen",
+            "content": "That is great news, Tim Underwood. Thank you very much for testing!\n\nI was pleasantly surprised about your relatively large performance increase as my own tests had a more modest increase for faceting. Visiting your site, I see that you faceting is much richer than my simple facets, which would explain it. I guess that my base response time (query match + logistics) is relatively large - I should try and make a test with more facets (and one with less) to probe that.\n\nI doubt that you will see much difference with your 8M docs index, but I would love to be proven wrong on that.\n\nCould you tell me how much of your index data are memory-cached?\n\nAnyway, your test verifies that the patch is relevant for other real-world setups, so I'll try and move forward with it. Thanks again. ",
+            "date": "2018-10-22T07:32:38+0000"
+        },
+        {
+            "id": "comment-16658708",
+            "author": "Toke Eskildsen",
+            "content": "Ported to Lucene/Solr 7.5. ",
+            "date": "2018-10-22T07:35:37+0000"
+        },
+        {
+            "id": "comment-16658713",
+            "author": "Toke Eskildsen",
+            "content": "Ported to Lucene/Solr 7.3. ",
+            "date": "2018-10-22T07:37:08+0000"
+        },
+        {
+            "id": "comment-16658966",
+            "author": "David Smiley",
+            "content": "Toke, the JIRA \"fix version\" should reflect the Git branches you commit to, or plan to commit to.  And 7.5 and 7.3 are not branches you are allowed to commit to since this is not a bug fix.  Once you do commit to branch_7x, you can put a fix version of \"7.6\" if 7.6 release branch hasn't been created yet.  If the release branch has been created, you can do 7.7 even if 7.7 is never ultimately released.  We don't have a \"trunk\" but we do have a \"master\".  BTW I don't bother assigning \"master\" to fix version if I'm also going to commit to another branch, since it's implied.  In other words, it's implied that if the fix version is 7.6 that the feature/fix will be fixed in 8 as well. ",
+            "date": "2018-10-22T13:05:54+0000"
+        },
+        {
+            "id": "comment-16659044",
+            "author": "Toke Eskildsen",
+            "content": "David Smiley the idea for making patches for older versions was to make it easier to measure its effect on existing setups: Testing an existing Solr 7.3 vs. a patched Solr 7.3 is much cleaner than testing a Solr 7.3 vs. patched master.\n\nIf that collides with the established workflow here, can you suggest how I can support easy testing? ",
+            "date": "2018-10-22T14:33:46+0000"
+        },
+        {
+            "id": "comment-16659478",
+            "author": "David Smiley",
+            "content": "Feel free to post version specific patches and/or create feature branches if it suites you.  I'm just telling you how to use the JIRA \"fix version\" field; that's all.  I know you're new to community development here so I'm just trying to help out. ",
+            "date": "2018-10-22T19:18:43+0000"
+        },
+        {
+            "id": "comment-16661728",
+            "author": "Tim Underwood",
+            "content": "Toke Eskildsen You are correct I have not seen any\u00a0noticeable performance differences on my index with 8M docs.\u00a0 However, I've been looking into converting it into parent/child docs which would expand it to ~300 million total docs so I suspect this patch would help out performance in that case.\n\nI've included some updated numbers from\u00a0re-running my\u00a0tests and making use of the\u00a0lucene8374 url parameter to enable/disable the caches.\n\nI've been running my informal benchmarking on my laptop which has 32GB of RAM.\u00a0 Activity Monitor reports 7.5GB of \"Cached Files\" and I see very little disk activity when running my tests so I suspect everything needed for faceting is in memory.\nTest 1 - Faceting on data for a single vehicle (same test I previously ran)\n\nIndex Size: 35.41 GB\n\nTotal Documents:\u00a084,159,576\n\nDocuments matching query: 3,447\n\n\u00a0\n\n\n\nlucene8374 Caches\nRequests per second\n\n\nAll Disabled\n88/second\n\n\nAll Enabled\n266/second\n\n\n\n\n\nNote: I'm using Apache Bench (ab) for this test with a static query, concurrency of 10, and 5,000 total requests.\u00a0 This is really just testing the performance of calculating the facets since the set of matching documents should be cached by Solr.\nTest 2 - Faceting on most of the index\n\nIndex Size: 35.41 GB\n\nTotal Documents:\u00a084,159,576\n\nDocuments Matching Query:\u00a073,241,182\n\n\u00a0\n\n\n\nlucene8374 Caches\nTime for Single Request\n\n\nAll Disabled\n~117 seconds\n\n\nAll Enabled\n~117 seconds\n\n\n\n\n\n\u00a0\n\nNote: This test is so slow that I only run one query at a time.\u00a0 This is NOT an actual use case for me.\u00a0 I was just curious if there was any performance difference.\n\n\u00a0 ",
+            "date": "2018-10-24T04:53:17+0000"
+        },
+        {
+            "id": "comment-16662036",
+            "author": "Toke Eskildsen",
+            "content": "David Smiley I think I got it now, thanks. I was confused by the upload-dialog, where the Fix version is available: I thought I should set it to reflect the concrete upload (e.g. a 7.3 patch for testing) rather than the overall issue. I will adjust it to 7.6 with master implied. I will also consider making a feature branch: If this it to be part of the codec instead of search-time only, I'll probably need assistance to make it happen. Thank you for your help.\n\n\u00a0\n\nTim Underwood Thank you for the follow-up. I would expect a parent/child structure with 300M documents to fit extremely well with the patch. Your new information supports that there are non-trivial gains even when everything is disk cached (yay!) and that small result sets benefits the most (expected, but nice to verify).\n\nAs for the \"Faceting on most of the index\", I guess all the time is spend on calculating the facets and that any speed-up for the retrieval of the facet values themselves are insignificant compared to the overall time. While the patch is also relevant for the calculation phase (to determine the ordinals for the facet values for the documents), a match for nearly all documents means a sequential iteration with extremely small gaps where the jump tables are not used.\n\nIt is nice to see that there is no penalty for having the optimizations enabled, though strictly speaking one needs to compare unpatched vs. patched rather than patch disabled/enabled to be sure that the if (patch_enabled) ... -check does not in itself make a difference (and to be sure I did not mess up elsewhere). But measuring tiny differences between individual runs is of course quite hard. ",
+            "date": "2018-10-24T09:53:35+0000"
+        },
+        {
+            "id": "comment-16662370",
+            "author": "Tim Underwood",
+            "content": "For what it's worth my original testing was with unpatched vs patched.\n\nI did some quick YourKit CPU sampling on my 2 tests with cached enabled/disable.\u00a0 I've excluded \"[Wall Time] java.lang.Thread.sleep(long)\" which is why the \"CPU (What-If)\" tab is active.\n\nI should also note that all of my testing (both caches enabled and disabled) has been done with 3 other patches applied (in addition to this one):\u00a0 SOLR-12875 (ArrayIndexOutOfBoundsException in JSON Facets), SOLR-12878 (large performance issue in FacetFieldProcessorByHashDV) and SOLR-12882 (lambda memory allocation removal in FacetFieldProcessorByHashDV.collectValFirstPhase).\n\nNote: Image thumbnails do not seem to be working right so I've included the file name so you can find the right image attachment that goes with the smaller resized image.\n\nTest 1 - Faceting on data for a single vehicle\nCaches Enabled:\n\n\u00a0\n\n\n\n\nimage-2018-10-24-07-30-06-663.png\n\n\nCaches Disabled:\n\n\u00a0\n\n\n\n\nimage-2018-10-24-07-30-56-962.png\n\n\u00a0\nTest 2 - Faceting on most of the index\n\n\u00a0\nCaches Enabled:\n\n\n \u00a0\n\nstart-2018-10-24_snapshot___Users_tim_Snapshots__-_YourKit_Java_Profiler_2017_02-b75_-_64-bit.png\n\n\nCaches Disabled:\n\n\n \u00a0\n\nstart-2018-10-24-1_snapshot___Users_tim_Snapshots__-_YourKit_Java_Profiler_2017_02-b75_-_64-bit.png\n\n\u00a0\n\n\u00a0 ",
+            "date": "2018-10-24T14:39:17+0000"
+        },
+        {
+            "id": "comment-16663475",
+            "author": "Toke Eskildsen",
+            "content": "Tim Underwood Profiling, nice! Must. Resist. Urge. To. Look. At. MonotonicDocValues \n\nThe differences for the profiles for \"Faceting on most of the index\" seems like jitter to me. Good to verify that.\n\n\"Faceting on data for a single vehicle\" has multiple interesting measurements:\n\n\n\tI am surprised that FieldCacheImpl#Cache.get takes 68,485ms for cached and only 4,792ms for non-cached. The LUCENE-8374 caches are lazy-created so I would expect the start-up overhead for them to be paid under SparseNumericDocValues.advanceExact or similar, but not as part of requesting the cache. I wonder why there is such a difference?\n\tSparseNumericDocValues.advanceExact is reduced by a factor 6 with caching. This factor should scale to the number of documents in each segment: If you try the 300M parent/child structure and the number of segments stays about the same, I would expect the factor to increase to 15-20.\n\tIndexedDISI.advanceBlock + IndexedDISI.rankSkip for cached is 46,540ms and IndexedDISI.advanceBlock is 79,185ms for non-cached, telling me that the BLOCK-cache is a noticeable win in itself. Glad to see that as my artificial test showed a lesser win.\n\tI wonder why IndexedDISI.advanceExactWithinBlock is not visible in any of the profiles. Could it be that practically all your documents has values defined for the fields used for faceting?\n\n\n\nIn the current patch, statistics for LUCENE-8374 are written to stdout, which Solr collects in the logfile solr-XXXX-console.log. If possible, I would like to see the content of that file as it contains a break-down of the DocValues-fields, thanks. ",
+            "date": "2018-10-25T09:15:05+0000"
+        },
+        {
+            "id": "comment-16665827",
+            "author": "Tim Underwood",
+            "content": "Toke Eskildsen I've attached the logs for both the single vehicle case and the entire index case.\u00a0 For each case I started up the server, ran a single request (either the single vehicle or entire index query) and then shutdown the server.\n\nI haven't had a chance to dig into the CPU sampling results or your comments about them yet.\u00a0 But I will \u00a0. If I find some time I'll run some non-sampled CPU profiling and maybe some memory allocation profiling too \u00a0. Speeding up anything related to faceting would be a win for most of my use cases. ",
+            "date": "2018-10-27T02:01:54+0000"
+        },
+        {
+            "id": "comment-16668773",
+            "author": "Toke Eskildsen",
+            "content": "Tim Underwood it might be that it is because of sampling that the advanceExactWithinBlock does not show up. Don't fret about it - I'll try some profiling experiments myself to see what's up with that.\n\nYour logs are very informative, thanks:\n{{\nSegments: 41\nFields: Total=41, vBPV(long)=30 (blocks: 128095)\nDISI-blocks: ALL=41, DENSE=76793, SPARSE=123, EMPTY=0\nOverhead: 20.98 MB, 412 ms startup\n}}\n\nThe patch introduces jumps for DISI-blocks, DENSE and vBPV. As most of your fields has this exact combination, your index is very receptive to the optimizations. Good for you and a caveat that this level of speed-up is not to be expected generally.\n\nThere is a lot of numerics to a front-end that uses string-facets. I guess you represent the facet entries as IDs and look up the string representations from another source? Is this because you found string faceting to be too slow? I tried looking at DocValues string resolving but there did not seem to be any easy gains like the one for numerics. ",
+            "date": "2018-10-30T14:21:15+0000"
+        },
+        {
+            "id": "comment-16673418",
+            "author": "Tim Underwood",
+            "content": "Yes, for that index I think almost everything[1] is indexed as Int IDs and then the entities they represent are looked up and converted to strings before being displayed on the front end.\u00a0 I don't think I ever considered or tried String fields for those since the Int IDs are a natural fit.\u00a0 We also have a few cases where we attempt to apply translations to things like the Part Type dropdown so we need to know the ID anyways (e.g. https://www.opticatonline.com/search?bv=18220&region=usa&lang=es-MX).\n\nMy other index[2] (with ~8 million docs) makes more use of String fields but that is mostly due to not using parent/child docs and needing to make use of facet prefix filtering to match values for a specific vehicle.\u00a0 For example a value might look like \"5411/1004\" where \"5411\" represents the id of the vehicle I'm filtered to and \"1004\" represents the type of part.\u00a0 If I ever convert that index to parent/child docs then I could convert a lot of those fields to ints.\n\n\u00a0\n\n[1] - The Brands are actually indexed as their 4 character ID string (e.g. \"BBHK\" for the brand \"Bosch\")\n\n[2] - I don't think I have any good non-login protected examples of this index.\u00a0 This one\u00a0has a very limited view on the data (if you have a non North American country selected):\u00a0 https://propartsnet.opticatonline.com/search?ltt=pc&ltid=5411&lcc=DK&cc=DK&lang=da&bn=100019\u00a0. It works very similar to\u00a0the\u00a0www.opticatonline.com\u00a0site except uses different underlying data for the non US/MX/CA countries. ",
+            "date": "2018-11-02T17:04:37+0000"
+        },
+        {
+            "id": "comment-16674489",
+            "author": "Toke Eskildsen",
+            "content": "We've used the patch in production for a few months and found zero issues. Tim Underwood was kind enough to provide independent verification of its impact, for a case where the jump-tables are activated as well as one where they aren't (to check for performance regression). To me this seems solid enough to move forward.\n\nI understand the recommendation from Adrien Grand to bake this into the DocValues codec. From my perspective, it makes sense to also make a search-time version for the current codec, which is what the current patch does. I have a few reasons for that\n\n\tWe (the Royal Danish Library) really needs it. Well, we don't as we already use the patch, but figuratively we do: We have 70TB+ of indexes which are logistically hard to run through an index upgrader. I imagine other people with large indexes faces similar challenges. By supporting search-time jump-tables the upgrade becomes plug'n'play for those.\n\tIt is practically free. The patch needs a clean-up, but unless I really messed up, this should be a minor thing.\n\tMy previous \u201clet's improve Solr performance\u201d-project died the legacy-code death by becoming unwieldy; hard to review and hard to port. I would very much like to avoid a repeat and so I push for the minimum viable product approach.\n\n\n\nUnless there is direct opposal to adding the search-time patch to Lucene/Solr master (with a back-port to 7), I will go ahead with this process. For that I need some help.\n\n\tWhat to do about messaging? The current patch spews statistics on stdout whenever a new segment is accessed. The Lucene codebase seems very silent, so should I just remove all that? Or can I tie into some sort of \u201cenable debugging messages\u201d-system?\n\tCurrently the different jump-tables can be turned off and on on a global basis. This is extremely useful to evaluate the effect, but not something people would normally have a use for. I could just leave it as it does no functional harm, but my suspicion is that it is seen ad clutter in the code base?\n\tReview after I have fixed 1+2? It would be nice, but I know that it is also a heavy thing. I guess I'll leave it as a wish for some time and then go ahead with a merge if no one bites.\n\n ",
+            "date": "2018-11-04T19:49:53+0000"
+        },
+        {
+            "id": "comment-16675285",
+            "author": "David Smiley",
+            "content": "\n\tUse of stdout needs to either be removed, commented, or guarded by a static final boolean if you really want them to stay.\n\tSimilar to #1 but I have a stronger preference to removing entirely as I imagine the option would be less self contained (i.e. yes would add clutter)\n\n\n\nThanks for the contribution Toke!  The sooner this gets committed, the sooner Jenkins starts beating on it. ",
+            "date": "2018-11-05T15:06:14+0000"
+        },
+        {
+            "id": "comment-16675298",
+            "author": "Uwe Schindler",
+            "content": "Instead of printing messages to stdout, you may add statistics using the Lucene-internal logging of IndexWriter. But this should still be reduced to important stuff that might be helpful during debugging the indexing chain and for endusers who want to see merges. This could be an option, but I do not know how verbose it is now.\n\nIf you look around other codecs, most debugging output is just commented out. ",
+            "date": "2018-11-05T15:20:35+0000"
+        },
+        {
+            "id": "comment-16676154",
+            "author": "Tim Underwood",
+            "content": "Toke Eskildsen Here is a delayed follow up on your\u00a0FieldCacheImpl#Cache.get observations:\n\nAt first I was a little confused why the FieldCache was showing up at all since I have docValues enabled on almost everything in order to avoid the uninverting.\u00a0 However looking at the Solr cache stats page shows the _root_ field showing up in the field cache.\u00a0 That makes sense since I don't have docValues=true specified for it and also since I'm requesting the \"uniqueBlock(_root_)\" count for each of my facet fields (since I only care how many parent documents match and not how many children).\n\nAnyways..\u00a0 as to why it shows up in the cpu sampling as taking so much time my best guess is that it has something to do with the synchronized blocks in FieldCacheImpl#Cache.get.\u00a0 As an experiment (which ignores the weak keys) I swapped out the\u00a0WeakHashMap<> (which uses nested HashMaps) for a ConcurrentHashMap with nested ConcurrentHashMaps in order to allow me to get rid of the synchronized blocks.\u00a0 After doing that\u00a0FieldCacheImpl#Cache.get disappeared from the CPU sampling.\u00a0 There may have been a minor performance increase but it certainly wasn't close to the 68,485ms that showed up on the original profiling.\u00a0 So it might have just been an artifact of the interaction between the cpu sampling and the synchronized blocks.\n\nPerhaps I'll go back and play with it some more and try swapping in Guava's Cache in order to make the weak keys work properly.\u00a0 Or maybe I'll try enabling docValues on my _root_ field to see what that does.\n\n\u00a0\n\n\u00a0 ",
+            "date": "2018-11-06T05:19:29+0000"
+        },
+        {
+            "id": "comment-16676295",
+            "author": "Toke Eskildsen",
+            "content": "Thank you, David Smiley & Uwe Schindler. The jump-tables are field-oriented, so the amount of output is currently #segments * #DocValue_fields * #reopens = verbose. Much too fine-grained from what Uwe describes. I'll remove it all.\n\nSame goes for the options for enabling & disabling the caches. Should it be relevant at a later point, that part is quite easy to re-introduce. ",
+            "date": "2018-11-06T07:32:37+0000"
+        },
+        {
+            "id": "comment-16678233",
+            "author": "Toke Eskildsen",
+            "content": "Cleaned patch (no output, no on/off switching) as suggested by Uwe Schindler and David Smiley. The patch applies to master as per 2018-11-07 and passes ant precommit, ant test and ant test-forbidden-apis. The core code is the same as LUCENE-8374.patch so anyone wanting to play with turning caching on/off should use that instead.\n\nThis patch is what I hope to commit to master. Or rather: This is the first version of what I hope to commit, as I would be grateful if anyone would take a look at it and tell me if I messed up somewhere. I am not too worried about functionality and Jenkins helps there. It is mostly architecturally where I am on shaky ground. ",
+            "date": "2018-11-07T13:41:28+0000"
+        },
+        {
+            "id": "comment-16679900",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  +1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 3 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   0m 32s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   0m 30s \n  the patch passed  \n\n\n +1 \n  javac  \n   0m 30s \n  the patch passed  \n\n\n +1 \n  Release audit (RAT)  \n   0m 30s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   0m 30s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   0m 30s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n  13m 36s \n  core in the patch passed.  \n\n\n  \n   \n  16m 55s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n LUCENE-8374 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12947230/LUCENE-8374.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene1-us-west 4.4.0-137-generic #163~14.04.1-Ubuntu SMP Mon Sep 24 17:14:57 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / 1b084db \n\n\n ant \n version: Apache Ant(TM) version 1.9.3 compiled on July 24 2018 \n\n\n Default Java \n 1.8.0_191 \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-LUCENE-Build/120/testReport/ \n\n\n modules \n C: lucene/core U: lucene/core \n\n\n Console output \n https://builds.apache.org/job/PreCommit-LUCENE-Build/120/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "date": "2018-11-08T15:22:43+0000"
+        },
+        {
+            "id": "comment-16681927",
+            "author": "Toke Eskildsen",
+            "content": "I have cleaned up the previous patch (removed dead code, out-commented lines etc.). Reviewing 2000+ patch-lines is a daunting task, so instead of trying to get anyone to commit to that, let me present the different parts - if anything sounds odd, don't hesitate to comment. I plan to push it to master in the near future.\n\n2 new utility classes are used for creating and accessing compact representations of sparse arrays of whole numbers:\n\n\tRankBitSet.java uses a rank function to provide O(1) rank (the number of set bits) for a given index in a bitmap. It is hard to grok, but there is not much active code and it was used previously in SOLR-5894, which we ran in production for 2 years.\n\tLongCompressor is basically glue around the greatest common divisor code from Lucene70DocValuesConsumer and RankBitSet.java. There's a monkey test as well as an explicit sparse-oriented test for that. The code seems solid to me.\n\n\n\n3 new classes are used to hold the generated jump-tables:\n\n\tIndexedDISICacheFactory.java is a simple pool holding all the jump-tables for a given segment. Each Lucene70DocValuesProducer.java creates one of these when it itself is created and consequently releases it when the segment is discarded. The jump-table-structures could also have been stored along with general caching, but as they are always-on and as it makes little sense to try and adjust size or other parameters for them, I chose to make them integral to Lucene70DocValuesProducer.java.\n\tIndexedDISICache.java builds & holds the jump-tables and index-tables for block-jumps in IndexedDISI as well as the rank for DENSE blocks. Both representations are in principle fairly simple, but it is a bit tricky to review all the shifts & masks.\n\tVaryingBPVJumpTable is a simple jump-table for numerics with varying bits per value. Building it is very similar to looking up a value in the last vBPV-block.\n\n\n\n2 classes are changed to use the caches:\n\n\tLucene70NormsProducer.java only uses the IndexedDISICache and the changes are quite trivial.\n\tLucene70DocValuesProducer.java has the same straight forward use of IndexedDISICache as the norms producer, but also uses the VaryingBPVJumpTable where relevant. To avoid redundant code, the inner helper class VaryingBPVReader handles the general task of reading from a vBPV-slice in a cache-aware manner.\n\n ",
+            "date": "2018-11-09T20:55:19+0000"
+        },
+        {
+            "id": "comment-16682233",
+            "author": "Lucene/Solr QA",
+            "content": "\n\n\n  +1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 3 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   1m 26s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   0m 19s \n  the patch passed  \n\n\n +1 \n  javac  \n   0m 19s \n  the patch passed  \n\n\n +1 \n  Release audit (RAT)  \n   0m 19s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   0m 19s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   0m 19s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n  30m 26s \n  core in the patch passed.  \n\n\n  \n   \n  37m  1s \n   \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n LUCENE-8374 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12947631/LUCENE-8374.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  \n\n\n uname \n Linux lucene2-us-west.apache.org 4.4.0-112-generic #135-Ubuntu SMP Fri Jan 19 11:48:36 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / 42ee966 \n\n\n ant \n version: Apache Ant(TM) version 1.9.6 compiled on July 20 2018 \n\n\n Default Java \n 1.8.0_191 \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-LUCENE-Build/121/testReport/ \n\n\n modules \n C: lucene lucene/core U: lucene \n\n\n Console output \n https://builds.apache.org/job/PreCommit-LUCENE-Build/121/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "date": "2018-11-10T06:20:33+0000"
+        },
+        {
+            "id": "comment-16686657",
+            "author": "Adrien Grand",
+            "content": "I'd really like to bake it into the codec and avoid computing the cache dynamically. If someone really needs this feature with the current codec, they could make a custom build that applies your patch?\n\nAs far as reviewing is concerned, maybe it would help to split the improvements to skipping blocks and skipping over blocks into two different patches (or commits)? That might help dig test failures or performance issues in the future as well since git bisect would point to a smaller commit. ",
+            "date": "2018-11-14T15:16:27+0000"
+        },
+        {
+            "id": "comment-16691026",
+            "author": "Toke Eskildsen",
+            "content": "Adrien Grand I do not understand your resistance against providing an out-of-the-box performance improvement to Lucene-based search engines. I do not see index-upgrades as trivial exercises and I have previously encountered quite a lot of resistance against trying patched versions of Lucene/Solr. As a developer it is probably second nature to you. For a lot of users, not so much.\n\nYour patch-splitting suggestion is interesting. The three parts [DISI-blocks, dense and variable bits per value] could reasonably easy be split into [DISI-blocks, dense] and [variable bits per value]. Or they could not-so-easily be split into all 3 parts. They would be additive though (as opposed to independent), as they share a lot of structure. If splitting helps acceptance, I'll try and commit that way. I'm also game to make a split patch, if someone commits to do a review.\n\nNote: I am aware that Lucene/Solr 7.6 is in pre-release and that larger patches should not be committed to master until 7.6 has been released. ",
+            "date": "2018-11-18T20:32:14+0000"
+        },
+        {
+            "id": "comment-16691790",
+            "author": "Adrien Grand",
+            "content": "I do not understand your resistance against providing an out-of-the-box performance improvement to Lucene-based search engines. \n\nI have nothing against making performance better, quite the opposite! But as often there are trade-offs and this patch spends significant CPU and I/O when opening the reader in order to build a cache while the same information could be computed at index time. This might be fine for static readers, but it doesn't sound like a net win otherwise.\n\nI do not see index-upgrades as trivial exercises and I have previously encountered quite a lot of resistance against trying patched versions of Lucene/Solr.\n\nSure, I agree patched versions have lots of drawbacks. I was suggesting this workaround in the case upgrading was a no-go given that this is more acceptable to me than adding such caching to the codec.\n\nIf splitting helps acceptance, I'll try and commit that way.\n\nThanks. I'm mostly interested in splitting from the perspective of tracking regressions. For instance it will be easier to track which change a slowdown/speedup relates to in Mike's nightly benchmarks.\n\nI'm also game to make a split patch, if someone commits to do a review.\n\nI'll take care of reviews.\n\nNote: I am aware that Lucene/Solr 7.6 is in pre-release and that larger patches should not be committed to master until 7.6 has been released.\n\nI don't think this is an issue. Nick already cut branch_7_6, so the 7.6 release shouldn't impact work that we are doing on the master and 7.x branches? ",
+            "date": "2018-11-19T14:48:05+0000"
+        },
+        {
+            "id": "comment-16693349",
+            "author": "Toke Eskildsen",
+            "content": "this patch spends significant CPU and I/O when opening the reader\nThis patch spends the IO equivalent of making a single worst-case search matching 1/16384th of the documents in the newly opened segment, sorting on a numeric DocValues field, for each used DocValued field. I am hard pressed to imagine a setup where that IO-penalty wouldn't pay off very quickly.\n\nAs for CPU it does perform a compression on the DENSE data structure, to lower the memory overhead. In Tim's setup, I could not get the timing for his smaller segments as they took less than 1ms. For his largest segment (19M documents) it took a total of 23ms across 41 DocValues fields. For Tim his startup overhead (a total of 412ms across all segments & fields) was paid off in less than a second of operation.\n\nBased on this, I disagree on your assertion of \"significant\" performance overhead for search-time. It might turn out to be significant when applied broadly or tested in depth, but at this point neither theory nor observations suggests so.\nFor instance it will be easier to track which change a slowdown/speedup relates to in Mike's nightly benchmarks.\nAs discussed on Mike's GitHub space, his nightly benchmarks are not really tracking this part (large-jump access of DocValues) of Lucene. If they were, an alarm would have been raised on the switch to the iterative API.\n\nIt is quite understandable that such tests are missing, as large indexes requires a lot of computing resources and/or time. How to quickly catch such regressions in the future, without spending a lump sum on hardware, is a challenge that I have no ready answers for.\n\nIn its current form, Mike's benchmarks seems fine for tracking LUCENE-8374 regressions in the areas where there is no expectation of a speed-up, which is an important part of testing the value of an attempted optimization.\nI'll take care of reviews.\nThank you, I appreciate that.\n\nAs for the wait-for-7.6, I just based it on the note in https://mail-archives.apache.org/mod_mbox/lucene-dev/201811.mbox/ajax/%3CCABM%2Bu9JU%3DQFshN_juicOohU8dZQBtZ0Nc7Zs79_Wt9wZRjTVqA%40mail.gmail.com%3E about big changes. I am happy to classify this patch as a non-big change. ",
+            "date": "2018-11-20T15:08:35+0000"
+        },
+        {
+            "id": "comment-16699003",
+            "author": "Toke Eskildsen",
+            "content": "As suggested, I have divided the patch into 4 parts:\n\n\tIndexedDISI block skips (every 65536 docIDs, low impact)\n\tIndexedDISI DENSE block (high impact)\n\tVarying Bits Per Value (high impact)\n\tThe 3 above enabled for Lucene70NormsProducer\n\n\n\nCollectively this is the same as the full LUCENE-8374 patch. The split is for easier review and to add the changes as 4 commits, for easier bisection in search of errors or other surprising behaviour.\n\nI will let this sit here for a few days. If nothing happens, I plan to push to master to let Jenkins play with it. ",
+            "date": "2018-11-26T14:10:40+0000"
+        },
+        {
+            "id": "comment-16707198",
+            "author": "ASF subversion and git services",
+            "content": "Commit 58a7a8ada5cebeb261060c56cd6d0a9446478bf6 in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=58a7a8a ]\n\nLUCENE-8374 part 1/4: Reduce reads for sparse DocValues\n\nOffset and index jump-table for IndexedDISI blocks. ",
+            "date": "2018-12-03T13:32:04+0000"
+        },
+        {
+            "id": "comment-16707199",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7ad027627a179daa7d8d56be191d5b287dfec6f4 in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7ad0276 ]\n\nLUCENE-8374 part 2/4: Reduce reads for sparse DocValues\n\nIndex jump-table for DENSE indexedDISI blocks. ",
+            "date": "2018-12-03T13:32:06+0000"
+        },
+        {
+            "id": "comment-16707201",
+            "author": "ASF subversion and git services",
+            "content": "Commit 7949b98f802c9ab3a588a33cdb1771b83c9fcafb in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7949b98 ]\n\nLUCENE-8374 part 3/4: Reduce reads for sparse DocValues\n\nOffset jump-table for variable bits per value blocks. ",
+            "date": "2018-12-03T13:32:08+0000"
+        },
+        {
+            "id": "comment-16707202",
+            "author": "ASF subversion and git services",
+            "content": "Commit e356d793caf2a899f23261baba922d4a08b362ed in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e356d79 ]\n\nLUCENE-8374 part 4/4: Reduce reads for sparse DocValues\n\nOffset and index jump-table for norm blocks. ",
+            "date": "2018-12-03T13:32:09+0000"
+        },
+        {
+            "id": "comment-16707215",
+            "author": "Adrien Grand",
+            "content": "Apologies Toke Eskildsen I had missed your update about the patch being split. I still don't think we should scan the entire data part in order to build a cache: this should be computed at index time. ",
+            "date": "2018-12-03T13:47:09+0000"
+        },
+        {
+            "id": "comment-16707216",
+            "author": "Toke Eskildsen",
+            "content": "Pushed to master. Let's see what happens.\n\nBesides following up on issues stemming from the search-time jump-tables, it's time to look at making an index-time version. I think this calls for a new JIRA-issue? ",
+            "date": "2018-12-03T13:47:46+0000"
+        },
+        {
+            "id": "comment-16707247",
+            "author": "Toke Eskildsen",
+            "content": "Adrien Grand Your preference is noted. I have presented my arguments for having a search-time version, you have presented yours. With no mediating party and as I saw no progress in our discussion, I decided to follow David Smileys suggestion and push to see what Jenkins and other testers says.\n\nThe patch is mostly new files and thus fairly easy to revert, even if there are subsequent changes to Lucene70DocValuesProducer & IndexedDISI. I hope this will only be considered after we as a collective has examined its impact on setups of different sizes and request types. ",
+            "date": "2018-12-03T14:05:32+0000"
+        },
+        {
+            "id": "comment-16707663",
+            "author": "Adrien Grand",
+            "content": "I'm a bit disappointed that my view is just considered a preference when it's about making Lucene behave like a search engine and compute data-structures at index time. Now some data-structures of doc values are lazily computed at search-time. It's not as bad as when we only had FieldCache but it still looks like a step back to me, especially as the actual fix (LUCENE-8585) is delayed to January at earliest. ",
+            "date": "2018-12-03T19:10:46+0000"
+        },
+        {
+            "id": "comment-16707797",
+            "author": "Jim Ferenczi",
+            "content": "I agree with Adrien here, why do we need two versions ? I understand that the search-time version can work on existing indices but it looks like the wrong tradeoff especially if we add this loading in a minor version. I also don't think that this affects all users so adding this loading to all use cases seem overkill if an optimized solution exists. Overall I am +1 to revert the commit on master and I volunteer to help on the index-time version if needed. ",
+            "date": "2018-12-03T21:12:12+0000"
+        },
+        {
+            "id": "comment-16708443",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6c111611118ceda0837f25a27e5b4549f2693457 in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6c11161 ]\n\nPre-commit fixes for LUCENE-8374 (JavaDoc + arguments) ",
+            "date": "2018-12-04T09:12:28+0000"
+        },
+        {
+            "id": "comment-16708764",
+            "author": "Toke Eskildsen",
+            "content": "Adrien Grand something might have been lost in translation or culture here. For me, \"preference\" is a neutral term, used in this context to signal that I understand that you do not see having a search-time cache as the right choice.\n\nWe have\n\n\tA DV-implementation (pre LUCENE-8374 commit) that is O(n), with poor scaling up\n\tAn instantly working band aid\n\tA plan to implement a better index-time solution for future segments\n\n\n\nI don't claim that search-time is a superior solution to index-time, when compared neutrally. You are absolutely right that it does lazy-load of data and it is technologically better to do index-time. But it is a red herring. The issue is whether the band-aid makes sense for existing setups.\n\nNow, this is all on master, so no need for panic. But at some point we will roll a 7.7 or an 8.0. Hopefully we will have the index-time implementation ready then. But on the off chance that we don't, let me ask you: Do you think it would be better to have no DV jump-tables at all, rather than have the search-time implementation only in a release? ",
+            "date": "2018-12-04T14:27:43+0000"
+        },
+        {
+            "id": "comment-16708794",
+            "author": "Adrien Grand",
+            "content": "Do you think it would be better to have no DV jump-tables at all, rather than have the search-time implementation only in a release?\n\nYes I do. I'm worried that\n\n\tThe fact that the default codec happily computes data at search-time rather than index-time may set a precedent and as future developers who do not have history of this codec in mind might see it as an ok practice since it's part of the default codec\n\tThe introduced complexity of search-time-only support for jump tables makes it harder to evolve this doc-value format so that it computes jump tables at index time.\n\tWe are reintroducing a feature that potentially allows the memory usage of readers to grow over time rather than being set in stone after the reader is open, which is helpful eg. when digging memory issues on production clusters.\n\tSearch-time-only support introduces contention and/or complexity due to the need to access a cache concurrently.\n\n ",
+            "date": "2018-12-04T14:46:03+0000"
+        },
+        {
+            "id": "comment-16708799",
+            "author": "Toke Eskildsen",
+            "content": "Jim Ferenczi this all started with us (Royal Danish Library) having large segments in our webarchive index. Our own experience, as well as that for other institutions we are in contact with, is that large indexes are unwieldy. One does not simply run an index upgrade on the full collection. In that context the search-time implementation means that a (relatively) simple upgrade of Solr, especially if ported to the 7.x-series, improves performance considerably.\n\nSo your \"why two versions?\" is akin to \"why backport anything?\". We do it because we acknowledge that circumstances differ greatly across organizations & installations and that there is a need for balancing legacy maintenance overhead and making people play the upgrade game. ",
+            "date": "2018-12-04T14:46:49+0000"
+        },
+        {
+            "id": "comment-16708899",
+            "author": "Joel Bernstein",
+            "content": "I have a couple of thoughts about this ticket:\n\n1) It probably should not have been committed to master so close to the 8.0 release without consensus. I'm in agreement with reverting the commit unless consensus can be reached.\n\n2) Is there a way to create another docValues type that users can select through configurations? This allows users to decide for themselves if they would like to make the tradeoffs that this patch introduces. ",
+            "date": "2018-12-04T15:45:01+0000"
+        },
+        {
+            "id": "comment-16708907",
+            "author": "Toke Eskildsen",
+            "content": "Adrien Grand thank you for the well-defined arguments. I see your point much more clearly now.\nThe fact that the default codec happily computes data at search-time rather than index-time may set a precedent...\nI think you place way too little faith in codec developers. Also, the codec is a scary beast and I seriously doubt that changes here will fly under the radar of you or other developers. Concretely the injection of caches is in a few key places and one could well add explicit comments of them being a band aid, to ensure no inspiration follows.\nThe introduced complexity of search-time-only support for jump tables makes it harder to evolve this doc-value format so that it computes jump tables at index time.\nI don't see how that follows. If anything the patch points out the places that should use the index-time structures, which (unless LUCENE-8585 changes that) works the same way as search-time. Where possible, the skipping code has been extracted to helper methods, making it even easier to build on.\nWe are reintroducing a feature that potentially allows the memory usage of readers to grow over time rather than being set in stone after the reader is open...\nTrue. I was not aware of the problems with this. One \"solution\" would be to cache all the DocValues up front. That would mean wasted time & space for non-used fields, so I don't like it.\nSearch-time-only support introduces contention and/or complexity due to the need to access a cache concurrently.\nTrue (and I think I have already found a problem there). With the addendum that we have the same problem if we decide that some structures should be kept in memory for LUCENE-8585.\n\nFrom my point of view you are prioritizing architecture over functionality to a very high degree.\n\nIt might well be more in line with the Lucene code base than my prioritization and on that ground I concede that the search-time code should be removed (and thereby that plug-in functionality for existing indexes goes away) when an index-time solution has been made. Removing a working band aid solution before a working clean one has been committed is not something I support at this point.\n\nOn the more agreeable side, thanks to Jim Ferenczi for volunteering with index-time. With a little luck we can wrap that up fairly quick. I do have time before January, just not much. I guess we should talk details in the LUCENE-8585 issue? ",
+            "date": "2018-12-04T15:52:36+0000"
+        },
+        {
+            "id": "comment-16708966",
+            "author": "Toke Eskildsen",
+            "content": "Joel Bernstein as for turning on optionally, then it was part of my first patch as a static global switch (for debugging). Easy to put back in that form and if JIT does what it's supposed to, a if (cache != null) check should not be noticeable.\n\nMaking a switch non-static is a question of how it fits into the whole codec-instantiation, specifically Lucene70DocValuesProducer. I don't know how that is done without kludging it in. ",
+            "date": "2018-12-04T16:35:56+0000"
+        },
+        {
+            "id": "comment-16708972",
+            "author": "Yonik Seeley",
+            "content": "as for turning on optionally, then it was part of my first patch as a static global switch\n\nThat sounds like a good compromise... just make it expert/experimental so it can be removed later.\nOne nice thing about search-time is that it doesn't introduce any index format back compat issues - it can be evolved or removed partially or entirely when the index format improves. ",
+            "date": "2018-12-04T16:46:56+0000"
+        },
+        {
+            "id": "comment-16712431",
+            "author": "Toke Eskildsen",
+            "content": "I have my hands full with LUCENE-8585 (index-time DV jump-tables), which seems to be coming along nicely. With the expectation that it will be in a reviewable/testable state in the near future and (hope hope hope) be in Lucene 7.7+, some decision should be made on LUCENE-8374.\n\n\tI can let it stay and let it be further tested & bugfixed. I would like this for the reasons stated earlier, but I accept that there is no consensus for this.\n\tI can make it an optional expert/experimental feature, with the default being off (and add opt-in in Solr config so it is easily usable there). As the jump-table using parts of the codecs are extremely localized (more or less jumpIfPossible(...) followed by the old code for fallback), I believe this can be done in a manner that is both very low-risk and easy to review. I like this solution.\n\tI can do a full revert when we have LUCENE-8585. Obviously I don't like this, but I accept the validity of the argument that the value of a plug'n'play performance upgrade diminishes greatly when a technically better plug'n'index-upgrade'n'play performance solution exists.\n\tI can do a full revert ASAP. I am against this as I see DV-scaling as very poor without jump-tables and want to be sure we have jump-tables from here on out: Keep it until a better alternative is in place.\n\n\n\nUnder the assumption of a soon-to-be working LUCENE-8585, it is my impression that #3 or #4 are the most favored actions. Until I learn otherwise, I'll go with #3 and pour my focus into LUCENE-8585. ",
+            "date": "2018-12-07T07:19:30+0000"
+        },
+        {
+            "id": "comment-16712684",
+            "author": "Adrien Grand",
+            "content": "I'm in favor of 4. LUCENE-8585 is a much better option to me and I hope that we never release this doc-value format. ",
+            "date": "2018-12-07T11:15:50+0000"
+        },
+        {
+            "id": "comment-16713665",
+            "author": "Toke Eskildsen",
+            "content": "I kinda guessed you were, Adrien Grand . I'll revert the changes. I presume that I should use the git revert for the 4 commits in reverse order? As far as I understand, this leaves a proper git history. ",
+            "date": "2018-12-08T13:05:27+0000"
+        },
+        {
+            "id": "comment-16716896",
+            "author": "Toke Eskildsen",
+            "content": "No reaction to that. Fair enough, I could have asked more directly. Looking back through the git log for Lucene/Solr, I infer that doing the git revert-thing is the correct course as it has been used multiple times before. I'll start that process. ",
+            "date": "2018-12-11T11:41:44+0000"
+        },
+        {
+            "id": "comment-16717124",
+            "author": "ASF subversion and git services",
+            "content": "Commit 870bb11cc85c961f9ca9fb638143d8189a5abd6a in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=870bb11 ]\n\nRevert \"Pre-commit fixes for LUCENE-8374 (JavaDoc + arguments)\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 6c111611118ceda0837f25a27e5b4549f2693457. ",
+            "date": "2018-12-11T13:26:43+0000"
+        },
+        {
+            "id": "comment-16717125",
+            "author": "ASF subversion and git services",
+            "content": "Commit 870bb11cc85c961f9ca9fb638143d8189a5abd6a in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=870bb11 ]\n\nRevert \"Pre-commit fixes for LUCENE-8374 (JavaDoc + arguments)\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 6c111611118ceda0837f25a27e5b4549f2693457. ",
+            "date": "2018-12-11T13:26:45+0000"
+        },
+        {
+            "id": "comment-16717127",
+            "author": "ASF subversion and git services",
+            "content": "Commit 3158d0c485449400d35a0095db15acdce9f8db5c in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3158d0c ]\n\nRevert \"LUCENE-8374 part 4/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit e356d793caf2a899f23261baba922d4a08b362ed. ",
+            "date": "2018-12-11T13:26:48+0000"
+        },
+        {
+            "id": "comment-16717128",
+            "author": "ASF subversion and git services",
+            "content": "Commit 3158d0c485449400d35a0095db15acdce9f8db5c in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3158d0c ]\n\nRevert \"LUCENE-8374 part 4/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit e356d793caf2a899f23261baba922d4a08b362ed. ",
+            "date": "2018-12-11T13:26:49+0000"
+        },
+        {
+            "id": "comment-16717130",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6c5d87a505e4ed5803c41c900a374791bb033a0b in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6c5d87a ]\n\nRevert \"LUCENE-8374 part 3/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 7949b98f802c9ab3a588a33cdb1771b83c9fcafb. ",
+            "date": "2018-12-11T13:26:52+0000"
+        },
+        {
+            "id": "comment-16717131",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6c5d87a505e4ed5803c41c900a374791bb033a0b in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6c5d87a ]\n\nRevert \"LUCENE-8374 part 3/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 7949b98f802c9ab3a588a33cdb1771b83c9fcafb. ",
+            "date": "2018-12-11T13:26:54+0000"
+        },
+        {
+            "id": "comment-16717134",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1da6d39b417148a3a5197931c92b6e8d409059bc in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1da6d39 ]\n\nRevert \"LUCENE-8374 part 2/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 7ad027627a179daa7d8d56be191d5b287dfec6f4. ",
+            "date": "2018-12-11T13:26:57+0000"
+        },
+        {
+            "id": "comment-16717135",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1da6d39b417148a3a5197931c92b6e8d409059bc in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1da6d39 ]\n\nRevert \"LUCENE-8374 part 2/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 7ad027627a179daa7d8d56be191d5b287dfec6f4. ",
+            "date": "2018-12-11T13:26:58+0000"
+        },
+        {
+            "id": "comment-16717137",
+            "author": "ASF subversion and git services",
+            "content": "Commit 8a20705b82272352ffcef8a18a7e8f96b2c05a7b in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8a20705 ]\n\nRevert \"LUCENE-8374 part 1/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 58a7a8ada5cebeb261060c56cd6d0a9446478bf6. ",
+            "date": "2018-12-11T13:27:01+0000"
+        },
+        {
+            "id": "comment-16717138",
+            "author": "ASF subversion and git services",
+            "content": "Commit 8a20705b82272352ffcef8a18a7e8f96b2c05a7b in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8a20705 ]\n\nRevert \"LUCENE-8374 part 1/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 58a7a8ada5cebeb261060c56cd6d0a9446478bf6. ",
+            "date": "2018-12-11T13:27:03+0000"
+        },
+        {
+            "id": "comment-16717528",
+            "author": "Toke Eskildsen",
+            "content": "I am marking this issue as \"Won't Fix\": LUCENE-8585 is the logical successor and implements the jump-tables at index-time. ",
+            "date": "2018-12-11T16:48:05+0000"
+        },
+        {
+            "id": "comment-16719143",
+            "author": "Adrien Grand",
+            "content": "Thanks, Toke. ",
+            "date": "2018-12-12T16:19:10+0000"
+        }
+    ]
+}

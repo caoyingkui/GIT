@@ -1,0 +1,72 @@
+{
+    "id": "LUCENE-5407",
+    "title": "Deadlock? while indexing in cascaded threads",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Not A Problem",
+        "components": [
+            "core/index"
+        ],
+        "affect_versions": "4.6",
+        "status": "Resolved",
+        "fix_versions": []
+    },
+    "description": "Apparently I found a deadlock problem with IndexWriter in a cascaded thread design to add documents (I am working on an application integrating Tika, which has the capability to add embedded documents to the index as independent documents as they are found). The attached code illustrates the problem. Sometimes it stops processing, at least one of the threads remains in WAITING state. It must be executed no more than 5 times in my environment to trigger the problem.",
+    "attachments": {
+        "Test.java": "https://issues.apache.org/jira/secure/attachment/12624122/Test.java",
+        "thread_dump.txt": "https://issues.apache.org/jira/secure/attachment/12624156/thread_dump.txt"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13877482",
+            "author": "Mikhail Khludnev",
+            "content": "I don't think so.\n\nWhy do you recreates indexwriter in this test, even if you have a reason, it's definitely not the case for which it was designed. \nAlso, I see that ParsingReader.run() calls indexWriter.addDocument(doc); when indexWriter might be already closed in the main thread.\nAnyway, please post thread dump with the deadlock that clarifies a lot. ",
+            "date": "2014-01-21T14:03:02+0000"
+        },
+        {
+            "id": "comment-13877543",
+            "author": "Luis Filipe Nassif",
+            "content": "The test does not recreate IndexWriter instances, It is created once in the main thread. And addDocument(doc) returns in the main thread only after pipedWriter is closed in the secondary thread (so pipedReader returns -1), then indexWriter is closed after adding all docs. I will post a thread dump. ",
+            "date": "2014-01-21T15:37:42+0000"
+        },
+        {
+            "id": "comment-13877747",
+            "author": "Mikhail Khludnev",
+            "content": "The test does not recreate IndexWriter instances, It is created once in the main thread\nYep. My fault. \n\nOk. I reproduced this case. I think the problem is that\n\n\"main\" ....\n   java.lang.Thread.State: TIMED_WAITING (on object monitor)\n\tat java.lang.Object.wait(Native Method)\n....\n\tat java.io.PipedReader.read(PipedReader.java:309)\n\n\tlocked <0x00000007ea28ada8> (a java.io.PipedReader)\n\tat org.apache.lucene.index.TestIndex2$ParsingReader.read(TestIndex2.java:85)\n\tat .....\n\tat org.apache.lucene.analysis.util.FilteringTokenFilter.incrementToken(FilteringTokenFilter.java:55)\n....\n\tat org.apache.lucene.index.IndexWriter.addDocument(IndexWriter.java:1179)\n\tat org.apache.lucene.index.TestIndex2.doIndex(TestIndex2.java:45)\n\n\n\n\"main\" obtains some locks in indexWriter, blocked by the reader and waits for closing the stream, which is blocked on obtaining those indexWriter locks.\n\n\"Thread-1\" ...\n   java.lang.Thread.State: WAITING (parking)\n        at sun.misc.Unsafe.park(Native Method)\n\n\tparking to wait for  <0x00000007e9ad1b80> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)\n        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:186)\n        at ....org.apache.lucene.index.DocumentsWriterFlushControl.obtainAndLock(DocumentsWriterFlushControl.java:445)\n...\n        at org.apache.lucene.index.IndexWriter.addDocument(IndexWriter.java:1179)\n        at org.apache.lucene.index.TestIndex2$ParsingReader.run(TestIndex2.java:99)\n\n\n\nit sounds like you expect \"reenterability\" (j2ee meme) from indexWriter and Lucene Analysis, which is never promised to be so. Sad.\nOverall, I don't think that obtaining any locks under Lucene Analysis API is a good idea. \n\nI'm not aware of Tika, but I suppose you need to somehow pre-process the docs and feed them into Lucene one-by-one or in parallel. Once again, Lucene indexes concurrently really well, but without thread-chaining. \n\n\n ",
+            "date": "2014-01-21T19:07:22+0000"
+        },
+        {
+            "id": "comment-13877850",
+            "author": "Luis Filipe Nassif",
+            "content": "Thank you for taking a look. Yes, Lucene indexes concurrently really well if I feed the docs to parallel threads for indexing with the same indexWriter. Even if some indexing thread becomes blocked while reading some doc (eg: slow network, infinite loop while extracting text from corrupted doc), the other indexing threads continue doing the work. So I thought this kind of thread chaining shoud also work fine... Why is Thread-1 blocked here if in a parallel setup the indexing threads do not block if one of them blocks while reading some doc? \n\nThe use case for this design is that we have terabytes of data to process from slow 7200rpm discs and we don't want to pre-process, process and post-process the docs. It is better to read each doc only once and do all the processing with it, taking advantage of disc and system cache, for example. ",
+            "date": "2014-01-21T20:59:48+0000"
+        },
+        {
+            "id": "comment-13878032",
+            "author": "Luis Filipe Nassif",
+            "content": "Actually the pre-processing approach could be done, but Tika does text and embedded doc extraction at the same time and we don't want to repeat part of the processing.\n\nBeside this, I expected Lucene should work in this \"thread-chaining\" setup. ",
+            "date": "2014-01-21T23:53:39+0000"
+        },
+        {
+            "id": "comment-13878397",
+            "author": "Simon Willnauer",
+            "content": "There is no way this would work here. Your first thread enters the index writer and gets a threadstate and then once it pulls the fields reader you enter the indexwriter again to add a \"sub-document\". This sub-document IW#addDocument call tries to get a thread-state as well but since there are only 8 ThreadStates by default you run into a deadlock since for the \"parent-doc\" thread to make progress the \"sub-documents\" thread must return from IW#addDocument but it can't since it waits for another thread to release one of the ThreadStates. So yes that is a deadlock situation but I really don't see any way this could work. I guess further this approach is not what I recommend you do anyways. If you want to index those documents in a stream then I guess a \"producer -> queue -> consumer\" approach might be best suited.   ",
+            "date": "2014-01-22T08:33:30+0000"
+        },
+        {
+            "id": "comment-13878399",
+            "author": "Simon Willnauer",
+            "content": "closing... this is not what the IW was designed for. ",
+            "date": "2014-01-22T08:34:02+0000"
+        },
+        {
+            "id": "comment-13878593",
+            "author": "Luis Filipe Nassif",
+            "content": "Thank you for comment.  Although there are less than 8 threads in example, I agree the general case will not work. ",
+            "date": "2014-01-22T12:28:36+0000"
+        }
+    ]
+}

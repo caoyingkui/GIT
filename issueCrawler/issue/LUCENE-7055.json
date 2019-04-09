@@ -1,0 +1,108 @@
+{
+    "id": "LUCENE-7055",
+    "title": "Better execution path for costly queries",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "In Lucene 5.0, we improved the execution path for queries that run costly operations on a per-document basis, like phrase queries or doc values queries. But we have another class of costly queries, that return fine iterators, but these iterators are very expensive to build. This is typically the case for queries that leverage DocIdSetBuilder, like TermsQuery, multi-term queries or the new point queries. Intersecting such queries with a selective query is very inefficient since these queries build a doc id set of matching documents for the entire index.\n\nIs there something we could do to improve the execution path for these queries?\n\nOne idea that comes to mind is that most of these queries could also run on doc values, so maybe we could come up with something that would help decide how to run a query based on other parts of the query? (Just thinking out loud, other ideas are very welcome)",
+    "attachments": {
+        "LUCENE-7055.patch": "https://issues.apache.org/jira/secure/attachment/12844582/LUCENE-7055.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15773128",
+            "author": "Adrien Grand",
+            "date": "2016-12-23T15:42:28+0000",
+            "content": "I have been looking at slow queries recently, which were slow for that exact reason. They were running a point range query that covered most of the index, intersected with selective queries, which is typically the case when doc values would perform better than points.\n\nSo I started exploring how we could improve this and got the following:\n\n\tPointValues get a new method that computes an estimate of the cost of a visitor. For the Lucene70 codec it basically counts the numbers of leaf blocks that intersect the visitor, and multiplies that number by the number of points on leaf blocks.\n\tA new API on Weight allows to get an estimate of the cost of a Scorer before building it. The underlying idea is that in the case of a conjunction that contains a range, the range should use points if it has the least cost (ie. it will lead the iteration) and doc values otherwise since the scorer will only be used to validate that the current document matched.\n\n\n\nI attached a patch if someone is interested to look into how that works. I tried to make it as little invasive as possible: the new API on Weight is optional, and we do not need to implement giant queries that know both how to use points and doc values, instead there is a wrapper query called IndexOrDocValuesQuery that wraps both a point/index query and a doc values query and it figures out which one to use based on costs. It is neither complete not commitable, just a proof of concept to trigger some discussion. "
+        },
+        {
+            "id": "comment-15774874",
+            "author": "Paul Elschot",
+            "date": "2016-12-24T13:04:27+0000",
+            "content": "Intersecting such queries with a selective query is very inefficient since these queries build a doc id set of matching documents for the entire index.\n\nJust thinking out loud: how about also using a lazy doc id set builder that works on the go?\nThis would use one extra bit per document to indicate whether the document is already evaluated. "
+        },
+        {
+            "id": "comment-15777151",
+            "author": "Adrien Grand",
+            "date": "2016-12-25T22:32:08+0000",
+            "content": "Maybe I miss something but I don't think it would help, since the problem is that points are ordered by value while our iterators need to be ordered by doc id. So you cannot check whether a particular doc id matches the query, this is why we build those large bit sets up front. "
+        },
+        {
+            "id": "comment-15777952",
+            "author": "Jim Ferenczi",
+            "date": "2016-12-26T09:18:29+0000",
+            "content": "I like the new cost estimation and the lazy scorer but maybe instead of a boolean LazyScorer#get should take the min cost as an argument. With a simple boolean it's the parent query that leads the decision based on the min cost. The min cost could be big and the intersection with the point query could be sparse so I think it would be more flexible if the IndexOrDocValuesQuery makes the choice. I also wonder if it's possible to completely disable the search for the next doc ids in the DocValuesNumbersQuery. Isn't it possible to transform this type of query in a simple filter that accepts or rejects docids ? This would eliminate the need to switch to a point query when the min cost is smaller than the point query cost but big enough to make the docvalues query costly since it will need to find the next docids that matches the range every time the leading iteration finds a match.  "
+        },
+        {
+            "id": "comment-15778043",
+            "author": "Adrien Grand",
+            "date": "2016-12-26T10:08:08+0000",
+            "content": "maybe instead of a boolean LazyScorer#get should take the min cost as an argument. With a simple boolean it's the parent query that leads the decision based on the min cost\n\nI am fine either way. I started with your idea but later switched to a boolean since I thought it would be easier to test and would open this API to a couple more use-cases in addition to conjunctions, in particular facets on filters (since filters are consumed in a random-access fashion in that case) and disjunctions (MUST_NOT clauses).\n\nI also wonder if it's possible to completely disable the search for the next doc ids in the DocValuesNumbersQuery. Isn't it possible to transform this type of query in a simple filter that accepts or rejects docids ? This would eliminate the need to switch to a point query when the min cost is smaller than the point query cost but big enough to make the docvalues query costly since it will need to find the next docids that matches the range every time the leading iteration finds a match. \n\nI think this problem was solved with the two-phase iteration API: if you put a DocValuesNumbersQuery in a conjunction, ConjunctionScorer will make sure to use the two-phase iteration API on the DocValuesNumbersQuery, so it will never make it search for the next matching doc. "
+        },
+        {
+            "id": "comment-15778113",
+            "author": "Jim Ferenczi",
+            "date": "2016-12-26T10:45:05+0000",
+            "content": "\nI think this problem was solved with the two-phase iteration API: if you put a DocValuesNumbersQuery in a conjunction, ConjunctionScorer will make sure to use the two-phase iteration API on the DocValuesNumbersQuery, so it will never make it search for the next matching doc.\n\nThanks for the explanation, I did not notice that RandomAccessWeight was meant to do that.\n\n\nI am fine either way. I started with your idea but later switched to a boolean since I thought it would be easier to test and would open this API to a couple more use-cases in addition to conjunctions, in particular facets on filters (since filters are consumed in a random-access fashion in that case) and disjunctions (MUST_NOT clauses).\n\nI agree, I was not sure about using the DocValuesNumbersQuery when the cost is big and the conjunction with another clause is sparse but as you mentioned the two phase iteration API should optimize this case efficiently. So +1 to keep the boolean if it simplifies the logic. "
+        },
+        {
+            "id": "comment-15795700",
+            "author": "Adrien Grand",
+            "date": "2017-01-03T18:10:00+0000",
+            "content": "Here is an updated patch. It adds docs, tests and improves the way BooleanQuery implements this new API so that cost estimations would be propagated lazily through deep query trees (similarly to the fact that two-phase iteration still executes slow bits in deep leaves after fast bits that are in the top-level BooleanQuery).\n\nOnly PointRangeQuery and BooleanQuery implement this API right now, since they are the two important ones to get started, but I think we might be able to generalize to other slow queries, like TermsQuery for instance, by leveraging the sumDocFreq index statistic. But this belongs to another issue.\n\nReviews are warmly welcome. "
+        },
+        {
+            "id": "comment-15797937",
+            "author": "Michael McCandless",
+            "date": "2017-01-04T10:57:24+0000",
+            "content": "I really like this idea and the latest patch: I think it will be an immense query-time optimization for some cases, e.g. a restrictive TermQuery against a massive PointRangeQuery where doc values are also indexed for that range field.\n\nI like how this solution let's us \"phase in\" queries over time (default impl for lazyScorer).\n\nFor the BKDReader impls and PointValues APIs can we rename estimateCost to estimatePointCount or just estimateCount since \"cost\" is a bit more vague here yet what we are computing is somewhat tightly defined.  I think cost is a good name for the LazyScorer method.\n\nMaybe rename LazyScorer to ScorerSource?  LazyScorer makes me feel like the laziness applies during actual iteration of the hits...\n\nI like the switch to a Map<Occur,Collection> for boolean scorer's subs tracking.\n\nFakeLazyScorer in TestLazyBoolean2Scorer seems to fail to initialize its this.randomAccess in its 2nd ctor so the assert is never invoked?\n\nIf I pass randomAccess = false to LazyScorer.get am I not allowed to invoke advance on the returned Scorer?  Maybe the javadocs can call this argument \"hint about expected usage\"?  It's too bad this is not somehow more strongly typed, like you get back a Bits (plus some way to score if it's needed) if you asked for random access, but I don't see how to do that.  Long ago (can't find the issue now) we had an issue exploring something along these lines. But, let's keep the approach now in your patch: progress not perfection!\n\nWe don't need to implement it now, but I'm curious how we'll implement the cost method for multi term queries?  It seems like merely computing the cost (enumerating all terms & summing their sumDocFreq) would be a big part of the overall cost of executing such queries.  I guess we would also need a doc-values based query here too, e.g. one that checks the automaton on a binary doc values field or something?\n\nMaybe change if (cost < 0) { }} to {{if (cost == -1) { in LazyBoolean2Scorer (more explicit)? "
+        },
+        {
+            "id": "comment-15798569",
+            "author": "Adrien Grand",
+            "date": "2017-01-04T15:55:45+0000",
+            "content": "Thanks for the great feedback! I did the following changes:\n\n\trenamed estimateCost to estimatePointCount. I kept Point in the name to make it clear it was about points rather than docs.\n\trenamed LazyScorer to ScorerSupplier to have a consistent naming with the JDK, hopefully that works for you?\n\tfixed FakeScorerSupplier and added a test to test the tester\n\tmade the cost caching in Boolean2ScorerSupplier more explicit\n\n\n\nWe don't need to implement it now, but I'm curious how we'll implement the cost method for multi term queries? It seems like merely computing the cost (enumerating all terms & summing their sumDocFreq) would be a big part of the overall cost of executing such queries. I guess we would also need a doc-values based query here too, e.g. one that checks the automaton on a binary doc values field or something?\n\nRight, I did not think too much about these ones. When figuring out the number of matching terms is cheap (TermsQuery, TermRangeQuery, PrefixQuery), we could return eg. num_matching_terms * sum_doc_freq / size. For more complex automata, this looks more complicated however. "
+        },
+        {
+            "id": "comment-15799488",
+            "author": "Michael McCandless",
+            "date": "2017-01-04T22:05:01+0000",
+            "content": "Thanks!  Looks like a few estimateCost's missed the replacement, e.g. private method in SimpleTextBKDReader, CheckIndex, BKDReader.\n\nScorerSupplier is great.\n\nOtherwise patch looks awesome, thanks Adrien Grand! "
+        },
+        {
+            "id": "comment-15825616",
+            "author": "ASF subversion and git services",
+            "date": "2017-01-17T08:05:54+0000",
+            "content": "Commit 86233cb95de6f24aa2ae7fd016b7d75d535024c7 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=86233cb ]\n\nLUCENE-7055: Add ScorerProvider to get an estimation of the cost of scorers before building them. "
+        },
+        {
+            "id": "comment-15826051",
+            "author": "ASF subversion and git services",
+            "date": "2017-01-17T13:32:38+0000",
+            "content": "Commit aba653960bc631c775128d31fcbb83e685b48680 in lucene-solr's branch refs/heads/branch_6x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=aba6539 ]\n\nLUCENE-7055: Add ScorerProvider to get an estimation of the cost of scorers before building them. "
+        },
+        {
+            "id": "comment-15829515",
+            "author": "ASF subversion and git services",
+            "date": "2017-01-19T08:31:00+0000",
+            "content": "Commit 4b2cc93a0a4124a777adce320ccdeed430e6c905 in lucene-solr's branch refs/heads/branch_6x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4b2cc93 ]\n\nLUCENE-7055: Make sure to use the same reader to create the weight and pull the scorers. "
+        },
+        {
+            "id": "comment-15829516",
+            "author": "ASF subversion and git services",
+            "date": "2017-01-19T08:31:01+0000",
+            "content": "Commit e8fa59904c99b7c09a89a4b2f79699ff5a384115 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e8fa599 ]\n\nLUCENE-7055: Make sure to use the same reader to create the weight and pull the scorers. "
+        }
+    ]
+}

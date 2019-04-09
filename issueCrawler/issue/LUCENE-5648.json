@@ -1,0 +1,134 @@
+{
+    "id": "LUCENE-5648",
+    "title": "Index/search multi-valued time durations",
+    "details": {
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "modules/spatial"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ]
+    },
+    "description": "If you need to index a date/time duration, then the way to do that is to have a pair of date fields; one for the start and one for the end \u2013 pretty straight-forward. But if you need to index a variable number of durations per document, then the options aren't pretty, ranging from denormalization, to joins, to using Lucene spatial with 2D as described here.  Ideally it would be easier to index durations, and work in a more optimal way.\n\nThis issue implements the aforementioned feature using Lucene-spatial with a new single-dimensional SpatialPrefixTree implementation. Unlike the other two SPT implementations, it's not based on floating point numbers. It will have a Date based customization that indexes levels at meaningful quantities like seconds, minutes, hours, etc.  The point of that alignment is to make it faster to query across meaningful ranges (i.e. [2000 TO 2014]) and to enable a follow-on issue to facet on the data in a really fast way.\n\nI'll expect to have a working patch up this week.",
+    "attachments": {
+        "LUCENE-5648.patch": "https://issues.apache.org/jira/secure/attachment/12644509/LUCENE-5648.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13991652",
+            "author": "Ere Maijala",
+            "content": "Since it will be date-based, can you make sure it also works with BC dates? Last time looked at the date implementation, it didn't handle the minus sign properly in ISO 8601 dates. ",
+            "date": "2014-05-07T07:55:32+0000"
+        },
+        {
+            "id": "comment-13992213",
+            "author": "David Smiley",
+            "content": "It will certainly work with BC dates; yes.  I'll keep the sign in mind when I do the year parsing. ",
+            "date": "2014-05-07T20:51:31+0000"
+        },
+        {
+            "id": "comment-13995772",
+            "author": "David Smiley",
+            "content": "Here it is; including tests.\n\n\tWorks with all main predicates: Intersects, IsWithin, Contains, IsDisjointTo\n\tThe implementation is split into the core, a NumberRangePrefixTree and knows nothing about calendars, and then a DateRangePrefixTree subclass which just has the calendaring specifics.\n\tIs able to work with any java.util.Calendar passed to it, including those initialized with Long.MIN_VALUE or MAX_VALUE.  Care is taken to check & avoid Calendar/Long underflow.\n\tOptimized calculation for dates after the \"Gregorian Change Date\" October 15th 1582, in which I basically need to check for leap years & that's it.  Earlier dates use Calendar directly with more overhead but will likely make this work with a variety of Calendars.\n\ttoString() for a cell will use ISO-8601 output, including putting a leading \"-\" if it's 2BC or before.  1BC is actually the year \"0000\".  \"*\" means the universe / all-time.  There is no date parsing in this patch; that is going to happen in a subsequent Solr FieldType.  I might end up moving the code down here for convenience of non-Solr users though.\n\tThe year range is divided into intermediate levels \u2013 there are 1 million year intervals and 1 thousand year intervals.  They are aligned at year 0000 (the year before 1AD).\n\n\n\nIt uses the changes to the SpatialPrefixTree API in LUCENE-5608 so it's still limited to trunk for now. I want to make some more changes to that API still, before eventually back-porting it all to 4x.\n\nThe patch references some changes in the various filters, which theoretically wouldn't have to be modified for new SPTs.  It's pretty much just comments, and limiting an over-aggressive assertion that couldn't universally hold. ",
+            "date": "2014-05-12T22:59:09+0000"
+        },
+        {
+            "id": "comment-13996930",
+            "author": "David Smiley",
+            "content": "Here's an update to the patch.  There were a few bugs fixed, and I do the decode of bytes to cell numbers lazily when needed, if at all.   I can run the test now with a thousand iterations of each predicate and no failures.\n\nOne notable change is that it will now optimize/normalize the precision of the range query, which is not only more efficient but it helped make some tests pass.  For example: April 1st - April 30th is the same thing as the month of April.  And likewise April 1st - May 10th is the same thing as April - May 10th.  Note that trying to say April - April 10th is an error.\n\nIt's probably ready to commit to trunk but I'll wait for any feedback. ",
+            "date": "2014-05-13T21:40:50+0000"
+        },
+        {
+            "id": "comment-14004379",
+            "author": "David Smiley",
+            "content": "New patch:\n\n\tFixed a bug in Cell.equals\n\tAdded Calendar parsing (w/ round-trip tests).  It parses an optional leading '+'/'-' and optionally allows a trailing 'Z' if present.\n\tIgnoring Disjoint tests because of LUCENE-5692\n\n ",
+            "date": "2014-05-21T05:47:38+0000"
+        },
+        {
+            "id": "comment-14005234",
+            "author": "David Smiley",
+            "content": "Updated patch:\n\n\tSupport ranges like 2014 TO 2014-03 which is semantically the same thing as 2014-01 TO 2014-03.  This means you can now do [* TO whatever].\n\tParses calendar ranges.  This means you can round-trip toString() and parseShape() wether it's a single Calendar value \"2014-05\" or a range \"[* TO 2013]\".\n\n ",
+            "date": "2014-05-21T21:03:13+0000"
+        },
+        {
+            "id": "comment-14005576",
+            "author": "David Smiley",
+            "content": "I was putting some thought into the different ways of indexing durations, listing pros & cons.  The approach here should work very well but it has two main down-sides of note:\n\n\tOverlapping or adjacent ranges are effectively coalesced, which impacts the semantics of Contains & Within.  To be clear, it's a non-issue if the multiple durations for a given field on a document don't touch.  But if you wanted to index say [2000 TO 2014] and [2006 TO 2007] then it's as if the 2nd range doesn't even exist.  The document won't match for IsWithin a query of [2006-2008].\n\tThe worst-case number of terms generated for a range at index-time is pretty high.  If you wanted to index Long.MIN_VALUE+1 TO Long.MAX_VALUE-1 (which spans hundreds of millions of years), we're talking about 14k terms.  But it's certainly not commonly that bad unless you were indexing random milliseconds at random millennia. Indexing a 2 adjacent month duration in the same year is only 7 terms.  At search time, lots of hypothetical terms in a duration isn't an issue for RPTs algorithms for the common case of a sparsely populated term space.\n\n\n\nInterestingly, using a 2D prefix-tree for single-dimensional durations expressed as points doesn't have these shortcomings.  But that approach is slower to search than this approach (more possible terms in a search area; it's half of the square of the number of terms in this 1D tree), and is not amenable to terms-enumeration style interval faceting that I'll be doing next.\n\n The number of terms currently being generated would be cut by ~40-50% once LUCENE-4942 gets done. ",
+            "date": "2014-05-22T03:30:55+0000"
+        },
+        {
+            "id": "comment-14012870",
+            "author": "David Smiley",
+            "content": "Some possible features to add, maybe before committing or maybe later:\n\n\tMake the TimeZone and/or Locale configurable.  It's fixed to UTC/ROOT right now.\n\tCap the precision at configuration/setup time to a specified level. New data would get truncated.  It's not needed if you never provide data beyond the desired precision but it's likely easier to do truncation here, and some RPT algorithms can work better if it knows where the bottom is (e.g. prefixGridScanLevel).\n\n\n\nHmmm; I'm not even checking/asserting the TimeZone is what I expect it to be when a Calendar is passed in; I should do that and assert a failure or add the ZONE_OFFSET value to correct into UTC.\n\nSome possible refactorings or performance improvements I see:\n\n\tOptimize Calendar formatting \u2013 don't use SimpleDateFormat.\n\tBreak out NRCell as a separate class (package access) to keep the line count more manageable.\n\tUse a private inner class for the shared state between NRCell instances in the same stack (currently 3 fields: the stack, BytesRef, and something else)\n\n ",
+            "date": "2014-05-29T20:45:28+0000"
+        },
+        {
+            "id": "comment-14017875",
+            "author": "Ryan McKinley",
+            "content": "This stuff is looking great.  java Calendar/Date is mess...  would be nice to use joda-time, but adding that as a dependency is not a great idea.\n\nThe name 'NRShape' and 'NRCell' are a little funny \u2013 maybe NumericRangeShape/NumericRangeCell would be better?\n\nI vote +1 to add it as experimental and get more eyes on it ",
+            "date": "2014-06-04T17:12:46+0000"
+        },
+        {
+            "id": "comment-14018405",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1600555 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1600555 ]\n\nLUCENE-5648: DateRangePrefixTree and NumberRangePrefixTreeStrategy ",
+            "date": "2014-06-05T01:43:12+0000"
+        },
+        {
+            "id": "comment-14018410",
+            "author": "David Smiley",
+            "content": "The \"NR\" abbreviation is purely used on internal classes and it's referenced a lot so I don't worry about it's succinct name.\n\nI committed against 5x.  LUCENE-5608 (spatial api refactoring) is a dependency which is still 5x; maybe I should back-port that to 4x now or soon.  Or wait a bit to see if further changes may arrive when I try to facet. ",
+            "date": "2014-06-05T01:50:06+0000"
+        },
+        {
+            "id": "comment-14018422",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1600560 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1600560 ]\n\nLUCENE-5648: unbreak ant test ",
+            "date": "2014-06-05T02:29:35+0000"
+        },
+        {
+            "id": "comment-14026822",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1601734 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1601734 ]\n\nLUCENE-5648: Bug fix for detecting Contains relation when on the edge. ",
+            "date": "2014-06-10T18:41:23+0000"
+        },
+        {
+            "id": "comment-14027069",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1601777 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1601777 ]\n\nLUCENE-5648: Bug fix for detecting Contains relation when on the edge. ",
+            "date": "2014-06-10T21:28:47+0000"
+        },
+        {
+            "id": "comment-14032391",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1602857 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1602857 ]\n\nLUCENE-5648: (NumberRangePrefixTree) Bug-fix in initIter optimization. Re-index required. ",
+            "date": "2014-06-16T12:38:44+0000"
+        },
+        {
+            "id": "comment-14245810",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1645381 from David Smiley in branch 'dev/trunk'\n[ https://svn.apache.org/r1645381 ]\n\nLUCENE-5648: spatial NumberRangePrefixTree refactorings, mostly:\n\n\trename NRPT.LevelledValue -> UnitNRShape, NRPT.NRShape -> SpanUnitsNRShape, both subclass new NRPT.NRShape marker class; make all 3 public and use these types in method signatures as appropriate.\n\tremove NRPT pass-through convenience methods on NRPTStrategy (not needed; maintenance burden)\n\tre-order some factory/parsing methods in NRPT to keep together at the top\n\tUnitNRShape implements Comparable, and both NRShape implements Cloneable\n\timprove randomized test to pick better random calendars\n\tmore docs\n\n ",
+            "date": "2014-12-14T04:33:01+0000"
+        },
+        {
+            "id": "comment-14245812",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1645382 from David Smiley in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1645382 ]\n\nLUCENE-5648: spatial NumberRangePrefixTree refactorings, mostly:\n\n\trename NRPT.LevelledValue -> UnitNRShape, NRPT.NRShape -> SpanUnitsNRShape, both subclass new NRPT.NRShape marker class; make all 3 public and use these types in method signatures as appropriate.\n\tremove NRPT pass-through convenience methods on NRPTStrategy (not needed; maintenance burden)\n\tre-order some factory/parsing methods in NRPT to keep together at the top\n\tUnitNRShape implements Comparable, and both NRShape implements Cloneable\n\timprove randomized test to pick better random calendars\n\tmore docs\n\n ",
+            "date": "2014-12-14T04:37:41+0000"
+        },
+        {
+            "id": "comment-14332853",
+            "author": "Anshum Gupta",
+            "content": "Bulk close after 5.0 release. ",
+            "date": "2015-02-23T05:02:16+0000"
+        }
+    ]
+}

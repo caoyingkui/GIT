@@ -1,0 +1,137 @@
+{
+    "id": "LUCENE-6553",
+    "title": "Simplify how we handle deleted docs in read APIs",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.3"
+        ],
+        "priority": "Minor",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "Today, all scorers and postings formats need to be able to handle deleted documents.\n\nI suspect that the reason is that we want to be able to make sure to not perform costly operations on documents that are deleted. For instance if you run a phrase query, reading positions on a document which is deleted is useless. I suspect this is also a source of inefficiencies since in some cases we apply deleted documents several times: for instance conjunctions apply deleted docs to every sub scorer.\n\nHowever, with the new two-phase iteration API, we have a way to make sure that we never run expensive operations on deleted documents: we could first iterate over the approximation, then check that the document is not deleted, and finally confirm the match. Since approximations are cheap, applying deleted docs after them would not be an issue.\n\nI would like to explore removing the \"Bits acceptDocs\" parameter from TermsEnum.postings, Weight.scorer, SpanWeight.getSpans and Weight.BulkScorer, and add it to BulkScorer.score. This way, bulk scorers would be the only API which would need to know how to apply deleted docs, which I think would be more manageable since we only have 3 or 4 impls. And DefaultBulkScorer would be implemented the way described above: first advance the approximation, then check deleted docs, then confirm the match, then collect. Of course that's only in the case the scorer supports approximations, if it does not, it means it is cheap so we can directly iterate the scorer and check deleted docs on top.",
+    "attachments": {
+        "LUCENE-6553.patch": "https://issues.apache.org/jira/secure/attachment/12741334/LUCENE-6553.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14582540",
+            "author": "Michael McCandless",
+            "date": "2015-06-11T21:30:08+0000",
+            "content": "+1, this sounds wonderful, to stop \"special casing\" the live docs filter, inefficiently. "
+        },
+        {
+            "id": "comment-14582568",
+            "author": "Robert Muir",
+            "date": "2015-06-11T21:47:06+0000",
+            "content": "I agree this is definitely worth exploring, it could simplify a lot.\n\n\nI suspect this is also a source of inefficiencies since in some cases we apply deleted documents several times: for instance conjunctions apply deleted docs to every sub scorer.\n\nIt also has the side effect of making code complex: trying to avoid these inefficiencies in other cases, such as in advance(). So code is completely duplicated from next() there just to avoid the livedocs check on every document when scanning. "
+        },
+        {
+            "id": "comment-14586318",
+            "author": "Adrien Grand",
+            "date": "2015-06-15T17:04:55+0000",
+            "content": "I started playing with this idea, and the only issue in core so far is FilteredQuery.RANDOM_ACCESS_STRATEGY which wants to apply a Filter as acceptDocs, which would not be supported anymore with this change. "
+        },
+        {
+            "id": "comment-14598032",
+            "author": "Adrien Grand",
+            "date": "2015-06-23T17:45:37+0000",
+            "content": "Here is a patch that removes the handling of acceptDocs from the postings, spans and scorer APIs, and moves it from the constructor to the score() method for BulkScorer.\n\nIn general I think it simplifies the code a lot:\n\n\twe have lots of postings formats and query impls that do not need to care about deleted docs at all anymore since they use the default bulk scorer\n\tCheckIndex does not need to test that postings formats ignore deleted docs correctly\n\n\n\nOne thing I am unsure about is whether LeafReader.postings should still apply deleted docs or not. At least for other call sites, there would be a compilation error since the acceptDocs parameter was removed, but this method did not have such a parameter and implicitely applied the reader's live docs. For now I documented explicitly that live docs were not applied, but I could also understand why someone would like to see live docs applied for this method. The reason why I decided to not apply live docs is that then if you use this method in a Query implementation, the Scorer would be illegal since it would apply live docs while it's not supposed to. "
+        },
+        {
+            "id": "comment-14598824",
+            "author": "David Smiley",
+            "date": "2015-06-24T03:47:03+0000",
+            "content": "+1 LGTM.  \n\nWow the patch is a doozy.  At least mostly it's changing parameters at call sites.  For the most part the patch seems to reduce the lines of code (a good thing), particularly at the low-level postings format parts, so I think that's good.\n\nOne thing I am unsure about is whether LeafReader.postings should still apply deleted docs or not.\n\nYour chosen approach makes sense to me.  If it were to do it, it takes away control of wether they should be filtered or not. "
+        },
+        {
+            "id": "comment-14599016",
+            "author": "Adrien Grand",
+            "date": "2015-06-24T07:42:57+0000",
+            "content": "I ran luceneutil on wikimedium10M with deleted documents:\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                  Fuzzy1       91.66      (7.4%)       89.66      (7.3%)   -2.2% ( -15% -   13%)\n            OrHighNotLow       62.10      (3.1%)       61.14      (4.8%)   -1.5% (  -9% -    6%)\n             LowSpanNear       27.30      (3.3%)       26.88      (4.6%)   -1.5% (  -9% -    6%)\n            OrHighNotMed       38.74      (2.8%)       38.31      (4.6%)   -1.1% (  -8% -    6%)\n        HighSloppyPhrase        3.23      (4.7%)        3.20      (4.6%)   -1.0% (  -9% -    8%)\n         MedSloppyPhrase       54.01      (2.6%)       53.55      (2.2%)   -0.9% (  -5% -    4%)\n         LowSloppyPhrase       41.78      (2.3%)       41.50      (2.5%)   -0.7% (  -5% -    4%)\n               LowPhrase       15.75      (1.2%)       15.68      (2.1%)   -0.4% (  -3% -    2%)\n               MedPhrase       14.62      (1.5%)       14.58      (2.4%)   -0.3% (  -4% -    3%)\n              HighPhrase       20.86      (3.1%)       20.86      (4.0%)   -0.0% (  -6% -    7%)\n                 Respell       94.55      (4.8%)       94.58      (4.5%)    0.0% (  -8% -    9%)\n                Wildcard       60.39      (4.4%)       60.49      (3.9%)    0.2% (  -7% -    8%)\n           OrHighNotHigh       33.38      (1.7%)       33.52      (3.3%)    0.4% (  -4% -    5%)\n            HighSpanNear        8.55      (2.4%)        8.61      (3.0%)    0.8% (  -4% -    6%)\n            OrNotHighMed      211.67      (1.6%)      214.27      (2.3%)    1.2% (  -2% -    5%)\n           OrNotHighHigh       63.32      (1.6%)       64.12      (3.1%)    1.3% (  -3% -    6%)\n            OrNotHighLow     1031.92      (3.7%)     1045.97      (4.7%)    1.4% (  -6% -   10%)\n                HighTerm      141.43      (3.7%)      143.85      (4.9%)    1.7% (  -6% -   10%)\n             MedSpanNear       34.47      (2.0%)       35.07      (2.1%)    1.7% (  -2% -    5%)\n                 MedTerm      208.01      (3.6%)      211.76      (4.8%)    1.8% (  -6% -   10%)\n              AndHighLow      819.26      (5.5%)      842.89      (5.5%)    2.9% (  -7% -   14%)\n              AndHighMed      203.53      (2.2%)      210.03      (2.1%)    3.2% (  -1% -    7%)\n                  IntNRQ       14.08      (8.1%)       14.59     (10.1%)    3.6% ( -13% -   23%)\n                 Prefix3       41.82      (7.6%)       43.52      (8.8%)    4.1% ( -11% -   22%)\n             AndHighHigh       47.54      (1.9%)       49.68      (2.2%)    4.5% (   0% -    8%)\n               OrHighMed       71.76      (5.4%)       76.11      (4.9%)    6.1% (  -4% -   17%)\n                 LowTerm      654.52      (9.3%)      695.50     (10.3%)    6.3% ( -12% -   28%)\n               OrHighLow       67.44      (5.4%)       72.46      (5.0%)    7.4% (  -2% -   18%)\n              OrHighHigh       26.92      (5.8%)       28.95      (5.4%)    7.5% (  -3% -   19%)\n                  Fuzzy2       81.71     (22.1%)       96.27     (18.1%)   17.8% ( -18% -   74%)\n\n\n\nFor most queries performance is similar, but disjunctions look like they got a slight peformance boost with this patch. "
+        },
+        {
+            "id": "comment-14599055",
+            "author": "Adrien Grand",
+            "date": "2015-06-24T08:13:23+0000",
+            "content": "Luceneutil on wikimedium10M again, but without deleted documents this time:\n\n\n                  IntNRQ        9.57      (5.8%)        9.31      (6.6%)   -2.7% ( -14% -   10%)\n                 Prefix3      253.58      (3.5%)      249.27      (3.4%)   -1.7% (  -8% -    5%)\n                 LowTerm      695.13      (2.9%)      685.91      (2.9%)   -1.3% (  -6% -    4%)\n                Wildcard       51.13      (3.6%)       50.49      (4.3%)   -1.3% (  -8% -    6%)\n         LowSloppyPhrase       13.87      (5.3%)       13.71      (5.4%)   -1.1% ( -11% -   10%)\n               MedPhrase       99.70      (3.2%)       98.69      (4.3%)   -1.0% (  -8% -    6%)\n                  Fuzzy1       86.60     (11.0%)       85.75     (11.0%)   -1.0% ( -20% -   23%)\n                 Respell      103.93      (3.3%)      103.18      (3.5%)   -0.7% (  -7% -    6%)\n        HighSloppyPhrase        8.18      (5.6%)        8.13      (5.9%)   -0.7% ( -11% -   11%)\n               OrHighLow       55.24      (6.4%)       54.90      (6.9%)   -0.6% ( -13% -   13%)\n              HighPhrase        8.42      (5.9%)        8.37      (6.4%)   -0.6% ( -12% -   12%)\n               OrHighMed       19.64      (6.4%)       19.52      (7.2%)   -0.6% ( -13% -   13%)\n               LowPhrase       58.69      (2.2%)       58.34      (2.4%)   -0.6% (  -5% -    4%)\n         MedSloppyPhrase       43.44      (5.4%)       43.21      (5.3%)   -0.5% ( -10% -   10%)\n              OrHighHigh       39.31      (6.5%)       39.14      (6.9%)   -0.4% ( -12% -   13%)\n              AndHighLow      690.71      (5.1%)      688.77      (4.3%)   -0.3% (  -9% -    9%)\n            OrNotHighMed      153.25      (1.8%)      152.97      (1.9%)   -0.2% (  -3% -    3%)\n             AndHighHigh       65.10      (2.6%)       65.08      (3.2%)   -0.0% (  -5% -    5%)\n           OrNotHighHigh       46.47      (1.4%)       46.47      (1.9%)   -0.0% (  -3% -    3%)\n              AndHighMed      168.75      (2.3%)      168.79      (2.2%)    0.0% (  -4% -    4%)\n             MedSpanNear       61.15      (3.9%)       61.41      (3.5%)    0.4% (  -6% -    8%)\n            OrNotHighLow     1137.12      (4.0%)     1142.11      (3.5%)    0.4% (  -6% -    8%)\n           OrHighNotHigh       54.49      (1.7%)       54.74      (1.9%)    0.5% (  -3% -    4%)\n             LowSpanNear       14.95      (2.8%)       15.02      (2.9%)    0.5% (  -5% -    6%)\n            OrHighNotMed       41.44      (2.5%)       41.73      (2.6%)    0.7% (  -4% -    5%)\n                 MedTerm      289.16      (3.5%)      292.24      (2.9%)    1.1% (  -5% -    7%)\n            OrHighNotLow       87.80      (3.3%)       88.86      (3.1%)    1.2% (  -5% -    7%)\n                HighTerm       81.86      (3.9%)       83.56      (3.5%)    2.1% (  -5% -    9%)\n            HighSpanNear       42.21      (3.5%)       43.33      (4.2%)    2.6% (  -4% -   10%)\n                  Fuzzy2       58.86     (15.6%)       60.45      (9.4%)    2.7% ( -19% -   32%)\n\n\n\nAll differences look like noise to me? "
+        },
+        {
+            "id": "comment-14599148",
+            "author": "Robert Muir",
+            "date": "2015-06-24T09:11:49+0000",
+            "content": "+1 "
+        },
+        {
+            "id": "comment-14599226",
+            "author": "Adrien Grand",
+            "date": "2015-06-24T10:34:43+0000",
+            "content": "Since it only modifies internal APIs, we could actually have this changed backported to 5.x. However, it would conflict with how FilteredQuery sometimes applies filters through acceptDocs so we would have to make FilteredQuery always rewrite to a BooleanQuery. I think it is fair, but it means that FilteredQuery will be slower when provided with a filter which has good random-access but a bad iterator.\n\nOpinions? "
+        },
+        {
+            "id": "comment-14599233",
+            "author": "Robert Muir",
+            "date": "2015-06-24T10:45:01+0000",
+            "content": "Maybe FilteredQuery can apply filters through acceptDocs by wrapping the Bits with a two-phase DISI. Then iteration will not be used just like today. "
+        },
+        {
+            "id": "comment-14599387",
+            "author": "Adrien Grand",
+            "date": "2015-06-24T13:15:52+0000",
+            "content": "This is a good idea, I opened LUCENE-6601. "
+        },
+        {
+            "id": "comment-14601205",
+            "author": "Adrien Grand",
+            "date": "2015-06-25T13:40:30+0000",
+            "content": "I just committed LUCENE-6601 so I'll commit this change to the 5.x branch as well. "
+        },
+        {
+            "id": "comment-14601237",
+            "author": "ASF subversion and git services",
+            "date": "2015-06-25T13:59:21+0000",
+            "content": "Commit 1687524 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1687524 ]\n\nLUCENE-6553: Simplify how live docs are applied. "
+        },
+        {
+            "id": "comment-14601528",
+            "author": "ASF subversion and git services",
+            "date": "2015-06-25T16:54:17+0000",
+            "content": "Commit 1687580 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1687580 ]\n\nLUCENE-6553: Fix how DrillSidewaysScorer handles deleted docs. "
+        },
+        {
+            "id": "comment-14601540",
+            "author": "ASF subversion and git services",
+            "date": "2015-06-25T17:07:14+0000",
+            "content": "Commit 1687581 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1687581 ]\n\nLUCENE-6553: Simplify how live docs are applied. "
+        },
+        {
+            "id": "comment-14601566",
+            "author": "ASF subversion and git services",
+            "date": "2015-06-25T17:21:10+0000",
+            "content": "Commit 1687586 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1687586 ]\n\nLUCENE-6553: Fixes to Weight's javadoc. "
+        },
+        {
+            "id": "comment-14602565",
+            "author": "ASF subversion and git services",
+            "date": "2015-06-26T08:35:49+0000",
+            "content": "Commit 1687712 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1687712 ]\n\nLUCENE-6553: Fix reuse of postings enums in DirectPostingsFormat. "
+        },
+        {
+            "id": "comment-14602608",
+            "author": "ASF subversion and git services",
+            "date": "2015-06-26T09:19:36+0000",
+            "content": "Commit 1687722 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1687722 ]\n\nLUCENE-6553: Fix reuse of postings enums in DirectPostingsFormat. "
+        },
+        {
+            "id": "comment-14713233",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-08-26T13:06:09+0000",
+            "content": "Bulk close for 5.3.0 release "
+        }
+    ]
+}

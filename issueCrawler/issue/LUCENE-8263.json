@@ -1,0 +1,150 @@
+{
+    "id": "LUCENE-8263",
+    "title": "Add indexPctDeletedTarget as a parameter to TieredMergePolicy to control more aggressive merging",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "7.5",
+            "master (8.0)"
+        ]
+    },
+    "description": "Spinoff of LUCENE-7976 to keep the two issues separate.\n\nThe current TMP allows up to 50% deleted docs, which can be wasteful on large indexes. This parameter will do more aggressive merging of segments with deleted documents when the total percentage of deleted docs in the entire index exceeds it.\n\nSetting this to 50% should approximate current behavior. Setting it to 20% caused the first cut at this to increase I/O roughly 10%. Setting it to 10% caused about a 50% increase in I/O.\n\nI was conflating the two issues, so I'll change 7976 and comment out the bits that reference this new parameter. After it's checked in we can bring this back. That should be less work than reconstructing this later.\n\nAmong the questions to be answered:\n\n1> what should the default be? I propose 20% as it results in significantly less space wasted and helps control heap usage for a modest increase in I/O.\n\n2> what should the floor be? I propose 10% with strong documentation warnings about not setting it below 20%.\n\n3> should there be two parameters? I think this was discussed somewhat in 7976. The first cut at  this used this number for two purposes:\n3a> the total percentage of deleted docs index-wide to trip this trigger\n3b> the percentage of an individual segment that had to be deleted if the segment was over maxSegmentSize/2 bytes in order to be eligible for merging. Empirically, using the same percentage for both caused the merging to hover around the value specified for this parameter.\n\nMy proposal for <3> would be to have the parameter do double-duty. Assuming my preliminary results hold, you specify this parameter at, say, 20% and once the index hits that % deleted docs it hovers right around there, even if you've forceMerged earlier down to 1 segment. This seems in line with what I'd expect and adding another parameter seems excessively complicated to no good purpose. We could always add something like that later if we wanted.",
+    "attachments": {
+        "LUCENE-8263.patch": "https://issues.apache.org/jira/secure/attachment/12931321/LUCENE-8263.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16457228",
+            "date": "2018-04-27T23:53:20+0000",
+            "content": "The other possibility is to give some guidance around setting reclaimDeletesWeight more aggressively. I'd rather not add another tuning parameter to TMP if possible so check that first. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16529960",
+            "date": "2018-07-02T14:02:48+0000",
+            "content": "I just had a quick look at this. Given that the score formula (the lower the better) for a merge is\n\n({largest segment to merge} / {total size of the merge}) * {total size of the merge} ^ 0.05 * {live docs ratio} ^ reclaimDeletesWeight\n\n\nA perfect merge with no deletes gets a score of\n\n1/maxMergeAtOnce * maxSegmentSize^0.05 * 1\n\nand a merge to reclaim deletes on a segment of the maximum size would get a score of (assuming we find small segments to merge with the large segment that has many deletes so that the merge size is maxSegmentSize)\n\n{live docs ratio} * maxSegmentSize^0.05 * {live docs ratio} ^ reclaimDeletesWeight\n\nSo if I'm not mistaken, we could just use reclaimDeletesWeight and add too-large segments to the list of candidates, and singleton merges would be possible when reclaimDeletesWeight is greater than\n\n-log(maxMergeAtOnce) / log({live docs ratio}) - 1\n\n\nAssuming the default max merge at once of 10, Lucene would allow for singleton merges with 20% deletes when reclaimDeletesWeight >= 9.3 and singleton merges with 50% deletes when reclaimDeletesWeight >= 2.3.\n\nI think the API would be nicer if we exposed this new target percentage of deleted docs that Erick is proposing, and then computed the weight for scoring deletes internally accordingly, so that we could remove this opaque reclaimDeletesWeight from the API?\n\nwhat should the floor be? I propose 10% with strong documentation warnings about not setting it below 20%.\n\nMy gut feeling is that our users focus on disk usage from deleted documents because this is something that we make very visible. I have seen some other systems reserve fixed amounts of space per value (thus waste) and users were just happy about it because they only looked at the average number of bytes per document which was fine and they didn't know about this waste. I'm tempted to be more conservative than that and rather use 20% as a floor. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16533467",
+            "date": "2018-07-05T10:04:10+0000",
+            "content": "+1 to remove the confusing reclaimDeletesWeight from the API and instead derive the (private) value for that from the public API's target percentage, and to simply allow the too-large segments into the scoring process so that they can be picked for singleton merges naturally.\n\nBut, we need to be careful, because very high reclaimDeletesWeight can cause TMP to make crazy decisions, over merging minuscule segments with huge ones just to remove a few deletes. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16533807",
+            "date": "2018-07-05T15:27:54+0000",
+            "content": "OK, thanks all. I'll get to this Real Soon Now. I'll have to uncrank some of my tests to see what the effects of changing these parameters are on I/O.\n\nI do agree that exposing this number makes it more noticeable, but I have to add that I also have seen 1T indexes in a single core. Yeah, yeah, yeah, we had them split it up, but still. My point is that disk space is a real concern as you scale up. Maybe for 95% of users it's a red herring...\n\nI'll think about this some more when I get back into the code. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16535763",
+            "date": "2018-07-07T13:58:10+0000",
+            "content": "Now would be a good time to add more unit tests to merge policies, which should be easier given that Simon Willnauer detached MergePolicy from IndexWriter (LUCENE-8330). This would help avoid introducing regressions to TieredMergePolicy with this change to how we reclaim deletes. I'm happy to work on this. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16535798",
+            "date": "2018-07-07T15:23:54+0000",
+            "content": "Adrien Grand All help welcome of course! The code changes for this one are actually pretty minimal, at least given my first go at it a while ago. The effects, well, we'll see.\n\nDo be careful of one thing though, when you forceMerge and specify N segments where N > 1, TMP no longer guarantees that there'll be exactly N segments when done. IT does a \"best effort\" single-pass attempt to avoid rewriting segments uselessly.\n\nFWIW, I ran 2,000 beasts of LUCENE-8383 and LUCENE-8385 combined last night and they all passed. I'll be happy to help beast any interim additional tests you come up with. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16541607",
+            "date": "2018-07-12T13:11:28+0000",
+            "content": "I gave a shot at various ideas for weighting deletes and ran simulations with the new tests, looking mostly at the write amplification given a target percentage of deleted documents. That wasn't really successful, the best output I got (within noise) was from keeping the current scoring formula, only considering large segments for merging if they have more deletes than the allowed percentage, and computing new merges until the number of deletes is low enough. Here are some numbers I got for write amplification.\n\n\n\n\nMax percentage of deletes\nMax merged segment = 5GB\nMax merged segment = 1TB (never reached)\n\n\n 10% \n6.2\n8.6\n\n\n 20% \n4.7\n5.7\n\n\n 30% \n4.3\n4.7\n\n\n 40% \n4.3\n4.4\n\n\n 50% \n4.3\n4.6\n\n\n\n\n\nAllowing for 30% or 40% of deletes doesn't behave much worse than 50%. 20% starts to reproducibly show an increase of write amplification and 10% is much more resource-intensive. As a consequence this patch proposes that 33% as a default value, ie. the index is at most 50% larger than an index without deletes, and enforces that the allowed percentage of deletes is at least 20%.\n\nI suspect that changes to the scoring formula could help even more, but that probably belongs to a follow-up. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16543346",
+            "date": "2018-07-13T15:31:30+0000",
+            "content": "+1, patch looks great, and those write amplification simulation experiments are wonderful; a default of 33% makes sense.\n\nIt's much more intuitive to the user to set the limit on overall % deletes, than the cryptic existing reclaimDeletesWeight.\n\nIt's surprising how many tests relied on the behavior of the default merge policy.\n\nOne question about this comment:\n// if this segment is merging, then its deletes are being reclaimed already. + // only count live docs in the total max doc\n\u00a0\n\nIt's true that a merging segments will have deletions reclaimed, but, the number of deletions that will be reclaimed is the deletion count for that segment when the merge first kicked off.\u00a0 Any new deletions that accumulate on that segment, won't be merged away, and will carry over to the merged segment, yet I think the logic in the patch will \"pretend\" those carry over deletions will also be merged away, because the MergePolicy.size method checks the live deletion count.\u00a0 I don't think we need to fix this here ... and, once the merge finishes, and the deletes carry over, the logic will then be correct when considering that merged segment for further merging. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16543375",
+            "date": "2018-07-13T15:58:57+0000",
+            "content": "It's surprising how many tests relied on the behavior of the default merge policy.\n\nI didn't find them all yet. \n\nthe number of deletions that will be reclaimed is the deletion count for that segment when the merge first kicked off\n\nGood point, I will add a comment about that. I don't think we can easily know the number of deletes that will be reclaimed, can we? If not I think the current approach of underestimating deletes is good since it means less merging. Like you said, the logic becomes correct again when the merge is over.\n\nThanks for looking! ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16543465",
+            "date": "2018-07-13T17:23:13+0000",
+            "content": "+1 to the patch.\n\nThere were some weird edge cases in TestTieredMergePolicy that only came to light when I beasted it, so I'll run a few thousand iterations over the weekend and report back if any pop out.\n\nYour simulations numbers square pretty well with mine when I was doing this one at the same time as 7976. \n\nI originally advocated  not putting a floor on the percentage and providing users with one more way to shoot themselves in the foot. I've changed my mind on that, I think 20% is fine. Now that they can forceMerge or expungeDeletes without creating massive segments, I don't think there's any good (or even bad) reason to allow < 20%.\n\nThanks again for working on this and your help with 7976. Much appreciated. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16543616",
+            "date": "2018-07-13T19:27:46+0000",
+            "content": "I would like to argue against a 20% floor.\n\nSome indexes contain documents of wildly different sizes with the larger documents experiencing much higher turnover. I have seen indexes with around 20% deletions that were more than 2x their optimized size because of this phenomenon.\n\nI such situations, deletesPctAllowed around 10-15% would make a lot of sense. I say keep the floor at 10%.\n\nOr maybe simply issue a warning instead? ",
+            "author": "Marc Morissette"
+        },
+        {
+            "id": "comment-16543800",
+            "date": "2018-07-13T22:15:45+0000",
+            "content": "I such situations, deletesPctAllowed around 10-15% would make a lot of sense. I say keep the floor at 10%.\n\nI'd like to avoid doing that. This option is a bit like the \"optimize\" button to me: why would I want to waste space for deleted documents? Yet it's hard to think about the consequences of setting this option: the above simulations suggest around 2.1x more merging with 10% of allowed deletes but I wouldn't be surprised that it could be much worse in practice in production under certain conditions. Since Lucene only guarantees something around 50% of deleted documents in the index at most today, I feel like the current patch is significant progress already? Someone who would really want to configure it with 10% deletes could still fork this merge policy?\n\nOr maybe simply issue a warning instead?\n\nThis would be possible from Solr, but Lucene can't do it since it is a library. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16544392",
+            "date": "2018-07-15T03:03:44+0000",
+            "content": "the above simulations suggest around 2.1x more merging with 10% of allowed deletes but I wouldn't be surprised that it could be much worse in practice in production under certain conditions.\nI understand why you would rather not give users another way to shoot\u00a0themselves in the foot but I think you may underestimate how diverse and idiosyncratic some use cases\u00a0can get.\u00a0There are many real world situations where a setting lower than 20% might be very appropriate\n\n\tSuper large indexes that are not updated often i.e. where size is way more important than IO\n\tIndexes where large documents are updated more often than small documents which skews TieredMergePolicy's estimate of\u00a0delete%\n\tQuery-heavy update-light indexes where update IO is a tiny fraction of query IO\n\n\n\nUsers who will be looking to alter deletesPctAllowed\u00a0will presumably be doing so because the default is inappropriate for their use case. I feel that\u00a020-50% might\u00a0be too narrow a range for some significant percentage of these use cases.\n\nI think documenting the danger of setting too low a value and letting users do their own experiments is the better course of action.\n\n\u00a0 ",
+            "author": "Marc Morissette"
+        },
+        {
+            "id": "comment-16544561",
+            "date": "2018-07-15T14:54:16+0000",
+            "content": "I've gone back and forth on this. Now that optimize and forceMerge respect maxSegmentSize I've been thinking that those operations would suffice for those real-world edge cases.\n\nforceMergeDeletes (expungeDeletes) has a maximum percent of deletes allowed per segment for instance that must be between 0 and 100. 0 is roughly equivalent to forceMerge/optimize at this point. And will not create any segments over maxSegmentSizeMB.\n\nWDYT? ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16544685",
+            "date": "2018-07-15T21:32:31+0000",
+            "content": "Adrien Grand Reproducing TestTieredMergePolicy failure, all that's necessary is the seed:\n\n -Dtests.seed=EF80BCABAD74A7CF\n\nThis is not a result of the code changes for this JIRA, I happened to notice it from a Jenkins build and chased it down. Turns out to be a rounding error that's been there forever. The max segment bytes in TieredMergePolicy is 1585. The test tries to calculate 125% like this:\n\n\nfinal long max125Pct = (long) ((tmp.getMaxMergedSegmentMB() * 1024.0 * 1024.0) * 1.25);\n\n\nwhich gives a value of  1280, should be closer to 1981, which would pass the test.\n\nIt all works if we change TMP.getMaxMergedSegmentMB()\nfrom \n\n    return maxMergedSegmentBytes/1024/1024.;\n\n\nto\n    return maxMergedSegmentBytes/1024./1024.;\n\n\n\n(note additional decimal point in first 1024)\n\nThis is something of a test artifact since having such tiny limits on the segment size is extremely artificial.\n\nDo you want to add that to the patch? Separate JIRA? ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16544687",
+            "date": "2018-07-15T21:36:42+0000",
+            "content": "Erick Erickson I would create a separate JIRA for this bug to make sure it has visibility in the changelog. Thanks for chasing it down! ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16544712",
+            "date": "2018-07-16T00:39:11+0000",
+            "content": "See LUCENE-8398, I'll commit tonight or tomorrow.\n\nJust to give you an idea how rare this is, I've beasted TestTieredMergePolicy with the patch for this JIRA 5,500 times over the weekend without hitting it.\n\nI guess it really wouldn't happen at all unless someone specified fractional megabytes to setMaxMergedSegmentMB, but that happens in the test. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16545788",
+            "date": "2018-07-16T22:01:23+0000",
+            "content": "I've gone back and forth on this. Now that optimize and forceMerge respect maxSegmentSize I've been thinking that those operations would suffice for those real-world edge cases.\n\nforceMergeDeletes (expungeDeletes) has a maximum percent of deletes allowed per segment for instance that must be between 0 and 100. 0 is roughly equivalent to forceMerge/optimize at this point. And will not create any segments over maxSegmentSizeMB.\nI hadn't considered using forceMergeDeletes to address these edge cases but the more I think about it, the more I like it. Consider me convinced.\n\nMy only remaining concern with forceMergeDeletes as it is currently designed\u00a0(and if I'm reading the code correctly) is that if enough segments somehow end up having a delete % above forceMergeDeletesPctAllowed, then it is possible for it to use a lot\u00a0of disk space. Perhaps we could find a way to configure an upper limit on the number of merges that forceMergeDeletes can perform per call? When configured this way, each forceMergeDeletes could only claim a maximum amount of disk space before returning. Repeated calls would be necessary to \"clean\"\u00a0an entire index but if each one were accompanied by a soft commit, then the amount of free disk space\u00a0required\u00a0to perform the entire operation\u00a0would be more predictable. ",
+            "author": "Marc Morissette"
+        },
+        {
+            "id": "comment-16545829",
+            "date": "2018-07-16T22:47:43+0000",
+            "content": "...is that if enough segments somehow end up having a delete % above forceMergeDeletesPctAllowed\n\nRight, the cap is always 2x the index size, and if you don't have that much free space you'll be courting disaster sometime.\n\nforceMerge has something akin to what you're looking for, but forceMergeDeletes doesn't. That's been mentioned as a possible enhancement. Although if you don't have at least as much free disk as your index takes up you're courting trouble down the road anyway. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16546854",
+            "date": "2018-07-17T16:32:15+0000",
+            "content": "Commit 8093c450c1fd22e2bfd5b2a4a1e45c6f95f16189 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8093c45 ]\n\nLUCENE-8263: Replace TieredMergePolicy's reclaimDeletesWeight with deletesPctAllowed. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16546870",
+            "date": "2018-07-17T16:43:12+0000",
+            "content": "Commit 8875402694b42791e18da2d3cf44a4353c676e26 in lucene-solr's branch refs/heads/branch_7x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8875402 ]\n\nLUCENE-8263: Replace TieredMergePolicy's reclaimDeletesWeight with deletesPctAllowed. ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

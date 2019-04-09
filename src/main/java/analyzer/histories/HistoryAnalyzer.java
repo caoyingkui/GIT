@@ -12,19 +12,16 @@ import org.eclipse.jgit.diff.Edit;
 import org.eclipse.jgit.diff.EditList;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.patch.FileHeader;
-import org.eclipse.jgit.patch.Patch;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import util.DateTool;
 import util.ReaderTool;
 import util.WriterTool;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileReader;
 import java.util.*;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class HistoryAnalyzer {
     private static GitAnalyzer git;
@@ -34,6 +31,8 @@ public class HistoryAnalyzer {
     private static Map<String, List<RevCommit>> issueCommitMap = new HashMap<>();
     static {
         git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+
+        //git = new GitAnalyzer("C:\\Users\\oliver\\Desktop\\firefox-browser-architecture");
         initializeCommit_Map();
         initializeIssue_Commit_Map();
 
@@ -84,6 +83,9 @@ public class HistoryAnalyzer {
 
         //回滚所有的提交历史，并从每个commit中抽取每个函数的内容，扩充上步骤建立的每个函数的历史
         for (Pair<ObjectId, Pair<String, String>> pair: commits) {
+            if (pair.getKey().getName().contains("a944ab17a712f58e8417639763a0c7267fa11e61")) {
+                int a = 2;
+            }
             if (!constructHistorySkeleton(pair))
                 break;
         }
@@ -93,41 +95,111 @@ public class HistoryAnalyzer {
         ObjectId commitId = pair.getKey();
         String oldPath = pair.getValue().getKey();
         String newPath = pair.getValue().getValue();
-        if(!newPath.equals(oldPath)) {
+        if(!newPath.equals(oldPath) && !oldPath.equals("/dev/null")) {
             return false;
         }
 
         RevCommit commitObject = git.getCommit(commitId.getName());
 
-        String oldFileContent = git.getFileFromCommit(git.getId(commitId.getName() + "^"), oldPath);
+        String oldFileContent = oldPath.equals("/dev/null") ? "" : git.getFileFromCommit(git.getId(commitId.getName() + "^"), oldPath);
         ClassParser oldParser = new ClassParser().setSourceCode(oldFileContent);
         List<Method> methods = oldParser.getMethods();
         Map<String, Method> oldMethods = new HashMap<>();
         methods.forEach(method -> oldMethods.put(method.fullName, method));
 
+        if (newPath.equals("lucene/core/src/java/org/apache/lucene/search/SynonymQuery.java")) {
+            int a = 2;
+        }
         String newFileContent = git.getFileFromCommit(commitId, newPath);
         ClassParser newParser = new ClassParser().setSourceCode(newFileContent);
         methods = newParser.getMethods();
         Map<String, Method> newMethods = new HashMap<>();
         methods.forEach(method -> newMethods.put(method.fullName, method));
 
-        for (String method: newMethods.keySet()) {
-            Method newMethod = newMethods.get(method);
-            Method oldMethod = oldMethods.getOrDefault(method, null);
+        for (String method: methodHistories.keySet()) {
+            if (method.contains("SynonymWeight")) {
+                int a = 2;
+            }
 
-            Event event = new Event();
-            event.commitId = commitId.getName();
-            event.commitMessage = commitObject.getShortMessage();
-            event.newContent = newParser.getSubString(newMethod.startLine, newMethod.endLine);
-            event.oldContent = oldMethod == null ? "" : oldParser.getSubString(oldMethod.startLine, oldMethod.endLine);
+            Event last = methodHistories.get(method).getLast();
+            String lastFullName = "";
+            if (last == null) lastFullName = methodHistories.get(method).methodName;
+            else lastFullName = last.oldFullName;
 
-            //说明该函数在出現在最终commit中
-            if(methodHistories.containsKey(method)) {
+            if (newMethods.containsKey(lastFullName)) {
+                Method newMethod = newMethods.get(lastFullName);
+                Method oldMethod = oldMethods.getOrDefault(lastFullName, null);
+                // oldMethod为空时，或者是该函数第一次添加，或者是存在重命名现象。
+                Event event = new Event();
+                event.commitId = commitId.getName();
+                event.commitMessage = commitObject.getShortMessage();
+                event.newFullName = newMethod.fullName;
+                event.newName = newMethod.name;
+                event.newContent = newMethod.methodContent;
+                if (oldMethod == null) {
+                    if (method.contains("SynonymWeight")) {
+                        int a = 2;
+                    }
+                    event.oldContent = "";
+                    for (String candidate: oldMethods.keySet()) {
+                        Method can = oldMethods.get(candidate);
+                        if (newMethods.containsKey(can.fullName)) continue;
+                        else {
+                            if (isSimilar(last == null ? newMethod.methodContent : last.oldContent, can.methodContent)) {
+                                event.oldContent = can.methodContent;
+                                event.oldFullName = can.fullName;
+                                event.oldName = can.name;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    event.oldContent = oldMethod.methodContent;
+                    event.oldFullName = oldMethod.fullName;
+                    event.oldName = oldMethod.name;
+                }
                 methodHistories.get(method).addEvent(event);
             }
+
         }
 
+//        for (String method: newMethods.keySet()) {
+//            Method newMethod = newMethods.get(method);
+//            Method oldMethod = oldMethods.getOrDefault(method, null);
+//
+//            Event event = new Event();
+//            event.commitId = commitId.getName();
+//            event.commitMessage = commitObject.getShortMessage();
+//            event.newContent = newMethod.methodContent;
+//            event.oldContent = oldMethod == null ? "" : oldMethod.methodContent;
+//
+//            //说明该函数在出現在最终commit中
+//            if(methodHistories.containsKey(method)) {
+//                methodHistories.get(method).addEvent(event);
+//            }
+//        }
+
         return true;
+    }
+
+    public static boolean isSimilar(String content1, String content2) {
+        String lon = content1.trim(), sht = content2.trim();
+        if (lon.length() == 0 || sht.length() == 0) return false;
+
+        if (lon.length() < sht.length()) {
+            String temp = lon;
+            lon = sht;
+            sht = temp;
+        }
+        int start = 0, len = 0;
+
+        for (len = sht.length() - 1; len > 0; len --) {
+            for (int i = 0; i + len < sht.length(); i++) {
+                if (lon.contains(sht.substring(i, i + len)))
+                    return len > 30;
+            }
+        }
+        return false;
     }
 
     /**
@@ -136,8 +208,8 @@ public class HistoryAnalyzer {
      * @param issueId issueId
      * @return 相关的commit列表
      */
-    private List<RevCommit> getAllRelatedCommits(String issueId) {
-        return issueCommitMap.get(issueId);
+    public static List<RevCommit> getAllRelatedCommits(String issueId) {
+        return issueCommitMap.getOrDefault(issueId, new ArrayList<>());
     }
 
     public String getHistories(String filePath) {
@@ -153,13 +225,14 @@ public class HistoryAnalyzer {
         for (Pair< ObjectId, Pair<String , String>> pair: commits) {
             String commitId = pair.getKey().getName();
             String msg = commitMap.get(commitId).getShortMessage();
-            List<String> issues = findIssueId(msg);
+            List<String> issues = GitAnalyzer.findIssueId(msg);
             for (String issueId: issues) {
                 if ( !issuedHasBeenVisited.contains(issueId)){
                     extractEventsFromIssue(issueId);
                     issuedHasBeenVisited.add(issueId);
                 }
             }
+            break;
         }
         historyCompact();
         JSONArray array = historyGeneration();
@@ -179,7 +252,7 @@ public class HistoryAnalyzer {
         }
     }
 
-    public JSONArray historyGeneration() {
+    private JSONArray historyGeneration() {
         JSONArray result = new JSONArray();
         for (String methodName: methodHistories.keySet()) {
             History history = methodHistories.get(methodName);
@@ -198,16 +271,19 @@ public class HistoryAnalyzer {
             return ;
         List<RevCommit> relatedCommits = getAllRelatedCommits(issueId);
 
+        Map<String, List<Comment>> commit_comment = issue.split(relatedCommits);
 
-        List<Variation> variations = new ArrayList<>();
+        List<Pair<Variation, Comment>> result = new ArrayList<>();
         for (RevCommit commit: relatedCommits) {
+            List<Variation> variations = new ArrayList<>();
             List<String> files = git.getAllFilesModifiedByCommit(commit.getName(), ".java");
             for (String file: files) {
                 //variations.addAll(getVariations(commitId, file));
                 variations.addAll(getVariationsByGumTree(commit.getName(), file));
             }
+            result.addAll(Matcher.match(variations, commit_comment.getOrDefault(commit.getName(), new ArrayList<>())));
         }
-        List<Pair<Variation, Comment>> result = Matcher.match(variations, issue);
+
         for (Pair<Variation, Comment> pair: result) {
             Variation variation = pair.getKey();
             Comment comment = pair.getValue();
@@ -261,20 +337,16 @@ public class HistoryAnalyzer {
             newMethodMap.put(item.fullName, item);
         });
 
-        Map<String, Method> oldMethodMap = new HashMap<>();
-        oldMethods.forEach(item -> {
-            oldMethodMap.put(item.fullName, item);
-        });
+        Map<String, Method> oldMethodMap = oldMethods.stream().collect(Collectors.toMap(item -> item.fullName, item -> item, (a, b) -> b));
 
         for (String methodName: newMethodMap.keySet()) {
             Method method = newMethodMap.get(methodName);
-            String newMethodContent = newClass.getSubString(method.startLine, method.endLine);
+            String newMethodContent = method.methodContent;
             String oldMethodContent = "";
             if (oldMethodMap.containsKey(methodName)) {
                 Method oldMethod = oldMethodMap.get(methodName);
-                oldMethodContent = oldClass.getSubString(oldMethod.startLine, oldMethod.endLine);
+                oldMethodContent = oldMethod.methodContent;
             }
-
 
             List<Mutant> difference = GumTree.getDifference(oldMethodContent, newMethodContent);
             Variation variation = new Variation();
@@ -327,41 +399,58 @@ public class HistoryAnalyzer {
         return result;
     }
 
+    private static void generate_issue_commit_map() {
+        List<RevCommit> commits = git.getCommits();
+        Map<String, List<String>> issue_commit_map = new HashMap<>();
+        for (RevCommit commit: commits) {
+            String commitMsg = commit.getShortMessage();
+            List<String> relatedIssues = GitAnalyzer.findIssueId(commitMsg);
+            for (String issue: relatedIssues) {
+                if (issue_commit_map.containsKey(issue)) {
+                    if (!issue_commit_map.get(issue).contains(commit.getName())){
+                        issue_commit_map.get(issue).add(0, commit.getName());
+                    }
 
-
-    /**
-     * 从commitMsg中获取issueID
-     * @param commitMsg 某次commit中的message
-     * @return commitMsg包含的issueId列表
-     */
-    public static List<String> findIssueId(String commitMsg){
-        List<String> result = new ArrayList<>();
-        Pattern pattern = Pattern.compile("(SOLR-[0-9]+)|(LUCENE-[0-9]+)");
-        java.util.regex.Matcher matcher = pattern.matcher(commitMsg);
-        while(matcher.find()){
-            result.add(matcher.group(0));
+                } else {
+                    List<String> commitList = new ArrayList<>();
+                    commitList.add(commit.getName());
+                    issue_commit_map.put(issue, commitList);
+                }
+            }
         }
-        return result;
+
+        StringBuilder fileContent = new StringBuilder();
+        for (String issue: issue_commit_map.keySet()) {
+            List<String> commitList = issue_commit_map.get(issue);
+
+            StringBuilder temp = new StringBuilder();
+            for (String commit: commitList) {
+                if (temp.length() > 0) temp.append("|");
+
+                temp.append(commit);
+            }
+
+            fileContent.append(issue).append(":").append(temp).append("\n");
+        }
+
+        WriterTool.write("issueCrawler/issue_commit.txt", fileContent.toString());
+
     }
 
     public static void main(String[] args) {
+        generate_issue_commit_map();
+
+
         /*GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
         HistoryAnalyzer analyzer = new HistoryAnalyzer();
-        analyzer.getHistories("solr/contrib/extraction/src/test/org/apache/solr/handler/extraction/ExtractingRequestHandlerTest.java");
-        */
+        analyzer.getHistories("solr/contrib/extraction/src/test/org/apache/solr/handler/extraction/ExtractingRequestHandlerTest.java");*/
 
-        GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+
+
+        //GitAnalyzer git = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
         //GitAnalyzer git = new GitAnalyzer("E:\\Intellij workspace\\GIT");
 
-        List<RevCommit> commits = git.getCommits();
-        Set<String> timezore = new HashSet<>();
-        for (RevCommit commit: commits) {
-            System.out.println(DateTool.toLocalTime(DateTool.getGMTTime(commit)));
-            int a = 2 + 1;
-        }
-        for (String time: timezore) {
-            System.out.println(time);
-        }
+
         /*int total = 0;
         double sim = 0;
         for (String issue: issueCommitMap.keySet()) {

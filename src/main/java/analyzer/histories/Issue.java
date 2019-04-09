@@ -1,13 +1,11 @@
 package analyzer.histories;
 
+import org.eclipse.jgit.revwalk.RevCommit;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import util.ReaderTool;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 public class Issue {
     public String id = "";
@@ -59,6 +57,30 @@ public class Issue {
         this.comments.add(comment);
     }
 
+    public Map<String, List<Comment>> split(List<RevCommit> commits) {
+        Map<String, List<Comment>> result = new HashMap<>();
+        int commentIndex = 0;
+        for (RevCommit commit: commits) {
+            //格林威治时间
+            long commitTime = commit.getAuthorIdent().getWhen().getTime();
+            List<Comment> commentList = new ArrayList<>();
+            while (commentIndex < comments.size()) {
+                Comment comment = comments.get(commentIndex);
+                //加上30秒钟的误差
+                if (comment.date.time < commitTime + 1000 *30) {
+                    commentList.add(comment);
+                    commentIndex ++;
+                } else {
+                    break;
+                }
+            }
+            if (commentList.size() > 0) {
+                result.put(commit.getName(), commentList);
+            }
+        }
+        return result;
+    }
+
     private String get(String field, JSONObject json) {
         String result = "";
         try{
@@ -69,9 +91,10 @@ public class Issue {
         }
     }
 
+
+
     public static void main(String[] args){
         Issue issue = new Issue("SOLR-1");
-
     }
 
 

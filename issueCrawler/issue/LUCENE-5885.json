@@ -1,0 +1,65 @@
+{
+    "id": "LUCENE-5885",
+    "title": "MergeScheduler should not implement Closeable",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [
+            "core/index"
+        ],
+        "affect_versions": "None",
+        "status": "Open",
+        "fix_versions": []
+    },
+    "description": "MergeScheduler implements Closeable and IndexWriter calls ms.close() when it's closed. But MergeScheduler can be shared between several writers, which means closing it by any particular writer is wrong. We should rather implement some ref-counting logic such that each IW will call incRef() in the ctor, and decRef() on close(), and MergeScheduler will truly close when the ref-count hits 0.\n\nAs it is now, if you share a MergeScheduler between writers and close() does something terminating, I doubt if it really works.\n\nAlso, when I look at ConcurrentMergeScheduler.close(), it calls sync() which joins all MergeThreads. But if that CMS instance is shared between few IWs, doesn't it mean that a single IW calling close() waits on MergeThreads that execute merges of other IWs!?!? This seems ... wrong?",
+    "attachments": {
+        "LUCENE-5885.patch": "https://issues.apache.org/jira/secure/attachment/12661717/LUCENE-5885.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14096926",
+            "author": "Michael McCandless",
+            "content": "+1 to remove Closeable.\n\nI think the sync() that CMS does in close today can be dropped: IW already finishes all merges itself. ",
+            "date": "2014-08-14T12:49:45+0000"
+        },
+        {
+            "id": "comment-14096931",
+            "author": "Shai Erera",
+            "content": "Oh, that simplifies things a lot. I started to look into adding MS.decRef(IndexWriter) and such horrible API . But if we can drop the call to sync() from CMS.close(), then it simplifies things.\n\nI wonder if we need to have CMS.sync() at all, rather than having the user call IndexWriter.waitForMerges() \u2013 this seems like a better API. It also ensures that IW isn't closed before CMS.sync() is called? ",
+            "date": "2014-08-14T12:56:56+0000"
+        },
+        {
+            "id": "comment-14096933",
+            "author": "Michael McCandless",
+            "content": "+1 to drop CMS.sync! ",
+            "date": "2014-08-14T12:57:58+0000"
+        },
+        {
+            "id": "comment-14096936",
+            "author": "Shai Erera",
+            "content": "I had a chat w/ Mike about this - we think that perhaps it's better if MergeScheduler doesn't implement close as well as any reference counting. Since IndexWriter either waits or aborts merges itself, there's nothing to close() about CMS. And if you have a custom MS, which e.g. uses a ThreadPool, you can implement a close() or ref-counting mechanism yourself. ",
+            "date": "2014-08-14T13:07:07+0000"
+        },
+        {
+            "id": "comment-14097003",
+            "author": "Shai Erera",
+            "content": "Patch removes CMS.sync() and Closeable from MergeScheduler. Note that this cannot be committed yet, since it depends on the fix Mike's working on on LUCENE-5871. Currently, without that fix, when you call IW.close() and commitOnClose=true, IW flushes, finishes merges and then commits. But that commit may spawn merges itself, and so if we don't wait/abort them in IW.rollbackInternal, some tests complain about still running merges, or hit AlreadyClosedExceptions. With the fix on LUCENE-5871, that commit won't spawn new merges, which is silly since IW is closing...\n\nI'll wait for that fix before I assert this patch really works. I also didn't add a CHANGES entry - the migration from CMS.sync() is to simply call IW.waitForMerges(), which I think is better to do anyway. ",
+            "date": "2014-08-14T14:25:49+0000"
+        },
+        {
+            "id": "comment-14097149",
+            "author": "Shai Erera",
+            "content": "I ran tests after the fix on LUCENE-5871, but I get this failure:\n\n\nant test  -Dtestcase=TestIndexWriter -Dtests.method=testThreadInterruptDeadlock -Dtests.seed=80C0F4CAF8F7E5D8 -Dtests.slow=true -Dtests.locale=bg_BG -Dtests.timezone=Africa/Blantyre -Dtests.file.encoding=US-ASCII\n\n\n\nThe test fails because a MergeThread hits AlreadyClosedException. I added some sops and I think that's because of how this test interrupts the indexing thread. So what I see is that the indexing thread enters IW.shutdown(), calls flush, then finishMerges, but doesn't get to call commitInternal, because it hits an interrupt. Therefore, I assume the indexing thread is inside flushMerges(true), which waitForMerges(). But since it hits an interrupt, it throws a ThreadInterruptedException.\n\nWith this patch, it means there are still pending or running merges, and since in IW.rollbackInternal I no longer call MS.close() (which for CMS meant finishing those merges, while ignoring InterruptedException), there is a merge still running, and hence the exception.\n\nIn fact, I think that the way we abortMerges() isn't safe. After we notify all merges to abort, we wait on the running merges. But if we hit an InterruptedException while waiting, we just throw this exception further, and in fact leave running merges behind. At some point they will die, since we marked their merges as aborted, but since this is rollback and we do EVERYTHING to close this writer, we proceed, and so the background running merge hits the AlreadyClosedException. I tried to quickly wait and ignore InterruptedException until success, but the test failed on being interrupted ... I'll debug it later. ",
+            "date": "2014-08-14T16:07:47+0000"
+        },
+        {
+            "id": "comment-14097379",
+            "author": "Shai Erera",
+            "content": "Patch fixes the bug - finishMerges(false) is more robust now, and waits for all runningMerges to abort, ignoring ThreadInterruptedExceptions (but restoring in the end).\n\nBut, our assumption that this is enough to release a MergeScheduler's resources was wrong. What happens is that IW waits until all runningMerges are done, but that doesn't mean all MergeThreads have died. So under some cases, this is what can happen (CTX = context switch):\n\n\nIW.finishMerges(false) calls merge.abort()\nCTX\nMergeThread.merge() hits a MergeAbortedException (expected)\nMergeThread.merge() enters finally {} and calls IW.mergeFinish\nIW.mergeFinish removes that merge from runningMerges\nCTX\nrunningMerges.size() == 0, so thread exits finishMerges()\nrollbackInternal continues, finishes\ntest continues, finishes (NOTE: MergeThread is still alive, as it didn't exit yet!!)\ntest-framework complains about thread leak\n\n\n\nSo I now wonder if we should add a ref-counting mechanism to MS. It's not simple, we cannot just add a decRef(), we need a decRef(IndexWriter) and then in CMS we need to handle only the MergeThreads that are associated with this IndexWriter instance. This may be easy for CMS, but is it a good API for our users? Is it clear that they need to handle only the resources that are associated with that IW instance?\n\nThoughts? ",
+            "date": "2014-08-14T18:56:53+0000"
+        }
+    ]
+}

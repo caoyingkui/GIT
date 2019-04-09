@@ -1,0 +1,105 @@
+{
+    "id": "LUCENE-8450",
+    "title": "Enable TokenFilters to assign offsets when splitting tokens",
+    "details": {
+        "components": [],
+        "status": "Open",
+        "resolution": "Unresolved",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "labels": "",
+        "priority": "Major",
+        "type": "Improvement"
+    },
+    "description": "CharFilters and TokenFilters may alter token lengths, meaning that subsequent filters cannot perform simple arithmetic to calculate the original (\"correct\") offset of a character in the interior of the token. A similar situation exists for Tokenizers, but these can call CharFilter.correctOffset() to map offsets back to their original location in the input stream. There is no such API for TokenFilters.\n\nThis issue calls for adding an API to support use cases like highlighting the correct portion of a compound token. For example the german word \"au\u00ad\u00dfer\u00adstand\" (meaning afaict \"unable to do something\") will be decompounded and match \"stand and \"ausser\", but as things are today, offsets are always set using the start and end of the tokens produced by Tokenizer, meaning that highlighters will match the entire compound.\n\nI'm proposing to add this method to `TokenStream`:\n\n{{\u00a0\u00a0\u00a0\u00a0 public CharOffsetMap getCharOffsetMap()\u00ad\u00ad\u00ad;}}\n\nreferencing a CharOffsetMap with these methods:\n\n\u00a0\u00a0\u00a0\u00a0 int correctOffset(int currentOff);\n \u00a0\u00a0\u00a0\u00a0 int uncorrectOffset(int originalOff);\n\n\u00a0\n\nThe uncorrectOffset method is a pseudo-inverse of correctOffset, mapping from original offset forward to the current \"offset space\".",
+    "attachments": {
+        "offsets.patch": "https://issues.apache.org/jira/secure/attachment/12934892/offsets.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16574493",
+            "author": "Robert Muir",
+            "content": "As mentioned on the mailing list, I don't think we should do this for tokenfilters due to complexity: it is not just on the API side, but the maintenance side too: worrying about how to keep all the tokenfilters correct.\n\nI am sorry that some tokenfilters that really should be tokenizers extend the wrong base class, but that problem should simply be fixed.\n\nSeparately I don't like the correctOffset() method that we already have on tokenizer today. maybe it could be in the offsetattributeimpl or similar instead. But at least today its just one method. ",
+            "date": "2018-08-09T08:46:57+0000"
+        },
+        {
+            "id": "comment-16574713",
+            "author": "Mike Sokolov",
+            "content": "I am sorry that some tokenfilters that really should be tokenizers extend the wrong base class, but that problem should simply be fixed.\nA tokenfilter such as decompounding can't really be a tokenizer since it needs normalization that is provided by earlier components (at the very least lower casing, but also splitting on script changes and other character normalization). I guess one could just smoosh all analysis logic into the tokenizer, but that really defeats the purpose of the architecture, which supports a nicely modular chain of filters.\n\nI suppose there is potential maintenance pain. First though, note that the patch I posted here does not actually implement this for all existing tokenfilters and tokenizers. It merely demonstrates the approach (and changes the implementation, but not the behavior of char filters). We can merge this patch and everything will work just as it did before. Once we actually start using the API and downstream consumers rely on the offsets being correct-able, then there would be some expectation of maintaining that. Let me work those changes into the patch for at least ICUFoldingFilter so we can see how burdensome that would be. I'll also note that the effect of failing to maintain would be just that token-splitting tokenfilters generate broken offsets, as they do today, just differently broken. ",
+            "date": "2018-08-09T11:29:43+0000"
+        },
+        {
+            "id": "comment-16574825",
+            "author": "Robert Muir",
+            "content": "I feel pretty strongly that we shouldn't go this route. The thing dividing text up into tokens, tokenizer is the lucene class for that.\n\nAlso when i say maintenance side just look at the offensive filters that really should be tokenizers: they are all a real nightmare: cjkbigramfilter, worddelimiterfilter, etc. These things are monstrously complex and difficult to work with: its clearly not what a tokenfilter should be doing.\n\nI don't want to change this situation into \"differently broken\" where somehow now we have to add logic to hundreds of tokenfilters when we could just fix the 2 or 3 bad ones such as wdf to be tokenizers instead. ",
+            "date": "2018-08-09T13:14:01+0000"
+        },
+        {
+            "id": "comment-16574854",
+            "author": "Mike Sokolov",
+            "content": "This approach does not impose any requirement to add any logic to all existing token filters. To get the benefit, it's only really necessary to change filters that change the length of tokens, and there are pretty few of these. As far as \"tokenizing\" token filters, they are basically operating as consumers of corrected offsets, and we can choose to leave the situation as is on a case-by-case basis for these. We can continue to use the existing full-width offsets for the generated sub-tokens, just ignoring this correction API, and fix only the ones we want to.\n\nI agree that tokenizer should in general be the class for splitting tokens, but there are reasons why these other filters have been implemented as they are; I mentioned some regarding DictionaryCompoundWordTokenFilter. I don't really know about the design of CJKBigramFilter, but it seems it also relies on ICUTokenizer running prior? ",
+            "date": "2018-08-09T13:41:01+0000"
+        },
+        {
+            "id": "comment-16576353",
+            "author": "Michael McCandless",
+            "content": "Separately I don't like the correctOffset() method that we already have on tokenizer today. maybe it could be in the offsetattributeimpl or similar instead.\nI like that idea \u2013 it always seemed weird that the correctOffset was only available via CharFilter whereas OffsetAttribute is really the more natural place for it.\n\n\u00a0 ",
+            "date": "2018-08-10T14:35:09+0000"
+        },
+        {
+            "id": "comment-16576633",
+            "author": "Robert Muir",
+            "content": "\nTo get the benefit, it's only really necessary to change filters that change the length of tokens, and there are pretty few of these\n\nSorry, I think this is wrong. For example most language stemmers are doing simple suffix or prefix stripping of tokens. They definitely change the length. These are hard enough, why should they have to deal with this artificial problem?\n\nIn general your problem is caused by \"decompounders\" that use the wrong base class. For chinese, decomposition is a tokenizer. For japanese, its the same. For korean, its the same. These aren't the buggy ones.\n\nThe problem is stuff like the Decompound* filters geared at stuff like german language, and the WordDelimiterFilter, and so on. These should be fixed. Sorry, this is honestly still a tokenization problem: breaking the text into meaningful tokens. These should not be tokenfilters, that will fix the issue. \n\nMaybe it makes sense for something like standardtokenizer to offer a \"decompound hook\" or something that is very limited (e.g., not a chain, just one thing) so that european language decompounders don't need to duplicate a lot of the logic around punctuation and unicode. Perhaps the same functionality could be used for \"word-delimiter\" so that people can have a \"unicode standard\" tokenizer but it just handles some ambiguous cases differently (such as when the case-changes and when there are hyphens etc). I think lucene is weak here, i don't think we should cancel the issue, but at the same time I don't think we should try to give tokenfilter \"tokenizer\" capabilities just for artificial code-reuse purposes: the abstractions need to make sense so that we can prevent and detect bugs and do a good job testing and maintain all the code. ",
+            "date": "2018-08-10T17:43:23+0000"
+        },
+        {
+            "id": "comment-16576676",
+            "author": "Uwe Schindler",
+            "content": "Separately I don't like the correctOffset() method that we already have on tokenizer today. maybe it could be in the offsetattributeimpl or similar instead.\n\nI think correctOffset should indeed be part of the OffsetAttribute (we need to extend the interface). But we have to make sure, that it does not contain any hidden state. Attributes are only \"beans\" with getters and setters and no hidden state, and must be symmetric (if you set something by setter, the getter must return it unmodified). They can be used as a state on their own (like flagsattribute) to control later filters, but they should not have any hidden state, that affects how the setters work.\n\nMaybe it makes sense for something like standardtokenizer to offer a \"decompound hook\" or something that is very limited (e.g., not a chain, just one thing) so that european language decompounders don't need to duplicate a lot of the logic around punctuation and unicode\n\nActually that the real solution for the decompounding or WordDelimiterFilter. Actually all tokenizers should support it. Maybe that can be done in the base class and the incrementToken() get's final. Instead the parsing code could push tokens that are passed to decompounder and then icrementToken returns them. So incrementToken is final and calls some next method on the tokenization and passes the result to the decompounder. Which is is a no-op by default.\n\nAnother way would be to have a special type of TokenFilter where the input is not TokenStream, but instead Tokenizer (constructor takes \"Tokenizer\" instead of \"TokenStream\", the \"input\" field is also Tokenizer). In general decompounders should always be directly after the tokenizer (some of them may need to lowercase currently to process the token like dictionary based decompounders, but that's a bug, IMHO). Those special TokenFilters \"know\" and can rely on the Tokenizer and call correctOffset on them, if they split tokens. ",
+            "date": "2018-08-10T18:18:56+0000"
+        },
+        {
+            "id": "comment-16576798",
+            "author": "Mike Sokolov",
+            "content": "about Tokenizer/decompounder as a paired thing, not a chain: then you could not combine WordDelimiterFilter with another decompounder? One would still need to be a filter. I'm curious what problem there would be with stacking Tokenizers, say?\n\nI'm also reluctant to place WDF early in the chain because it does some weird recombinations that I only want to happen after I have already had a chance to do more tightly-scoped processing like handling numbers: decimals, fractions and the like. ",
+            "date": "2018-08-10T20:19:05+0000"
+        },
+        {
+            "id": "comment-16576805",
+            "author": "Robert Muir",
+            "content": "{quotdine}\nI'm also reluctant to place WDF early in the chain because it does some weird recombinations that I only want to happen after I have already had a chance to do more tightly-scoped processing like handling numbers: decimals, fractions and the like.\n\n\nI get that sentiment, but i would like for us to think a little bit farther than just \"before\" for \"after\" according to the current status quo. The fact of life here is, it seems you want to customize the tokenizer in certain ways (e.g. numerics) but also other ways such as hyphens or similar. I don't think its abnormal or a strange use-case, I think we just don't support it well with the current APIs. ",
+            "date": "2018-08-10T20:24:47+0000"
+        },
+        {
+            "id": "comment-16576828",
+            "author": "Mike Sokolov",
+            "content": "The fact of life here is, it seems you want to customize the tokenizer in certain ways (e.g. numerics) but also other ways such as hyphens or similar\nIf something like WDGF existed that did not turn \"1-1/2\" into \"112\", but still did a reasonable job at handling part numbers like\u00a0 \"X-4000\" <-> X4000, that might help avoid some of the sequencing constraints. I would still want to be able to use German decompounding in the same Analyzer with this punctuation-handling thing though. WIth perfect highlighting  I don't have any better solutions yet, but I like the way this discussion is opening up possibilities! ",
+            "date": "2018-08-10T20:44:45+0000"
+        },
+        {
+            "id": "comment-16577055",
+            "author": "Robert Muir",
+            "content": "\nActually that the real solution for the decompounding or WordDelimiterFilter. Actually all tokenizers should support it. Maybe that can be done in the base class and the incrementToken() get's final. Instead the parsing code could push tokens that are passed to decompounder and then icrementToken returns them. So incrementToken is final and calls some next method on the tokenization and passes the result to the decompounder. Which is is a no-op by default.\n\nIf we take this simplistic approach it means the decompounder only sees a single token (versus say, entire sentence or phrase)? This might only work for \"easy\" decompounder algorithms like WDF and the german Decompounding* implementations. Maybe it is possible to refactor ThaiTokenizer to this and it will also be fine? Currently that one gets the context of the whole sentence (but I am not sure it needs that / impacts the current underlying algorithm). \n\nBut I think chinese, japanese, and korean tokenizers use more context than just one whitespace/punctuation delimited word (n-gram features and so on in the model). So its good just to think things through a bit, would be great to consolidate a lot of this if we can. \n\nAt the same time I think its ok to make the API limited, you know, if we think that will help true use-cases today. So we could just document that if you use this decompounder interface that you only see individual delimited tokens and not some bigger context. I'm hoping we can avoid situations where the algorithm has to capture/restore a bunch of state: if we end out with that, then things haven't really gotten any better. ",
+            "date": "2018-08-11T05:12:26+0000"
+        },
+        {
+            "id": "comment-16577137",
+            "author": "Uwe Schindler",
+            "content": "I'm hoping we can avoid situations where the algorithm has to capture/restore a bunch of state: if we end out with that, then things haven't really gotten any better.\n\nIf some decompounder needs that, I think it should keep the tracking internally. As it is called for each token in order, it can keep track of previous tokens internally (it can just clone attributes when its called and add to linked lists, wtf). No need to add that in the API. ",
+            "date": "2018-08-11T10:56:16+0000"
+        },
+        {
+            "id": "comment-16585134",
+            "author": "Mike Sokolov",
+            "content": "I was trying to think about how to make progress here, but I am still hung up on the \"bug\" Uwe pointed out:\n... In general decompounders should always be directly after the tokenizer (some of them may need to lowercase currently to process the token like dictionary based decompounders, but that's a bug, IMHO).\nthen thinking oh maybe lowercasing can be handled by a charfilter, but then some token filters will want access to the original case, so it's a conundrum. If you have a sequence of text processors you really do want to be able to choose their order flexibly. If we make hard structural constraints like this, it seems to be creating more problems that will be difficult to solve. Do we have ideas about how to handle this case-folding in decompounders in this scheme? Would we just fold the case-folding into the decompounder? What about other character normalization like \u00df =>\u00a0 \"ss\", ligatures, accent-folding and so on? Does the decompounder implement all that internally? Do we force that to happen in a CharFilter if you want to use a decompounder? ",
+            "date": "2018-08-19T12:13:37+0000"
+        },
+        {
+            "id": "comment-16586454",
+            "author": "Robert Muir",
+            "content": "Look at worddelimiterfilter, it wants to use case information in order to split stuff up for example.\n\nTokenizer/Decompounder's job is to divide the text into tokens. That is it. making things lowercase, removing accents, none of that is related to this process at all whatsoever.\n\nThe subsequent filters need to be doing the actual normalization.  ",
+            "date": "2018-08-20T20:08:04+0000"
+        }
+    ]
+}

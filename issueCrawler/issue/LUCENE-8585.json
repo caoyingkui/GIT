@@ -1,0 +1,156 @@
+{
+    "id": "LUCENE-8585",
+    "title": "Create jump-tables for DocValues at index-time",
+    "details": {
+        "components": [
+            "core/codecs"
+        ],
+        "status": "Open",
+        "resolution": "Unresolved",
+        "fix_versions": [],
+        "affect_versions": "master (8.0)",
+        "labels": "",
+        "priority": "Minor",
+        "type": "Improvement"
+    },
+    "description": "As noted in LUCENE-7589, lookup of DocValues should use jump-tables to avoid long iterative walks. This is implemented in LUCENE-8374 at search-time (first request for DocValues from a field in a segment), with the benefit of working without changes to existing Lucene 7 indexes and the downside of introducing a startup time penalty and a memory overhead.\n\nAs discussed in LUCENE-8374, the codec should be updated to create these jump-tables at index time. This eliminates the segment-open time & memory penalties, with the potential downside of increasing index-time for DocValues.\n\nThe three elements of LUCENE-8374 should be transferable to index-time without much alteration of the core structures:\n\n\tIndexedDISI block offset and index skips: A long (64 bits) for every 65536 documents, containing the offset of the block in 33 bits and the index (number of set bits) up to the block in 31 bits.\n It can be build sequentially and should be stored as a simple sequence of consecutive longs for caching of lookups.\n As it is fairly small, relative to document count, it might be better to simply memory cache it?\n\tIndexedDISI DENSE (> 4095, < 65536 set bits) blocks: A short (16 bits) for every 8 longs (512 bits) for a total of 256 bytes/DENSE_block. Each short represents the number of set bits up to right before the corresponding sub-block of 512 docIDs.\n The shorts can be computed sequentially or when the DENSE block is flushed (probably the easiest). They should be stored as a simple sequence of consecutive shorts for caching of lookups, one logically independent sequence for each DENSE block. The logical position would be one sequence at the start of every DENSE block.\n Whether it is best to read all the 16 shorts up front when a DENSE block is accessed or whether it is best to only read any individual short when needed is not clear at this point.\n\tVariable Bits Per Value: A long (64 bits) for every 16384 numeric values. Each long holds the offset to the corresponding block of values.\n The offsets can be computed sequentially and should be stored as a simple sequence of consecutive longs for caching of lookups.\n The vBPV-offsets has the largest space overhead og the 3 jump-tables and a lot of the 64 bits in each long are not used for most indexes. They could be represented as a simple PackedInts sequence or MonotonicLongValues, with the downsides of a potential lookup-time overhead and the need for doing the compression after all offsets has been determined.\n\n\n\nI have no experience with the codec-parts responsible for creating index-structures. I'm quite willing to take a stab at this, although I probably won't do much about it before January 2019. Should anyone else wish to adopt this JIRA-issue or co-work on it, I'll be happy to share.",
+    "attachments": {
+        "make_patch_lucene8585.sh": "https://issues.apache.org/jira/secure/attachment/12950949/make_patch_lucene8585.sh",
+        "LUCENE-8585.patch": "https://issues.apache.org/jira/secure/attachment/12950986/LUCENE-8585.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16709234",
+            "author": "Toke Eskildsen",
+            "content": "Preliminary notes after inspecting the Lucene7DocValues-codec: It seems that the meta data for the DocValue entries are loaded one-off and that any subsequently needed data is fetched from the data-slices.\n\nIn line with TermsDictEntry, the jump-tables for IndexedDISI-blocks and vBPV can be stored at the end of their respective data-slices, with only the offsets to the jump-tables being stored in meta. The downside to this solution is that the full jump-tables needs to be kept in memory until the data has been written, for a worst-case temporary overhead of 2MB and 8MB when flushing 2 billion documents with values.\n\nAs mentioned in the description, DENSE ranks belongs naturally in their blocks in data. This makes their representation extremely simple and makes the rank & data be disk cached together. meta is not involved here. ",
+            "date": "2018-12-04T20:52:16+0000"
+        },
+        {
+            "id": "comment-16709931",
+            "author": "Adrien Grand",
+            "content": "It seems that the meta data for the DocValue entries are loaded one-off and that any subsequently needed data is fetched from the data-slices.\n\nThis is correct.\n\nIn line with TermsDictEntry, the jump-tables for IndexedDISI-blocks and vBPV can be stored at the end of their respective data-slices, with only the offsets to the jump-tables being stored in meta.\n\nI don't think they are comparable: the terms dictionary is kept on disk while jump tables would be fully loaded in memory. Like you said, meta is about information that is loaded one-off, so this is where we should put jump tables.\n\nThe downside to this solution is that the full jump-tables needs to be kept in memory until the data has been written, for a worst-case temporary overhead of 2MB and 8MB when flushing 2 billion documents with values.\n\nRight. I'm a bit less worried about the write-time memory usage than I am about search-time: at write time we only write one field at once. On the other hand at search time we would have jump tables loaded in memory for every field at the same time. Maybe we could explore inlining skip data between DISI blocks similarly to postings alternatively, that would still require memory at index-time because of buffering, but almost nothing at search time.\n\nDENSE ranks belongs naturally in their blocks in data\n\n+1 ",
+            "date": "2018-12-05T11:15:29+0000"
+        },
+        {
+            "id": "comment-16710238",
+            "author": "Toke Eskildsen",
+            "content": "Thank you for your suggestions, Adrien Grand. I am a bit surprised that you advocate for having the jump-tables for IndexedDISI and vBPV on heap? They are not that big, but it still means heap + extra startup-time to fetch them!? It also means that it will be done for all fields, regardless of whether they are used or not, if I understand Entry-loading correctly.\n\nI have a hard time discerning what the principal difference is between this and search-time build of the jump-tables. The only difference I see is that the index-time version loads the data contiguously instead of having to visit every block, which boils down to segment-open performance. I am not opposed to pre-computing and having them on heap - if nothing else it will make lookups slightly faster - I just can't follow the logic.\n\nI tinkered a bit and got the IndexedDISI block jump-tables to work when stored as I described in the first comment (after the regular blocks, accessed as needed). The scary codec beast is not that scary once you get to know it. It should be easy enough to flush the data to meta instead.\n\nAs this has the potential to be more of a collaborative project, what is the easiest way (ping to Jim Ferenczi)? Sending patches back and forth seems a bit heavy to me, so perhaps a git branch? Should I create one in the Apache git repository or on GitHub? ",
+            "date": "2018-12-05T15:34:00+0000"
+        },
+        {
+            "id": "comment-16710332",
+            "author": "Jim Ferenczi",
+            "content": "\nAs this has the potential to be more of a collaborative project, what is the easiest way (ping to Jim Ferenczi)? Sending patches back and forth seems a bit heavy to me, so perhaps a git branch? Should I create one in the Apache git repository or on GitHub?\n\nThanks for the ping Toke Eskildsen. I volunteered to port your patch in case you would/could not work on the index-time solution. If you can think of a way to split the work I can also help but at this point I'd certainly slow things down  (I am no expert in this area of the code either).\nRegarding the back and forth with patches, I think a pull request is appropriate here and should help to iterate ? ",
+            "date": "2018-12-05T16:50:42+0000"
+        },
+        {
+            "id": "comment-16710601",
+            "author": "Toke Eskildsen",
+            "content": "Jim Ferenczi you are off the hook . I did not plan on working on this, but it seems that it must be done in order to get DV-scaling in some form into Lucene for the release after 7.6. I have currently hacked IndexedDISI block jump-tables as well as DENSE block ranking into the codec, but as can be seen above, I might have stored it in the wrong slices. I hope to find the time/energy to look at variable bits per value blocks tomorrow, but I kind of marathoned the first parts today, so no promises.\n\nAs I did not know how to approach this logistically, I just used my own fork. Should anyone be curious, it is on https://github.com/tokee/lucene-solr/tree/lucene8585 - work in progress and all that. Do you suggest that I make a pull-request from that one to the Lucene GitHub repository in order to benefit from its fine tools for reviews etc.?\n\nApart from the ever-present need for reviewing at some point, some kind of performance testing would be great, should anyone feel like it. Unfortunately this is not a light task as an index of non-trivial size needs to be build (or index-upgraded?). ",
+            "date": "2018-12-05T20:34:56+0000"
+        },
+        {
+            "id": "comment-16710725",
+            "author": "Adrien Grand",
+            "content": "Thank you for your suggestions, Adrien Grand. I am a bit surprised that you advocate for having the jump-tables for IndexedDISI and vBPV on heap?\n\nActually I had misunderstood your proposal. I was mistakenly assuming that you were trying to load a long[] like the change your did in LUCENE-7589. Storing offsets at the end of the data and reading them directly from the Directory via a RandomAccessSlice sounds good to me! ",
+            "date": "2018-12-05T23:06:02+0000"
+        },
+        {
+            "id": "comment-16711062",
+            "author": "Toke Eskildsen",
+            "content": "Adrien Grand the confusion probably stems from the fact that I was (and a little bit still am) unsure if it is best to load the the IndexedDISI and vBPV jump-tables to heap or keep them on storage, from a pure performance perspective. Since I am leaning to keeping them on storage and you green light my first take (append to data), everything's great.\n\nI would appreciate a sanity check on how to change the codec:\n\nI have copied LuceneDocValuesFormat, LuceneDocValuesConsumer, LuceneDocValuesProducer and IndexedDISI from lucene70 to lucene80 and made the changes there. The test-class TestIndexedDISI is specifically for the 7.0 version due to package privacy, so I copied that one too. Was that correct? It seems a bit clunky to have a copy of a class with only a few methods added, but on the other hand it does work well for separation of codec versions.\n\nI added org.apache.lucene.codecs.lucene80.Lucene80DocValuesFormat to the org.apache.lucene.codecs.DocValuesFormat in META_INF/services, to get the Lucene 80 codec to discover the new DocValues. I kept the old org.apache.lucene.codecs.lucene70.Lucene70DocValuesFormat in the file. Was that the right way to do it? ",
+            "date": "2018-12-06T07:20:59+0000"
+        },
+        {
+            "id": "comment-16712432",
+            "author": "Toke Eskildsen",
+            "content": "I uploaded a rough patch with all functionality in place. One known unit-test fail TestDocValues.testNumericEntryZeroesLastBlock which was also a problem with LUCENE-8374, so fixing that problem should be similar. ",
+            "date": "2018-12-07T07:24:07+0000"
+        },
+        {
+            "id": "comment-16712534",
+            "author": "Adrien Grand",
+            "content": "unsure if it is best to load the the IndexedDISI and vBPV jump-tables to heap or keep them on storage\n\nIf the access pattern is sequential, which I assume would be the case in both cases, then it's fine to keep them on storage.\n\nI have copied LuceneDocValuesFormat, LuceneDocValuesConsumer, LuceneDocValuesProducer and IndexedDISI from lucene70 to lucene80 and made the changes there. The test-class TestIndexedDISI is specifically for the 7.0 version due to package privacy, so I copied that one too. Was that correct? It seems a bit clunky to have a copy of a class with only a few methods added, but on the other hand it does work well for separation of codec versions.\n\nThis is the correct approach indeed. We can also move the 7.0 format to lucene/backward-codecs since lucene/core only keeps formats that are used for the current codec.\n\nI kept the old org.apache.lucene.codecs.lucene70.Lucene70DocValuesFormat in the file. Was that the right way to do it?\n\nIf you move the 7.0 format to lucene/backward-codecs, then you'll need to move it to lucene/backward-codecs/src/resources/META-INF/services/org.apache.lucene.codecs.DocValuesFormat. ",
+            "date": "2018-12-07T09:31:01+0000"
+        },
+        {
+            "id": "comment-16712860",
+            "author": "Toke Eskildsen",
+            "content": "Uploaded patch with all known code-bugs fixed. There is still some documentation to be done and some more unit-tests for large jumps would be nice, but from a feature viewpoint this seems like a good first bet. ",
+            "date": "2018-12-07T13:29:59+0000"
+        },
+        {
+            "id": "comment-16712878",
+            "author": "Toke Eskildsen",
+            "content": "Thank you for the clarifications, Adrien Grand.\n\nRegarding where to put the jump-data:\nIf the access pattern is sequential, which I assume would be the case in both cases, then it's fine to keep them on storage.\nWell, that really depends on the access pattern from the outside . But as the jump-entries are stored sequentially then a request hitting a smaller subset of the documents in a manner that will benefit from jumps means that the jump-entries will be accessed in increasing order. They won't be used if the jumps are within the current block or to the block immediately following the current one.\nWe can also move the 7.0 format to lucene/backward-codecs since lucene/core only keeps formats that are used for the current codec.\nBefore I began there was a single file Lucene80Codec.java in the lucene80 package, picking codec-parts from both 50, 60 and 70. After having implemented the jumps, I have not touched the Lucene70Norms*-part. I guess I should move the Lucene70DocValues*-files from lucene70 to backward-codecs, leaving the norms-classes?\n\nSince the norms-classes also uses IndexedDISI, I expect it would be best to upgrade them too. This would leave the core lucene70 folder empty of active code.\nIf you move the 7.0 format to lucene/backward-codecs, then you'll need to move it to lucene/backward-codecs/src/resources/META-INF/services/org.apache.lucene.codecs.DocValuesFormat.\nThat makes sense, thanks! ",
+            "date": "2018-12-07T13:48:57+0000"
+        },
+        {
+            "id": "comment-16713081",
+            "author": "Adrien Grand",
+            "content": "Since the norms-classes also uses IndexedDISI, I expect it would be best to upgrade them too. This would leave the core lucene70 folder empty of active code.\n\n+1 to improve norms at the same time ",
+            "date": "2018-12-07T16:53:56+0000"
+        },
+        {
+            "id": "comment-16713668",
+            "author": "Toke Eskildsen",
+            "content": "Updated patch with norms switched to the jump-table enabled IndexedDISI and a smaller overhead (a single short when the block structure is too small to benefit from jumps).\n\nI have not yet moved the lucene70 codec files to lucene/backward-codecs: I'll create a patch with that after LUCENE-8374 has been reverted, for a cleaner switch.\n\nLucene70SegmentInfoFormat is left in lucene70. I have a hard time figuring out if that should be copied to lucene80 too or if it should be kept where it is? It seems to work fine to mix that with the lucene80 doc value and norm codec classes. ",
+            "date": "2018-12-08T13:14:30+0000"
+        },
+        {
+            "id": "comment-16717126",
+            "author": "ASF subversion and git services",
+            "content": "Commit 870bb11cc85c961f9ca9fb638143d8189a5abd6a in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=870bb11 ]\n\nRevert \"Pre-commit fixes for LUCENE-8374 (JavaDoc + arguments)\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 6c111611118ceda0837f25a27e5b4549f2693457. ",
+            "date": "2018-12-11T13:26:46+0000"
+        },
+        {
+            "id": "comment-16717129",
+            "author": "ASF subversion and git services",
+            "content": "Commit 3158d0c485449400d35a0095db15acdce9f8db5c in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3158d0c ]\n\nRevert \"LUCENE-8374 part 4/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit e356d793caf2a899f23261baba922d4a08b362ed. ",
+            "date": "2018-12-11T13:26:51+0000"
+        },
+        {
+            "id": "comment-16717133",
+            "author": "ASF subversion and git services",
+            "content": "Commit 6c5d87a505e4ed5803c41c900a374791bb033a0b in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6c5d87a ]\n\nRevert \"LUCENE-8374 part 3/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 7949b98f802c9ab3a588a33cdb1771b83c9fcafb. ",
+            "date": "2018-12-11T13:26:55+0000"
+        },
+        {
+            "id": "comment-16717136",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1da6d39b417148a3a5197931c92b6e8d409059bc in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1da6d39 ]\n\nRevert \"LUCENE-8374 part 2/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 7ad027627a179daa7d8d56be191d5b287dfec6f4. ",
+            "date": "2018-12-11T13:27:00+0000"
+        },
+        {
+            "id": "comment-16717139",
+            "author": "ASF subversion and git services",
+            "content": "Commit 8a20705b82272352ffcef8a18a7e8f96b2c05a7b in lucene-solr's branch refs/heads/master from Toke Eskildsen\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8a20705 ]\n\nRevert \"LUCENE-8374 part 1/4: Reduce reads for sparse DocValues\".\nLUCENE-8374 was committed without consensus and is expected to be superseded by LUCENE-8585.\n\nThis reverts commit 58a7a8ada5cebeb261060c56cd6d0a9446478bf6. ",
+            "date": "2018-12-11T13:27:04+0000"
+        },
+        {
+            "id": "comment-16719050",
+            "author": "Toke Eskildsen",
+            "content": "I have cleaned up, moved old lucene70 codec classes and in general tried to finish the job. For a change of pace and ease of review, I have created a pull-request instead of a patch. I'll create a patch, should anyone want that instead.\n\nI have a single pending issue with unit-testing: The method BaseDocValuesformatTestCase.doTestNumericsVsStoredFields is used a lot and currently operates with 300 documents. This is far from enough when testing jumps. Upping it to 200,000 means that jumping can be implicitly tested for all the different test-cases in BaseDocValuesformatTestCase, but that increases processing time a lot. I could make it switch from 300 to 200,000 when running Nightly or I could hand-pick some of the tests and increase documents for them, which would mean worse coverage but better speed? ",
+            "date": "2018-12-12T14:56:37+0000"
+        },
+        {
+            "id": "comment-16719167",
+            "author": "Adrien Grand",
+            "content": "Thanks Toke, I'll give it a look by the end of the week.\n\nI could make it switch from 300 to 200,000 when running Nightly or I could hand-pick some of the tests and increase documents for them, which would mean worse coverage but better speed?\n\nThis trade-off is hard indeed. We should try to optimize coverage while keeping the test reasonably fast, I guess it should run in under 10 seconds or so. Maybe there are things that we can improve in tests that are dedicated for the sparse case, such as avoiding tiny flushes or too aggressive merge settings. ",
+            "date": "2018-12-12T16:42:38+0000"
+        },
+        {
+            "id": "comment-16719252",
+            "author": "Toke Eskildsen",
+            "content": "Thank you for reviewing, Adrien Grand.\n\nI'll try and run an index-upgrade on one of our large shards and measure the difference. I'll also take another look at doTestNumericsVsStoredFields to see if anything can be done there. ",
+            "date": "2018-12-12T17:40:34+0000"
+        },
+        {
+            "id": "comment-16719464",
+            "author": "Toke Eskildsen",
+            "content": "Just a quick note: Running ant test -Dtestcase=TestLucene80DocValuesFormat took 1:19 minutes with 300 documents and 7:30 minutes with 200K. There are about 120 tests in BaseDocValuesFormatTestCase and 14 of them calls doTestNumericsVsStoredFields. Back-of-the-envelope: Increasing to 200K documents adds half a minute for each of the 14 tests. They all pass BTW. ",
+            "date": "2018-12-12T21:30:34+0000"
+        }
+    ]
+}

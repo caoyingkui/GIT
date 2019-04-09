@@ -1,0 +1,147 @@
+{
+    "id": "LUCENE-6779",
+    "title": "Reduce memory allocated by CompressingStoredFieldsWriter to write large strings",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [
+            "core/codecs"
+        ],
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "In SOLR-7927, I am trying to reduce the memory required to index very large documents (between 10 to 100MB) and one of the places which allocate a lot of heap is the UTF8 encoding in CompressingStoredFieldsWriter. The same problem existed in JavaBinCodec and we reduced its memory allocation by falling back to a double pass approach in SOLR-7971 when the utf8 size of the string is greater than 64KB.\n\nI propose to make the same changes to CompressingStoredFieldsWriter as we made to JavaBinCodec in SOLR-7971.",
+    "attachments": {
+        "LUCENE-6779_alt.patch": "https://issues.apache.org/jira/secure/attachment/12754117/LUCENE-6779_alt.patch",
+        "LUCENE-6779.patch": "https://issues.apache.org/jira/secure/attachment/12754072/LUCENE-6779.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14729708",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-03T20:21:12+0000",
+            "content": "Patch with the changes. "
+        },
+        {
+            "id": "comment-14729765",
+            "author": "Dawid Weiss",
+            "date": "2015-09-03T20:54:32+0000",
+            "content": "\n+  /** Writes UTF8 into the given OutputStream by first writing to the given scratch array\n+   * and then writing the contents of the scratch array to the OutputStream. The given scratch byte array\n+   * is used to buffer intermediate data before it is written to the byte buffer.\n+   *\n+   * @return the number of bytes written\n+   */\n+  public static int writeUTF16toUTF8(final CharSequence s, final int offset, final int len, final DataOutput dataOutput, final byte[] scratch) throws IOException {\n\n\n\nIsn't this a mix of two things (buffering and coding)? I think it'd be nicer to have the DataOutput (or some decorator) take care of the buffering aspects and the routine could then focus on transcoding from UTF16 to UTF8.\n\nAlso, most of the hardcoded constants/ checks for surrogate pairs, etc. do have counterparts in Character.* methods (and they should inline very well). "
+        },
+        {
+            "id": "comment-14729779",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-03T21:01:59+0000",
+            "content": "Isn't this a mix of two things (buffering and coding)? I think it'd be nicer to have the DataOutput (or some decorator) take care of the buffering aspects and the routine could then focus on transcoding from UTF16 to UTF8.\n\nYes but that actually has better performance than writing bytes directly to the DataOutput. I tested this with JavaBinCodec and I don't think performance will be very different here (see JMH benchmark results in SOLR-7971). Presumably, the huge amount of invocations of writeByte don't perform well compared to setting a byte in a scratch array directly.\n\nAlso, most of the hardcoded constants/ checks for surrogate pairs, etc. do have counterparts in Character.* methods (and they should inline very well).\n\nI didn't know about that. The constants here are the same as the ones in the existing UnicodeUtil.UTF16toUTF8 method. "
+        },
+        {
+            "id": "comment-14730001",
+            "author": "Robert Muir",
+            "date": "2015-09-03T23:11:48+0000",
+            "content": "\nYes but that actually has better performance than writing bytes directly to the DataOutput. I tested this with JavaBinCodec and I don't think performance will be very different here (see JMH benchmark results in SOLR-7971). Presumably, the huge amount of invocations of writeByte don't perform well compared to setting a byte in a scratch array directly.\n\nIts unclear to me the complexity is worth it. The data used in the benchmark is 100% latin-1 (completely english), which certainly isn't representative of reality, so the benchmarks don't mean anything to me.\n\nOne thing to keep in mind is it only affects writes from string fields on flush, during merging, bulk copying can kick in, and even in the worst case where that can't happen, we really shouldn't be taking this codepath anyway, we should just do byte[] -> byte[] for string fields \n\nSo I'm not sure if the optimization (especially for 10MB documents which is a ridiculous case) is really that powerful? We have to be extremely careful here because with these kind of optimizations, any bug -> data corruption. "
+        },
+        {
+            "id": "comment-14730033",
+            "author": "Robert Muir",
+            "date": "2015-09-03T23:32:47+0000",
+            "content": "Also i still think this doesn't really provide any benefits here to do this buffering, as the output in question is just a byte array anyway (going to compression). I don't think buffering to a separate byte[] really saves anything when we are talking about a ByteArrayDataOutput, this is an entirely different beast than the \"FastOutputStream\" used in the benchmark.\n\nSo because its already going to a byte[] I think its not so useful to stream it this way for a huge document. For such a huge doc (10MB) case the current scheme probably has a number of disadvantages both in that buffering and in the underlying compression parameters anyway.\n\nI think it would be good to do real indexing benchmarks to see if this really helps your case. I suspect to improve it would really require other things, as many aspects of the current codec may be suboptimal: not just flush, but merge too. "
+        },
+        {
+            "id": "comment-14730065",
+            "author": "Robert Muir",
+            "date": "2015-09-04T00:00:35+0000",
+            "content": "btw, in my opinion, the way to do this one would be to just call bufferedDocs.writeString() from CompressingStoredFieldsWriter.\n\nThen, fix override writeString() in GrowableByteArrayDataOutput to have a more efficient implementation than the default one from DataOutput (which makes its own byte[]/BytesRef, thats why its not being used here). \n\nBy pushing it down to that output it would be much easier to test at the very least. Optimizing for large sizes otherwise is very risky because most tests will not cover the changes. "
+        },
+        {
+            "id": "comment-14730111",
+            "author": "Robert Muir",
+            "date": "2015-09-04T00:44:30+0000",
+            "content": "here is my prototype just to show you what i mean. This one just removes the extra buffer entirely.\n\nSo my suggestion would be, just benchmark/optimize/test this GrowableByteArrayDataOutput.writeString() itself.\n\nIf it needs an extra buffer added back to speed up small strings, then lets add it back here. I also think this thing does not need to be in a .util package, since its only used by .compressing package. Lets move it there, and let it make appropriate tradeoffs specific to writing this data for CompressingXXX. \n\nAnd test the hell out of it with unit tests if the logic must be any fancier. "
+        },
+        {
+            "id": "comment-14730434",
+            "author": "Dawid Weiss",
+            "date": "2015-09-04T07:27:25+0000",
+            "content": "I like what Robert suggested. I'd still use Character constants/ methods where applicable though. Not that I don't know what the code means, but for somebody not familiar with UTF8 it may be easier on the eyes. "
+        },
+        {
+            "id": "comment-14730748",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-04T12:56:21+0000",
+            "content": "Thanks Robert Muir. I like this idea of writing directly to the byte array of GrowableByteArrayDataOutput and doing away with the intermediate buffer entirely.\n\nI'll benchmark this method and report what I find. "
+        },
+        {
+            "id": "comment-14743527",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-14T13:48:43+0000",
+            "content": "This patch is based on Robert's earlier patch but I fallback to the double pass approach only if string is larger than 64KB. This patch also moves GrowableByteArrayDataOutput from the util to codecs.compressing package as suggested.\n\nI benchmarked both approaches (i.e. use double pass always vs use single pass below 64KB) against test data generated using TestUtil.randomRealisticUnicodeString between 5 and 64 characters) and for such short fields, double pass is approx 30% slower. I don't think short fields should pay this penalty considering those should be far more common.\n\n\ntestWriteString1 = Use double pass always\ntestWriteString2 = Use double pass if utf8 size is greater than 64KB\ntestWriteStringDefault = Use writeString from base DataOutput class\n\n10K Randomly generated strings (5 <= len <= 64)\n======================================\njava -server -Xmx2048M -Xms2048M -Dtests.seed=18262 -Dtests.datagen.path=./data.txt -Dtests.string.minlen=5 -Dtests.string.maxlen=64 -Dtests.string.num=10000 -jar target/benchmarks.jar -wi 5 -i 50 -gc true -f 2 -prof gc \".*GrowableByteArrayDataOutputBenchmark.*\"\n\n# Run complete. Total time: 00:06:41\n\nBenchmark                                                                         Mode  Cnt        Score       Error   Units\nGrowableByteArrayDataOutputBenchmark.testWriteString1                            thrpt  100  2916182.627 \u00b1  5219.401   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate             thrpt  100        0.001 \u00b1     0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate.norm        thrpt  100       \u2248 10\u207b\u2074                B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.count                  thrpt  100          \u2248 0              counts\nGrowableByteArrayDataOutputBenchmark.testWriteString2                            thrpt  100  4226084.451 \u00b1  7188.594   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate             thrpt  100      596.567 \u00b1     1.016  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate.norm        thrpt  100      148.060 \u00b1     0.001    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.count                  thrpt  100          \u2248 0              counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault                      thrpt  100  4221729.873 \u00b1 13558.316   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate       thrpt  100      595.961 \u00b1     1.916  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate.norm  thrpt  100      148.060 \u00b1     0.001    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.count            thrpt  100        1.000              counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.time             thrpt  100       19.000                  ms\n\n10MB latin-1 field\n=============\njava -server -Xmx2048M -Xms2048M -Dtests.seed=18262 -Dtests.string.num=0 -Dtests.json.path=./input14.json -jar target/benchmarks.jar -wi 5 -i 50 -gc true -f 2 -prof gc \".*GrowableByteArrayDataOutputBenchmark.*\n\n# Run complete. Total time: 00:06:47\n\nBenchmark                                                                                  Mode  Cnt         Score        Error   Units\nGrowableByteArrayDataOutputBenchmark.testWriteString1                                     thrpt  100        27.985 \u00b1      0.074   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate                      thrpt  100         0.001 \u00b1      0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate.norm                 thrpt  100        24.951 \u00b1     20.652    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.count                           thrpt  100           \u2248 0               counts\nGrowableByteArrayDataOutputBenchmark.testWriteString2                                     thrpt  100        28.105 \u00b1      0.090   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate                      thrpt  100         0.001 \u00b1      0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate.norm                 thrpt  100        24.888 \u00b1     20.655    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.count                           thrpt  100           \u2248 0               counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault                               thrpt  100        36.185 \u00b1      0.099   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate                thrpt  100      1123.864 \u00b1      3.077  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate.norm           thrpt  100  32575891.405 \u00b1     16.168    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.churn.PS_Eden_Space       thrpt  100       645.241 \u00b1      7.098  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.churn.PS_Eden_Space.norm  thrpt  100  18703213.617 \u00b1 205570.201    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.count                     thrpt  100       100.000               counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.time                      thrpt  100       299.000                   ms\n\n100MB latin-1 string\n================\njava -server -Xmx2048M -Xms2048M -Dtests.seed=18262 -Dtests.string.num=0 -Dtests.json.path=./input140.json -jar target/benchmarks.jar -wi 5 -i 50 -gc true -f 2 -prof gc \".*GrowableByteArrayDataOutputBenchmark.*\n\n# Run complete. Total time: 00:07:14\n\nBenchmark                                                                         Mode  Cnt          Score     Error   Units\nGrowableByteArrayDataOutputBenchmark.testWriteString1                            thrpt  100          2.814 \u00b1   0.008   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate             thrpt  100          0.001 \u00b1   0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate.norm        thrpt  100        236.853 \u00b1 196.100    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.count                  thrpt  100            \u2248 0            counts\nGrowableByteArrayDataOutputBenchmark.testWriteString2                            thrpt  100          2.811 \u00b1   0.022   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate             thrpt  100          0.001 \u00b1   0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate.norm        thrpt  100        236.853 \u00b1 196.100    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.count                  thrpt  100            \u2248 0            counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault                      thrpt  100          3.617 \u00b1   0.009   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate       thrpt  100       1123.487 \u00b1   2.667  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate.norm  thrpt  100  325758521.800 \u00b1 147.457    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.count            thrpt  100            \u2248 0            counts\n\n "
+        },
+        {
+            "id": "comment-14743538",
+            "author": "Robert Muir",
+            "date": "2015-09-14T14:00:31+0000",
+            "content": "I cant read the benchmarks (the table formatting is crazy) but now with this patch, there are allocations for every short string where there was not before. This should be fixed.  "
+        },
+        {
+            "id": "comment-14743544",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-14T14:06:16+0000",
+            "content": "This patch adds scratch bytes to GrowableArrayDataOutput itself to reduce allocations for small strings. "
+        },
+        {
+            "id": "comment-14743566",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-14T14:18:30+0000",
+            "content": "In these results, testWriteString3 is the one which uses scratch bytes to encode small strings:\n\njava -server -Xmx2048M -Xms2048M -Dtests.seed=18262 -Dtests.datagen.path=./data.txt -Dtests.string.minlen=5 -Dtests.string.maxlen=64 -Dtests.string.num=10000 -jar target/benchmarks.jar -wi 5 -i 50 -gc true -f 2 -prof gc \".*GrowableByteArrayDataOutputBenchmark.*\"\n\n# Run complete. Total time: 00:08:55\n\nBenchmark                                                                                  Mode  Cnt        Score       Error   Units\nGrowableByteArrayDataOutputBenchmark.testWriteString1                                     thrpt  100  2915687.179 \u00b1  4981.266   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate                      thrpt  100        0.001 \u00b1     0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.alloc.rate.norm                 thrpt  100       \u2248 10\u207b\u2074                B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString1:\u00b7gc.count                           thrpt  100          \u2248 0              counts\nGrowableByteArrayDataOutputBenchmark.testWriteString2                                     thrpt  100  4216428.245 \u00b1  7822.793   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate                      thrpt  100      595.210 \u00b1     1.103  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.alloc.rate.norm                 thrpt  100      148.060 \u00b1     0.001    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.count                           thrpt  100        1.000              counts\nGrowableByteArrayDataOutputBenchmark.testWriteString2:\u00b7gc.time                            thrpt  100        2.000                  ms\nGrowableByteArrayDataOutputBenchmark.testWriteString3                                     thrpt  100  4581362.617 \u00b1 11683.766   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteString3:\u00b7gc.alloc.rate                      thrpt  100        0.001 \u00b1     0.001  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteString3:\u00b7gc.alloc.rate.norm                 thrpt  100       \u2248 10\u207b\u2074                B/op\nGrowableByteArrayDataOutputBenchmark.testWriteString3:\u00b7gc.count                           thrpt  100          \u2248 0              counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault                               thrpt  100  4277669.423 \u00b1 19742.963   ops/s\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate                thrpt  100      603.855 \u00b1     2.787  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.alloc.rate.norm           thrpt  100      148.060 \u00b1     0.001    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.churn.PS_Eden_Space       thrpt  100        5.947 \u00b1    20.169  MB/sec\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.churn.PS_Eden_Space.norm  thrpt  100        1.462 \u00b1     4.958    B/op\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.count                     thrpt  100        2.000              counts\nGrowableByteArrayDataOutputBenchmark.testWriteStringDefault:\u00b7gc.time                      thrpt  100        3.000                  ms\n\n "
+        },
+        {
+            "id": "comment-14743567",
+            "author": "Robert Muir",
+            "date": "2015-09-14T14:18:32+0000",
+            "content": "OK this is starting to look good. I personally don't mind the complexity (even though I feel huge documents is not really a use case, here is your search result, somewhere in this 10MB document), as long as we add unit tests for this output class that stress the string writing.\n\nThe thing is, otherwise that logic is basically untested, because tests rarely make long strings. That is ripe for bugs now or in the future. "
+        },
+        {
+            "id": "comment-14743570",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-14T14:20:49+0000",
+            "content": "Sure, I'll add a test. "
+        },
+        {
+            "id": "comment-14745473",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-15T13:45:25+0000",
+            "content": "Patch with a TestGrowableByteArrayDataOutput that stresses small and large strings. "
+        },
+        {
+            "id": "comment-14745492",
+            "author": "Robert Muir",
+            "date": "2015-09-15T13:56:19+0000",
+            "content": "+1, thanks for adding those tests. "
+        },
+        {
+            "id": "comment-14745569",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-15T15:00:33+0000",
+            "content": "Commit 1703219 from shalin@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1703219 ]\n\nLUCENE-6779: Reduce memory allocated by CompressingStoredFieldsWriter to write strings larger than 64kb by an amount equal to string's utf8 size "
+        },
+        {
+            "id": "comment-14745612",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-15T15:36:10+0000",
+            "content": "Commit 1703231 from shalin@apache.org in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1703231 ]\n\nLUCENE-6779: Reduce memory allocated by CompressingStoredFieldsWriter to write strings larger than 64kb by an amount equal to string's utf8 size "
+        },
+        {
+            "id": "comment-14745613",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-09-15T15:37:26+0000",
+            "content": "Thanks for the reviews Dawid and Robert! "
+        }
+    ]
+}

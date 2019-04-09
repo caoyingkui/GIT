@@ -1,0 +1,76 @@
+{
+    "id": "LUCENE-6369",
+    "title": "Make queries more defensive and clone deeply",
+    "details": {
+        "resolution": "Won't Fix",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "It is very important for the query cache that queries be either immutable or clone deeply so that they cannot change after having been put into the cache.\n\nThere are three issues that need to be addressed:\n\n\tmutable queries such as boolean or phrase queries do not clone deeply\n\tqueries that wrap mutable objects such as TermQuery's term\n\tfilters inherit Query's default clone impl which is not enough in most cases",
+    "attachments": {
+        "LUCENE-6369.patch": "https://issues.apache.org/jira/secure/attachment/12706876/LUCENE-6369.patch",
+        "immutable_queries.patch": "https://issues.apache.org/jira/secure/attachment/12707213/immutable_queries.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14377630",
+            "author": "Adrien Grand",
+            "date": "2015-03-24T10:39:00+0000",
+            "content": "Here is a patch:\n\n\tqueries wrapping Term instances (TermQuery, PhraseQuery, MultiPhraseQuery, CommonTermsQuery) now perform a defensive copy of the provided term\n\tmutable queries (BooleanQuery, ConstantScoreQuery, DisjunctionMaxQuery, FilteredQuery, ...) now clone deeply\n\tfilters (QueryWrapperFilter and some test impls) implement equals/hashcode/clone as expected\n\tadded eviction error detection to the query cache and made the test query cache smaller so that having evictions running is more likely\n\n\n\nWhen merging to 5.x I would add migration notes to explain that custom filters need to implement equals/hashcode/clone correctly now that Filter extends Query. "
+        },
+        {
+            "id": "comment-14377647",
+            "author": "ASF subversion and git services",
+            "date": "2015-03-24T10:44:27+0000",
+            "content": "Commit 1668840 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1668840 ]\n\nMute TestSloppyPhraseQuery2 until LUCENE-6369 is fixed. "
+        },
+        {
+            "id": "comment-14377662",
+            "author": "ASF subversion and git services",
+            "date": "2015-03-24T10:45:43+0000",
+            "content": "Commit 1668841 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1668841 ]\n\nMute TestSloppyPhraseQuery2 until LUCENE-6369 is fixed. "
+        },
+        {
+            "id": "comment-14377794",
+            "author": "Yonik Seeley",
+            "date": "2015-03-24T12:53:40+0000",
+            "content": "Hmmm, but clone() did exactly what I wanted previously... a shallow clone.   It's also more in line with Java cloning of things like List, Map, etc.  Was anyone hitting an issue due to shallow cloning? \n\nAlso, what happens to deeply nested boolean queries during a rewrite?  It looks like we might now make a copy of everything just because one thing changed?  That could also represent a significant regression for some.  We might also have an N^2 bug (N==nesting depth) where each level does a deep clone()?  It's definitely harder to understand/debug the BooleanQuery.rewrite w/ deep cloning "
+        },
+        {
+            "id": "comment-14377861",
+            "author": "Adrien Grand",
+            "date": "2015-03-24T13:44:33+0000",
+            "content": "Was anyone hitting an issue due to shallow cloning?\n\nWe have had test failures due to shallow cloning when using the query cache. For instance, consider a test that would look like this (similar to what TestSloppyPhraseQuery2 does):\n\n\n  public void testFoo() {\n    PhraseQuery query = ...;\n    for (int i = 0; i < 10; ++i) {\n      query.setSlop(i);\n      doTest(query);\n    }\n  }\n\n  private void doTest(Query q) {\n    BooleanQuery filtered = new BooleanQuery();\n    filtered.add(q, Occur.MUST);\n    filtered.add(q, Occur.FILTER);\n\n    assertEquals(searcher.count(q), searcher.count(filtered));\n  }\n\n\n\nThen the first iteration would put a BooleanQuery around a PhraseQuery with a slop of 0 in the cache. But then later iterations will modify the slop of the inner phrase query, making it unreachable in the cache (which is essentially a LinkedHashMap). This is why we have seen these test failures which time out due to the fact that the cache was not able to evict entries. If we have this issue in our tests, I'm afraid this would be an issue as well for our users.\n\nAn alternative to deep cloning would be to make queries immutable (up to the boost) and Query.clone() final. I gave up on the idea since it would be a very large change (because it impacts *very* common queries such as BooleanQuery and PhraseQuery) and it would be nice to have a fix for this issue for 5.1. But if this is the only viable option then we can disable automatic query caching for now, add a note to the query cache javadocs that queries should not be modified after they been passed to IndexSearcher and work on making queries immutable.\n\nAlso, what happens to deeply nested boolean queries during a rewrite?\n\nGood call. Even if the depth should remain low in practice, I agree that a N\u00b2 complexity is not good! I think we could easily fix it by making BooleanQuery.rewrite do a shallow clone by calling super.clone() and shallow cloning the list of clauses instead of deep cloning. "
+        },
+        {
+            "id": "comment-14377898",
+            "author": "Yonik Seeley",
+            "date": "2015-03-24T14:01:06+0000",
+            "content": "What about a new deepClone() method that makes it more explicit?\nThen other code (including rewrite()) can still use the shallow clone, and it will be OK since the caching code will call deepClone anyway? "
+        },
+        {
+            "id": "comment-14378024",
+            "author": "Adrien Grand",
+            "date": "2015-03-24T15:30:27+0000",
+            "content": "This would work but I'm a bit on the fence to add a new API to Query. "
+        },
+        {
+            "id": "comment-14380004",
+            "author": "Adrien Grand",
+            "date": "2015-03-25T15:01:14+0000",
+            "content": "Here is a diff of what I have been exploring with immutable queries. The patch does not compile, even just migrating lucene/core would be a lot of work given how much we have and use mutable queries everywhere. However it should give an idea of what we could have in terms of API. For instance BooleanQuery does not have any setters anymore besides setBoost and the constructor looks like this: new BooleanQuery(boolean disableCoord, int minShouldMatch, BooleanClause... clauses).\n\nI would be happy to do the work but it would certainly take several days of work so I would like to make sure nobody has concerns before starting. For now I suggest to just focus on trunk and not worry about bw compat, we can discuss it once we agree how it should look like on trunk. Feedback is highly welcome! "
+        },
+        {
+            "id": "comment-14734753",
+            "author": "Adrien Grand",
+            "date": "2015-09-08T12:44:32+0000",
+            "content": "Superseded by LUCENE-6590: queries should now be immutable. "
+        }
+    ]
+}

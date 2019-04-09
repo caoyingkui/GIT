@@ -1,0 +1,189 @@
+{
+    "id": "LUCENE-5574",
+    "title": "NRT Reader close can wipe index it doesn't own",
+    "details": {
+        "type": "Bug",
+        "priority": "Critical",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/index"
+        ],
+        "affect_versions": "4.7.1,                                            4.8,                                            6.0",
+        "status": "Closed",
+        "fix_versions": [
+            "4.7.2",
+            "4.8",
+            "6.0"
+        ]
+    },
+    "description": "Today NRT Readers try to clean up unused files via their IW reference when they are closed. Yet, if the index writer is already closed another index could have been created on the same directory which can create the same files as the IW before. For the NRT Reader those files are not referenced and it will simply wipe them away. If you use this in a replication scenario where directories are reused this can simply wipe your index away or in combination with the FSync issue LUCENE-5570 create 0-byte files. I have a test that reproduces this issue",
+    "attachments": {
+        "LUCENE-5574.patch": "https://issues.apache.org/jira/secure/attachment/12638651/LUCENE-5574.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13959771",
+            "author": "Simon Willnauer",
+            "content": "here is a patch that shows the issue and applies a fix. Yet there are still a couple of test taht fail because they now run into this issue... I will try to fix them too ",
+            "date": "2014-04-04T08:51:24+0000"
+        },
+        {
+            "id": "comment-13959775",
+            "author": "Michael McCandless",
+            "content": "God this is really awful; we should have checked that the IW is not closed when we did LUCENE-5434.  I think we should also ensureOpen() in deletePendingFiles? ",
+            "date": "2014-04-04T08:56:36+0000"
+        },
+        {
+            "id": "comment-13959794",
+            "author": "Michael McCandless",
+            "content": "In fact, I wonder if we can get lower level protection here, e.g. fix IFD so that it only attempts file deletion if its \"owning\" IW is still open.  I'll try this ... ",
+            "date": "2014-04-04T09:16:10+0000"
+        },
+        {
+            "id": "comment-13959821",
+            "author": "Simon Willnauer",
+            "content": "I agree - I tried to make this patch as simple as possible I think we should prevent IFD from doing anything if IW is closed. It should barf if IW is closed! ",
+            "date": "2014-04-04T09:42:57+0000"
+        },
+        {
+            "id": "comment-13959831",
+            "author": "Michael McCandless",
+            "content": "Patch, starting from Simon's, but also checking in IW.deletePendingFiles and down in IndexFileDeleter.deleteFile (where it actually does the delete).\n\nCore tests pass (once anyway), but lots of tests still need fixing, to either close the IW after any NRT readers, or to fix MDW to not care about extra files; there will be a long tail of random failures until we fix all tests... I'll do some distributed beasting. ",
+            "date": "2014-04-04T10:00:42+0000"
+        },
+        {
+            "id": "comment-13959859",
+            "author": "Michael McCandless",
+            "content": "Another iteration, fixing more tests to close their writers after closing all readers.\n\nDistributed beasting has gone through all Lucene core + modules tests 35 times with no failures ... I'll leave it running. ",
+            "date": "2014-04-04T10:41:59+0000"
+        },
+        {
+            "id": "comment-13959875",
+            "author": "Shai Erera",
+            "content": "I think this is a good change \u2013 it makes IndexReader more read-only in nature. I.e. previously it could modify the index, then we made it read-only in that aspect. Now we make it sort of read-only such that it cannot modify the Directory. So I wonder, if we viewed IndexReader as a \"user\" with read-only permissions on the index Directory, we wouldn't even attempt deleting unused files by it, right? So maybe we should just do that \u2013 never call IFD from an nrt-reader.close() chain? Then, if you have a write open, it will eventually delete those files, otherwise the files are there until you open a new writer?\n\nAs for MDW, what if on close() it attempted to open a writer w/ OpenMode.OPEN, then close it, before it verifies there are no leftover files? Then the unused files will get deleted, and we'd still have a check in MDW that we didn't leave any writer/reader open, or leaking files? ",
+            "date": "2014-04-04T11:14:14+0000"
+        },
+        {
+            "id": "comment-13959891",
+            "author": "Simon Willnauer",
+            "content": "So maybe we should just do that \u2013 never call IFD from an nrt-reader.close() chain? \n\nwell I guess we have to since we decrement the reference. but I agree I wonder if the  writer.deletePendingFiles(); call is necessary?\n\nAs for MDW, what if on close() it attempted to open a writer w/ OpenMode.OPEN, then close it, before it verifies there are no leftover files? Then the unused files will get deleted, and we'd still have a check in MDW that we didn't leave any writer/reader open, or leaking files?\n\non the one hand I think this would be odd but on the other our current behavior requires you to close everything in order which might not be absolutely necessary and might actually lead to bug if we enforce calling inorder so I think that might actually be a good thing what you suggest? Mike WDYT ",
+            "date": "2014-04-04T11:52:33+0000"
+        },
+        {
+            "id": "comment-13959900",
+            "author": "Shai Erera",
+            "content": "I looked at MDW.close() and looks like it already does that \u2013 it opens IW and close it, then diff the files before and after the close \u2013 so that idea is not new . That way it protects against e.g. IFD bugs (or bugs elsewhere where you don't decRef() a file or something).\n\nBut perhaps we can make MDW lenient by default (assertNoUnreferencedFilesOnClose=false) and turn it on in tests where we'd like to catch IFD bugs? Then in the majority of tests we can code \"normally\", but in the few tests that need to make sure IW is bullet-proof, we make sure to close things in order?\n\nAnother idea I had is to use the newly added checksums to make sure that the file we're about to delete has the checksum that we think it should have. Of course, if you re-index the exact same set of documents in the exact same order, this is still a false positive, but I don't know how common that is. But then, I'm not sure if it's ok to rely on such logic, and perhaps the simplest thing we could do is treat the Directory read-only by IndexReader instances. ",
+            "date": "2014-04-04T12:03:07+0000"
+        },
+        {
+            "id": "comment-13960006",
+            "author": "Michael McCandless",
+            "content": "I think we should remove IW.deletePendingFiles from StandardDirectoryReader.close: the less the IR does with deleting files on close the better!\n\nBut we cannot remove the incRef/decRef unless we want to revert LUCENE-5434, ie stop protecting the files referenced by opened NRT readers from deletion.  So leave that for now.\n\nOn MDW, I think we could do a middle ground: it should only complain about unref'd files that nobody had previously tried to delete.  I think this will 1) let us leave this checking on by default, and 2) should still catch bugs in IFD where it caused IW not to attempt deletion of files that it should have. ",
+            "date": "2014-04-04T14:33:34+0000"
+        },
+        {
+            "id": "comment-13960010",
+            "author": "Robert Muir",
+            "content": "I don't think we should do a complicated bugfix.\n\nI think we should fix the bug straight up in a simple way that won't introduce other bugs: add the missing ensureOpen, disable the unref'd files check.\n\nLeave such complicated refactorings to the future and do them slowly. I would hate to see a bugfix release go out with a fix for this that just causes other bugs because we cant just be reasonable aout it. ",
+            "date": "2014-04-04T14:38:38+0000"
+        },
+        {
+            "id": "comment-13960052",
+            "author": "Michael McCandless",
+            "content": "OK, I agree: let's do what's simplest/minimal here to fix the bug, and\njust disable MDW's checking of unref'd files.\n\nThis new patch does that, and only one (test-the-tester) test needed\nfixing.\n\nI still also removed calling deletePendingFiles when closing the NRT\nreader: I think it's just too dangerous.  And I added ensureOpen where\nIFD actually deletes files...\n\nFinally I made a test case, but I could not provoke corruption unless\nI did a \"hard delete\" of the files in the index.  Ie, because IW is\nwrite-once, even if you close and open a new one with OpenMode.CREATE,\nthe old writer won't delete files created by the new writer, I think.\n\nI think it's ready. ",
+            "date": "2014-04-04T15:29:51+0000"
+        },
+        {
+            "id": "comment-13960088",
+            "author": "Robert Muir",
+            "content": "Thanks, this looks great. We should open a followup issue to do \"more complicated stuff\" so we can re-enable the unref'd files check. ",
+            "date": "2014-04-04T16:17:15+0000"
+        },
+        {
+            "id": "comment-13960181",
+            "author": "Michael McCandless",
+            "content": "OK I opened LUCENE-5576 to re-enable unref'd checking in MDW.  I'll commit this soon. ",
+            "date": "2014-04-04T17:44:47+0000"
+        },
+        {
+            "id": "comment-13960195",
+            "author": "Shai Erera",
+            "content": "+1, looks good. Maybe just clarify why it's OK to ignore the AlreadyClosedEx when you call decRefDeleter? ",
+            "date": "2014-04-04T17:57:01+0000"
+        },
+        {
+            "id": "comment-13960198",
+            "author": "Michael McCandless",
+            "content": "Good point, I'll add a comment explaining why it's safe to ignore the ACE. ",
+            "date": "2014-04-04T17:59:02+0000"
+        },
+        {
+            "id": "comment-13960202",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1584840 from mikemccand@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1584840 ]\n\nLUCENE-5574: when closing an NRT reader, do not delete files if the original writer has since been closed ",
+            "date": "2014-04-04T18:03:33+0000"
+        },
+        {
+            "id": "comment-13960209",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1584842 from mikemccand@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1584842 ]\n\nLUCENE-5574: when closing an NRT reader, do not delete files if the original writer has since been closed ",
+            "date": "2014-04-04T18:09:21+0000"
+        },
+        {
+            "id": "comment-13960219",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1584846 from mikemccand@apache.org in branch 'dev/branches/lucene_solr_4_7'\n[ https://svn.apache.org/r1584846 ]\n\nLUCENE-5574: when closing an NRT reader, do not delete files if the original writer has since been closed ",
+            "date": "2014-04-04T18:15:03+0000"
+        },
+        {
+            "id": "comment-13960247",
+            "author": "Uwe Schindler",
+            "content": "Hi Mike,\n\nthe test does not work on windows with a FSDirectory subclass. This is because Windows does not allow to write to a file thats already open. So we must disable this test for Windows filesystems:\n\n\nassumeFalse(Constants.WINDOWS && dir instanceof FSDirectory);\n\n\n\nThat is the error I get:\n\n\nC:\\Users\\Uwe Schindler\\Projects\\lucene\\trunk-lusolr2\\lucene\\core>ant test -Dtestcase=TestIndexWriter -Dtestmethod=testClosingNRTReaderDoesNotCorruptYourIndex -Dtests.directory=SimpleFSDirectory\n\n   [junit4] <JUnit4> says kaixo! Master seed: 46D71A0205CD3C16\n   [junit4] Your default console's encoding may not display certain unicode glyphs: windows-1252\n   [junit4] Executing 1 suite with 1 JVM.\n   [junit4] \n   [junit4] Started J0 PID(10652@VEGA).\n   [junit4] Suite: org.apache.lucene.index.TestIndexWriter\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestIndexWriter -Dtests.method=testClosingNRTReaderDoesNotCorruptYourIndex -Dtests.seed=46D71A0205CD3C16 -Dtests.directory=SimpleFSDirectory -Dtests.locale=pt_BR -Dtests.timezone=Portugal -Dtests.file.encoding=Cp1252\n   [junit4] ERROR   0.63s | TestIndexWriter.testClosingNRTReaderDoesNotCorruptYourIndex <<<\n   [junit4]    > Throwable #1: java.io.IOException: Cannot delete C:\\Users\\Uwe Schindler\\Projects\\lucene\\trunk-lusolr2\\lucene\\build\\core\\test\\J0\\index5311553115tmp\\_0.doc\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([46D71A0205CD3C16:31060EF37DD6C629]:0)\n   [junit4]    > \tat org.apache.lucene.store.FSDirectory.deleteFile(FSDirectory.java:256)\n   [junit4]    > \tat org.apache.lucene.store.MockDirectoryWrapper.deleteFile(MockDirectoryWrapper.java:456)\n   [junit4]    > \tat org.apache.lucene.store.MockDirectoryWrapper.deleteFile(MockDirectoryWrapper.java:409)\n   [junit4]    > \tat org.apache.lucene.index.TestIndexWriter.testClosingNRTReaderDoesNotCorruptYourIndex(TestIndexWriter.java:2403)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:724)\n   [junit4]   2> NOTE: test params are: codec=Asserting, sim=RandomSimilarityProvider(queryNorm=true,coord=no): {a=IB LL-L3(800.0)}, locale=pt_BR, timezone=Portugal\n   [junit4]   2> NOTE: Windows 7 6.1 amd64/Oracle Corporation 1.7.0_25 (64-bit)/cpus=8,threads=1,free=133047752,total=156237824\n   [junit4]   2> NOTE: All tests run in this JVM: [TestIndexWriter]\n   [junit4] Completed in 1.11s, 1 test, 1 error <<< FAILURES!\n   [junit4] \n   [junit4] \n   [junit4] Tests with failures:\n   [junit4]   - org.apache.lucene.index.TestIndexWriter.testClosingNRTReaderDoesNotCorruptYourIndex\n   [junit4] \n   [junit4] \n   [junit4] JVM J0:     0.67 ..     2.61 =     1.94s\n   [junit4] Execution time total: 2.62 sec.\n   [junit4] Tests summary: 1 suite, 1 test, 1 error\n\n\n\nIn general, I don't think the whole problem exists on Windows! The file system protects you from doing this crazy stuff like nuking the index while a NRT reader has it open. Its also impossible to do stuff like replication while a Reader is open.\n\nSimon's system called El*s* should in any case create a new index in a new directory if it needs to recover... ",
+            "date": "2014-04-04T18:27:38+0000"
+        },
+        {
+            "id": "comment-13960267",
+            "author": "Michael McCandless",
+            "content": "Argh... right, I cannot just \"setNoDeleteOpenFile(false)\" on Windows!\n\nBut, yes, I think this corruption case won't happen on Windows.\n\nI'll disable the test on Windows w/ FSDir like you suggested... ",
+            "date": "2014-04-04T18:45:47+0000"
+        },
+        {
+            "id": "comment-13960297",
+            "author": "Uwe Schindler",
+            "content": "I'll disable the test on Windows w/ FSDir like you suggested...\n\nThats not so easy because of crazy wrapping we do with MockDirs, NRTCaching and others. So I think you can only disable on WINDOWS. I tried to go the path up to the root directory, but that does only work if the dir extends FilterDirectory. ",
+            "date": "2014-04-04T19:08:59+0000"
+        },
+        {
+            "id": "comment-13960299",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1584868 from mikemccand@apache.org in branch 'dev/trunk'\n[ https://svn.apache.org/r1584868 ]\n\nLUCENE-5574: disable this test on Windows ",
+            "date": "2014-04-04T19:10:35+0000"
+        },
+        {
+            "id": "comment-13960300",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1584869 from mikemccand@apache.org in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1584869 ]\n\nLUCENE-5574: disable this test on Windows ",
+            "date": "2014-04-04T19:11:04+0000"
+        },
+        {
+            "id": "comment-13960301",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1584870 from mikemccand@apache.org in branch 'dev/branches/lucene_solr_4_7'\n[ https://svn.apache.org/r1584870 ]\n\nLUCENE-5574: disable this test on Windows ",
+            "date": "2014-04-04T19:12:11+0000"
+        },
+        {
+            "id": "comment-13960489",
+            "author": "Uwe Schindler",
+            "content": "Mike fixed the Windows bug. ",
+            "date": "2014-04-04T22:09:22+0000"
+        },
+        {
+            "id": "comment-13982653",
+            "author": "Uwe Schindler",
+            "content": "Close issue after release of 4.8.0 ",
+            "date": "2014-04-27T23:26:05+0000"
+        }
+    ]
+}

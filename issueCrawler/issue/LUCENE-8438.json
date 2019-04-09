@@ -1,0 +1,136 @@
+{
+    "id": "LUCENE-8438",
+    "title": "RAMDirectory speed improvements and cleanup",
+    "details": {
+        "components": [],
+        "status": "Open",
+        "resolution": "Unresolved",
+        "fix_versions": [],
+        "affect_versions": "None",
+        "labels": "",
+        "priority": "Minor",
+        "type": "Improvement"
+    },
+    "description": "RAMDirectory screams for a cleanup. It is used and abused in many places and even if we discourage its use in favor of native (mmapped) buffers, there seem to be benefits of keeping RAMDirectory available (quick throw-away indexes without the need to setup external tmpfs, for example).\n\nCurrently RAMDirectory performs very poorly under concurrent loads. The implementation is also open for all sorts of abuses \u2013 the streams can be reset and are used all around the place as temporary buffers, even without the presence of RAMDirectory itself. This complicates the implementation and is pretty confusing.\n\nAn example of how dramatically slow RAMDirectory is under concurrent load, consider this PoC pseudo-benchmark. It creates a single monolithic segment with 500K very short documents (single field, with norms). The index is ~60MB once created. We then run semi-complex Boolean queries on top of that index from N concurrent threads. The attached capture-4 shows the result (queries per second over 5-second spans) for a varying number of concurrent threads on an AWS machine with 32 CPUs available (of which it seems 16 seem to be real, 16 hyper-threaded). That red line at the bottom (which drops compared to a single-threaded performance) is the current RAMDirectory. RAMDirectory2 is an alternative implementation I wrote that uses ByteBuffers. Yes, it's slower than the native mmapped implementation, but a lot faster then the current RAMDirectory (and more GC-friendly because it uses dynamic progressive block scaling internally).",
+    "attachments": {
+        "capture-4.png": "https://issues.apache.org/jira/secure/attachment/12933758/capture-4.png",
+        "capture-1.png": "https://issues.apache.org/jira/secure/attachment/12934624/capture-1.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16570052",
+            "author": "Robert Muir",
+            "content": "I do think the new code looks pretty clean and I like the additional checks in the code (which was desperately needed), but i have some concerns about the timing. How to reduce the risks here release-wise? \n\nI'm pretty much against committing this to trunk and then immediately trying to start spinning up lucene 8.0. The problem is this code has its tentacles in everything: a bug in this thing will impact far more than just windows users who can't use mmap over tmpfs  Core codecs etc are using little ramoutputstreams here and there for various crap. \n\nWe need a strategy to reduce the risks here for so many changes to o.a.l.store code. And we should honestly discuss whether the tradeoffs are the right ones. For Lucene 8 which Adrien wants to work on soon, i would rather us just tell users to use mmap over tmpfs and not have corruption.  ",
+            "date": "2018-08-06T11:08:06+0000"
+        },
+        {
+            "id": "comment-16570159",
+            "author": "Dawid Weiss",
+            "content": "I've done some work on this and have some thoughts to share, so looking for feedback. The branch and PR diff is here, it's not merge'able as-is, but it provides grounds for discussion.\n\nhttps://github.com/apache/lucene-solr/pull/432\n\nHere are some\u00a0notes introducing you to this patch and things and decisions I consider somewhat important.\n\nRAMDirectory and ByteBuffersDirectory (and associated classes).\n\nRAMDirectory and its bits and pieces (RAMFile, RAMOutputStream) are used in many, many places in the code. In many of those places the actual use case\u00a0is a writeable (and reusable) abstraction of a buffer where vints and other\u00a0data structures can be accumulated, then flushed to another buffer (or sink). The fact that RAMOutputStream implements full IndexOutput and not just DataOutput is\u00a0contradicting those use cases (a flag on optional CRC computation, reset method).\n\nWhile it is possible to\u00a0change\u00a0those\u00a0classes in-place, I initially\u00a0opted for writing a \"second set\" of ram-based classes. This allows more progressive transition from RAM* classes and, perhaps more importantly, provides some room for a different structuring of relationships among those new classes (not to mention it makes baby steps of re-running full test suite easier).\n\nI opted to use ByteBuffers (heap-based) as the underlying storage in memory, so all the classes are named ByteBuffers*. And so we have:\n\n\tByteBuffersDirectory - a replacement/equivalent of RAMDirectory, essentially.\u00a0\n\tByteBuffersDataOutput - a growing, paged buffer that implements DataOutput and adds additional utility methods like current size, returning the content as a contiguous array or a set of underlying ByteBuffers. The implementation is paged, but does not use a fixed page size.\u00a0Once the content grows past 100 \"blocks\" the blocks are\u00a0doubled and existing content is copied to those new blocks. This solution\u00a0is\u00a0nicer for heap memory than the fixed 1024-byte blocks in RAMOutputStream. Sure, some memory copying overhead does occur, but I haven't noticed any practical impact from this.\u00a0\n\tByteBuffersDataInput - a\u00a0DataInput implementation on top of a collection of ByteBuffers. There requirements for the input byte buffers are that for N buffers, the capacity of buffers 1..N-1 is constant and power-of-two (which is what ByteBuffersDataOutput emits) to allow efficient\u00a0page/buffer seeks. The initial buffer can also have the\u00a0initial read position shifted from 0 (for easy slicing).\u00a0\n\tByteBuffersIndexInput - An IndexInput implementation that reads from the delegate ByteBuffersDataInput\n\tByteBuffersIndexOutput - An IndexOutput implementation that writes to a delegate ByteBuffersDataOutput and computes the CRC of the written data. This is done lazily (so no special switches are required for temporary index outputs where previously we explicitly passed crc=false).\n\n\n\nWhy not byte[] instead of ByteBuffers?\n\nMostly\u00a0in hope that byte buffers provide JVM intrinsics\u00a0that would be faster than\u00a0plain Java code (range checking, int or long access over the underlying byte arrays). They also make certain things more problematic or complex (especially to those not familiar with Buffers), but overall I think it came out quite nicely and integrates well with filesystem buffers we use anyway.\n\nWhy not reuse exiting ByteBufferIndexInput abstractions?\n\nMy design decision was to avoid the exception-handler logic control currently used in Lucene's memory mapped buffer IndexInput implementation. This is subjective taste, really, but also driven by the fact that byte buffers here can and will be much smaller than mapped buffer slices (so in-between buffer region reads will happen more frequently). So I left the ByteBuffersDataInput\u00a0class in the code, although ByteBuffersDirectory provides a mapper that maps each written file's ByteBuffer[] into an IndexInput and one of the provided defaults can use Lucene's \"native\" byte buffer wrappers. Finally redundancies can be stripped from the patch entirely (or left in, if we decide they're useful).\u00a0See notes about performance below too.\n\nWhat to do with RAMDirectory and other Ram*Stream classes?\n\nThere is an obvious question what to do with RAMDirectory classes now. Should\u00a0this patch substitute the internals (a rename of ByteBuffers*, effectively), should we deprecate RAMDirectory and then drop it entirely? My gut feeling is that many people use RAMDirectory, but I'd rather deprecate it and remove it eventually to give a clear signal that (a) it's not efficient, (b) it's going away. I am really open to discussion here though.\n\nWhat are the performance implications?\n\nI ran a few quick experiments creating and reading from indexes and ByteBuffersDirectory performs quite nicely. I'll attach a\u00a0chart from AWS 32-cpu instance for a taste.\u00a0In short, the performance is comparable with FSDirectory, especially when the output buffer is consolidated.\n\nThis said, I also replaced a number of\u00a0RAMInput/OutputStream used as buffers in internal codec classes, etc., and the implications there may have escaped my attention. Please report if you see anything odd.\n\nWhat's next?\n\nThis depends mostly on what we decide to do with RAMDirectory. It's still used heavily in tests (and mocks),\u00a0so there's still some work to be done there, but I wanted to circulate this for feedback so that I don't spend my time on something that won't be accepted. ",
+            "date": "2018-08-06T12:41:05+0000"
+        },
+        {
+            "id": "comment-16570164",
+            "author": "Dawid Weiss",
+            "content": "Jeez, Robert, you're fast. I was writing some follow-up intro to the patch (because it is quite large).\u00a0\n\u00a0I'm pretty much against committing this to trunk and then immediately trying to start spinning up lucene 8.0. The problem is this code has its tentacles in everything: a bug in this thing will impact far more than just windows users who can't use mmap over tmpfs\u00a0\nI absolutely agree with you. I'm in no pressure of time \u2013 this PR is for review and discussion. I'll be happy to keep cleaning things up (an they pop up as I go), but I didn't want to\u00a0dig myself a hole people will reject.\n\nIf we do decide to deprecate RAMDirectory (instead of changing its implementation) then I'd add deprecation markers to Lucene 8.0 though (without introducing this patch in full).\u00a0 ",
+            "date": "2018-08-06T12:44:13+0000"
+        },
+        {
+            "id": "comment-16571426",
+            "author": "Dawid Weiss",
+            "content": "This shows the QPS performance on an AWS 36-core (18 physical cores) with increasing thread count and various directory implementations \u2013 BBDIR is ByteBuffersDirectory, FSDir is Lucene's native FSDirectory, RAMDIR is current RAMDirectory. The variations of BBDIR relate to which\u00a0IndexInput is returned: MANY_BUFS is multiple ByteBuffers (exactly the buffers written to IndexOutput), ONE_BUF is the same implementation, buf buffers rewritten into a single ByteBuffer (results in contiguous access and fewer block-boundary hits), BYTE_ARRAY is rewritten into a contiguous array and wrapped in\u00a0ByteArrayIndexInput, LUCENE_BUFS is the original ByteBuffers wrapped in Lucene's ByteBuffer handling code.\n\nMy opinion is to\u00a0leave\u00a0LUCENE_BUFS as the default since it exhibits high performance, doesn't require contiguous memory allocation, etc.\n\n ",
+            "date": "2018-08-07T10:33:27+0000"
+        },
+        {
+            "id": "comment-16571744",
+            "author": "David Smiley",
+            "content": "Nice job Dawid!  It'll be nice to see RAMDirectory go away (eventually). ",
+            "date": "2018-08-07T14:22:08+0000"
+        },
+        {
+            "id": "comment-16571951",
+            "author": "Adrien Grand",
+            "content": "+1 to clean up these abstractions. I don't have strong preferences regarding whether we should change the implementation in-place or deprecate and introduce a replacement. It looks like either way, we don't need to migrate all codecs to the new inputs/outputs immediately, which should address concerns about merging this change soon before releasing 8.0? ",
+            "date": "2018-08-07T16:45:52+0000"
+        },
+        {
+            "id": "comment-16572010",
+            "author": "Uwe Schindler",
+            "content": "Hi, that was a lot of work already! Great! I see, you also used the powerOf2 buffer structure for the multi-indexinput. One question: Can we not reuse the already existing ByteBufferIndexInput? ",
+            "date": "2018-08-07T17:27:00+0000"
+        },
+        {
+            "id": "comment-16572774",
+            "author": "Dawid Weiss",
+            "content": "Can we not reuse the already existing ByteBufferIndexInput?\n\nWe can \u2013 it's in the chart above (BBDIR_LUCENE_BUFS). I wrote my own implementation for completeness (so that input/outputs have their counterpart classes), but also because I wondered how a non-specialized (single vs. multiple buffers, no catch-exception trickery) would perform. Turns out there's very little difference. We can definitely strip the redundancies before they're officially published. ",
+            "date": "2018-08-08T06:57:05+0000"
+        },
+        {
+            "id": "comment-16572903",
+            "author": "Uwe Schindler",
+            "content": "OK!\n\nWhich Java version was you test? 8 or 9+. Because Java 9 had some improvements in bytebuffers because of the checkIndex intrinsics. ",
+            "date": "2018-08-08T08:59:48+0000"
+        },
+        {
+            "id": "comment-16572907",
+            "author": "Uwe Schindler",
+            "content": "And yes, I agree with you about bytebuffers: Let's use ByteBuffers and not byte[]. I know the problems of misuse/incorrect use of the bytebuffer APIs by beginners, but in general we have an abstraction, so Lucene's codecs or users of the new directory implementations do not need to take care. We just have to make the implementations in this issue correct. To me it looks ok, no major problems.\n\nIn addition with bytebuffers, we can (possibly) make a small knob in ByteBufferDirectory do use ByteBuffer.allocateDirect() instead of allocate(). But then we have to add the usual unmapping code, so when the file is deleted in the directory, we can unmap all buffers. Ah, and in Java 12 we may get non-volatile bytebuffers! ",
+            "date": "2018-08-08T09:04:37+0000"
+        },
+        {
+            "id": "comment-16572977",
+            "author": "Dawid Weiss",
+            "content": "So here's what I think should work with regard to concerns about stability, API continuity and experimental implementation of this new ram-based Directory:\n\n1) add those ByteBuffers* classes immediately to 7.x and 8.x line, together with tests, mark them as experimental (do not change anything in existing code). This allows people (like me) to play with those classes, provide feedback and perhaps discover bugs.\n2) mark RAMDirectory deprecated in 7.x and 8.x, schedule it for removal in a later major version.\n3) postpone all codec changes and other replacements until after 8.0 is released, schedule them for 8.1, for example. I honestly don't think anything can go bad in there, but it's software, after all. Can be proven correct, but nobody knows until you run it. \n4) separate another subtask to replace all RAMDirectory uses in tests and other places. These can also go to 8.1 after 8.0 branch is cut.\n\nThe above will require splitting this patch into at least two, but it's quite trivial. ",
+            "date": "2018-08-08T10:07:21+0000"
+        },
+        {
+            "id": "comment-16574743",
+            "author": "Dawid Weiss",
+            "content": "I'll take the above plan as a lazy consensus yes?  I'll create sub-tasks for the above and start with adding deprecations first, then hold until 8.x branch is cut before I integrate the rest of this stuff. ",
+            "date": "2018-08-09T12:04:34+0000"
+        },
+        {
+            "id": "comment-16575901",
+            "author": "Uwe Schindler",
+            "content": "Hi,\nat the moment I am not fully happy with the naming (plural in ByteBuffers) vs. the already existing class for supporting Mmap. I like the name without \"s\" more, the plural looks forced. At the end for the actual directory I'd like to have a name that's more generic, like \"HeapBufDirectory\" (whatever). RAMDirectory is a horribly name anywhays, because its not \"RAM\", it's \"heap\" in reality (and heap may be anything, not only physical RAM). So we can a new name and the stupid \"RAMDirectory\" can go away. ",
+            "date": "2018-08-10T07:50:37+0000"
+        },
+        {
+            "id": "comment-16575905",
+            "author": "Dawid Weiss",
+            "content": "To me it's physically a set of buffers that hold the content, so ByteBuffersXXX is more intuitive to me (and concise). I'd expect something called ByteBufferDataOutput to use a single buffer and I reflected this in the naming.\n\nAs for ByteBuffersDirectory I don't have a strong opinion there. My take is that given the flexibility of the provided buffer supplier/ recycler (you can use direct buffers instead of heap buffers) it may make more sense to name it after what it does \u2013 use byte buffers to store the content of files.  ",
+            "date": "2018-08-10T07:57:12+0000"
+        },
+        {
+            "id": "comment-16575907",
+            "author": "Uwe Schindler",
+            "content": "Maybe we can then still cleaup the other names. E.g. remove your own ByteBuffersIndexInput and rename the one behind MMAPDir. At the moment I see too much names in the store folder and it's very hard to figure out whoich one is the right one. We should also make everything package private, which is internal implementations. ",
+            "date": "2018-08-10T08:00:00+0000"
+        },
+        {
+            "id": "comment-16575933",
+            "author": "Dawid Weiss",
+            "content": "Sure. I tried to explain why I wrote ByteBuffersIndexInput separately (structural conditions instead of exception handlers, etc). It's just more appealing to me, but also I kept wondering what's going to happen if you have smaller page sizes (mmap will typically default to a single buffer, even on fairly sizeable files; this is no longer the case with smaller heap-chunked files).\n\nWe should also make everything package private, which is internal implementations.\n\nThere are numerous classes around the codebase that use those in-memory buffer classes, so we can't make them package-private (we could make them module-private if we target the module system at some point).\n\nAlso, making everything package private gives a cleaner API, but it also forces virtually everyone who'd like to experiment with different directory/ buffer wrapper implementations to reinvent the wheel here (read: copy-paste). Look at LUCENE-8406 \u2013 one can't even reuse that buffers-based IndexInput implementation because it's package-private. And it's really complex stuff that took serious effort to write and test. My personal opinion is that if we provide a public API for low-level index tinkering (IndexInput) then it would be a nice think to also make some crucial implementation bits that implement those interfaces available. As a programmer it makes me feel bad to copy/paste those bits over to my codebase just because of a package-private scope on the constructor (sure, we still do it a lot).\n\nThere are pros and cons to both choices I guess, but I think it's worth leaving reusable (or customizable) implementation classes of public API interfaces a bit more open. ",
+            "date": "2018-08-10T08:23:25+0000"
+        },
+        {
+            "id": "comment-16576026",
+            "author": "Uwe Schindler",
+            "content": "For the bounds checks, can you use the new FutureObjects.checkIndex methods? Those are transformed to Objects.checkIndex in the Java 9 VM (using MR-JAR). Those are automatically eliminated in Java 9+ then. In the future we can for sure also use them in MMapDir, but it was too risky yet, so we stay with the try/catch stuff. ",
+            "date": "2018-08-10T09:44:57+0000"
+        },
+        {
+            "id": "comment-16576033",
+            "author": "Dawid Weiss",
+            "content": "Good point! ",
+            "date": "2018-08-10T09:50:16+0000"
+        },
+        {
+            "id": "comment-16576058",
+            "author": "Uwe Schindler",
+            "content": "...but they don't work for if/then/else. checkIndex is only good to throw IOOBE! Nevertheless, we should look into those and usage here. ",
+            "date": "2018-08-10T10:18:15+0000"
+        }
+    ]
+}

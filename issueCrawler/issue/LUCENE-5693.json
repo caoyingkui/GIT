@@ -1,0 +1,123 @@
+{
+    "id": "LUCENE-5693",
+    "title": "don't write deleted documents on flush",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Won't Fix",
+        "components": [],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": []
+    },
+    "description": "When we flush a new segment, sometimes some documents are \"born deleted\", e.g. if the app did a IW.deleteDocuments that matched some not-yet-flushed documents.\n\nWe already compute the liveDocs on flush, but then we continue (wastefully) to send those known-deleted documents to all Codec parts.\n\nI started to implement this on LUCENE-5675 but it was too controversial.\n\nAlso, I expect typically the number of deleted docs is 0, or small, so not writing \"born deleted\" docs won't be much of a win for most apps.  Still it seems silly to write them, consuming IO/CPU in the process, only to consume more IO/CPU later for merging to re-delete them.",
+    "attachments": {
+        "LUCENE-5693.patch": "https://issues.apache.org/jira/secure/attachment/12646050/LUCENE-5693.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14004821",
+            "author": "Robert Muir",
+            "content": "This only makes sense for postings though.\n\nHow can we avoid writing deleted documents in:\n\n\tstored fields and term vectors (which we arent flushing)\n\tdocvalues (we would need to remap ordinals)\n\n\n\nBy writing them some places and not writing them other places, we open the possibility of extremely confusing corner cases and bugs. ",
+            "date": "2014-05-21T15:59:19+0000"
+        },
+        {
+            "id": "comment-14004835",
+            "author": "Shai Erera",
+            "content": "Today we apply the deletes (update the bitset) when a Reader is being requested. At that point, we have a SegmentReader at hand and we can resolve the delete-by-Term/Query to the actual doc IDs ... how would we do that while the segment is flushed? How do we know which documents were associated with Term t, while it was sent as a delete?\n\nWhen I worked on LUCENE-5189 (NumericDocValues update), I had the same thought \u2013 why flush the original numeric value when the document has already been updated? But I had the same issue - which documents were affected by the update Term. ",
+            "date": "2014-05-21T16:06:34+0000"
+        },
+        {
+            "id": "comment-14004902",
+            "author": "Michael McCandless",
+            "content": "how would we do that while the segment is flushed?\n\nWe do it in FreqProxTermsWriter.applyDeletes; since we know the terms to be deleted, and we have the BytesRefHash, it's easy. ",
+            "date": "2014-05-21T16:55:54+0000"
+        },
+        {
+            "id": "comment-14004906",
+            "author": "Michael McCandless",
+            "content": "This only makes sense for postings though.\n\nRight, postings is much easier than doc values.  But postings are also the most costly to merge.\n\nBy writing them some places and not writing them other places, we open the possibility of extremely confusing corner cases and bugs.\n\nI disagree: I think we discover places that are \"relying\" on deleted docs behavior, i.e. test bugs.  When I did this on LUCENE-5675 there were only a few places that relied on deleted docs. ",
+            "date": "2014-05-21T16:58:01+0000"
+        },
+        {
+            "id": "comment-14004943",
+            "author": "Michael McCandless",
+            "content": "Patch, decoupled from LUCENE-5675.  Tests pass.\n\nThe trickiest one was the new TestFieldCacheVsDocValues: it heavily\nrelies on being able to read deleted docs from postings, which I think\nis invalid.\n\nI also had to fix CheckIndex to not verify term vectors for deleted\ndocs; I think that's fair.\n\nThe core fix is easy: FreqProxFields (passed to the PostingsWriterat\nflush) just skips the deleted docs.\n\nAlso, this uncovered a bug in ToParentBJQ.explain's handling of\ndeleted docs. ",
+            "date": "2014-05-21T17:21:32+0000"
+        },
+        {
+            "id": "comment-14005450",
+            "author": "Robert Muir",
+            "content": "\nI disagree: I think we discover places that are \"relying\" on deleted docs behavior, i.e. test bugs. When I did this on LUCENE-5675 there were only a few places that relied on deleted docs.\n\nThat's not the complexity i'm concerned about. I'm talking about bugs in lucene itself because shit like the following happens:\n\n\tvarious codec apis unable to cope with writing 0 doc segments because all the docs were deleted\n\tvarious codec apis with corner case bugs because stuff like 'maxdoc' in segmentinfo they are fed is inconsistent with what they saw.\n\tvarious index/search apis unable to cope with docid X appears in codec api Y but not codec api Z where its expected to exist.\n\tslow O passes thru indexwriter apis to recalculate and reshuffle ordinals and stuff like that.\n\tcorner case bugs like incorrect statistics.\n\tadditional complexity inside indexwriter/codecs to handle this, when just merging away would be better.\n\n\n\nSo if we want to rename the issue to \"as a special case, don't write deleted postings on flush\" and remove the TODO about changing this for things like DV, then I'm fine.\n\nBut otherwise, if this is intended to be a precedent of how things should work, then I strongly feel we should not do this. The additional complexity and corner cases are simply not worth it. ",
+            "date": "2014-05-22T00:21:53+0000"
+        },
+        {
+            "id": "comment-14005735",
+            "author": "Shai Erera",
+            "content": "So the question is, if we think the common case is to have close to 0 deleted documents in a new flushed segment, how important is it to not write the postings of those documents. For example, I believe that many applications include stored fields in their Documents, and probably a good portion also TermVectors. Since those two are big, but we're not removing deleted documents from them, what's the advantage of not writing on postings of deleted docs, at the cost of introducing potential bugs as Rob mentions?\n\nAnd besides bugs, this does put the index into an inconsistent state \u2013 yes, users should not rely on Lucene to be able to retrieve deleted documents, and we should have the freedom to optimize Lucene internals such that deleted docs are never flushed, but I just wonder if in this case, handling only postings while leaving the majority of the index as-is today, is worth the hassle and potential bugs.\n\nI'm +0.5 to make this change to only postings.\n\nIf we can make this change global to all flushed content, including DocValues, I'd feel better about it. And I wonder if we can't ... so I understand this is not how the code works today, but if we computed the liveDocs before we flush any field, including DV, couldn't we change the code to not send deleted docs' fields to the DocValues API too? In that case we won't need to remap ordinals, right? We'd still be flushing stored fields and TV of deleted docs, but perhaps that's acceptable? ",
+            "date": "2014-05-22T08:54:01+0000"
+        },
+        {
+            "id": "comment-14005736",
+            "author": "Michael McCandless",
+            "content": "So if we want to rename the issue to \"as a special case, don't write deleted postings on flush\" and remove the TODO about changing this for things like DV, then I'm fine.\n\n+1, I'll rename the issue, remove the TODO about not sending deleted docs to DVs on flush (make it clear this is only about not writing deleted docs to postings), and add a separate test case for the ToParentBJQ.explain bug. ",
+            "date": "2014-05-22T08:54:37+0000"
+        },
+        {
+            "id": "comment-14005740",
+            "author": "Michael McCandless",
+            "content": "couldn't we change the code to not send deleted docs' fields to the DocValues API too?\n\nWe could, but Rob is strongly against that, so I'll remove that TODO and make it clear this is just about not wasting IO/CPU writing deleted postings.\n\nAlso, remember that postings is the most costly part of the merge, so not writing deleted docs there gets us the most gains. ",
+            "date": "2014-05-22T08:58:02+0000"
+        },
+        {
+            "id": "comment-14005751",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1596783 from Michael McCandless in branch 'dev/branches/lucene5675'\n[ https://svn.apache.org/r1596783 ]\n\nLUCENE-5693, LUCENE-5675: also decouple this bug fix (move to LUCENE-5693) in ToParentBJQ.explain ",
+            "date": "2014-05-22T09:08:56+0000"
+        },
+        {
+            "id": "comment-14005754",
+            "author": "Shai Erera",
+            "content": "I don't see what's wrong w/ not sending the values of deleted docs to the DV API. As far as they're concerned, they get null values for Sorted/SortedSet/Binary/Numeric, which they should also be prepared for, as not all docs will have values even without deletes. And so there won't be any ord-remapping? Like if all docs associated w/ value \"foo\" are deleted, \"foo\" won't be sent to the Codec in the first place, and therefore will never receive an ord?\n\nI wonder how complicated it is to patch it up, so we can look at it. And perhaps we'd even be able to tell if there's any code that breaks. ",
+            "date": "2014-05-22T09:09:59+0000"
+        },
+        {
+            "id": "comment-14005787",
+            "author": "Simon Willnauer",
+            "content": "I really wonder if this issue matters. The usecase of this when you update a document while it's still in ram and to me this seems really a corner case. I think we should just stick with the corner case and not complicate the code if possible? If it makes things cleaner I am ok with it but please don't complicate things for this corner case... ",
+            "date": "2014-05-22T09:37:22+0000"
+        },
+        {
+            "id": "comment-14005795",
+            "author": "Shai Erera",
+            "content": "Hmm, I reviewed SortedDVWriter and I understand the ord remapping problem that Rob was talking about. I was confused and thought that the Codec is the one that assigns the ords, and so if it receives a null value, it would be fine. But it's the SortedDVWriter which assigns the ords, and since it already assigned an ord to a value of a document that was later deleted, it would need to remap the ords around it.\n\nSo maybe we do only need to focus on postings in this issue. I don't think that we need to remove the TODO though ... we have plenty of TODOs in the code, and it's something valid to consider one day, only keep this issue focused for now.\n ",
+            "date": "2014-05-22T09:52:54+0000"
+        },
+        {
+            "id": "comment-14005828",
+            "author": "Michael McCandless",
+            "content": "I really wonder if this issue matters. \n\nI suspect it's uncommon in most cases, that docs are \"born deleted\".  But it does happen and it seems silly to waste IO/CPU if we can help it.\n\nI think we should just stick with the corner case and not complicate the code if possible?\n\nThe patch really does not complicate the code?  It adds a check against the liveDocs in the Docs/AndPositionsEnum passed to the codec during flush.  The only \"complexity\" was fixing a test that made invalid assumption that deleted docs must be present in postings.\n\nI guess what bothers me here is this apparent precedent that deleted docs are in fact required to be present everywhere in a segment.  Yes, this is the case today, but I think it's an impl detail and should not be required, e.g. enforced by CheckIndex, tests asserting that it's the case.\n\nBut I'll resolve this as WONTFIX ... looks like I'm just outvoted. ",
+            "date": "2014-05-22T11:21:53+0000"
+        },
+        {
+            "id": "comment-14005837",
+            "author": "Shai Erera",
+            "content": "But I'll resolve this as WONTFIX ... looks like I'm just outvoted.\n\nI think you jumped to that conclusion too soon. The way I read it, there's one committer who +0.5, one who was OK w/ restricting this to postings only, and one who said that if it complicates the code, please don't do that \u2013 but it doesn't. I don't think that's called \"outvoted\" . But it's your call... ",
+            "date": "2014-05-22T11:46:32+0000"
+        },
+        {
+            "id": "comment-14005862",
+            "author": "Robert Muir",
+            "content": "\nI guess what bothers me here is this apparent precedent that deleted docs are in fact required to be present everywhere in a segment. Yes, this is the case today, but I think it's an impl detail and should not be required, e.g. enforced by CheckIndex, tests asserting that it's the case.\n\nThats not the case. I am worried about bugs, complexities, and slowdowns in lucene itself. I already mentioned my list of concerns and I think they are all realistic.\n\nTo me, the patch is a bit naive.\n\nPerhaps you forgot (or didn't think about) what Sorted/SortedSetDocValuesWriter would have to do, if it wanted to filter out deleted documents? This would slow down flushing a lot, which presumably is important to people who are deleting documents in IndexWriter's ramBuffer. Filtering out deleted documents here would only hurt the user. Better to leave this to merge.\n\nAnd what about stored fields and term vectors? why wouldn't you put a TODO there in your patch? Is it because its \"ok\" to have the API and system inconsistency there, because it would be slower to buffer them in RAM?\n\nI don't like these implicit exceptions to the rule. If we want to intentionally make a mess, there needs to be hard justification why we are doing such a thing. All these little unproven optimizations, API inconsistencies, exceptional cases, they all add up. I think it would be better to only complicate things when its a big win, otherwise the whole codebase will end out looking like IndexWriter.java.\n\nAll that being said, as I already stated on this issue, I am fine with filtering out the postings as an exception to the rule. I really don't like it one bit: but i can compromise for this piece if it really brings big benefits. Doing it for the rest of the codec api makes no sense at all. ",
+            "date": "2014-05-22T12:20:59+0000"
+        },
+        {
+            "id": "comment-14006306",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1596938 from Michael McCandless in branch 'dev/branches/lucene5675'\n[ https://svn.apache.org/r1596938 ]\n\nLUCENE-5675, LUCENE-5693: improve javadocs, disallow term vectors, fix precommit issues, remove trivial diffs, add new test case ",
+            "date": "2014-05-22T18:50:57+0000"
+        }
+    ]
+}

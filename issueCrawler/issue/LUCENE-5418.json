@@ -1,0 +1,122 @@
+{
+    "id": "LUCENE-5418",
+    "title": "Don't use .advance on costly (e.g. distance range facets) filters",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "modules/facet"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.7",
+            "6.0"
+        ]
+    },
+    "description": "If you use a distance filter today (see http://blog.mikemccandless.com/2014/01/geospatial-distance-faceting-using.html ), then drill down on one of those ranges, under the hood Lucene is using .advance on the Filter, which is very costly because we end up computing distance on (possibly many) hits that don't match the query.\n\nIt's better performance to find the hits matching the Query first, and then check the filter.\n\nFilteredQuery can already do this today, when you use its QUERY_FIRST_FILTER_STRATEGY.  This essentially accomplishes the same thing as Solr's \"post filters\" (I think?) but with a far simpler/better/less code approach.\n\nE.g., I believe ElasticSearch uses this API when it applies costly filters.\n\nLongish term, I think  Query/Filter ought to know itself that it's expensive, and cases where such a Query/Filter is MUST'd onto a BooleanQuery (e.g. ConstantScoreQuery), or the Filter is a clause in BooleanFilter, or it's passed to IndexSearcher.search, we should also be \"smart\" here and not call .advance on such clauses.  But that'd be a biggish change ... so for today the \"workaround\" is the user must carefully construct the FilteredQuery themselves.\n\nIn the mean time, as another workaround, I want to fix DrillSideways so that when you drill down on such filters it doesn't use .advance; this should give a good speedup for the \"normal path\" API usage with a costly filter.\n\nI'm iterating on the lucene server branch (LUCENE-5376) but once it's working I plan to merge this back to trunk / 4.7.",
+    "attachments": {
+        "LUCENE-5418.patch": "https://issues.apache.org/jira/secure/attachment/12625850/LUCENE-5418.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13884331",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1562127 from Michael McCandless in branch 'dev/branches/lucene5376'\n[ https://svn.apache.org/r1562127 ]\n\nLUCENE-5418: fix drill-down & drill-sideways to use Bits interface when applying a Filter ",
+            "date": "2014-01-28T17:07:21+0000"
+        },
+        {
+            "id": "comment-13885268",
+            "author": "Michael McCandless",
+            "content": "Patch, I think it's ready.\n\nI simplified DrillSideways by removing the collector method and cutting over to DISI (not DocsEnum), and then using Bits.get from a Filter when it supports random access.  I also cutover DrillDownQuery to FilteredQuery. ",
+            "date": "2014-01-29T11:45:27+0000"
+        },
+        {
+            "id": "comment-13885487",
+            "author": "Robert Muir",
+            "content": "The workaround seems pretty complicated. \n\nI don't think we should have slow advance() implementations that run in linear time, thats the real issue, it would be better if advance() was an optional operation [add boolean hasAdvance() method or something], and they just threw UOE instead. ",
+            "date": "2014-01-29T16:29:03+0000"
+        },
+        {
+            "id": "comment-13885499",
+            "author": "Michael McCandless",
+            "content": "it would be better if advance() was an optional operation [add boolean hasAdvance() method or something], and they just threw UOE instead.\n\n+1\n\nAnd, fix our queries to handle this properly; e.g. BS2 should detect when a CSQ(Filter) cannot do advance, and (somehow) pull its Bits instead.\n\nAt one point in my patch I was doing this w/ the slow Filters ... but then I was foiled by FilteredQuery.rewrite (it detects when the base query is MatchAll and switches back to the iterator) ... maybe we can remove that rewrite \"smartness\" and then I'll go back to throwing UOE. ",
+            "date": "2014-01-29T16:35:50+0000"
+        },
+        {
+            "id": "comment-13885500",
+            "author": "Robert Muir",
+            "content": "The same applies to next() really: so the whole thing is that for such filters, we should only be using Bits. ",
+            "date": "2014-01-29T16:36:10+0000"
+        },
+        {
+            "id": "comment-13885533",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1562508 from Michael McCandless in branch 'dev/branches/lucene5376'\n[ https://svn.apache.org/r1562508 ]\n\nLUCENE-5418: throw UOE from Filter.docIdSet again ",
+            "date": "2014-01-29T17:08:23+0000"
+        },
+        {
+            "id": "comment-13886760",
+            "author": "David Smiley",
+            "content": "How ironic that I was contemplating this very same issue yesterday (shared on IRC #lucene-dev) as I work on LUCENE-5408 and now I see you guys were just thinking about it.  Rob's right; the problem isn't just advance(), it's next() too.  \n\nThere may be a place to share some code that Mike is committing here in his facet module with a static utility class I coded yesterday in LUCENE-5408 (not yet posted).  It's a BitsDocIdSet and it's roughly similar to Mike's SlowBitsDocIdSetIterator:\n\n  /** Utility class that wraps a {@link Bits} with a {@link DocIdSet}. */\n  private static class BitsDocIdSet extends DocIdSet {\n    final Bits bits;//not null\n\n    public BitsDocIdSet(Bits bits) {\n      if (bits == null)\n        throw new NullPointerException(\"bits arg should be non-null\");\n      this.bits = bits;\n    }\n\n    @Override\n    public DocIdSetIterator iterator() throws IOException {\n      return new DocIdSetIterator() {\n        final Bits bits = BitsDocIdSet.this.bits;//copy reference to reduce outer class access\n        int docId = -1;\n\n        @Override\n        public int docID() {\n          return docId;\n        }\n\n        @Override\n        public int nextDoc() throws IOException {\n          return advance(docId + 1);\n        }\n\n        @Override\n        public int advance(int target) throws IOException {\n          for (docId = target; docId < bits.length(); docId++) {\n            if (bits.get(docId))\n              return docId;\n          }\n          return NO_MORE_DOCS;\n        }\n\n        @Override\n        public long cost() {\n          return bits.length();\n        }\n      };\n    }\n\n    @Override\n    public Bits bits() throws IOException {\n      return bits;//won't be null\n    }\n\n    //we don't override isCacheable because we want the default of false\n  }//class BitsDocIdSet\n\n\n\nSo Mike; you've got just the DISI portion, and you're also incorporating acceptDocs.  For me I elected to have acceptDocs be pre-incorporated into the Bits I pass through.  I'll post my intermediate progress on LUCENE-5408.  So any way; how about we have something in the \"utils\" package to share? ",
+            "date": "2014-01-30T16:42:28+0000"
+        },
+        {
+            "id": "comment-13886925",
+            "author": "Michael McCandless",
+            "content": "Actually, I've removed the SlowBitsDocIdSetIterator (need to post a patch again soon...), because it's too trappy.  I think it's better if the user gets an exception here than just silently run super slowly, and at least for this issue there are always ways to run the Filter \"quickly\" (use DrillSideways or DrillDownQuery, or create FilteredQuery directly). ",
+            "date": "2014-01-30T19:04:52+0000"
+        },
+        {
+            "id": "comment-13887943",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1563195 from Michael McCandless in branch 'dev/branches/lucene5376'\n[ https://svn.apache.org/r1563195 ]\n\nLUCENE-5418: add optional fast-match Filter to range faceting / drill down / drill sideways ",
+            "date": "2014-01-31T17:49:23+0000"
+        },
+        {
+            "id": "comment-13888154",
+            "author": "Michael McCandless",
+            "content": "New patch, throwing UOE from DocIdSet.iterator() for the Filter returned by Range.getFilter().  I like this approach: it's safer for the user so they don't accidentally apply a super slow filter.\n\nI also added \"fastmatch\" Filter to range faceting, so if e.g. your ValueSource is costly to compute, you can pass a fastmatch filter to rule out docs that should not even be considered. ",
+            "date": "2014-01-31T20:49:45+0000"
+        },
+        {
+            "id": "comment-13892084",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1564765 from Michael McCandless in branch 'dev/branches/lucene5376'\n[ https://svn.apache.org/r1564765 ]\n\nLUCENE-5418: fix typo ",
+            "date": "2014-02-05T13:22:37+0000"
+        },
+        {
+            "id": "comment-13892088",
+            "author": "Michael McCandless",
+            "content": "I think the last patch is ready except for a small typo ... I'll commit soon. ",
+            "date": "2014-02-05T13:28:08+0000"
+        },
+        {
+            "id": "comment-13893633",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1565387 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1565387 ]\n\nLUCENE-5418: faster drill-down/sideways on costly filters ",
+            "date": "2014-02-06T18:36:49+0000"
+        },
+        {
+            "id": "comment-13893649",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1565391 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1565391 ]\n\nLUCENE-5418: faster drill-down/sideways on costly filters ",
+            "date": "2014-02-06T18:50:51+0000"
+        },
+        {
+            "id": "comment-14357420",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1665972 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1665972 ]\n\nLUCENE-5418: Remove incorrect javadocs relict ",
+            "date": "2015-03-11T19:20:52+0000"
+        },
+        {
+            "id": "comment-14357424",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1665973 from Uwe Schindler in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1665973 ]\n\nMerged revision(s) 1665972 from lucene/dev/trunk:\nLUCENE-5418: Remove incorrect javadocs relic ",
+            "date": "2015-03-11T19:22:06+0000"
+        }
+    ]
+}

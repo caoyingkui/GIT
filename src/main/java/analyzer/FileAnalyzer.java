@@ -45,10 +45,10 @@ public class FileAnalyzer {
                 Pair<String, String> filePair = (Pair<String,String>)(pair.getValue());
                 String newFile = analyzer.getFileFromCommit(commit, filePair.getValue().toString());
                 String oldFile = analyzer.getFileFromCommit(analyzer.getId(commit.getName() + "^"), filePair.getKey().toString());
-                ClassParser newParser = new ClassParser(newFile);
+                ClassParser newParser = new ClassParser().setSourceCode(newFile);
                 Set<String> methodNames = newParser.getAllMethodNames();
 
-                ClassParser oldParser = new ClassParser(oldFile);
+                ClassParser oldParser = new ClassParser().setSourceCode(oldFile);
                 methodNames.addAll(oldParser.getAllMethodNames());
 
                 for(String methodName: methodNames){
@@ -65,9 +65,9 @@ public class FileAnalyzer {
                 }
 
                 Set<String> changeMethodName = new HashSet<>();
-                changeMethodName.addAll(newParser.getChangedMethod(patch,true));
-                changeMethodName.addAll(oldParser.getChangedMethod(patch,false));
-                for(String methodName: newParser.getChangedMethod(patch, true)){
+                changeMethodName.addAll(newParser.getChangedMethod(patch,true).keySet());
+                changeMethodName.addAll(oldParser.getChangedMethod(patch,false).keySet());
+                for(String methodName: newParser.getChangedMethod(patch, true).keySet()){
                     changeTimes.put(methodName, changeTimes.get(methodName) + 1);
                     if(ccc == 1){
                         changeTimes_patch_with_one_file.put(methodName, changeTimes_patch_with_one_file.get(methodName) + 1);

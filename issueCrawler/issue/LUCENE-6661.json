@@ -1,0 +1,69 @@
+{
+    "id": "LUCENE-6661",
+    "title": "Allow queries to opt out of caching",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "5.2",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Minor",
+        "status": "Resolved",
+        "type": "Improvement"
+    },
+    "description": "Some queries have out-of-band dependencies that make them incompatible with caching, it'd be great if they could opt out of the new fancy query/filter cache in IndexSearcher.\n\nThis affects DrillSidewaysQuery and any user-provided custom Query implementations.",
+    "attachments": {
+        "LUCENE-6661.patch": "https://issues.apache.org/jira/secure/attachment/12743800/LUCENE-6661.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14615665",
+            "author": "Terry Smith",
+            "date": "2015-07-06T21:06:20+0000",
+            "content": "Rather than add a new method to Query/Weight this feature I've added a small marker interface and an instanceof check to prototype this feature.\n\nIf this is of interest we should decide whether Query, Weight, or both could implement this interface to disable caching. "
+        },
+        {
+            "id": "comment-14615703",
+            "author": "Adrien Grand",
+            "date": "2015-07-06T21:33:28+0000",
+            "content": "One issue I have with marker interfaces is that they do not support wrapping. Eg. if you put such a query in a BooleanQuery, then the BooleanQuery would be considered cacheable although it should not be cached either.\n\nOne way to work around this issue would be to make a query that is not equal to any other query but itself? Eg:\n\n\nclass MyQuery extends Query {\n\n  private Object identity = null;\n\n  boolean equals(Object o) {\n    if (super.equals(o) == false) {\n      return false;\n    }\n    MyQuery that = (MyQuery) o;\n    return identity == that.identity;\n  }\n\n  int hashcode() {\n    return 31 * super.hashcode() + Objects.hashcode(identity);\n  }\n\n  Weight createWeight(IndexSearcher searcher, boolean needsScores) {\n    // create a query that will be equal to no other query\n    // given that we use Weight.getQuery() for caching\n    Query weightQuery = clone();\n    weightQuery.identity = new Object();\n    return new Weight(weightQuery) {\n      // weight impl\n    };\n  }\n\n}\n\n\n\nGiven that the cache only caches queries that are reused, it will never be cached. "
+        },
+        {
+            "id": "comment-14615872",
+            "author": "Hoss Man",
+            "date": "2015-07-06T23:24:00+0000",
+            "content": "Given that the cache only caches queries that are reused, it will never be cached.\n\nIf i'm understanding your example, then I think you mean \"rewritten\" not \"reused\" in that sentence ... correct?  (Otherwise how does the cache know if i plan on \"reusing\" a specific Query instance vs constructing many instances with will all be \".equals()\")\n\n\u2014\n\nAssuming i understand your example correctly: This won't actually prevent a query from getting put in the cache, it will only prevent there from being cache hits \u2013 correct?\n\nIf someone does a MyQuery search 1000 times (regardless of wether it's 100 diff instances or 1 instance reused 1000 times), won't that be be a 1000 \"inserts\" into the cache (potentially causing other things to be evicted from the cache) that will never be of any use?\n "
+        },
+        {
+            "id": "comment-14616316",
+            "author": "Adrien Grand",
+            "date": "2015-07-07T07:28:09+0000",
+            "content": "I think you mean \"rewritten\" not \"reused\" in that sentence\n\nIt is true that the query cache only caches on the rewritten query, but what I meant is that we try to only cache queries if there is evidence of reuse. Let me try to clarify:\n\nThe query cache is split in two parts: the actual cache (oal.search.QueryCache) which maps (Query, segment) pairs to cached DocIdSets, and a caching policy (oal.search.QueryCachingPolicy) which defines whether to cache a query or not. In the above example, I was assuming that that the caching policy would only cache queries if there is evidence of reuse. For instance, we have oal.search.UsageTrackingQueryCachingPolicy which keeps a ring buffer of the hashcodes of the 256 most-recently used queries, and only decides to cache a query if its hashcode appears 5 times or more in this ring buffer.\n\nThe reasoning behind only caching if there is evidence of reuse is that caching is wasteful if the cache entry is never reused given that it needs to read the whole set of matching documents, while intersecting two queries together often skips over large portions of the doc ID space.\n\nThe query which is used for caching is the one returned by Weight.getQuery(). This helps since all queries that are rewritten to the same query will share the same cache key, but it also means that if you provide a new unique query in every call to Query.createWeight then the query will never be cached. "
+        },
+        {
+            "id": "comment-14616723",
+            "author": "Terry Smith",
+            "date": "2015-07-07T13:48:53+0000",
+            "content": "I'd completely missed the issue with marker interfaces, this really ought to be a method on Weight itself, perhaps Weight.cacheCompatible().\n\nYou suggested workaround sounds a little special casey. I'd be concerned that a future release something would change in such a way that the workaround would be lost with no alternative. Specifically, it relies on the cache implementation tracking usage when the cache itself is pluggable (it could be replaced with one that does not) and when LRUQueryCache itself in play I see the following issues:\n\n1) The queries that we know ahead of time should never be cached would still take up room in the ring buffer and thus push aside other less frequent queries that could be great cache candidates.\n\n2)  Special care would want to be taken over the Query instances used in the ring buffer and cache so that things like dependent FacetCollectors don't get added and bloat memory usage. You described earlier how to handle this from createWeight().\n\n3) CachingWrapperWeight forces the cached query to use scorer() instead of bulkScorer(). Both my custom query and DrillSidewaysQuery implement a custom bulkScorer() method and throw an UnsupportedOperationException from scorer(). They break when wrapped in a CachingWraperWeight. The ability to opt of of caching would remove the need for the hacky workaround in DrillSideways.\n\nMy current solution is a custom QueryCache implementation that just delegates to the LRUQueryCache and does not propagate doCache() for some Weights. However, this has the same problem with wrapped queries as the marker interface scenario.\n\n\n "
+        },
+        {
+            "id": "comment-14617435",
+            "author": "Adrien Grand",
+            "date": "2015-07-07T21:15:36+0000",
+            "content": "I agree the proposed work-around feels hacky but I suspect this is because the queries we are talking about are hacky too. I see queries as objects representing an information need, and we already have Query.equals() which tells us that two queries define the same information need. If two queries are equal then it should be legal to cache matching documents, as well as scores.\n\nThe queries that we know ahead of time should never be cached would still take up room in the ring buffer and thus push aside other less frequent queries that could be great cache candidates.\n\nI tend to see it as a feature: if you offload such queries from the ring buffer, then some queries might look frequently used even though they are rarely used in practice, so not worth caching?\n\nBoth my custom query and DrillSidewaysQuery implement a custom bulkScorer() method and throw an UnsupportedOperationException from scorer(). They break when wrapped in a CachingWraperWeight. The ability to opt of of caching would remove the need for the hacky workaround in DrillSideways.\n\nTo me queries that can implement bulkScorer() but not scorer() are hacky given that scorer() is not an optional API. This also means such queries cannot be embedded in other queries like BooleanQuery, etc. so I'm on the fence about adding new APIs that would be dictated by such queries. "
+        },
+        {
+            "id": "comment-14622271",
+            "author": "Terry Smith",
+            "date": "2015-07-10T13:21:49+0000",
+            "content": "I agree that we shouldn't base API's off of already hacking solutions.\n\nI'm going to play with your suggestion a little more and see how it pans out for my usecases, will report back.\n\nThe ring buffer frequency for non-cacheable queries issue is interesting. If in some obscure but easy to understand scenario half of my queries are good cache candidates but the other half are never to be cached (using the Weight.getQuery() equals busting method) then the ring buffer will be a lot less effective at finding new cache candidates purely based on the churn of never-to-be-cached queries. Still, I can see why that might also be a good thing, it all depends on your definition of frequently used.\n\nWhere would be the best place to expand this discussion to include score based caching? A new Jira, one of the mailing lists?\n\n "
+        },
+        {
+            "id": "comment-16266599",
+            "author": "Adrien Grand",
+            "date": "2017-11-27T10:03:06+0000",
+            "content": "Has been addressed by LUCENE-8017. "
+        }
+    ]
+}

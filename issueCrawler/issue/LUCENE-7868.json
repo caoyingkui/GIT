@@ -1,0 +1,157 @@
+{
+    "id": "LUCENE-7868",
+    "title": "Use multiple threads to apply deletes and DV updates",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Resolved",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "7.0"
+        ]
+    },
+    "description": "Today, when users delete documents or apply doc values updates, IndexWriter buffers them up into frozen packets and then eventually uses a single thread (BufferedUpdatesStream.applyDeletesAndUpdates) to resolve delete/update terms to docids.  This thread also holds IW's monitor lock, so it also blocks refresh, merges starting/finishing, commits, etc.\n\nWe have heavily optimized this part of Lucene over time, e.g. LUCENE-6161, LUCENE-2897, LUCENE-2680, LUCENE-3342, but still, it's a single thread so it can't use multiple CPU cores commonly available now.\n\nThis doesn't affect append-only usage, but for update-heavy users (me!) this can be a big bottleneck, and causes long stop-the-world hangs during indexing.\n\nI have an initial exploratory patch to make these lookups concurrent, without holding IW's lock, so that when a new packet of deletes is pushed, which happens when we flush a new segment, we immediately use that same indexing thread to and resolve the deletions.\n\nThis is analogous to when we made segment flushing concurrent (LUCENE-3023), just for deletes and DV updates as well.",
+    "attachments": {
+        "cpu-before.png": "https://issues.apache.org/jira/secure/attachment/12871842/cpu-before.png",
+        "LUCENE-7868.patch": "https://issues.apache.org/jira/secure/attachment/12871839/LUCENE-7868.patch",
+        "cpu-after.png": "https://issues.apache.org/jira/secure/attachment/12871841/cpu-after.png"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16040962",
+            "date": "2017-06-07T14:29:18+0000",
+            "content": "Current WIP patch; core tests mostly pass but I still have plenty of nocommits. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16040975",
+            "date": "2017-06-07T14:35:04+0000",
+            "content": "CPU usage charts. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16040984",
+            "date": "2017-06-07T14:39:56+0000",
+            "content": "I ran a quick indexing performance test on an internal corpus using an older version of the patch, comparing CPU usage before:\n\n\n\nto CPU usage with the patch:\n\n\n\nI don't have the exact numbers, and I need to re-run on the latest patch, but I think it was ~50% indexing throughput improvement overall.  This is on 64-core box, 480 GB RAM (an i3.16xlarge EC2 instance).\n\nThe before chart doesn't drop to 100 (one CPU) while applying deletes because there are concurrent merges running.\n\n(Those little spiky drops down to near 0 CPU usage are from GC; I was using the default parallel collector I think). ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16045675",
+            "date": "2017-06-10T20:12:14+0000",
+            "content": "Another iteration; tests seem to be passing consistently now, but I still have 27 nocommits.\n\nI re-tested the speedup with this change, re-indexing nearly a billion documents into an index that already had all of those documents indexed once, and the overall speedup is ~53% faster with the patch (26.8 K docs/sec vs 17.5 K docs/sec).\n\nI still need to test doc-values updates performance.\n\nBesides the performance gains from concurrent deletes/updates, the patch has two user-visible changes:\n\n\n\tReader pooling is now enabled by default in IndexWriter; previously it was only turned on the first time you pulled an NRT reader.  You can still disable this, but it will hurt indexing perf since all deletes/updates will be eagerly written through to the filesystem.\n\n\n\n\n\tRemoved IndexWriterConfig.set/getMaxBufferedDeleteTerms; this setting is no longer possible because Lucene eagerly resolves the deletes and updates.\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16045802",
+            "date": "2017-06-11T04:22:44+0000",
+            "content": "Very exciting performance improvement Mike!  How many concurrent threads are you using in your benchmarks? ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16045870",
+            "date": "2017-06-11T08:38:58+0000",
+            "content": "Very exciting performance improvement Mike!\n\nThank you David Smiley.\n\nHow many concurrent threads are you using in your benchmarks?\n\nI used 40 indexing threads, with 2 GB IW RAM buffer, on a 64 core box ... but I think this didn't buy much gain over 32 threads.  I haven't tried to optimize for indexing thread count much. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16046621",
+            "date": "2017-06-12T14:31:40+0000",
+            "content": "Another iteration, with feedback from Robert Muir (thank you!) and still many nocommits.\n\nI added a new test case testing index sorting with DV updates and this uncovered a pre-existing bug, I think introduced with LUCENE-6766, when you try to update recently indexed documents ... I'll open a separate issue later to fix this for 6.6.x.\n\nI've also run some DV update performance tests and this uncovered problems with the patch ... still iterating. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16050729",
+            "date": "2017-06-15T16:27:20+0000",
+            "content": "Another iteration, I think it's ready!\n\nAll nocommits are gone, all tests and \"ant precommit\" passes.  I'll beast all tests some more before pushing.\n\nI improved how we compress the frozen packet of DV updates for better RAM efficiency: each frozen packet is ~8.3% of the original size of the un-frozen packet in my benchmark.\n\nI also tested DV updates performance, updating the price field in my internal corpus.  With no refresh (just writing DV updates when RAM buffer is full) trunk updates at 8.0 K docs/sec, and the patch 58.0 K docs/sec (7.25X faster).  With refresh every 60 seconds, trunk gets 7.4 K docs/sec and the patch gets 63.7 K docs/sec (8.6X faster).  This is with 12 threads, 128 MB IW buffer.\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16051880",
+            "date": "2017-06-16T13:23:17+0000",
+            "content": "I posted the last patch in Review Board: https://reviews.apache.org/r/60154/ ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16052351",
+            "date": "2017-06-16T20:33:12+0000",
+            "content": "Michael McCandless i did a first pass at the patch... good stuff but I think we need to clean up some of the big ass loops  ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16052429",
+            "date": "2017-06-16T21:55:59+0000",
+            "content": "Thanks Simon Willnauer!  I'll update the patch with your feedback. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16053193",
+            "date": "2017-06-18T13:22:23+0000",
+            "content": "New patch, folding in Simon Willnauer's feedback.  I also updated the diff on Review Board. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16053746",
+            "date": "2017-06-19T10:17:29+0000",
+            "content": "Michael McCandless I did a second pass.. I think we are close ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16053944",
+            "date": "2017-06-19T13:01:32+0000",
+            "content": "Thank you Simon Willnauer, I'll look! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16055814",
+            "date": "2017-06-20T14:08:25+0000",
+            "content": "Another iteration folding Simon Willnauer's last feedback.  Test, ant precommit -Dtests.nightly=true pass! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16057196",
+            "date": "2017-06-21T08:49:14+0000",
+            "content": "Michael McCandless can you update reviewboard as well, it's way easier to review there. ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16057284",
+            "date": "2017-06-21T10:06:03+0000",
+            "content": "Ugh, sorry, I though I had done that, but I must have forgot to click the \"Publish Changes\" button.  Try now?\n\nI also realize I failed to click Publish Changes on my replies to your first review, sheesh!!  So I clicked that now and I guess you now got an email with my comments from the first iteration! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16057623",
+            "date": "2017-06-21T14:42:24+0000",
+            "content": "LGTM thanks for all the iterations ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16057633",
+            "date": "2017-06-21T14:49:57+0000",
+            "content": "Thanks Simon Willnauer; I'll run tests and push soon. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16057911",
+            "date": "2017-06-21T17:47:28+0000",
+            "content": "Commit 58105a203a19d18a56e09cf69dc0083c1b890315 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=58105a2 ]\n\nLUCENE-7868: use multiple threads to concurrently resolve deletes and DV udpates ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16057913",
+            "date": "2017-06-21T17:48:23+0000",
+            "content": "I was unable to make writing of live docs files and new doc values files concurrent here: IW's concurrency is just too messy. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16076820",
+            "date": "2017-07-06T16:18:41+0000",
+            "content": "For some reason these commit logs didn't get posted here:\n\n\nRepository: lucene-solr\nUpdated Branches:\n refs/heads/master f0cc3769b -> 7c704d525\n\n\nLUCENE-7868: fix race condition when reader pooling is disabled\n\n\nProject: http://git-wip-us.apache.org/repos/asf/lucene-solr/repo\nCommit: http://git-wip-us.apache.org/repos/asf/lucene-solr/commit/7c704d52\nTree: http://git-wip-us.apache.org/repos/asf/lucene-solr/tree/7c704d52\nDiff: http://git-wip-us.apache.org/repos/asf/lucene-solr/diff/7c704d52\n\nBranch: refs/heads/master\nCommit: 7c704d5258b3be8c383ccb96bf4a30be441f091c\nParents: f0cc376\nAuthor: Mike McCandless <mikemccand@apache.org>\nAuthored: Wed Jul 5 16:53:05 2017 -0400\nCommitter: Mike McCandless <mikemccand@apache.org>\nCommitted: Wed Jul 5 16:53:05 2017 -0400\n\n\n\n\nRepository: lucene-solr\nUpdated Branches:\n refs/heads/branch_7x 454950aae -> 40dd3efb8\n\n\nLUCENE-7868: fix race condition when reader pooling is disabled\n\n\nProject: http://git-wip-us.apache.org/repos/asf/lucene-solr/repo\nCommit: http://git-wip-us.apache.org/repos/asf/lucene-solr/commit/40dd3efb\nTree: http://git-wip-us.apache.org/repos/asf/lucene-solr/tree/40dd3efb\nDiff: http://git-wip-us.apache.org/repos/asf/lucene-solr/diff/40dd3efb\n\nBranch: refs/heads/branch_7x\nCommit: 40dd3efb8fb6b33a3e010e8c3d391d1165bd51e6\nParents: 454950a\nAuthor: Mike McCandless <mikemccand@apache.org>\nAuthored: Wed Jul 5 16:53:05 2017 -0400\nCommitter: Mike McCandless <mikemccand@apache.org>\nCommitted: Wed Jul 5 16:53:33 2017 -0400\n\n\n\n\nRepository: lucene-solr\nUpdated Branches:\n refs/heads/branch_7_0 ec306dce2 -> 9ec400c4f\n\n\nLUCENE-7868: fix race condition when reader pooling is disabled\n\n\nProject: http://git-wip-us.apache.org/repos/asf/lucene-solr/repo\nCommit: http://git-wip-us.apache.org/repos/asf/lucene-solr/commit/9ec400c4\nTree: http://git-wip-us.apache.org/repos/asf/lucene-solr/tree/9ec400c4\nDiff: http://git-wip-us.apache.org/repos/asf/lucene-solr/diff/9ec400c4\n\nBranch: refs/heads/branch_7_0\nCommit: 9ec400c4f69432773edd3678e21c4c08590cddf6\nParents: ec306dc\nAuthor: Mike McCandless <mikemccand@apache.org>\nAuthored: Wed Jul 5 16:53:05 2017 -0400\nCommitter: Mike McCandless <mikemccand@apache.org>\nCommitted: Wed Jul 5 16:54:12 2017 -0400\n\n ",
+            "author": "Steve Rowe"
+        }
+    ]
+}

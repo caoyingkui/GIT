@@ -1,0 +1,96 @@
+{
+    "id": "LUCENE-7462",
+    "title": "Faster search APIs for doc values",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "7.0",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "7.0"
+        ],
+        "priority": "Minor",
+        "status": "Resolved",
+        "type": "Improvement"
+    },
+    "description": "While the iterator API helps deal with sparse doc values more efficiently, it also makes search-time operations more costly. For instance, the old random-access API allowed to compute facets on a given segment without any conditionals, by just incrementing the counter at index ordinal+1 while the new API requires to advance the iterator if necessary and then check whether it is exactly on the right document or not.\n\nSince it is very common for fields to exist across most documents, I suspect codecs will keep an internal structure that is similar to the current codec in the dense case, by having a dense representation of the data and just making the iterator skip over the minority of documents that do not have a value.\n\nI suggest that we add APIs that make things cheaper at search time. For instance in the case of SORTED doc values, it could look like LegacySortedDocValues with the additional restriction that documents can only be consumed in order. Codecs that can implement this API efficiently would hide it behind a SortedDocValues adapter, and then at search time facets and comparators (which liked the LegacySortedDocValues API better) would either unwrap or hide the SortedDocValues they got behind a more random-access API (which would only happen in the truly sparse case if the codec optimizes the dense case).\n\nOne challenge is that we already use the same idea for hiding single-valued impls behind multi-valued impls, so we would need to enforce the order in which the wrapping needs to happen. At first sight, it seems that it would be best to do the single-value-behind-multi-value-API wrapping above the random-access-behind-iterator-API wrapping. The complexity of wrapping/unwrapping in the right order could be contained in the DocValues helper class.\n\nI think this change would also simplify search-time consumption of doc values, which currently needs to spend several lines of code positioning the iterator everytime it needs to do something interesting with doc values.",
+    "attachments": {
+        "LUCENE-7462.patch": "https://issues.apache.org/jira/secure/attachment/12834388/LUCENE-7462.patch",
+        "LUCENE-7462-advanceExact.patch": "https://issues.apache.org/jira/secure/attachment/12834126/LUCENE-7462-advanceExact.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15517144",
+            "author": "David Smiley",
+            "date": "2016-09-23T18:08:15+0000",
+            "content": "Thanks for bringing this up.  As I was reviewing the big commit for the iterator style, I kept seeing the condition over and over again like you do.  I thought to myself, maybe we should at least have some convenience method, possibly overridable by the codec/impl. "
+        },
+        {
+            "id": "comment-15517228",
+            "author": "Michael McCandless",
+            "date": "2016-09-23T18:41:41+0000",
+            "content": "I'm not convinced this is necessary.  I think it may be a step backwards, and we should instead spend our effort making a codec who's advance impls is fast.\n\nWouldn't this mean we'd need 2X the search-time code, to handle the \"yeah codec secretly is actually random access so I specialize that case\" and \"no, it's really an iterator\" cases?\n\nI think this change would also simplify search-time consumption of doc values, which currently needs to spend several lines of code positioning the iterator everytime it needs to do something interesting with doc values.\n\nLikely some of the places I had to fix to use an iterator could be improved, e.g. if they could know their DV iterator was not already on the current doc, they could blindly call advance. "
+        },
+        {
+            "id": "comment-15587192",
+            "author": "Yonik Seeley",
+            "date": "2016-10-19T00:40:36+0000",
+            "content": "Wouldn't this mean we'd need 2X the search-time code [...]\n\nIf there were a utility to always get you a random access API?  Perhaps not.\nIt does seem like a majority of consumers would want the random access API only... things like grouping, sorting, and faceting are all driven off of document ids.   For each ID, we check the docvalues.  We don't actually do skipping/leapfrogging like a filter would do since we still need to do work for each document, even if the DV doesn't exist for that document.\n\nI haven't thought about what this means for code further down the stack, but it does seem worth exploring in general. "
+        },
+        {
+            "id": "comment-15588179",
+            "author": "Adrien Grand",
+            "date": "2016-10-19T09:31:07+0000",
+            "content": "I have been playing with the idea of having an advanceExact method (which I guess is the alternative to adding a 2nd search API for doc values). It removes stress on consumers since this method can be called blindly since it does not advance beyond the target document. It also removes some stress on the codec since it doesn't have to find the next document that has a value anymore.\n\nI ran the wikimedium10m benchmark, to which I added the sorting tasks from the nigthly benchmark to check the impact. There seems to be a consistent speedup for queries for which norms is the bottleneck (term queries and simple conjunctions/disjunctions) and sorted queries (TermTitleSort and TermDTSort).\n\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                  Fuzzy2       55.31     (20.1%)       54.45     (18.5%)   -1.6% ( -33% -   46%)\n            OrNotHighLow      875.16      (3.3%)      870.60      (2.9%)   -0.5% (  -6% -    5%)\n         MedSloppyPhrase      210.38      (3.9%)      209.40      (3.8%)   -0.5% (  -7% -    7%)\n         LowSloppyPhrase      126.86      (2.5%)      126.74      (2.1%)   -0.1% (  -4% -    4%)\n              AndHighMed      151.22      (1.7%)      151.30      (2.3%)    0.0% (  -3% -    4%)\n             LowSpanNear       20.08      (2.6%)       20.10      (2.9%)    0.1% (  -5% -    5%)\n                 Respell       77.27      (3.8%)       77.36      (3.5%)    0.1% (  -6% -    7%)\n               LowPhrase       42.32      (2.1%)       42.40      (1.9%)    0.2% (  -3% -    4%)\n              HighPhrase       20.01      (4.1%)       20.06      (3.7%)    0.3% (  -7% -    8%)\n                Wildcard       46.20      (3.5%)       46.32      (3.9%)    0.3% (  -6% -    7%)\n        HighSloppyPhrase       15.99      (5.1%)       16.04      (4.9%)    0.3% (  -9% -   10%)\n                 Prefix3       43.21      (2.9%)       43.39      (3.1%)    0.4% (  -5% -    6%)\n               MedPhrase      151.07      (3.4%)      151.69      (3.7%)    0.4% (  -6% -    7%)\n            OrNotHighMed      151.21      (2.3%)      151.98      (2.6%)    0.5% (  -4% -    5%)\n             AndHighHigh       58.73      (1.4%)       59.05      (1.4%)    0.5% (  -2% -    3%)\n             MedSpanNear       22.36      (1.6%)       22.48      (1.6%)    0.6% (  -2% -    3%)\n                  IntNRQ       13.75     (12.5%)       13.83     (13.1%)    0.6% ( -22% -   29%)\n            OrHighNotMed       62.26      (2.7%)       62.70      (3.2%)    0.7% (  -5% -    6%)\n           OrNotHighHigh       58.38      (2.6%)       58.82      (2.4%)    0.7% (  -4% -    5%)\n            HighSpanNear       39.78      (2.2%)       40.09      (3.0%)    0.8% (  -4% -    6%)\n           OrHighNotHigh       44.88      (2.8%)       45.29      (2.7%)    0.9% (  -4% -    6%)\n              AndHighLow      694.25      (4.8%)      703.66      (3.8%)    1.4% (  -6% -   10%)\n               OrHighLow       91.20      (3.4%)       92.54      (3.7%)    1.5% (  -5% -    8%)\n            OrHighNotLow      105.90      (3.0%)      107.79      (4.4%)    1.8% (  -5% -    9%)\n                  Fuzzy1       79.92     (12.3%)       81.61     (12.1%)    2.1% ( -19% -   30%)\n              OrHighHigh       29.18      (7.2%)       29.83      (7.3%)    2.2% ( -11% -   18%)\n               OrHighMed       19.44      (7.2%)       19.89      (7.3%)    2.3% ( -11% -   18%)\n           TermTitleSort       81.70      (5.6%)       83.67      (5.8%)    2.4% (  -8% -   14%)\n                 LowTerm      682.24      (4.5%)      704.58      (4.1%)    3.3% (  -5% -   12%)\n              TermDTSort      103.25      (5.7%)      106.77      (4.0%)    3.4% (  -5% -   13%)\n                 MedTerm      249.00      (2.5%)      260.56      (3.2%)    4.6% (  -1% -   10%)\n                HighTerm      103.70      (3.2%)      109.27      (3.6%)    5.4% (  -1% -   12%)\n\n\n\nNote that the patch has barely any tests, so it's really just for playing.  We'd also still need to define the semantics of this method. "
+        },
+        {
+            "id": "comment-15588818",
+            "author": "Michael McCandless",
+            "date": "2016-10-19T13:49:16+0000",
+            "content": "I also see good speedups to the otherwise \"lightweight\" queries:\n\n\nReport after iter 19:\n                    Task    QPS base      StdDev    QPS comp      StdDev                Pct diff\n                 Prefix3       43.40      (5.2%)       42.48      (8.8%)   -2.1% ( -15% -   12%)\n                  IntNRQ       10.05      (8.8%)        9.87     (10.5%)   -1.8% ( -19% -   19%)\n            HighSpanNear       19.38      (5.2%)       19.14      (6.6%)   -1.2% ( -12% -   11%)\n               LowPhrase       19.34      (1.9%)       19.21      (3.6%)   -0.7% (  -6% -    4%)\n                PKLookup      350.45      (1.3%)      348.51      (2.8%)   -0.6% (  -4% -    3%)\n             MedSpanNear       41.12      (4.5%)       40.98      (4.7%)   -0.4% (  -9% -    9%)\n                  Fuzzy1      115.35      (2.3%)      115.06      (2.8%)   -0.2% (  -5% -    5%)\n             LowSpanNear       85.93      (2.1%)       85.78      (2.3%)   -0.2% (  -4% -    4%)\n               MedPhrase       77.08      (2.7%)       77.03      (2.9%)   -0.1% (  -5% -    5%)\n                 Respell       62.22      (2.2%)       62.26      (1.4%)    0.1% (  -3% -    3%)\n                Wildcard       37.39      (4.4%)       37.43      (5.8%)    0.1% (  -9% -   10%)\n                  Fuzzy2      100.18      (2.0%)      100.31      (1.6%)    0.1% (  -3% -    3%)\n         LowSloppyPhrase       14.75      (4.9%)       14.79      (4.2%)    0.2% (  -8% -    9%)\n              HighPhrase        3.81      (5.2%)        3.82      (6.2%)    0.4% ( -10% -   12%)\n              AndHighLow      912.50      (2.5%)      916.11      (3.8%)    0.4% (  -5% -    6%)\n            OrNotHighLow      957.24      (2.5%)      963.91      (2.7%)    0.7% (  -4% -    6%)\n         MedSloppyPhrase       48.46      (4.8%)       48.80      (4.3%)    0.7% (  -8% -   10%)\n              AndHighMed       46.40      (1.7%)       46.87      (1.6%)    1.0% (  -2% -    4%)\n             AndHighHigh       43.36      (1.9%)       43.80      (1.9%)    1.0% (  -2% -    4%)\n                 LowTerm      449.83      (2.5%)      454.76      (5.1%)    1.1% (  -6% -    8%)\n        HighSloppyPhrase       16.13      (6.8%)       16.34      (6.3%)    1.3% ( -11% -   15%)\n            OrNotHighMed       98.19      (3.2%)       99.56      (3.1%)    1.4% (  -4% -    7%)\n           OrNotHighHigh       21.69      (4.5%)       22.16      (4.8%)    2.2% (  -6% -   12%)\n           OrHighNotHigh       18.16      (7.7%)       18.75      (8.0%)    3.2% ( -11% -   20%)\n            OrHighNotMed       61.81      (9.4%)       64.27      (9.5%)    4.0% ( -13% -   25%)\n                 MedTerm      123.87      (4.5%)      129.22      (3.3%)    4.3% (  -3% -   12%)\n            OrHighNotLow       25.19     (11.2%)       26.28     (11.5%)    4.4% ( -16% -   30%)\n              OrHighHigh       12.29      (7.4%)       12.96      (8.7%)    5.5% (  -9% -   23%)\n               OrHighMed       12.36      (7.4%)       13.09      (8.5%)    5.9% (  -9% -   23%)\n                HighTerm       38.51      (5.7%)       40.80      (4.4%)    5.9% (  -3% -   17%)\n               OrHighLow       19.42      (8.6%)       20.66      (9.7%)    6.4% ( -10% -   26%)\n\n "
+        },
+        {
+            "id": "comment-15588903",
+            "author": "Michael McCandless",
+            "date": "2016-10-19T14:19:31+0000",
+            "content": "Sorry, that was wikimediumall that I ran, 20 JVM iters, multiple iters per JVM, multiple concurrent queries, etc. "
+        },
+        {
+            "id": "comment-15591788",
+            "author": "Adrien Grand",
+            "date": "2016-10-20T13:14:48+0000",
+            "content": "Here is a patch that tries to implement this advanceExact method on all codecs. Initially I wanted to require that the target is strictly greater than the current doc id but this caused issues with comparators that may need to get the value multiple times or with scorers that call Scorer.score() multiple times (which makes the norm be decoded twice). So the current patch only requires that the target is greater than or equal to the current document. I managed to get the whole test suite passing twice in a row and luceneutil still gives results that are similar to above. "
+        },
+        {
+            "id": "comment-15595145",
+            "author": "Michael McCandless",
+            "date": "2016-10-21T13:50:18+0000",
+            "content": "+1 to the semantics and the patch.  Thanks Adrien Grand! "
+        },
+        {
+            "id": "comment-15601384",
+            "author": "ASF subversion and git services",
+            "date": "2016-10-24T08:52:13+0000",
+            "content": "Commit 9aca4c9d56089a9ac89df5fd93be76a4fe822448 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9aca4c9 ]\n\nLUCENE-7462: Give doc values APIs an `advanceExact` method. "
+        },
+        {
+            "id": "comment-15601392",
+            "author": "Adrien Grand",
+            "date": "2016-10-24T08:57:47+0000",
+            "content": "I merged the proposed change. I'll keep an eye on the nightly benchmarks to verify there is a speedup as expected. "
+        },
+        {
+            "id": "comment-15602025",
+            "author": "ASF subversion and git services",
+            "date": "2016-10-24T13:45:03+0000",
+            "content": "Commit 97339e2cacc308c3689d1cd16dfbc44ebea60788 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=97339e2 ]\n\nLUCENE-7462: Fix LegacySortedSetDocValuesWrapper to reset `upTo` when calling `advanceExact`. "
+        },
+        {
+            "id": "comment-15607992",
+            "author": "ASF subversion and git services",
+            "date": "2016-10-26T09:37:33+0000",
+            "content": "Commit 71c65184562499eba365d166fe3fabe0dbdc747b in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=71c6518 ]\n\nLUCENE-7462: Fix buggy advanceExact impl of empty binary doc values. "
+        }
+    ]
+}

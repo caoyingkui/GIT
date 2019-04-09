@@ -1,0 +1,128 @@
+{
+    "id": "LUCENE-6770",
+    "title": "FSDirectory ctor should use getAbsolutePath instead of getRealPath for directory",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "5.2.1",
+        "components": [
+            "core/store"
+        ],
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "After upgrade from 4.1 to 5.2.1 I found that one of our test failed. Appeared the guilty was FSDirectory that converts given Path to Path.getRealPath. As result the test will fail:\n\n\nPath p = Paths.get(\"/var/lucene_store\");\nFSDirectory d = new FSDirectory(p);\nassertEquals(p.toString(), d.getDirectory().toString());\n\nIt because /var/lucene_store is a symlink and \nPath directory =path.getRealPath(); \nresolves it to /private/var/lucene_store\n\nI think this is bad design decision because \"direcrory\" isn't just internal state but is exposed in a public interface and \"getDirectory()\" is widely used to initialize other components. \n\nIt should use paths.getAbsolutePath() instead.\n\nbuild and \"ant test\" were successful after fix.",
+    "attachments": {
+        "LUCENE-6770.patch": "https://issues.apache.org/jira/secure/attachment/12753088/LUCENE-6770.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14721093",
+            "author": "Dawid Weiss",
+            "date": "2015-08-29T12:10:13+0000",
+            "content": "This is also an issue with Windows (if you use reparse points, so-called \"junctions\"). But if I recall, there was a valid reason for using this particular method. "
+        },
+        {
+            "id": "comment-14731290",
+            "author": "Uwe Schindler",
+            "date": "2015-09-04T19:26:21+0000",
+            "content": "The reason why we have the canonic path is the following: The NativeFSLockFactory has the limitation that the underlying OS does not lock files for the same process. It only prevents other processes from using the locked file/directory. So NativeFSLockFactory internally uses a static set of \"locked index directories\" and during aquiring locks it first checks if the given directory is in the set. If this is true it refuses to aquire lock. Otherwise it fall backs to OS kernel in checking the lock.\nFor this check with a simple set to work correctly, the path must be canonic. If this is not done, it may happen that a user opens in the same JVM an index with 2 different Path objects (which somehow point to same dir using symlink/hardlinks/junctions), causing index corrumption.\nAs getting canonic path is quite expensive, we dont expand it on every try to lock (which may also break if people change links while having index open). So we do it on FSDirectory init.\nTo work around the issue mentioned here, one possibility would be to save the original Path as given in Ctor and return that one getDirectory(). The canonic path would be an implementation detail. "
+        },
+        {
+            "id": "comment-14731297",
+            "author": "Dawid Weiss",
+            "date": "2015-09-04T19:31:53+0000",
+            "content": "Thanks for clarifying this, Uwe. Makes sense. "
+        },
+        {
+            "id": "comment-14731502",
+            "author": "Vladimir Kuzmin",
+            "date": "2015-09-04T21:58:48+0000",
+            "content": "Thanks, Uwe, I see obtainLock converts directory toRealPath anyway and adds then to concurent set LOCK_HELD. Do you mean tha NIO guarantees that call toRealPath will always return the same value even if link has changed? Is it documented behavior? Yes, we could add another method, like getLockDirectory and return toRealPath saved at ctor. My concern is that this all internal LOCK_HELD optimization looks useless and may even has some unpredictable behavior. I would always delegate it to system call. obtainLock tries to create lock file on every call, calls toRealPath, throws exception if failed to add to LOCK_HELD - it doesnt look like a solid optimization. In short, I would fix FSDirectory and remove static concurent set from NativeLockFactory at all. If obtainLock really needs optimization, we would need something like tryToObtain that returns true/false, check if Path is 'real', check LOCK_HELD before trying to create file. I can miss some historical reason though. "
+        },
+        {
+            "id": "comment-14736005",
+            "author": "Vladimir Kuzmin",
+            "date": "2015-09-09T02:08:42+0000",
+            "content": "Interesting, I see that in past versions Directory interface already had it LockID: http://lucene.apache.org/core/4_9_0/core/org/apache/lucene/store/Directory.html#getLockID%28%29  "
+        },
+        {
+            "id": "comment-14736347",
+            "author": "Uwe Schindler",
+            "date": "2015-09-09T07:14:08+0000",
+            "content": "getLockId was not related to that. It was completely unused. In earlier Lucene version this was used to create the lock file outside the index directory (e.g., in /tmp). For that it created a hash code that was included into file name. This is no longer possible, lock files are in index directory. This method was not used anymore.\n\nThe real path is needed not for creating the lock file, it is needed for identifying the lock in the same JVM based on a unique key (so its similar but still different). "
+        },
+        {
+            "id": "comment-14736362",
+            "author": "Uwe Schindler",
+            "date": "2015-09-09T07:24:21+0000",
+            "content": "My concern is that this all internal LOCK_HELD optimization looks useless and may even has some unpredictable behavior. I would always delegate it to system call.\n\nThis is no optimization, it is a bug fix!!! If you close a file channel after non-successful locking in the same JVM it releases all locks on all other FileChannels,too (on some platforms, including Linux). This caused index corruption in some search application, because the lock was unfortunately released by this problem: other IndexWriter in same JVM tried to lock a second time and released the lock (and unfortunately all other locks) after work done. By that another process was able to write to index => BOOM\n\nSee LUCENE-5738:\n\nNote this from the FileLock documentation (http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/java/nio/channels/FileLock.java#28 )\n\"On some systems, closing a channel releases all locks held by the Java virtual machine on the underlying file regardless of whether the locks were acquired via that channel or via another channel open on the same file. It is strongly recommended that, within a program, a unique channel be used to acquire all locks on any given file.\"\n\nThis bug was fixed in Lucene in 4.9 by using the HashSet (we had that long ago, too, for similar reasons, so this was a regression). The change in 5.0 is just that the canonical path is aquired on FSDirectory ctor, because LockFactories are singletons and don't know about directories. In 4.x the canonical patch was aquired when creating a lock factory instance for a specific directory.\n\nSo having the canonic/real path in a separate variable would mimic the same behaviour like 4.x, the \"state\" is just hold somewhere else. "
+        },
+        {
+            "id": "comment-14736608",
+            "author": "Robert Muir",
+            "date": "2015-09-09T10:13:05+0000",
+            "content": "I don't think we should make any changes here. Please, we finally just got the locking working! don't mess around with it unless you understand it!!!!!! "
+        },
+        {
+            "id": "comment-14737116",
+            "author": "Vladimir Kuzmin",
+            "date": "2015-09-09T16:16:24+0000",
+            "content": "Uwe, it makes it clear. Can you also clarify the last thing. I see the code at NativeFSLockFactory.java:\n\n   87   protected Lock obtainFSLock(FSDirectory dir, String lockName) throws IOException {\n   88     Path lockDir = dir.getDirectory();\n   89 \n   90     // Ensure that lockDir exists and is a directory.\n   91     // note: this will fail if lockDir is a symlink\n   92     Files.createDirectories(lockDir);\n   93 \n   94     Path lockFile = lockDir.resolve(lockName);\n   95 \n   96     try \n{\n   97       Files.createFile(lockFile);\n   98     }\n catch (IOException ignore) \n{\n   99       // we must create the file to have a truly canonical path.\n  100       // if it's already created, we don't care. if it cant be created, it will fail below.\n  101     }\n  102 \n  103     // fails if the lock file does not exist\n  104     final Path realPath = lockFile.toRealPath();\n\nSo, it calls toRealPath also. Does it mean that it relies on that after FSDirectory called\ndirectory = path.toRealPath();\n\nsecond call\n\ndirectory.toRealPath()\n\ndoesn't resolve it but returns some internal state? I wasn't able to find this at documentation. "
+        },
+        {
+            "id": "comment-14737158",
+            "author": "Uwe Schindler",
+            "date": "2015-09-09T16:40:52+0000",
+            "content": "Hi,\n\nthansk for pointing to this. The additional lockFile.toRealPath() was added later during some more fixes in NativeFSLockFactory. So indeed the realPath call in FSDirectory may be unneccessary. But we wont fix this in a minor version. This needs a lot of good tests using symlinks.\n\nFor now I would just add more documentation to FSDirecory's ctor/open that explicitely states: \"FSDirectory resolves the given Path in its constructor to a canonical path to ensure it can correctly lock the index directory and no other process can interfere with changing possible symlinks to the index directory inbetween. If you want to use symlinks and change them dynamically, close all IndexWriters and create a new FSDirecory instance.\" "
+        },
+        {
+            "id": "comment-14737164",
+            "author": "Uwe Schindler",
+            "date": "2015-09-09T16:42:55+0000",
+            "content": "So, it calls toRealPath also. Does it mean that it relies on that after FSDirectory called directory = path.toRealPath(); second call directory.toRealPath() doesn't resolve it but returns some internal state? I wasn't able to find this at documentation.\n\nThis is just a test if the previous Files.createFile() worked (as this suppresses Exceptions). If the file was already existing and was something else, the toRealPath() call fails and we can bail out. "
+        },
+        {
+            "id": "comment-14737178",
+            "author": "Uwe Schindler",
+            "date": "2015-09-09T16:50:40+0000",
+            "content": "Patch with additional documentation. "
+        },
+        {
+            "id": "comment-14741630",
+            "author": "Vladimir Kuzmin",
+            "date": "2015-09-11T22:20:16+0000",
+            "content": "+1\n\nbtw, I just found that in fact, this was similar problem in 4.1 too! It also converted given path to canonical, just happened that I found it only when tried to upgrade to 5.2.1 "
+        },
+        {
+            "id": "comment-14742022",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-12T11:43:22+0000",
+            "content": "Commit 1702619 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1702619 ]\n\nLUCENE-6770: Add javadocs that FSDirectory canonicalizes the path "
+        },
+        {
+            "id": "comment-14742025",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-12T11:45:17+0000",
+            "content": "Commit 1702621 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1702621 ]\n\nLUCENE-6770: Add javadocs that FSDirectory canonicalizes the path (changes entry) "
+        },
+        {
+            "id": "comment-14742027",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-12T11:46:28+0000",
+            "content": "Commit 1702622 from Uwe Schindler in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1702622 ]\n\nMerged revision(s) 1702619-1702621 from lucene/dev/trunk:\nLUCENE-6770: Add javadocs that FSDirectory canonicalizes the path "
+        },
+        {
+            "id": "comment-14742028",
+            "author": "Uwe Schindler",
+            "date": "2015-09-12T11:47:07+0000",
+            "content": "Fixed by adding Javadocs "
+        }
+    ]
+}

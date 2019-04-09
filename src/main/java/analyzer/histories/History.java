@@ -44,6 +44,10 @@ public class History {
         return result;
     }
 
+    public Event getLast() {
+        return events.size() > 0 ? events.get(events.size() - 1) : null;
+    }
+
     public JSONObject toJSON() {
         JSONObject object = new JSONObject();
         object.put("method_name", methodName);

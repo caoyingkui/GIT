@@ -1,0 +1,144 @@
+{
+    "id": "LUCENE-7905",
+    "title": "Optimizations for OrdinalMap",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "7.1"
+        ]
+    },
+    "description": "OrdinalMap is a useful class to quickly map per-segment ordinals to global space, but it's fairly costly to build, which must typically be done on every NRT refresh.\n\nI'm using it quite heavily in two different places, one for SortedSetDocValuesFacetCounts, and another custom usage, and I found some small optimizations to improve its construction time.\n\nI switched it to use a simple priority queue to merge the terms instead of the more general MultiTermsEnum, which does extra work since it must also provide postings, implement seekExact, etc.\n\nI also pulled OrdinalMap out into its own oal.index class.\n\nWhen testing construction time for my case the patch is ~16% faster (159.9s -> 134.2s) in one case with 91.4 M terms and ~9% faster (115.6s -> 105.7s) in another case with 26.6 M terms.",
+    "attachments": {
+        "LUCENE-7905.patch": "https://issues.apache.org/jira/secure/attachment/12876862/LUCENE-7905.patch",
+        "LUCENE-7905-specialized.patch": "https://issues.apache.org/jira/secure/attachment/12876934/LUCENE-7905-specialized.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16084096",
+            "date": "2017-07-12T14:58:36+0000",
+            "content": "Patch; I think it's ready. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16084128",
+            "date": "2017-07-12T15:21:17+0000",
+            "content": "Its a bit tricky to see the diffs since the file got moved too, but basically it just replaces MultiTermsEnum with a standard PQ?\n\nDo we know why this is a speedup? Is it an inefficiency in MultiTermsEnum? ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16084134",
+            "date": "2017-07-12T15:23:04+0000",
+            "content": "I like the idea of switching to a simple priority queue to remove overhead. Maybe we should also check how much better things would be with a specialized priority queue too? As far as I remember, it helped a lot with disjunction scorers.\n\nOne minor thing that confuses me with the patch is that it moves off MultiTermsEnum but reuses MultiTermsEnum.TermsEnumIndex and adds an additional method to it. Maybe we should decouple OrdinalMap and  MultiTermsEnum entirely and give OrdinalMap its own TermsEnum+index wrapper? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16084136",
+            "date": "2017-07-12T15:25:03+0000",
+            "content": "From your explain that MTE must do more work because it \"provides postings\", this doesn't seem right to me that it would slow down the actual merging of terms. I can see the argument about seekExact because next() has some special code to accomodate that:\n\nhttps://github.com/apache/lucene-solr/blob/master/lucene/core/src/java/org/apache/lucene/index/MultiTermsEnum.java#L287-L298 ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16084281",
+            "date": "2017-07-12T16:42:17+0000",
+            "content": "Its a bit tricky to see the diffs since the file got moved too, but basically it just replaces MultiTermsEnum with a standard PQ?\n\nThat's it, except I also changed:\n\n\n          while (segmentOrds[segmentIndex] <= segmentOrd) {\n            ordDeltaBits[segmentIndex] |= delta;\n            ordDeltas[segmentIndex].add(delta);\n            segmentOrds[segmentIndex]++;\n          }\n\n\n\nto:\n\n\n        assert segmentOrds[segmentIndex] <= segmentOrd;\n        do {\n          ordDeltas[segmentIndex].add(delta);\n          segmentOrds[segmentIndex]++;\n        } while (segmentOrds[segmentIndex] <= segmentOrd);\n\n\n\nWhich should make the branch easier to predict (since the loop will always run the first time), but maybe the effect is negligible.\n\nI think likely the cost we're saving from MTE is its TermMergeQueue.fillTop method?  It's doing a lot of work, sort of recursing into the PQ, with a if inside a for inside a while, to find all subs on the current term, and then it has to do pushTop after that.  In general MTE is not allowed to .next() the subs because it doesn't know if the caller will ask for postings on this term.  Robert Muir suggested we could maybe make pullTop()/pushTop() lazy which is a neat idea... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16084284",
+            "date": "2017-07-12T16:43:16+0000",
+            "content": "Maybe we should also check how much better things would be with a specialized priority queue too? As far as I remember, it helped a lot with disjunction scorers.\n\nI like that idea!  I'll look at what we did there and see if it can work here.\n\nMaybe we should decouple OrdinalMap and MultiTermsEnum entirely and give OrdinalMap its own TermsEnum+index wrapper?\n\n+1, I'll do that. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16084349",
+            "date": "2017-07-12T17:29:50+0000",
+            "content": "\nThat's it, except I also changed:\n          while (segmentOrds[segmentIndex] <= segmentOrd) \nUnknown macro: {            ordDeltaBits[segmentIndex] |= delta;            ordDeltas[segmentIndex].add(delta);            segmentOrds[segmentIndex]++;          } \n\nOK, I have to look in more detail later. We should be a little careful because this class is also used by merging, and merging has a strange case that you won't encounter during manual construction: the case where there are \"holes\" in the ords (deleted ords when all documents containing that ord are merged away). Might be best if can test some of this directly... ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16084578",
+            "date": "2017-07-12T19:57:43+0000",
+            "content": "I tried specializing the PQ (patch attached) but it was only a small improvement so I don't plan to pursue it any more.  It could be I should have also specialized the logic to look for all subs sharing the same term?  But I ran out of time I have to play with this so much \n\nI also ran YourKit and found some silly slow code in DefaultSortedSetDocValuesReaderState, where it does a linear scan of all ord -> BytesRef to find the ord range of each dimension; we could do this much more efficiently with binary searching instead.  I'll put a TODO but don't plan to tackle that now/here.  That was 12% of the time.\n\nOther hot areas were calling next() on the doc values (~25%) and updateTop in the tem queue (~46%).\n\nI do feel like how we compare terms in the PQ is inefficient, and we should be able to do something like what radix sort does, because at any given time, the terms in the queue likely share long common prefixes yet we keep inefficiently re-comparing those long common prefixes.  It seems like there should be a powerful optimization here, where if we could somehow efficiently know that e.g. right now all terms have a common prefix of length=5, and then only do our comparisons starting from the 6th digit, or something ... but I don't see how to do it. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16084616",
+            "date": "2017-07-12T20:19:29+0000",
+            "content": "New patch, folding in Adrien's suggestion to fully decouple MultiTermsEnum and OrdinalMap, and adding a couple new TODOs.  I think it's ready. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16085139",
+            "date": "2017-07-13T03:43:56+0000",
+            "content": "I think its good to pull out OrdinalMap into its own class from MultiDocValues, but i think its a little trappy that it then has no warnings on it and just some cool sounding javadocs.\n\nMultiDocValues still warns you twice: https://github.com/apache/lucene-solr/blob/master/lucene/core/src/java/org/apache/lucene/index/MultiDocValues.java#L40-L46\n\nBut I think we should have some kind of doc about the cost of this thing in OrdinalMap now that its separated? The \"tax\" of multiple segments is real here, makes it a hotspot just like it is for blocktree term dictionaries at merge. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16085413",
+            "date": "2017-07-13T09:08:37+0000",
+            "content": "Good point @rcmuir; I'll improve the javadocs. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16085423",
+            "date": "2017-07-13T09:21:39+0000",
+            "content": "I do feel like how we compare terms in the PQ is inefficient, and we should be able to do something like what radix sort does, because at any given time, the terms in the queue likely share long common prefixes yet we keep inefficiently re-comparing those long common prefixes.\n\nYou could do it with radix-like sort, but you'd need all the terms from all the TermEnums; the pq has the advantage of scanning through them on the fly, progressively? ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16085437",
+            "date": "2017-07-13T09:31:16+0000",
+            "content": "You could do it with radix-like sort, but you'd need all the terms from all the TermEnums; the pq has the advantage of scanning through them on the fly, progressively?\n\nExactly!  I want a combined algorithm, that uses the \"streaming\" that the PQ gives us, and uses the \"don't redundantly compare common prefixes over and over again\" that radix sort gives us, because if you think about the comparisons that PQ is doing to maintain its heap structure, many of them are wasted on common prefixes.  The hard part is efficiently computing \"all entries in the PQ now share a common prefix of 6\" as heap entries are updated over time, but surely there is a way.\n\nThough I suppose it's gains would be limited in this usage (merge sorting terms from all segments), because the small/tiny segments would mess up the common prefixes, i.e. the common prefix would often be low or 0 because of them.  But if you merge sorted equal sized segments, e.g. what happens when merging segments, then it could be powerful. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16085452",
+            "date": "2017-07-13T09:37:48+0000",
+            "content": "It'd probably have to be stored per-leaf of a binary tree the pq actually is. And then you'd need to maintain those prefix counts when pushing elements up/down the tree... The associated bookkeeping may not be worth it.\n\nThis said, an algorithm for this has probably been invented. Back in the 70s.  ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16085455",
+            "date": "2017-07-13T09:40:19+0000",
+            "content": "New patch, adding a warning NOTE to OrdinalMap's javadocs.  I think it's ready. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16085535",
+            "date": "2017-07-13T11:00:12+0000",
+            "content": "thanks Mike! ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16087429",
+            "date": "2017-07-14T15:02:10+0000",
+            "content": "Commit 3df97d3f0c0e558c52514a7e500afeffe96e795d in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3df97d3 ]\n\nLUCENE-7905: optimize how OrdinalMap builds its map ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16087430",
+            "date": "2017-07-14T15:02:57+0000",
+            "content": "Commit a0557cfef970780eff355a06f9fc39b97777ecc6 in lucene-solr's branch refs/heads/branch_7x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a0557cf ]\n\nLUCENE-7905: optimize how OrdinalMap builds its map ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16087431",
+            "date": "2017-07-14T15:03:05+0000",
+            "content": "Thanks everyone! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16207308",
+            "date": "2017-10-17T11:03:24+0000",
+            "content": "Bulk close after 7.1.0 release ",
+            "author": "Shalin Shekhar Mangar"
+        }
+    ]
+}

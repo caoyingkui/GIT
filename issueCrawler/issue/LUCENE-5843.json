@@ -1,0 +1,201 @@
+{
+    "id": "LUCENE-5843",
+    "title": "IndexWriter should refuse to create an index with more than INT_MAX docs",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/index"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "4.9.1",
+            "4.10",
+            "6.0"
+        ]
+    },
+    "description": "It's more and more common for users these days to create very large indices, e.g.  indexing lines from log files, or packets on a network, etc., and it's not hard to accidentally exceed the maximum number of documents in one index.\n\nI think the limit is actually Integer.MAX_VALUE-1 docs, because we use that value as a sentinel during searching.\n\nI'm not sure what IW does today if you create a too-big index but it's probably horrible; it may succeed and then at search time you hit nasty exceptions when we overflow int.\n\nI think it should throw an IndexFullException instead.  It'd be nice if we could do this on the very doc that when added would go over the limit, but I would also settle for just throwing at flush as well ... i.e. I think what's really important is that the index does not become unusable.",
+    "attachments": {
+        "LUCENE-5843.patch": "https://issues.apache.org/jira/secure/attachment/12657710/LUCENE-5843.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14071978",
+            "author": "Hoss Man",
+            "content": "I'm not sure what IW does today if you create a too-big index but it's probably horrible; it may succeed and then at search time you hit nasty exceptions when we overflow int.\n\nthat is exactly what happens \u2013 see SOLR-6065 for context ",
+            "date": "2014-07-23T17:10:22+0000"
+        },
+        {
+            "id": "comment-14071993",
+            "author": "Robert Muir",
+            "content": "In my opinion the way to go is to have a package-private limit (for test purposes) that defaults to Integer.MAX_VALUE.\n\nthis way we can actually test the thing with values like... 5\n\nIts more than just checking either at addDocument (ideal) or flush (not great but as you say, better), we also have to handle cases like addIndexes(Dir) and addIndexes(Reader). ",
+            "date": "2014-07-23T17:23:58+0000"
+        },
+        {
+            "id": "comment-14072300",
+            "author": "Jack Krupansky",
+            "content": "That Solr Jira has my comments as well, but I just want to reiterate that the actual limit should be more clearly documented. I filed a Jira for that quite awhile ago - LUCENE-4104. And if this new issue will resolve the problem, please mark my old LUCENE-4105 issue as a duplicate. ",
+            "date": "2014-07-23T20:41:28+0000"
+        },
+        {
+            "id": "comment-14072414",
+            "author": "Uwe Schindler",
+            "content": "I'm not sure what IW does today if you create a too-big index but it's probably horrible; it may succeed and then at search time you hit nasty exceptions when we overflow int.\n\nIf a single segment while merging exceeds the limit, its horrible. If you have an index that exceeds the limit, you get an Exception when opening: BaseCompositeReader throws Exception in its ctor:\n\n\n      maxDoc += r.maxDoc();      // compute maxDocs\n      if (maxDoc < 0 /* overflow */) {\n        throw new IllegalArgumentException(\"Too many documents, composite IndexReaders cannot exceed \" + Integer.MAX_VALUE);\n      }\n\n\n\nThe limit is MAX_VALUE, the -1 is just a stupid limitation of TopDocs, but it is actually smaller, because arrays have a maximum size in Java. DocIdSetIterators sentinel is not a problem, because its simply the last document (MAX_VALUE), which is always the last possible one (the iterator is always exhausted is you reach the last doc). ",
+            "date": "2014-07-23T21:49:44+0000"
+        },
+        {
+            "id": "comment-14073004",
+            "author": "Michael McCandless",
+            "content": "The limit is MAX_VALUE, the -1 is just a stupid limitation of TopDocs, but it is actually smaller, because arrays have a maximum size in Java. \n\nYeah, I'll set the limit (public static int on IndexWriter) to ArrayUtil.MAX_ARRAY_LENGTH. ",
+            "date": "2014-07-24T08:49:08+0000"
+        },
+        {
+            "id": "comment-14073241",
+            "author": "Uwe Schindler",
+            "content": "Should we then also fix the CompositeReader ctor check to be consistent? ",
+            "date": "2014-07-24T14:37:27+0000"
+        },
+        {
+            "id": "comment-14073248",
+            "author": "Michael McCandless",
+            "content": "Should we then also fix the CompositeReader ctor check to be consistent?\n\nI think so ... I'll do that. ",
+            "date": "2014-07-24T14:47:14+0000"
+        },
+        {
+            "id": "comment-14073256",
+            "author": "Uwe Schindler",
+            "content": "Yeah, I'll set the limit (public static int on IndexWriter) to ArrayUtil.MAX_ARRAY_LENGTH\n\nI am not sure if this is the best idea. This constant is now dynamic, so it could happen that one IndexWriter with a 32 bit JVM creates an Index that not readable with another JVM (e.g., 64 bits and different vendor), because the constant changes.\n\nI am fine with using the dynamic constant for stuff like overallocating arrays and so on, but we should hardcode the maximum document number in an Index system independent. ",
+            "date": "2014-07-24T14:50:06+0000"
+        },
+        {
+            "id": "comment-14073284",
+            "author": "Michael McCandless",
+            "content": "I am fine with using the dynamic constant for stuff like overallocating arrays and so on, but we should hardcode the maximum document number in an Index system independent.\n\nHmm, good point ... I'll make it fixed. ",
+            "date": "2014-07-24T15:13:46+0000"
+        },
+        {
+            "id": "comment-14073808",
+            "author": "Michael McCandless",
+            "content": "Patch, just adding a counter to IndexWriter that tracks how many docs\nare in the index.\n\nI added public static final int IndexWriter.MAX_DOCS with the limit\nset to ArrayUtil.MAX_ARRAY_LENGTH, and added a new\noal.index.IndexFullException, thrown by any method that add docs to\nthe index.\n\nInternally, the counter acts like a credit card: before any operation\nis allowed to actually modify the index / change the segmentInfos or\nDWPT state (via addIndexes, add/updateDocument/s), it first \"charges\"\nthe credit card and if the charge fails it throws IndexFullException.\n\nWhen a merge commits, I deduct the deleted docs it had reclaimed, and\nI also deduct in places where we drop 100% deleted segments.\n\nI didn't add a setting to IWC for this ... I think that's sort of\nodd. ",
+            "date": "2014-07-24T23:09:01+0000"
+        },
+        {
+            "id": "comment-14074546",
+            "author": "Shai Erera",
+            "content": "\nI added public static final int IndexWriter.MAX_DOCS with the limit\nset to ArrayUtil.MAX_ARRAY_LENGTH.\n\nBut MAX_ARRAY_LENGTH is dynamic, and depends on the JRE (32/64-bit). So that's not \"fixed\" across JVMs, right? ",
+            "date": "2014-07-25T16:39:10+0000"
+        },
+        {
+            "id": "comment-14074551",
+            "author": "Robert Muir",
+            "content": "Can it be INT_MAX-8 for this reason? ",
+            "date": "2014-07-25T16:41:33+0000"
+        },
+        {
+            "id": "comment-14074554",
+            "author": "Shai Erera",
+            "content": "Yes, I think we shouldn't try to be too smart here. It can even be MAX_INT-1024 for all practical purposes (and if we want to be on the safe side w/ int[] allocations), as I doubt anyone will complain he cannot put MAX_INT-1023 docs in an index... ",
+            "date": "2014-07-25T16:44:20+0000"
+        },
+        {
+            "id": "comment-14074572",
+            "author": "Michael McCandless",
+            "content": "Sorry, my description was stale: in the patch I settled on MAX_INT - 128 as a \"defensive\" attempt to be hopefully well below the min value for the MAX_ARRAY_LENGTH over normal JVMs ... ",
+            "date": "2014-07-25T16:56:07+0000"
+        },
+        {
+            "id": "comment-14074575",
+            "author": "Shai Erera",
+            "content": "oh good, I didn't read the patch before, but I see you even explain why we don't use the constant from ArrayUtil! +1 ",
+            "date": "2014-07-25T16:59:04+0000"
+        },
+        {
+            "id": "comment-14075069",
+            "author": "Michael McCandless",
+            "content": "New patch, I think it's ready: I resolved the nocommits, and removed\nTest2BDocs (I think its tests are folded into\nTestIndexWriterMaxDocs). ",
+            "date": "2014-07-25T22:36:17+0000"
+        },
+        {
+            "id": "comment-14075135",
+            "author": "Hoss Man",
+            "content": "Mike: couple quick suggestions...\n\n\n\t\nprivate static int actualMaxDocs = MAX_DOCS;\nstatic void setMaxDocs(int docs) {\n  if (MAX_DOCS < docs) throw UglyException\n  actualMaxDocs = docs;\n}\n\n\n...that way some poor bastard who sees it in the code and tries to be crafty and add a stub class to that package to set it to Integer.MAX_VALUE will get an immedaite error instead of a timebomb.\n\tadd a public method to the test-framework that wraps this package protected setter, so that tests in other packages besides org.apache.lucene.index can mutate this.\n\t\n\t\tthen we can add tests for clean behavior in solr as well (not to mention anybody else who writes a Lucene app and wants to test for how their app behaves when the index gets too big w/o adding an org/apache/lucene/index dir to their test source\n\t\n\t\n\n ",
+            "date": "2014-07-25T23:35:20+0000"
+        },
+        {
+            "id": "comment-14075328",
+            "author": "Michael McCandless",
+            "content": "Thanks Hoss, those are good ideas ... I'll fold them in. ",
+            "date": "2014-07-26T10:34:56+0000"
+        },
+        {
+            "id": "comment-14075761",
+            "author": "Erick Erickson",
+            "content": "Heck, as far as I'm concerned, tripping an exception when we're 1M below the limit is fine .\n\nAt those numbers, a million between friends is nothing... ",
+            "date": "2014-07-27T21:29:46+0000"
+        },
+        {
+            "id": "comment-14075784",
+            "author": "Michael McCandless",
+            "content": "New patch w/ Hoss's feedback ... I think it's ready. ",
+            "date": "2014-07-27T23:00:21+0000"
+        },
+        {
+            "id": "comment-14077758",
+            "author": "Michael McCandless",
+            "content": "New patch, I just removed the custom exc and throw IllegalStateException.  I'll commit soon... ",
+            "date": "2014-07-29T14:31:12+0000"
+        },
+        {
+            "id": "comment-14077916",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1614402 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1614402 ]\n\nLUCENE-5843: IndexWriter now enforces max docs in one index ",
+            "date": "2014-07-29T16:22:00+0000"
+        },
+        {
+            "id": "comment-14078018",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1614422 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1614422 ]\n\nLUCENE-5843: this is a bug not a feature! ",
+            "date": "2014-07-29T17:20:58+0000"
+        },
+        {
+            "id": "comment-14078022",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1614423 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1614423 ]\n\nLUCENE-5843: woops, I committed too much ",
+            "date": "2014-07-29T17:21:51+0000"
+        },
+        {
+            "id": "comment-14078023",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1614424 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1614424 ]\n\nLUCENE-5843: this is a bug not a feature! ",
+            "date": "2014-07-29T17:22:33+0000"
+        },
+        {
+            "id": "comment-14078024",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1614425 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1614425 ]\n\nLUCENE-5843: this is a bug not a feature! ",
+            "date": "2014-07-29T17:22:49+0000"
+        },
+        {
+            "id": "comment-14136336",
+            "author": "Michael McCandless",
+            "content": "Reopen for backport to 4.9.1... ",
+            "date": "2014-09-16T22:09:31+0000"
+        },
+        {
+            "id": "comment-14136348",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1625415 from Michael McCandless in branch 'dev/branches/lucene_solr_4_9'\n[ https://svn.apache.org/r1625415 ]\n\nLUCENE-5843: backport to 4.9.x ",
+            "date": "2014-09-16T22:13:44+0000"
+        },
+        {
+            "id": "comment-14151047",
+            "author": "Michael McCandless",
+            "content": "Bulk close for Lucene/Solr 4.9.1 release ",
+            "date": "2014-09-28T09:05:50+0000"
+        }
+    ]
+}

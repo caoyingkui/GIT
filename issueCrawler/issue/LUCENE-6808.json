@@ -1,0 +1,75 @@
+{
+    "id": "LUCENE-6808",
+    "title": "Term(Ord)ValComparator.value return BytesRefs that are re-used internally",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "Bug"
+    },
+    "description": "While working on SOLR-6168, which involves some non-trivial usage of FieldComparator, I discovered some weird bugs anytime I was using TermOrdValComparator.  I ultimately tracked this down to the fact that the BytesRef instances returned by TermOrdValComparator.value(int slot) are backed by BytesRefBuilder instances that the Comparator hangs on to and re-uses \u2013 so the values a caller gets back from FieldComparator.value(slot) might be changed out from under it before it has a chance to use that value in something like FieldComparator.compareValues(first,second).\n\nThe general approach when dealing with BytesRef instances (as i understand it) is that the caller is responsible for making a copy if it wants to hang on to it \u2013 but in this case that would violate the generic API of FieldComparator \u2013 callers would have to pay attention to when a FieldComparator is a \nFieldComparator<BytesRef> and do casting to copy the BytesRef.\n\nIt seems like the right solution is for TermOrdValComparator.value(slot) (and TermValComparator.value(slot) which has a similar BytesRef usage) to return BytesRef.deepCopyOf(values[slot])",
+    "attachments": {
+        "LUCENE-6808.patch": "https://issues.apache.org/jira/secure/attachment/12757149/LUCENE-6808.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14804445",
+            "author": "Hoss Man",
+            "date": "2015-09-17T20:30:55+0000",
+            "content": "\nHere's a patch which includes:\n\n\n\tA new testcase TestFieldComparatorValues demonstrating the problem when using TermOrdValComparator and TermValComparator and how the behavior of these two are inconsistent with the other existing impls.\n\tthe previously mentioned fix to the value(slot) methods\n\tsome other misc test coverage additions of FieldComparator.values(slot) and fieldComparator.compareValues(first,second) (These don't demonstrate the problem at all \u2013 there were test improvements i attempted before i fullyer understood the problem but they seemed like useful additions ot leave in)\n\n\n\nThere are still a few nocommits in FieldComparator.java related to the one other place where a BytesRef is \"shared\" with the caller: setTopValue(value) ... it's not clear to me if this should make a defensive copy or not.  If i understand correctly, the theory is that this value is either coming from a previous call to value(slot) from the same, or another instance of the same type of, FieldComparator (ie: FieldDoc from searchAfter) and so we're safe since we already have a defensive copy (introduced by this patch); or it's coming from a more complex client that knows it's dealing with BytesRef and that client should have passed setTopValue a \"safe\" copy to use internally. ... but maybe i'm wrong, maybe setTopValue should make it's own copy?\n\n\n "
+        },
+        {
+            "id": "comment-14804589",
+            "author": "Michael McCandless",
+            "date": "2015-09-17T21:51:01+0000",
+            "content": "The intention of the FieldComparator.value API is that you would use it to look up a value after all collection is complete, e.g. to fill the fields to create the FieldDoc for this hit, and so the comparator would naturally not be changing it anymore.\n\nI don't think this API should have to make a deep clone of the value it returns; this is just extra per-hit garbage created for searches sorting by field ...\n\nBut I don't really understand what SOLR-6168 is trying to do ... maybe there is another way to do it w/o abusing this API? "
+        },
+        {
+            "id": "comment-14877262",
+            "author": "Hoss Man",
+            "date": "2015-09-19T18:41:19+0000",
+            "content": "\nWeird, i wrote this comment yesterday, but aparently something failed when my browser tried to submit it...\n\n\nThe intention of the FieldComparator.value API is that you would use it to look up a value after all collection is complete, e.g. to fill the fields to create the FieldDoc for this hit, and so the comparator would naturally not be changing it anymore.\n\nok, but that's not clear/enforced anywhere in the API itself \u2013 if you are only suppose to fetch back all the slots after the search is complete, why support fetching the individual slots (and compareValues()) at all?\n\nBut I don't really understand what SOLR-6168 is trying to do ... maybe there is another way to do it w/o abusing this API?\n\nIn a nutshell the CollapseQParser is another style of \"group collapsing\" where it picks a single best representative doc for each group on the fly as docs are collected \u2013 currently it does this only based on a single field via DocValues, SOLR-6168 is about making this work with any arbitrary \"Sort\" object.  The code in the patch (in SOLR-6168) is analogous to the type of logic that FieldValueHitQueue does, but instead of tracking the \"N best docs\" (according to the sort) in a single priority queue (which re-orders on the fly), it tracks the 1 best doc for every \"group\" as it makes a single pass collection uses value() + compareValues to know when a \"better\" doc has been found for that group.\n\n(The most trivial implementation would be to use a FieldValueHitQueue of size '1' for each group, but this approach unwinds the logic a track the values directly.  When i was first looking at this approach, i initially considered using a FieldComparator \"slot\" for each group, but the number of groups isn't neccessarly known in advance and there's no way to \"grow\" a FieldComparator)\n\nIt doesn't feel like an abuse of the FieldComparator API to do this ... every other Comparator works fine as is.  As i mentioned I could always put hacks in the caller code (ColapseQParser) to do instanceof/casting/deepCopy when the FieldComparator returns BytesRefs \u2013 but fixing Term(Ord)ValComparator.value to return \"safe\" objects seemed saner.\n\n\u2014\n\nForgetting SOLR-6168, even if you asssume that all callers should know that the result of FieldComparator.value is only usable afte the end of a search, the BytesRefs returned by Term(Ord)ValComparator.value don't really seem to be safe for a caller to hang on to (for later use searchAfter, etc...) in any situation where the FieldComparator itself might get re-used \u2013 ie: re-using a FieldValueHitQueue (or Collector that uses FieldValueHitQueue) in a subsequent search.\n\nwhat protects the user from those values being changed out from under them in that situation?\n\n\n...but beyond that, this morning a slightly diff impl occurred to me that should still address my Comparator re-use concerns w/o the \"extra per-hit garbage\" mike was worded about in the more common case...\n\n\n    public BytesRef value(int slot) {\n      // null out the corrisponding Builder to prevent future changes to returned BytesRef instance\n      // in cases where the user makes additional slot changes after calling value\n      tempBRs[slot] = null;\n      return values[slot];\n    }\n\n\n\n...any concerns with this mike?  A new BytesRefBuilder instance will be created in tempBRs[slot] if and only if the FieldComparator gets re-used after the call to value(slot). "
+        },
+        {
+            "id": "comment-14877278",
+            "author": "Yonik Seeley",
+            "date": "2015-09-19T19:05:20+0000",
+            "content": "I was going to reply that having to make a copy of BytesRef objects returned to you (because they may be reused) was standard practice across our APIs... but then I noticed that this case is different since FieldComparator returns a generic object.  So this case does seem pretty trappy and should be fixed IMO. "
+        },
+        {
+            "id": "comment-14877337",
+            "author": "Robert Muir",
+            "date": "2015-09-19T22:47:51+0000",
+            "content": "I agree with Mike, I don't think we should create extra garbage here, the documentation says:\n\n  /**\n   * Return the actual value in the slot.\n   *\n   * @param slot the value\n   * @return value in this slot\n   */\n  public abstract T value(int slot);\n\n\n\nIt says the value \"in the slot\" which isn't trappy at all. Its not a copy of the value or something else.\n\nAlso docs at the start of the class reiterate what Mike said, that its only called at the end of the search:\n\n\n   <li> {@link #value} Return the sort value stored in\n        the specified slot.  This is only called at the end\n        of the search, in order to populate {@link\n        FieldDoc#fields} when returning the top results.\n\n "
+        },
+        {
+            "id": "comment-14877340",
+            "author": "Yonik Seeley",
+            "date": "2015-09-19T23:28:01+0000",
+            "content": "\n    public BytesRef value(int slot) {\n      // null out the corrisponding Builder to prevent future changes to returned BytesRef instance\n      // in cases where the user makes additional slot changes after calling value\n      tempBRs[slot] = null;\n      return values[slot];\n    }\n\n\n\n+1 to this... seems to have no downsides when used as lucene currenly uses it (i.e. only called at the end of search) "
+        },
+        {
+            "id": "comment-14900420",
+            "author": "Michael McCandless",
+            "date": "2015-09-21T09:19:09+0000",
+            "content": "I know that's a compromise (thank you), in that it would in fact create no new garbage, but I think it's dangerous/unexpected for what is supposed to be a \"getter\" like API to have unexpected side effects like that.\n\nAnd it's not clear on first inspection that this is a safe thing to do (nowhere else do we set this to null) ... all to support what I think is really an abuse case of this API (peeking into the slots while collection is still running). "
+        },
+        {
+            "id": "comment-14901500",
+            "author": "Yonik Seeley",
+            "date": "2015-09-21T22:08:15+0000",
+            "content": "And it's not clear on first inspection that this is a safe thing to do\n\nOK, in that case I just did a thorough code review to investigate any issues.  The approach Hoss came up with is completely safe.\n\nThe array being modified is defined as\n\n    private final BytesRefBuilder[] tempBRs;\n\n\n\nAnd it's only used in this little block of code, and nowhere else:\nhttps://github.com/apache/lucene-solr/blob/72aa5784ecd7024dce7599c358b658bed4b31596/lucene/core/src/java/org/apache/lucene/search/FieldComparator.java#L914-L918\n\nSo the fix prevents the trap that Hoss found (and actually, I think I just found another place where we fell into that same trap), turns out to be trivial and has no downsides! "
+        },
+        {
+            "id": "comment-14901752",
+            "author": "Michael McCandless",
+            "date": "2015-09-22T01:42:21+0000",
+            "content": "OK, in that case I just did a thorough code review to investigate any issues. \n\nThank you for the thorough code review / explanation ...\n\nBut my concern wasn't that we can convince ourselves today that setting to null (this change) is OK, it's that the code, to future devs looking at it, looks bad/buggy because a getter really should not have side effects.  This class is already scary enough, I don't think we should make it worse ...\n\nSo the fix prevents the trap that Hoss found\n\nI don't think this is a trap: I think it's abusing the API.\n\nI think I just found another place where we fell into that same trap\n\nHmm, where? "
+        }
+    ]
+}

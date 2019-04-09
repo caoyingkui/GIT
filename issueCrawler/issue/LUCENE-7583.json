@@ -1,0 +1,171 @@
+{
+    "id": "LUCENE-7583",
+    "title": "Can we improve OutputStreamIndexOutput's byte buffering when writing each BKD leaf block?",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Resolved",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "6.4",
+            "7.0"
+        ]
+    },
+    "description": "When BKD writes its leaf blocks, it's essentially a lot of tiny writes (vint, int, short, etc.), and I've seen deep thread stacks through our IndexOutput impl (OutputStreamIndexOutput) when pulling hot threads while BKD is writing.\n\nSo I tried a small change, to have BKDWriter do its own buffering, by first writing each leaf block into a RAMOutputStream, and then dumping that (in 1 KB byte[] chunks) to the actual IndexOutput.\n\nThis gives a non-trivial reduction (~6%) in the total time for BKD writing + merging time on the 20M NYC taxis nightly benchmark (2 times each):\n\nTrunk, sparse:\n\n\ttotal: 64.691 sec\n\ttotal: 64.702 sec\n\n\n\nPatch, sparse:\n\n\ttotal: 60.820 sec\n\ttotal: 60.965 sec\n\n\n\nTrunk dense:\n\n\ttotal: 62.730 sec\n\ttotal: 62.383 sec\n\n\n\nPatch dense:\n\n\ttotal: 58.805 sec\n\ttotal: 58.742 sec\n\n\n\nThe results seem to be consistent and reproducible.  I'm using Java 1.8.0_101 on a fast SSD on Ubuntu 16.04.\n\nIt's sort of weird and annoying that this helps so much, because OutputStreamIndexOutput already uses java's BufferedOutputStream (default 8 KB buffer) to buffer writes.\n\nUwe Schindler suggested maybe hotspot is failing to inline/optimize the writeByte / the call stack just has too many layers.\n\nWe could commit this patch (it's trivial) but it'd be nice to understand and fix why buffering writes is somehow costly so any other Lucene codec components that write lots of little things can be improved too.",
+    "attachments": {
+        "LUCENE-7583-hardcode-writeVInt.patch": "https://issues.apache.org/jira/secure/attachment/12841939/LUCENE-7583-hardcode-writeVInt.patch",
+        "LUCENE-7583.patch": "https://issues.apache.org/jira/secure/attachment/12841935/LUCENE-7583.patch",
+        "LUCENE-7583.private-IndexOutput.patch": "https://issues.apache.org/jira/secure/attachment/12841985/LUCENE-7583.private-IndexOutput.patch",
+        "LUCENE-7583.fork-FastOutputStream.patch": "https://issues.apache.org/jira/secure/attachment/12841989/LUCENE-7583.fork-FastOutputStream.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15725171",
+            "date": "2016-12-06T11:02:51+0000",
+            "content": "Simple patch. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725218",
+            "date": "2016-12-06T11:33:41+0000",
+            "content": "As discusses yesterday, I'd try to do 2 things:\n\n\tEnsure that synchronization in BufferedOutputStream is not the issue (by replacing with a Solr-Like FastOutputStream). I don't think this will help, because the misdesign in the Input/OutputStream is one of the first thing Hotspot eliminates. In general the whole Input/OutputStream API was synchronized in Java 1.0, which is bogus. But backwards compatibility... Same issue like StringBuilder vs. StringBuffer.\n\tAnother try would be to hardcode writeVInit in OutputStreamIndexOutput\n\n ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15725237",
+            "date": "2016-12-06T11:44:37+0000",
+            "content": "Another try would be to hardcode writeVInt in OutputStreamIndexOutput\n\nOK, I tried this, in the attached patch, but it didn't help that much (maybe a bit):\n\nSparse:\n\n\ttotal: 64.387 sec\n\n\n\nDense:\n\n\ttotal: 62.134 sec\n\n\n\nI'll try an unsynchronized variant of BufferedOutputStream next. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725419",
+            "date": "2016-12-06T12:55:56+0000",
+            "content": "Do we call flush at some places? I am sure you checked this, but maybe we missed some place. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15725607",
+            "date": "2016-12-06T14:17:41+0000",
+            "content": "Do we call flush at some places? I am sure you checked this, but maybe we missed some place.\n\nThat's a good idea (I hadn't check for it), but the only place we call OutputStream.flush is in OutputStreamIndexOutput.close. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725624",
+            "date": "2016-12-06T14:23:28+0000",
+            "content": "Hmm, this is interesting:\n\nI temporarily forked BufferedOutputStream.java into oal.store as a\npackage private class, and changed OutputStreamIndexOutput to use\nthat version.  I then ran the benchmark again, and the times were the\nsame.\n\nThen I remove synchronized from the 3 methods that have it now\n(flush, and the two write methods) and the times improved quite a bit:\n\nSparse:\n\n\ttotal: 61.591 sec\n\n\n\nDense:\n\n\ttotal: 59.739 sec\n\n\n\nNot quite as fast as the patch (to use RAMOutputStream to buffer writes) but close (~4.8% faster vs ~5.8%). ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725732",
+            "date": "2016-12-06T14:59:39+0000",
+            "content": "So this looks like a problem of the Hotspot VM that does not fully remove the stupid synchronized on this call stack. This should not happen, because most optimizations in the VM are there to fix IO, because every Input/OutputStream has an internal synchronized lock.... BufferedOutputStream just has an additional one. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15725736",
+            "date": "2016-12-06T15:01:46+0000",
+            "content": "Are we sure that we do not open the IndexOutput in one thread and had it over to another one? we should also make all references to the IndexOutput private, so it cannot escape the current thread (to help hotspot). This means: no non-private fields holding the reference to the stream. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15725796",
+            "date": "2016-12-06T15:18:55+0000",
+            "content": "If we are really required to fork the buffered stream, we may use: https://github.com/apache/lucene-solr/blob/master/solr/solrj/src/java/org/apache/solr/common/util/FastOutputStream.java (but without the DataOutput interface impl). ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15725830",
+            "date": "2016-12-06T15:34:15+0000",
+            "content": "Are we sure that we do not open the IndexOutput in one thread and had it over to another one? \n\nYeah, the IndexOutput is opened in Lucene60PointsWriter, and then that same thread goes and writes all points via writeField.  At IW flush time it's an indexing thread, and at merge time it's a merge thread, but it should only ever be a single thread touching that IndexOutput.  The benchmark I'm running only ever uses a single thread anyway ...\n\nwe should also make all references to the IndexOutput private, so it cannot escape the current thread (to help hotspot). This means: no non-private fields holding the reference to the stream.\n\nI'll try to do this; there's at least one place where it's protected, but that's way high up in the stack (Lucene60PointsWriter).\n\nIf we are really required to fork the buffered stream, we may use: https://github.com/apache/lucene-solr/blob/master/solr/solrj/src/java/org/apache/solr/common/util/FastOutputStream.java (but without the DataOutput interface impl).\n\nI'll test that too.\n\nThanks Uwe Schindler. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725835",
+            "date": "2016-12-06T15:36:23+0000",
+            "content": "I also tried with ByteArrayDataOutput and it gets the fastest result, ~9.6% faster than trunk today:\n\nSparse:\n\n\ttotal: 58.503 sec\n\n\n\nDense:\n\n\ttotal: 57.227 sec\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725878",
+            "date": "2016-12-06T15:54:34+0000",
+            "content": "I think ByteArrayDataOutput is always a good idea to create \"small\" blobs of structured data. You have full control of the buffer and there is almost no checks and multi-buffer handling involved. It just writes to an byte array that you can reuse later or write to IndexOutput as block. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15725943",
+            "date": "2016-12-06T16:19:40+0000",
+            "content": "OK I made the 2 places where we hang onto the IndexOutput instance in a class instance private (see attached patch) but it looks like this didn't really help:\n\nSparse:\n\n\n\ttotal: 64.457 sec\n\n\n\nDense:\n\n\n\ttotal: 62.412 sec\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15725996",
+            "date": "2016-12-06T16:40:14+0000",
+            "content": "OK, I forked Solrj's FastOutputStream.java into oal.store, and it\ngets similar performance to forking BufferedOutputStream and\nremoving its synchronized keywords:\n\nSparse:\n\n\n\ttotal: 61.584 sec\n\n\n\nDense:\n\n\n\ttotal: 59.602 sec\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15726001",
+            "date": "2016-12-06T16:41:11+0000",
+            "content": "I think ByteArrayDataOutput is always a good idea to create \"small\" blobs of structured data.\n\nYeah I'm leaning towards just doing this for BKDWriter at this point.  I'll clean up that approach and post a patch. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15728464",
+            "date": "2016-12-07T11:01:07+0000",
+            "content": "Here's a patch, just moving GrowableByteArrayDataOutput from the compressing codecs to oal.store, and tightening it a bit (making fields private) and switching over BKDWriter to use it as well ... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15730379",
+            "date": "2016-12-07T23:59:52+0000",
+            "content": "Commit b97d9d7478f99660c1cfc91ef4461b7405254dea in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b97d9d7 ]\n\nLUCENE-7583: buffer small leaf-block writes in BKDWriter ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15730388",
+            "date": "2016-12-08T00:04:15+0000",
+            "content": "Commit 28a22c0203f8ffb6f71d6a2c0a610eebf9cbfd12 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=28a22c0 ]\n\nLUCENE-7583: buffer small leaf-block writes in BKDWriter ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15731714",
+            "date": "2016-12-08T09:57:10+0000",
+            "content": "Thanks Mike!\nI was just wondering why you added the \"if (newSize > currentSize)\" like checks before ArrayUtil.grow. ArrayUtil.grow does this already and exits early, so the check is done twice. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-15731833",
+            "date": "2016-12-08T10:52:39+0000",
+            "content": "I was just wondering why you added the \"if (newSize > currentSize)\" like checks before ArrayUtil.grow.\n\nBecause I wasn't trusting that the JVM would inline this method call.\n\nAlso, I think these methods are poorly named.  They should be maybeGrow or growIfNeeded if indeed they are lenient when you call them on an array that is not in fact in need of growing.\n\nIf you feel strongly, I can remove that if, but I think it makes the code look sloppier. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15733619",
+            "date": "2016-12-08T22:44:51+0000",
+            "content": "Note: this breaks my eclipse build (on 6x at least, and I presume master) because lucene/core/src/java/org/apache/lucene/util/GrowableByteArrayDataOutput.java claims to be in package org.apache.lucene.store, but is actually in the util dir.\n\nAnt compile is fine, but I guess Eclipse is more pedantic. ",
+            "author": "Daniel Collins"
+        },
+        {
+            "id": "comment-15733691",
+            "date": "2016-12-08T23:16:39+0000",
+            "content": "Note: this breaks my eclipse build (on 6x at least, and I presume master)\n\nGak, I'll fix!  Thanks for reporting this. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15733734",
+            "date": "2016-12-08T23:36:47+0000",
+            "content": "Commit c185617582b4bf3ce2899c9ae67e9eeaf2c21741 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=c185617 ]\n\nLUCENE-7583: move this class to the right package ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15733737",
+            "date": "2016-12-08T23:38:05+0000",
+            "content": "Commit ca428ce2381fd9a8e6f56767ad9d0fb1638ba7dc in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ca428ce ]\n\nLUCENE-7583: move this class to the right package ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

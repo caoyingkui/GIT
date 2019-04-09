@@ -1,0 +1,127 @@
+{
+    "id": "LUCENE-7963",
+    "title": "Useless getAttribute() in DefaultIndexingChain causes performance drop",
+    "details": {
+        "labels": "",
+        "priority": "Blocker",
+        "resolution": "Fixed",
+        "affect_versions": "7.0",
+        "status": "Resolved",
+        "type": "Bug",
+        "components": [
+            "core/index"
+        ],
+        "fix_versions": [
+            "7.0"
+        ]
+    },
+    "description": "Some background: We have spotted a significant drop in indexing throughput on machines with a large number of cores (see https://github.com/elastic/elasticsearch/issues/26339 for details).\n\nWe finally managed to isolate the behavior in a JMH \"microbenchmark\". Here is the output of running that benchmark with 32 threads with JMH's perfasm profiler (also Oracle Development Studio finds the same hotspot):\n\n\n\n....[Hottest Region 1]..............................................................................\nC2, level 4, org.apache.lucene.index.DefaultIndexingChain$PerField::invert, version 1231 (792 bytes)\n\n                          0x00007f52d56b026a: xor    %r10d,%r10d        ;*invokevirtual isAssignableFrom\n                                                                        ; - org.apache.lucene.util.AttributeSource::addAttribute@28 (line 207)\n                                                                        ; - org.apache.lucene.document.Field$BinaryTokenStream::&lt;init&gt;@8 (line 512)\n                                                                        ; - org.apache.lucene.document.Field::tokenStream@82 (line 491)\n                                                                        ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@99 (line 729)\n                          0x00007f52d56b026d: mov    $0x8,%r11d         ;*invokeinterface iterator\n                                                                        ; - org.apache.lucene.util.AttributeSource::getCurrentState@46 (line 254)\n                                                                        ; - org.apache.lucene.util.AttributeSource::clearAttributes@1 (line 269)\n                                                                        ; - org.apache.lucene.document.Field$BinaryTokenStream::incrementToken@10 (line 532)\n                                                                        ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@153 (line 736)\n  0.00%    0.02%       \u2197  0x00007f52d56b0273: test   %r10,%r10\n                  \u256d    \u2502  0x00007f52d56b0276: je     0x00007f52d56b0292  ;*getfield fieldsData\n                  \u2502    \u2502                                                ; - org.apache.lucene.document.Field::binaryValue@1 (line 441)\n                  \u2502    \u2502                                                ; - org.apache.lucene.document.Field::tokenStream@65 (line 487)\n                  \u2502    \u2502                                                ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@99 (line 729)\n  0.00%    0.00%  \u2502    \u2502  0x00007f52d56b0278: mov    (%r11),%rsi        ;*getfield next\n                  \u2502    \u2502                                                ; - java.util.HashMap::getNode@137 (line 580)\n                  \u2502    \u2502                                                ; - java.util.LinkedHashMap::get@6 (line 440)\n                  \u2502    \u2502                                                ; - org.apache.lucene.util.AttributeSource::getAttribute@6 (line 245)\n                  \u2502    \u2502                                                ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@143 (line 734)\n  0.09%    0.51%  \u2502    \u2502  0x00007f52d56b027b: mov    0x18(%rsi),%r8\n 23.70%    3.54%  \u2502    \u2502  0x00007f52d56b027f: mov    $0x7f4926a81d88,%rcx  ;   {metadata(&apos;org/apache/lucene/analysis/tokenattributes/CharTermAttribute&apos;)}\n  0.00%    0.00%  \u2502    \u2502  0x00007f52d56b0289: cmp    %rcx,%r8\n                  \u2502    \u2502  0x00007f52d56b028c: jne    0x00007f52d56b0949  ;*instanceof\n                  \u2502    \u2502                                                ; - org.apache.lucene.document.Field::binaryValue@4 (line 441)\n                  \u2502    \u2502                                                ; - org.apache.lucene.document.Field::tokenStream@65 (line 487)\n                  \u2502    \u2502                                                ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@99 (line 729)\n  0.01%    0.00%  \u2198    \u2502  0x00007f52d56b0292: test   %r10,%r10\n                       \u2502  0x00007f52d56b0295: je     0x00007f52d56b1e0d  ;*invokevirtual addAttributeImpl\n                       \u2502                                                ; - org.apache.lucene.util.AttributeSource::addAttribute@80 (line 213)\n                       \u2502                                                ; - org.apache.lucene.document.Field$StringTokenStream::&lt;init&gt;@8 (line 550)\n                       \u2502                                                ; - org.apache.lucene.document.Field::tokenStream@47 (line 483)\n                       \u2502                                                ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@99 (line 729)\n  0.01%    0.00%       \u2502  0x00007f52d56b029b: mov    (%r11),%rsi        ;*invokevirtual hashCode\n                       \u2502                                                ; - java.util.HashMap::hash@9 (line 338)\n                       \u2502                                                ; - java.util.LinkedHashMap::get@2 (line 440)\n                       \u2502                                                ; - org.apache.lucene.util.AttributeSource::getAttribute@6 (line 245)\n                       \u2502                                                ; - org.apache.lucene.index.DefaultIndexingChain$PerField::invert@143 (line 734)\n\n\n\n\nYou can see that a significant amount of time is spent in mov $0x7f4926a81d88,%rcx. It turns out that this maps to the following line in Java (DefaultIndexingChain$PerField::invert):\n\n\n\nCharTermAttribute termAtt = tokenStream.getAttribute(CharTermAttribute.class);\n\n\n\nWhich is - luckily - unused (and removed by the attached patch).\n\nWe have verified the impact of the change with an Elasticsearch macrobenchmark which indexes 165,346,692 documents (~ 74GB) with 24 clients concurrently. The reported numbers are median indexing throughput during that benchmark against a single Elasticsearch node:\n\n\n\tWithout the patch: 125418 documents/s\n\tWith the patch: 221237 documents/s\n\n\n\nDetails about the benchmark setup etc. are mentioned in the Elasticsearch issue #26339 if you're interested.\n\nUnfortunately, it is beyond me why writing this register to main memory takes such a long time and why C2 did not eliminate this line as dead code to begin with.",
+    "attachments": {
+        "0001-Remove-unused-variable-in-DefaultIndexingChain.patch": "https://issues.apache.org/jira/secure/attachment/12886049/0001-Remove-unused-variable-in-DefaultIndexingChain.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16158479",
+            "date": "2017-09-08T11:22:08+0000",
+            "content": "This is Mike's commit 64b86331c and I don't see any particular reason for this line to be there. Michael McCandless? ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16158498",
+            "date": "2017-09-08T11:35:29+0000",
+            "content": "I think this was a relict from debugging! This was caused by LUCENE-7626.\n\nAbout the patch: Patch is fine, thanks also for removing the import! +1 ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16158504",
+            "date": "2017-09-08T11:45:11+0000",
+            "content": "Cool, thank you for the quick feedback guys! ",
+            "author": "Daniel Mitterdorfer"
+        },
+        {
+            "id": "comment-16158511",
+            "date": "2017-09-08T11:58:10+0000",
+            "content": "I will commit this later, I am just waiting for a confirmation by Michael McCandless! I set it as blocker for 7.0, I hope Anshum Gupta is fine with putting that into RC3 of Lucene 7. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16158520",
+            "date": "2017-09-08T12:04:16+0000",
+            "content": "\nUnfortunately, it is beyond me why writing this register to main memory takes such a long time and why C2 did not eliminate this line as dead code to begin with.\n\nThe tool you are using is just buggy here. The reason it is slow is because of the unnecessary per-document hash lookup. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16158531",
+            "date": "2017-09-08T12:15:00+0000",
+            "content": "Robert Muir: Agree, I was afraid to say this  The typical profiler bullshit. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16158541",
+            "date": "2017-09-08T12:20:06+0000",
+            "content": "> The tool you are using is just buggy here. \n\nThat may be possible that it does not assign the time to the correct statement. I still wonder why dead-code elimination did not kick in. For me, that line would be a classic candidate for that. ",
+            "author": "Daniel Mitterdorfer"
+        },
+        {
+            "id": "comment-16158549",
+            "date": "2017-09-08T12:27:34+0000",
+            "content": "If it writes to memory it's not dead code? Could be the memfence is someplace else, but is there so the memwrite can be visible to other threads. Also, depends on the address really \u2013 it can be a poison address (safepoint)... many different reasons. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16158588",
+            "date": "2017-09-08T12:58:23+0000",
+            "content": "If it writes to memory it's not dead code?\n\nThe write here is not the write to the termAtt local variable. This one is already removed (it ignores the return value). The write comes from something inside getAttribute, as it needs to cast the attribute so it does a lot of work. In fact it is also not dead code - although the return value is ignroed, because the HashMap#get or the Class#cast may have side effects (like throwing exception,...). It might have no side effects, but that's hard to figure out by the optimizer. As far as I remeber: Hotspot was never able to remove hashmap gets easily! ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16158598",
+            "date": "2017-09-08T13:03:38+0000",
+            "content": "Yeah, the method is not without side effects. I can't see how you'd eliminate the Class.cast on the result from the hashmap. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16158657",
+            "date": "2017-09-08T13:45:27+0000",
+            "content": "By the way, this is almost exactly the same situation as LUCENE-7419 ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16158799",
+            "date": "2017-09-08T15:39:30+0000",
+            "content": "Commit a5402f68631768bae57d923613211128de077982 in lucene-solr's branch refs/heads/master from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a5402f6 ]\n\nLUCENE-7963: Remove useless getAttribute() in DefaultIndexingChain that causes performance drop, introduced by LUCENE-7626 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16158803",
+            "date": "2017-09-08T15:40:49+0000",
+            "content": "Commit 7cc8d14755966b6ac72676fda5f927c4e4dc8f2c in lucene-solr's branch refs/heads/branch_7x from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7cc8d14 ]\n\nLUCENE-7963: Remove useless getAttribute() in DefaultIndexingChain that causes performance drop, introduced by LUCENE-7626 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16158806",
+            "date": "2017-09-08T15:42:13+0000",
+            "content": "Commit 3ba304b29825a94249c5145b3f5061e87b87d8f8 in lucene-solr's branch refs/heads/branch_7_0 from Uwe Schindler\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3ba304b ]\n\nLUCENE-7963: Remove useless getAttribute() in DefaultIndexingChain that causes performance drop, introduced by LUCENE-7626 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16158810",
+            "date": "2017-09-08T15:43:45+0000",
+            "content": "Thanks Daniel Mitterdorfer! ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16159005",
+            "date": "2017-09-08T17:50:35+0000",
+            "content": "+1 to remove, phew!!  Thanks Daniel Mitterdorfer and Uwe Schindler! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16160768",
+            "date": "2017-09-11T05:53:25+0000",
+            "content": "Thanks Uwe Schindler for jumping on it and also Robert Muir and Dawid Weiss for the explanations. Glad it's resolved now.  ",
+            "author": "Daniel Mitterdorfer"
+        }
+    ]
+}

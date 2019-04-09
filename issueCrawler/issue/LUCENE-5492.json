@@ -1,0 +1,73 @@
+{
+    "id": "LUCENE-5492",
+    "title": "IndexFileDeleter AssertionError in presence of *_upgraded.si files",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [],
+        "affect_versions": "4.7",
+        "status": "Open",
+        "fix_versions": []
+    },
+    "description": "When calling IndexWriter.deleteUnusedFiles against an index that contains 3.x segments, i am seeing the following exception:\n\n\njava.lang.AssertionError: failAndDumpStackJunitStatment: RefCount is 0 pre-decrement for file \"_0_upgraded.si\"\n        at org.apache.lucene.index.IndexFileDeleter$RefCount.DecRef(IndexFileDeleter.java:630)\n        at org.apache.lucene.index.IndexFileDeleter.decRef(IndexFileDeleter.java:514)\n        at org.apache.lucene.index.IndexFileDeleter.deleteCommits(IndexFileDeleter.java:286)\n        at org.apache.lucene.index.IndexFileDeleter.revisitPolicy(IndexFileDeleter.java:393)\n        at org.apache.lucene.index.IndexWriter.deleteUnusedFiles(IndexWriter.java:4617)\n\n\n\nI believe this is caused by IndexFileDeleter not being aware of the Lucene3x Segment Infos Format (notably the _upgraded.si files created to \"upgrade\" an old index)\n\nThis is new in 4.7 and did not occur in 4.6.1\n\nStill trying to track down a workaround/fix",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13921389",
+            "author": "Michael McCandless",
+            "content": "That assert trip is very, very bad. ",
+            "date": "2014-03-05T20:59:11+0000"
+        },
+        {
+            "id": "comment-13921398",
+            "author": "Tim Smith",
+            "content": "to the best of my knowledge, i don't think its something crazy or wrong i'm doing on my part\n\nstill trying to get to the bottom of it\n\nseems to be related to the accounting files in a SegmentInfos not behaving properly for legacy 3.x segments ",
+            "date": "2014-03-05T21:04:35+0000"
+        },
+        {
+            "id": "comment-13921432",
+            "author": "Tim Smith",
+            "content": "The following FileNotFound exception is firing:\n\njava.io.FileNotFoundException: target/data-16000/mockEngine/index/_0.si (No such file or directory)\n        at java.io.RandomAccessFile.open(Native Method)\n        at java.io.RandomAccessFile.<init>(RandomAccessFile.java:241)\n        at org.apache.lucene.store.FSDirectory$FSIndexInput.<init>(FSDirectory.java:382)\n        at org.apache.lucene.store.NIOFSDirectory$NIOFSIndexInput.<init>(NIOFSDirectory.java:127)\n        at org.apache.lucene.store.NIOFSDirectory.openInput(NIOFSDirectory.java:80)\n        at org.apache.lucene.codecs.lucene3x.Lucene3xSegmentInfoReader.read(Lucene3xSegmentInfoReader.java:103)\n        at org.apache.lucene.index.SegmentInfos.read(SegmentInfos.java:340)\n        at org.apache.lucene.index.IndexFileDeleter.<init>(IndexFileDeleter.java:175)\n        at org.apache.lucene.index.IndexWriter.<init>(IndexWriter.java:773)\n\n\n\nthis results in IndexFileDeleter ignoring the segment (skipping incRef()), resulting in 0 refcounts for said files\n\nthen, the CommitPoint is deleted (which does reference the files properly), and the files are decRef'd, resulting in the exception ",
+            "date": "2014-03-05T21:18:19+0000"
+        },
+        {
+            "id": "comment-13921452",
+            "author": "Tim Smith",
+            "content": "FileNotFound was actually triggered later (as things were shutting down, after the initial assertion tripped)\n\nmy current theory is that the .si and _upgraded.si files are not being registered into the index file deleter properly, or it is somehow double decref'd\n\ni see the upgraded.si and .si file get decref'd and deleted, followed by another decref, which trips the assert ",
+            "date": "2014-03-05T21:38:19+0000"
+        },
+        {
+            "id": "comment-13922646",
+            "author": "Tim Smith",
+            "content": "Narrowing it down\n\ndefinitely seeing a reference count issue\n\nthis only seems to occur when using DirectoryReader.open(IndexWriter ...) methods\n\nfor one particular commit point \"segments_4\", i see the following refcount behavior:\n\n\tincref segments_4\n\t\n\t\tincref _0_upgraded.si refcount=3\n\t\tdecref _0_upgraded.si refcount=2\n\t\n\t\n\tincref segments_4\n\t\n\t\tNOTE: _0_upgraded.si not incref'd this time\n\t\n\t\n\t...\n\tdelete segments_4\n\t\n\t\tdecref _0_upgraded.si ERROR\n\t\n\t\n\n\n\n\n\n\n\n ",
+            "date": "2014-03-06T15:29:22+0000"
+        },
+        {
+            "id": "comment-13922663",
+            "author": "Michael McCandless",
+            "content": "Hmm I wonder if this is related to LUCENE-5434; we added incRef/decRef for NRT readers pulled from IndexWriter.  If you revert that change locally do you still see this happening? ",
+            "date": "2014-03-06T15:44:41+0000"
+        },
+        {
+            "id": "comment-13922847",
+            "author": "Tim Smith",
+            "content": "that seems to be the culprit\n\nin my IndexWriter subclass, i overrode incRefDeleter and decRefDeleter to be no-ops and it no longer fails horribly\n\nhopefully this doesn't have any negative effects (looks like that was all that was in the patch on LUCENE-5434, so worst case scenario i just don't get to take advantage of the benefits there)\n ",
+            "date": "2014-03-06T18:26:49+0000"
+        },
+        {
+            "id": "comment-13923813",
+            "author": "Michael McCandless",
+            "content": "Hmm, not good.  Can you describe what you are doing / boil it down to a test case? ",
+            "date": "2014-03-07T11:56:11+0000"
+        },
+        {
+            "id": "comment-13923910",
+            "author": "Tim Smith",
+            "content": "Here's what my test is doing:\n\n1. unpacks lucene 3.x era index (has one segment in it)\n2. opens IndexWriter on 3.x index\n3. opens DirectoryReader using IndexWriter\n4. Add 1 new document\n5. commit IndexWriter\n6. reopens DirectoryReader using IndexWriter\n7. optimizes IndexWriter\n8. commit optimized index\n9. reopens DirectoryReader using IndexWriter\n\nOne thing of note is that i have a custom IndexDeletionPolicy\nthis policy will hold onto \"named\" commit points \ni hold onto the previous commit point at commit time, and then release it shortly after the commit is finished, once i have persisted my acceptance of the new commit point (calling deleteUnusedFiles() to purge it)\n\n ",
+            "date": "2014-03-07T14:32:35+0000"
+        }
+    ]
+}

@@ -1,0 +1,108 @@
+{
+    "id": "LUCENE-7792",
+    "title": "Add optional concurrency to OfflineSorter",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "6.6",
+            "7.0"
+        ]
+    },
+    "description": "OfflineSorter is a heavy operation and is really an embarrassingly concurrent problem at heart, and if you have enough hardware concurrency (e.g. fast SSDs, multiple CPU cores) it can be a big speedup.\n\nE.g., after reading a partition from the input, one thread can sort and write it, while another thread reads the next partition, etc.  Merging partitions can also be done in the background.  Some things still cannot be concurrent, e.g. the initial read from the input must be a single thread, as well as the final merge and writing to the final output.\n\nI think I found a fairly non-invasive way to add optional concurrency to this class, by adding an optional ExecutorService to OfflineSorter's ctor (similar to IndexSearcher) and using futures to represent each partition as we sort, and creating Callable classes for sorting and merging partitions.",
+    "attachments": {
+        "LUCENE-7792.patch": "https://issues.apache.org/jira/secure/attachment/12864263/LUCENE-7792.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15976647",
+            "date": "2017-04-20T13:00:29+0000",
+            "content": "Patch, I think it's ready. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15976659",
+            "date": "2017-04-20T13:14:02+0000",
+            "content": "Looks good looking at the patch alone. It could be probably made more elegant if null executor was substituted with a \"same thread\" executor \u2013 then no if/else checks would be necessary, you'd simply pass the callable to an executor always (and it'd execute the job immediately on submission).\n\nSome day we could think of changing reThrow to return a dummy RuntimeException so that:\n\n+          IOUtils.reThrow(ee.getCause());\n+\n+          // dead code but javac disagrees:\n+          result = null;\n\n\ncould be changed to this:\n\n+          throw IOUtils.reThrow(ee.getCause());\n\n\n\nreThrow would never return any value anyway, but it'd shut up the compiler and make cleaner code (I think). ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-15976764",
+            "date": "2017-04-20T14:15:46+0000",
+            "content": "It could be probably made more elegant if null executor was substituted with a \"same thread\" executor \u2013 then no if/else checks would be necessary, you'd simply pass the callable to an executor always (and it'd execute the job immediately on submission).\n\nI was about to mention the same thing   Search for \"Executor\" in Solr's SimpleFacets.java which uses this technique. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-15977482",
+            "date": "2017-04-20T20:48:25+0000",
+            "content": "Some day we could think of changing reThrow to return a dummy RuntimeException so that:\n\n+1!  I get tired of typing that javac dig \n\nIt could be probably made more elegant if null executor was substituted with a \"same thread\" executor\nSearch for \"Executor\" in Solr's SimpleFacets.java which uses this technique.\n\nI agree this would be cleaner, but I really need a \"same thread\" (direct) ExecutorService here, I think?  Solr is using Executor there.\n\nI found this: http://stackoverflow.com/questions/6581188/is-there-an-executorservice-that-uses-the-current-thread/6583868 but that looked quite a bit more complex than the if/then. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15978202",
+            "date": "2017-04-21T07:15:58+0000",
+            "content": "I'll file a separate issue for reThrow.\n\nAs for executor service \u2013 we can do this as a separate issue. There are multiple ways to implement this:\n\n\timmediate (executorservice computes the result on the same thread in submit/execute; returns value-ready future),\n\tlazy (executorservice returns a future that lazily computes the result on the get-calling thread).\n\n\n\nThere is some bookkeeping if you want to be super exact (associated with termination status), but otherwise option 1 is fairly simple:\n\n    ExecutorService service = new AbstractExecutorService() {\n      private volatile boolean shutdown;\n\n      @Override\n      public void execute(Runnable command) {\n        checkShutdown();\n        command.run();\n      }\n\n      @Override\n      public List<Runnable> shutdownNow() {\n        shutdown();\n        return Collections.emptyList();\n      }\n\n      @Override\n      public void shutdown() {\n        this.shutdown = true;\n      }\n      \n      @Override\n      public boolean isTerminated() {\n        // Simplified: we don't check for any threads hanging in execute (we could\n        // introduce an atomic counter, but there seems to be no point).\n        return shutdown == true;\n      }\n      \n      @Override\n      public boolean isShutdown() {\n        return shutdown == true;\n      }\n\n      @Override\n      public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {\n        // See comment in isTerminated();\n        return true;\n      }\n\n      private void checkShutdown() {\n        if (shutdown) {\n          throw new RejectedExecutionException(\"Executor is shut down.\");\n        }\n      }      \n    };\n\n\nand is pretty much what you had in if/else. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-15978479",
+            "date": "2017-04-21T10:34:27+0000",
+            "content": "Thanks Dawid Weiss; I'll try your impl. above. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15979835",
+            "date": "2017-04-22T09:42:26+0000",
+            "content": "New patch; that ExecutorService impl works great!  Thanks Dawid Weiss. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15980070",
+            "date": "2017-04-22T18:28:10+0000",
+            "content": "Looks good to me. I'd be picky with naming and change two things:\n\n +  private ExecutorService randomExecutorService() {\n\n\nto randomExecutorServiceOrNull \u2013 hey, you're the one appending Ms or Nanos suffix for clarity!  \n\nThe second thing is to me SameThreadExecutorService is more understandable than DirectExecutorService, but maybe it's because I'm not a native speaker and need things to be more in your face. \n\nUp to you on both. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-15980937",
+            "date": "2017-04-24T09:37:37+0000",
+            "content": "OK I folded in those two suggestions Dawid Weiss; I think it's ready. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15984561",
+            "date": "2017-04-26T10:38:39+0000",
+            "content": "Commit db92a9efc2eeea9a8002a8b8b05828f2411d2a7b in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=db92a9e ]\n\nLUCENE-7792: add optional concurrency to OfflineSorter ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15984562",
+            "date": "2017-04-26T10:39:14+0000",
+            "content": "Commit bb8dd7a9f98dd172a66fe6686402500164d69162 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=bb8dd7a ]\n\nLUCENE-7792: add optional concurrency to OfflineSorter ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15984563",
+            "date": "2017-04-26T10:39:27+0000",
+            "content": "Thanks Dawid Weiss. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15984818",
+            "date": "2017-04-26T13:36:25+0000",
+            "content": "Commit 25f1dd2f9b2a984cc59202fe56f7a8860f514657 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=25f1dd2 ]\n\nLUCENE-7792: add try/finally to make sure semaphore is released on exceptions ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15984819",
+            "date": "2017-04-26T13:37:06+0000",
+            "content": "Commit e83829478e891eecd88a15067e29995f1b706cff in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e838294 ]\n\nLUCENE-7792: add try/finally to make sure semaphore is released on exceptions ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

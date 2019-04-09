@@ -1,0 +1,99 @@
+{
+    "id": "LUCENE-8005",
+    "title": "Avoid Class.getSimpleName in UsageTrackingQueryCachingPolicy",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "status": "Open",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": []
+    },
+    "description": "By profiling an Elasticsearch cluster, I found the private method UsageTrackingQueryCachingPolicy.isPointQuery to be quite expensive due to the clazz.getSimpleName() call.\n\nHere is an excerpt from hot_threads:\n\n\njava.lang.Class.getEnclosingMethod0(Native Method)\n       java.lang.Class.getEnclosingMethodInfo(Class.java:1072)\n       java.lang.Class.getEnclosingClass(Class.java:1272)\n       java.lang.Class.getSimpleBinaryName(Class.java:1443)\n       java.lang.Class.getSimpleName(Class.java:1309)\n       org.apache.lucene.search.UsageTrackingQueryCachingPolicy.isPointQuery(UsageTrackingQueryCachingPolicy.java:39)\n       org.apache.lucene.search.UsageTrackingQueryCachingPolicy.isCostly(UsageTrackingQueryCachingPolicy.java:54)\n       org.apache.lucene.search.UsageTrackingQueryCachingPolicy.minFrequencyToCache(UsageTrackingQueryCachingPolicy.java:121)\n       org.apache.lucene.search.UsageTrackingQueryCachingPolicy.shouldCache(UsageTrackingQueryCachingPolicy.java:179)\n       org.elasticsearch.index.shard.ElasticsearchQueryCachingPolicy.shouldCache(ElasticsearchQueryCachingPolicy.java:53)\n       org.apache.lucene.search.LRUQueryCache$CachingWrapperWeight.bulkScorer(LRUQueryCache.java:806)\n       org.elasticsearch.indices.IndicesQueryCache$CachingWeightWrapper.bulkScorer(IndicesQueryCache.java:168)\n       org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:665)\n       org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:472)\n       org.elasticsearch.search.query.QueryPhase.execute(QueryPhase.java:388)\n       org.elasticsearch.search.query.QueryPhase.execute(QueryPhase.java:108)",
+    "attachments": {
+        "LUCENE-8005.patch": "https://issues.apache.org/jira/secure/attachment/12893556/LUCENE-8005.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16215533",
+            "date": "2017-10-23T17:57:18+0000",
+            "content": "Attached a patch of one possible fix. It makes all existing Point*Query classes that I could find extend a new abstract base class, PointQuery, which extends Query then we can do an instanceof check instead of reflection.\n\nAlternatively, PointQuery could be an interface that each one implements. ",
+            "author": "Scott Somerville"
+        },
+        {
+            "id": "comment-16215539",
+            "date": "2017-10-23T18:02:42+0000",
+            "content": "Are you sure there is a real performance problem? I don't believe that accessing a class's getSimpleName is expensive.\n\nSuch \"sampling\" profiling techniques are fundamentally broken with java: http://psy-lob-saw.blogspot.com/2016/02/why-most-sampling-java-profilers-are.html ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16215556",
+            "date": "2017-10-23T18:11:53+0000",
+            "content": "Here's a quick code snippet:\n\n\n        Stopwatch sw = Stopwatch.createStarted();\n\n        for (int i = 0; i < 100_000_000; i++) {\n            Integer.class.getSimpleName();\n        }\n\n        System.out.println(\"getSimpleName took \" + sw);\n\n        sw.reset();\n        sw.start();\n\n        for (int i = 0; i < 100_000_000; i++) {\n            Integer.class.getSuperclass();\n        }\n\n        System.out.println(\"getSuperclass took \" + sw);\n\n        sw.reset();\n        sw.start();\n\n        Integer a = 42;\n\n        for (int i = 0; i < 100_000_000; i++) {\n            boolean b = a instanceof Number;\n        }\n\n        System.out.println(\"instanceof took \" + sw);\n\n\n\nOutput:\n\n\ngetSimpleName took 9.810 s\ngetSuperclass took 5.454 ms\ninstanceof took 4.348 ms\n\n ",
+            "author": "Scott Somerville"
+        },
+        {
+            "id": "comment-16215659",
+            "date": "2017-10-23T18:59:25+0000",
+            "content": "In case the above was too nonsensical, here is another snippet that actually uses the change:\n\n\n    long start = System.currentTimeMillis();\n    \n    Query q = IntPoint.newRangeQuery(\"intField\", 1, 1000);\n    \n    for (int i = 0; i < 10_000_000; i++) {\n      assertTrue(UsageTrackingQueryCachingPolicy.isCostly(q));\n    }\n    \n    System.out.println(\"Took \" + (System.currentTimeMillis() - start) + \"ms\");\n\n\n\nI ran it before and after, 3 times each:\n\n\nBEFORE: Took 7019ms, Took 7074ms, Took 8108ms\nAFTER:    Took 17ms,     Took 12ms,     Took 17ms\n\n ",
+            "author": "Scott Somerville"
+        },
+        {
+            "id": "comment-16215747",
+            "date": "2017-10-23T20:04:39+0000",
+            "content": "OK, but I think the issue should be restated (not avoid reflection, just avoid Class.getSimpleName).\n\nIf we care about this being faster we should change to use Class.getName which becomes the speed of an ordinary getter: http://hg.openjdk.java.net/jdk9/jdk9/jdk/file/tip/src/java.base/share/classes/java/lang/Class.java#l772\n\nIn our case here we don't deal with arrays so it should be very easy. I greatly prefer this to adding new abstractions (Lucene has too many of those). ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16215782",
+            "date": "2017-10-23T20:28:17+0000",
+            "content": "IMHO, the current code looks horrible. On the other hand, I agree with Robert that adding a superclass makes no sense as there is no funtionality to share. Maybe we will refactor some subclasses to use another query type. How about adding a marker interface and doing instance of check on it?\n\nI don't like the current code as it is not type safe. What happens if you create a new point query without \"point\" in the name? Or if you have your own class with a name like this? The full class name, as suggested by Robert, does not help with that, it just improves performance of the buggy check. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16215786",
+            "date": "2017-10-23T20:33:50+0000",
+            "content": "Yes, an interface was the other way I would have gone with it depending on the feedback here.\n\nI added a patch to use Class.getName and the timings from running my previous snippet became: 867ms, 861ms, 859ms\n\nSo a sizable improvement but not as fast as an instanceof check. ",
+            "author": "Scott Somerville"
+        },
+        {
+            "id": "comment-16215790",
+            "date": "2017-10-23T20:35:46+0000",
+            "content": "Hi Uwe, I agree with those concerns too. But we should separate the two issues:\n\n1) Class.getSimpleName not being fast enough\n2) doing it in a cleaner way.\n\nIt is possible to fix #1 without fixing #2. And its far too easy to add abstractions to lucene \"because its faster\". In this case the two concerns are unrelated, so IMO we should fix #1 here, and then make a separate issue about #2. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16215797",
+            "date": "2017-10-23T20:41:11+0000",
+            "content": "\nSo a sizable improvement but not as fast as an instanceof check.\n\nBut this is not the bottleneck for lucene's processing so we can't make decisions that way. Otherwise we optimize the wrong stuff. i wish it was the bottleneck, that 10 million queries could run in 20ms versus 900ms. But a ~ 100 ns cost to check if a query is cached seems reasonable to me. And the current speed of ~ 1 microsecond per query seems also just fine. \n\nI am more concerned that we don't introduce bad apis and complex abstractions. In this case I'm sorry, i dont see a performance justification for that. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16215812",
+            "date": "2017-10-23T20:50:49+0000",
+            "content": "Because of that I'd add a package private marker interface. Much cleaner and invisible from public API (a pkg private super all is invisible, too). The other idea would have been an annotation, but those are not inherited. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16215833",
+            "date": "2017-10-23T21:03:35+0000",
+            "content": "Robert: No disagreements here, was just contrasting the different results - apologies for the poor wording. I agree that the performance boost here is sufficient for something that isn't on a critical code path.\n\nUwe: The problem is some of these classes are in different packages/modules. For example:\n\n\torg.apache.lucene.spatial3d.PointInGeo3DShapeQuery\n\torg.apache.lucene.search.join.PointInSetIncludingScoreQuery\n\torg.apache.lucene.search.PointRangeQuery\n\n\n\nSo you either have to move these queries to the same package or add something to the public API.\n\nThis seems to be motivation for taking this approach ( https://issues.apache.org/jira/browse/LUCENE-7050 ) rather than doing a series of instanceof checks ",
+            "author": "Scott Somerville"
+        },
+        {
+            "id": "comment-16215849",
+            "date": "2017-10-23T21:11:55+0000",
+            "content": "Yeah my main argument is just, lets get any discussion of performance out of the way, this should be a pure API-driven decision.\n\nIn this case it strongly appears to me that you see this in a sampling profiler just because of safepoint bias since it calls a native method every time. calling a non-native method is of course a little faster, but it was never a perf issue: you have to be careful to avoid these profiler \"ghosts\".\n ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16216577",
+            "date": "2017-10-24T09:06:09+0000",
+            "content": "Maybe we should remove this special case for point queries, given that you can now ensure that they are not slow by coupling them with a doc-values query and let Lucene make the right decisions with IndexOrDocValuesQuery. ",
+            "author": "Adrien Grand"
+        }
+    ]
+}

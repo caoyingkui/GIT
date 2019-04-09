@@ -1,0 +1,99 @@
+{
+    "id": "LUCENE-5688",
+    "title": "NumericDocValues fields with sparse data can be compressed better",
+    "details": {
+        "type": "Improvement",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": []
+    },
+    "description": "I ran into this problem where I had a dynamic field in Solr and indexed data into lots of fields. For each field only a few documents had actual values and the remaining documents the default value ( 0 ) got indexed. Now when I merge segments, the index size jumps up.\n\nFor example I have 10 segments - Each with 1 DV field. When I merge segments into 1 that segment will contain all 10 DV fields with lots if 0s. \n\nThis was the motivation behind trying to come up with a compression for a use case like this.",
+    "attachments": {
+        "LUCENE-5688.patch": "https://issues.apache.org/jira/secure/attachment/12645789/LUCENE-5688.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14003212",
+            "author": "Varun Thacker",
+            "content": "Here is a quick patch. Wanted to get some feedback on the approach.\n\nWhen I run  the showIndexBloat method without the SPARSE_COMPRESSED changes, this is the size of the docValues data - \n\n-rw-r--r--  1 varun  wheel   9.9M May 20 18:28 _a_Lucene45_0.dvd\n-rw-r--r--  1 varun  wheel   312B May 20 18:28 _a_Lucene45_0.dvm\n\n\n\nWith the SPARSE_COMPRESSED changes\n\n-rw-r--r--  1 varun  wheel   2.7M May 20 18:51 _a_Lucene45_0.dvd\n-rw-r--r--  1 varun  wheel   352B May 20 18:51 _a_Lucene45_0.dvm\n\n ",
+            "date": "2014-05-20T13:25:52+0000"
+        },
+        {
+            "id": "comment-14003220",
+            "author": "Robert Muir",
+            "content": "I think this is a duplicate of LUCENE-4921 ?\n\nI guess the main thing is to differentiate between \"sparse\" data and \"thousands and thousands of fields\" which usually hints at the problem not being in lucene  ",
+            "date": "2014-05-20T13:29:38+0000"
+        },
+        {
+            "id": "comment-14003226",
+            "author": "Robert Muir",
+            "content": "Varun, i dont think we should make a long[] of size maxDoc in ram here just to save some space on disk. ",
+            "date": "2014-05-20T13:32:43+0000"
+        },
+        {
+            "id": "comment-14003231",
+            "author": "Grant Ingersoll",
+            "content": "Varun, i dont think we should make a long[] of size maxDoc in ram here just to save some space on disk.\n\nIn a large index, this can be quite significant, FWIW.  Agreed on the long[] in RAM, but would be good to have a better way of controlling the on-disk behavior. ",
+            "date": "2014-05-20T13:36:30+0000"
+        },
+        {
+            "id": "comment-14003234",
+            "author": "Varun Thacker",
+            "content": "Completely overlooked LUCENE-4921. Should I mark this as duplicate and post the same patch there?\n\nVarun, i dont think we should make a long[] of size maxDoc in ram here just to save some space on disk.\n\nI felt the same way when I was writing it, but that was the easiest way to get a quick patch out. I will try to think of a better way to achieve this. Do you have any suggestions?  ",
+            "date": "2014-05-20T13:37:59+0000"
+        },
+        {
+            "id": "comment-14003321",
+            "author": "Robert Muir",
+            "content": "You otherwise don't load hardly anything in RAM, so its extremely trappy to do this.\n\nAs i mentioned, the obvious approach is O(log N), like android's SparseArray. so array 1 is increasing documents that have value (can be a monotonicblockreader). you can binarysearch that to find your value in the \"real values\".\n\nYou have to decide how 'missing' should be represented. currently it will be 1 bit per document as well. if it stays that way, you can check that first (which is the typical case) before binary searching.\n\nIn all cases this has performance implications (slower access), and isn't specific to numerics (all dv fields could be sparse). So I think its best to start outside of the default codec rather than trying to do it automatically. Not everyone will want the space-time tradeoff. ",
+            "date": "2014-05-20T14:09:47+0000"
+        },
+        {
+            "id": "comment-14004562",
+            "author": "Adrien Grand",
+            "content": "+1 to using binary search on an in-memory MonotonicBlockPackedReader to implement sparse doc values.  ",
+            "date": "2014-05-21T10:45:11+0000"
+        },
+        {
+            "id": "comment-14008450",
+            "author": "Varun Thacker",
+            "content": "I created a new DocValue format - SparseDocValuesFormat\n\nI have just added Numeric support till now. Adding other should not take too long. Wanted to get some feedback on whether I'm on the right track.\n\nIt does a binary search on the position data which is read using MonotonicBlockPackedReader.\n\nAlso I am not too familiar with lucene-util but is there a test which benchmarks DocValue read times? Should be interesting to see the read time difference. ",
+            "date": "2014-05-25T21:47:18+0000"
+        },
+        {
+            "id": "comment-14012177",
+            "author": "Shai Erera",
+            "content": "It does a binary search on the position data which is read using MonotonicBlockPackedReader.\n\nPerhaps you can also experiment with a tiny hash-map, using plain int[]+long[] or a pair of packed arrays, instead of the binary search tree. I am writing one now because I am experimenting with improvements to updatable DocValues. It's based on Solr's HashDocSet which I modify to act as an int-to-long map. I can share the code here if you want.\n\nAlso I am not too familiar with lucene-util but is there a test which benchmarks DocValue read times? Should be interesting to see the read time difference.\n\nLuceneutil has a search task benchmark (searchBench.py) which you can use. I recently augmented it (while benchmarking updatable DV) with a sort-by-DocValues, so I think you can use that to exercise the sparse DV? Once you're ready to run the benchmark let me know, I can share the tasks file with you. You will also need to modify the indexer to create sparse DVs (make it configurable) as currently when DV is turned on, each document is indexed a set of fields.\n\nAbout the patch, I see you always encode a bitset + the values (sparse). I wonder if you used a hashtable-approach as I described above, you could just encode the docs that have a value. Then in the producer you can load them into memory (it's supposed to be small) and implement both getDocsWithField and getNumeric. It will impact docsWithField, but it's worth benchmarking I think.\n\nAnother thing, maybe this codec should wrap another and delegate to in case the number of docs-with-values exceeds some threshold? For instance, ignoring packing, the default DV encodes 8 bytes per document, while this codec encodes 12 bytes (doc+value) per document which has a value. So I'm thinking that unless the field is really sparse, we might prefer the default encoding. We should fold that as well into the benchmark. ",
+            "date": "2014-05-29T08:07:26+0000"
+        },
+        {
+            "id": "comment-14013414",
+            "author": "Varun Thacker",
+            "content": "Hi Shai,\n\nThanks for reviewing.\n\nPerhaps you can also experiment with a tiny hash-map, using plain int[]+long[] or a pair of packed arrays, instead of the binary search tree. I am writing one now because I am experimenting with improvements to updatable DocValues. It's based on Solr's HashDocSet which I modify to act as an int-to-long map. I can share the code here if you want\n\nSure this approach looks promising also. Faster access vs more memory. Perhaps we could provide both options in the same codec.\n\nAnother thing, maybe this codec should wrap another and delegate to in case the number of docs-with-values exceeds some threshold? For instance, ignoring packing, the default DV encodes 8 bytes per document, while this codec encodes 12 bytes (doc+value) per document which has a value. So I'm thinking that unless the field is really sparse, we might prefer the default encoding. We should fold that as well into the benchmark.\n\nI thought about it, but since we are writing a codec dedicated to sparse values and not adding it as an optimization for the default codec I did not include it in my patch. If you feel that we should then I will add it.\n\nA couple of other general doubts that I had - \n\n\tCurrently only addNumericField is implemented. Looking at the Lucene45DocValuesConsumer - addBinaryField does not write missing value so the same code can be reused?\n\tFor addSortedField, addSortedSetField the only method which needs to be changed would be addTermsDict?\n\n ",
+            "date": "2014-05-30T08:26:00+0000"
+        },
+        {
+            "id": "comment-14014922",
+            "author": "Shai Erera",
+            "content": "Ahh, I see now that you only wrote a DVFormat, not a Codec. In that case I agree, apps should plug it in per-field and that it doesn't need to wrap another format. Can you perhaps make the Consumer/Producer package-private? I think only the Format needs to be public?\n\nAbout Binary field, indeed it doesn't write the data if a BytesRef is missing, but it does write all the meta information, e.g. the missing bitset, the addresses (in case the BytesRef aren't of equal length). So I think sparseness should be really sparse. But I'm fine if you leave that out for now - we first need to make sure the numeric field performs and that there are any gains (even if only during indexing). ",
+            "date": "2014-06-01T07:26:08+0000"
+        },
+        {
+            "id": "comment-14019814",
+            "author": "Varun Thacker",
+            "content": "Can you perhaps make the Consumer/Producer package-private? I think only the Format needs to be public?\n\nDone. Lucene45DocValues producer and consumer are public. We could fix that in some other issue?\n\nIn SparseDocValuesProducer I have implemented 2 ways to get numerics - \ngetNumericUsingBinarySearch -> uses the binary search approach\ngetNumericUsingHashMap -> uses a hash map based approach\n\nTest passes for both. So I think we should benchmark both approaches. based on the results we could pick one approach or even have both on them and pick the right stratergy using data from the benchmark results.\n\nIt's based on Solr's HashDocSet which I modify to act as an int-to-long map. I can share the code here if you want.\nThat will be great. We can replace the HashMap in getNumericUsingHashMap with this.\n\nFrom what I understand this is how we can run luceneutil benchmark tests - \n\n\tpython setup.py -prepareTrunk\n\tsvn checkout https://svn.apache.org/repos/asf/lucene/dev/trunk patch\n\tApply the patch in this checkout\n\tWe need a task file and then call searchBench.py with -index and -search\n\n ",
+            "date": "2014-06-06T13:02:56+0000"
+        },
+        {
+            "id": "comment-14993822",
+            "author": "Adrien Grand",
+            "content": "Fixed via LUCENE-6863 ",
+            "date": "2015-11-06T15:35:12+0000"
+        }
+    ]
+}

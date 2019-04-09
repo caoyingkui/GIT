@@ -1,0 +1,494 @@
+{
+    "id": "LUCENE-5879",
+    "title": "Add auto-prefix terms to block tree terms dict",
+    "details": {
+        "type": "New Feature",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/codecs"
+        ],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.2",
+            "6.0"
+        ]
+    },
+    "description": "This cool idea to generalize numeric/trie fields came from Adrien:\n\nToday, when we index a numeric field (LongField, etc.) we pre-compute\n(via NumericTokenStream) outside of indexer/codec which prefix terms\nshould be indexed.\n\nBut this can be inefficient: you set a static precisionStep, and\nalways add those prefix terms regardless of how the terms in the field\nare actually distributed.  Yet typically in real world applications\nthe terms have a non-random distribution.\n\nSo, it should be better if instead the terms dict decides where it\nmakes sense to insert prefix terms, based on how dense the terms are\nin each region of term space.\n\nThis way we can speed up query time for both term (e.g. infix\nsuggester) and numeric ranges, and it should let us use less index\nspace and get faster range queries.\n\nThis would also mean that min/maxTerm for a numeric field would now be\ncorrect, vs today where the externally computed prefix terms are\nplaced after the full precision terms, causing hairy code like\nNumericUtils.getMaxInt/Long.  So optos like LUCENE-5860 become\nfeasible.\n\nThe terms dict can also do tricks not possible if you must live on top\nof its APIs, e.g. to handle the adversary/over-constrained case when a\ngiven prefix has too many terms following it but finer prefixes\nhave too few (what block tree calls \"floor term blocks\").",
+    "attachments": {
+        "LUCENE-5879.patch": "https://issues.apache.org/jira/secure/attachment/12660594/LUCENE-5879.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14090530",
+            "author": "Michael McCandless",
+            "content": "Initial work-in-progress patch: tests do NOT consistently pass, there\nare still bugs/corner cases (e.g. when an auto-prefix term is the last\nterm in a block...).\n\nThis change very much requires LUCENE-5268 (pull API for postings\nformat) which I'd like to backport to 4.x along with this: it makes an\ninitial pass through all terms to identify \"good\" prefixes, using the\nsame algorithm block tree uses to assign terms to blocks, just with\ndifferent block sizes.  I haven't picked defaults yet, but e.g. you\ncould state that an auto prefix term should expand to 100-200 terms\nand then the first pass picks prefix terms to handle that.\n\nThe problem is inherently over-constrained: a given set of prefixes\nlike fooa*, foob*, fooc*, etc. may have too-few terms each, but then\ntheir common prefix foo* would have way too many.  For this case it\ncreates \"floored\" prefix terms, e.g. foo[a-e]*, foo[f-p]*, foo[q-z]*.\n\nOn the 2nd pass, when it writes the actual terms, it inserts these\nauto-prefix terms at the right places.\n\nCurrently it only works for DOCS_ONLY fields, and it uses a\nFixedBitSet(maxDoc) when writing each prefix term.\n\nThese auto-prefix terms are fully hidden from all the normal\nTerms/Enum APIs, statistics, etc.  They are only used in\nTerms.intersect, if you pass a new flag allowing them to be used.\n\nI haven't done anything about the document / searching side of things:\nthis is just a low level change at this point, for the terms dict.\nMaybe we need a new FieldType boolean \"computeAutoPrefixTerms\" or some\nsuch; currently it's just exposed as additional params to the block\ntree terms dict writer.\n\nI think this would mean NumericRangeQuery/Filter can just rewrite to\nordinary TermRangeQuery/Filter, and the numeric fields just become\nsugar for encoding their numeric values as sortable binary terms. ",
+            "date": "2014-08-08T09:34:50+0000"
+        },
+        {
+            "id": "comment-14092809",
+            "author": "Michael McCandless",
+            "content": "Another iteration ... still tons of nocommits.  I added Automata.makeBinaryInterval, so you can easily make an automaton that matches a min / max term range.  I plan to switch the read-time API to use a new CompiledAutomaton.AUTOMATON_TYPE.RANGE, and fix e.g. PrefixQuery (and eventually maybe the infix suggester, and numeric range query) to use this API. ",
+            "date": "2014-08-11T14:23:11+0000"
+        },
+        {
+            "id": "comment-14093891",
+            "author": "Adrien Grand",
+            "content": "Thanks Mike for working on this, this is a very exciting issue! I'm very curious what the space/speed trade-off will look-like compared to static prefix encoding like NumericUtils does.\n\nMaybe we need a new FieldType boolean \"computeAutoPrefixTerms\"\n\nWhy would it be needed? If the search APIs use intersect, this should be transparent?\n\n\n ",
+            "date": "2014-08-12T08:30:15+0000"
+        },
+        {
+            "id": "comment-14093924",
+            "author": "Michael McCandless",
+            "content": "\nMaybe we need a new FieldType boolean \"computeAutoPrefixTerms\"\n\nWhy would it be needed? If the search APIs use intersect, this should be transparent?\n\nI think being totally transparent would be the best solution!  This would mean BT will always index auto-prefix terms for DOCS_ONLY fields ... I'll just have to test what the indexing time / disk usage cost is.  If we need to make it optional at indexing time, I'm not sure what the API should look like to make it easy... ",
+            "date": "2014-08-12T09:36:32+0000"
+        },
+        {
+            "id": "comment-14093926",
+            "author": "Robert Muir",
+            "content": "If the existing API is confusing, making it worse by adding a confusing boolean won't really fix the problem. ",
+            "date": "2014-08-12T09:40:59+0000"
+        },
+        {
+            "id": "comment-14093929",
+            "author": "Uwe Schindler",
+            "content": "In fact, as far as I see: NumericRangeQuery with that would then just be a standard TermRangeQuery with a special binary upper/lower term?\n\nOtherwise very cool! ",
+            "date": "2014-08-12T09:56:25+0000"
+        },
+        {
+            "id": "comment-14094076",
+            "author": "Michael McCandless",
+            "content": "In fact, as far as I see: NumericRangeQuery with that would then just be a standard TermRangeQuery with a special binary upper/lower term?\n\nI think so!  We should be able to use NumericUtils.XToSortableInt/Long I think?\n\nBut that's phase 2 here... it's hard enough just getting these terms working low-level... ",
+            "date": "2014-08-12T14:07:39+0000"
+        },
+        {
+            "id": "comment-14106905",
+            "author": "Michael McCandless",
+            "content": "Latest patch: tests are passing, but still many nocommits ... I think net/net the approach is done and now I'm gonna wrap up / clean nocommits. ",
+            "date": "2014-08-22T14:36:36+0000"
+        },
+        {
+            "id": "comment-14109791",
+            "author": "Michael McCandless",
+            "content": "New patch, resolving a few nocommits (but more remain!).  Tests pass.\n\nI created a simple benchmark, generating random longs over the full\nrange, and random ranges as queries.  For each test, I build the index\nonce (10M longs), and then run all queries (10K random ranges) 10\ntimes and record best time.  I also print out the number of terms\nvisited for the first query as a coarse measure of the prefix terms\ndensity.\n\nNF is numeric field and AP is auto-prefix. For AP I just index the\nlong values as 8 byte binary term, using the same logic in\nNumericUtils.longToPrefixCodedBytes to make the binary sort the same\nas the numeric sort.\n\nSource code for benchmark is here:\n\n  https://code.google.com/a/apache-extras.org/p/luceneutil/source/browse/src/python/autoPrefixPerf.py\n\nAnd here:\n\n  https://code.google.com/a/apache-extras.org/p/luceneutil/source/browse/src/main/perf/AutoPrefixPerf.java\n\nIndexer uses single thread and SerialMergeScheduler to try to measure\nthe added indexing cost terms writing.\n\nCurrently the auto-prefix terms are configured like term blocks in\nblock tree, with a min/max number of items (terms, or \"child\"\nauto-prefix terms) per auto-prefix term.\n\nHere are the raw results ... net/net it looks like AP can match NF's\nperformance with a ~50% smaller index and slightly faster indexing\ntime.  The two approaches are quite different: NF uses TermsEnum.seek,\nbut AP uses Terms.intersect which for block tree does no seeking.\n\nHowever, there's a non-trivial indexing time & space cost vs the\nbaseline... not sure we can/should just always enable this by default\nfor DOCS_ONLY fields ...\n\n\nBaseline (8-byte binary terms like AP)\n    index sec 20.312 sec\n    index MB 123.4\n\nNF precStep=4\n    index sec 225.06\n    index MB 1275.70\n    term count 560\n    search msec 6056\nNF precStep=8\n    index sec 115.44\n    index MB 675.55\n    term count 2983\n    search msec 5547\nNF precStep=12\n    index sec 80.77\n    index MB 470.96\n    term count 37405\n    search msec 6080\nNF precStep=16 (default)\n    index sec 61.13\n    index MB 363.19\n    term count 125906\n    search msec 10466\nAP min=5 max=8\n    index sec 194.21\n    index MB 272.06\n    term count 315\n    search msec 5715\nAP min=5 max=12\n    index sec 179.86\n    index MB 256.88\n    term count 295\n    search msec 5771\nAP min=5 max=16\n    index sec 168.91\n    index MB 254.32\n    term count 310\n    search msec 5727\nAP min=5 max=20\n    index sec 157.48\n    index MB 252.04\n    term count 321\n    search msec 5742\nAP min=5 max=2147483647\n    index sec 64.03\n    index MB 164.55\n    term count 3955\n    search msec 6168\nAP min=10 max=18\n    index sec 106.52\n    index MB 215.26\n    term count 552\n    search msec 5792\nAP min=10 max=27\n    index sec 99.00\n    index MB 212.45\n    term count 533\n    search msec 5814\nAP min=10 max=36\n    index sec 88.45\n    index MB 207.43\n    term count 505\n    search msec 5850\nAP min=10 max=45\n    index sec 79.15\n    index MB 194.73\n    term count 650\n    search msec 5681\nAP min=10 max=2147483647\n    index sec 42.68\n    index MB 162.64\n    term count 6077\n    search msec 6199\nAP min=15 max=28\n    index sec 84.83\n    index MB 204.29\n    term count 641\n    search msec 5763\nAP min=15 max=42\n    index sec 74.20\n    index MB 193.24\n    term count 753\n    search msec 5828\nAP min=15 max=56\n    index sec 63.69\n    index MB 190.06\n    term count 662\n    search msec 5839\nAP min=15 max=70\n    index sec 62.53\n    index MB 185.96\n    term count 866\n    search msec 5846\nAP min=15 max=2147483647\n    index sec 40.94\n    index MB 162.52\n    term count 6258\n    search msec 6156\nAP min=20 max=38\n    index sec 69.26\n    index MB 192.11\n    term count 839\n    search msec 5837\nAP min=20 max=57\n    index sec 60.75\n    index MB 186.18\n    term count 1034\n    search msec 5877\nAP min=20 max=76\n    index sec 60.69\n    index MB 185.21\n    term count 980\n    search msec 5866\nAP min=20 max=95\n    index sec 59.87\n    index MB 184.20\n    term count 985\n    search msec 5940\nAP min=20 max=2147483647\n    index sec 41.64\n    index MB 162.52\n    term count 6258\n    search msec 6196\nAP min=25 max=48\n    index sec 61.81\n    index MB 187.08\n    term count 806\n    search msec 5790\nAP min=25 max=72\n    index sec 58.69\n    index MB 183.02\n    term count 929\n    search msec 5894\nAP min=25 max=96\n    index sec 56.80\n    index MB 178.29\n    term count 841\n    search msec 5938\nAP min=25 max=120\n    index sec 55.81\n    index MB 177.75\n    term count 1044\n    search msec 5883\nAP min=25 max=2147483647\n    index sec 40.99\n    index MB 162.52\n    term count 6258\n    search msec 6189\nAP min=30 max=58\n    index sec 56.99\n    index MB 182.91\n    term count 1012\n    search msec 5891\nAP min=30 max=87\n    index sec 55.22\n    index MB 178.16\n    term count 1065\n    search msec 5921\nAP min=30 max=116\n    index sec 54.78\n    index MB 177.39\n    term count 1142\n    search msec 5811\nAP min=30 max=145\n    index sec 54.22\n    index MB 176.64\n    term count 1340\n    search msec 5798\nAP min=30 max=2147483647\n    index sec 40.76\n    index MB 162.44\n    term count 6445\n    search msec 6191\nAP min=35 max=68\n    index sec 56.75\n    index MB 182.45\n    term count 1265\n    search msec 5403\nAP min=35 max=102\n    index sec 53.87\n    index MB 177.99\n    term count 1302\n    search msec 5924\nAP min=35 max=136\n    index sec 51.10\n    index MB 177.25\n    term count 1547\n    search msec 6082\nAP min=35 max=170\n    index sec 50.77\n    index MB 176.93\n    term count 1402\n    search msec 5994\nAP min=35 max=2147483647\n    index sec 40.73\n    index MB 161.75\n    term count 8045\n    search msec 6271\nAP min=40 max=78\n    index sec 55.75\n    index MB 185.57\n    term count 1499\n    search msec 5917\nAP min=40 max=117\n    index sec 53.12\n    index MB 180.57\n    term count 1501\n    search msec 5961\nAP min=40 max=156\n    index sec 50.93\n    index MB 179.38\n    term count 1806\n    search msec 5487\nAP min=40 max=195\n    index sec 50.31\n    index MB 178.81\n    term count 1763\n    search msec 5484\nAP min=40 max=2147483647\n    index sec 38.59\n    index MB 158.98\n    term count 12573\n    search msec 6281\n\n ",
+            "date": "2014-08-25T21:43:49+0000"
+        },
+        {
+            "id": "comment-14112128",
+            "author": "Adrien Grand",
+            "content": "The numbers look great, it's quite interesting to see the impact of the auto-prefix parameters on the number of visited terms! ",
+            "date": "2014-08-27T10:52:03+0000"
+        },
+        {
+            "id": "comment-14130852",
+            "author": "Michael McCandless",
+            "content": "Another patch, with all real nocommits removed (the only ones that\nremain are for DEBUG prints... I'll remove those before committing).\nI think this is close.\n\nI picked a \"gentle\" (does not add too many auto-prefix terms) default\nof minItemsInPrefix=100 and maxItemsInPrefix=Integer.MAX_VALUE.\n\nWith these defaults, on the simple \"random longs\" test, the increase\nin index size for DOCS_ONLY fields is small (123.4 MB vs 137.69 MB:\n~12%), much smaller than current default precStep=16 for long\nNumericField (363.19 MB vs 137.69 MB: ~62% smaller) and search time is\nfaster (10.5 sec vs 6.0 sec: ~43% faster).  Indexing time is also ~2X\nfaster (29.96 sec vs 61.13 sec) than using default NumericField, but\n~48% slower (20.31 sec vs 29.96 sec) than indexing simple binary\nterms.\n\nI think it's OK to just turn this on by default for all DOCS_ONLY\nfields... apps can always disable by passing minItemsInPrefix=0 to\nLucene41PF or BlockTreeTermsWriter if necessary.\n\nNote that this optimization currently only kicks in for TermRangeQuery\nand PrefixQuery.  It's also possible to enable it for certain wildcard\n(e.g. foo?x*) and regexp (e.g. foo[m-p]*) queries but this can wait.\n\nThere is plenty more to explore here in how auto-prefix terms are\nassigned, e.g. like the multi-level postings skip lists, we could have\ndifferent thresholds for the \"level 1\" (the prefix matches real terms)\nskip lists vs \"level 2+\" (the prefix also matches other prefix terms),\nbut we can iterate later / get feedback from users.\n\nWith this change an application can simply index numbers as binary\nterms (carefully flipping the sign bit so negative numbers sort\nbefore) or as fixed width terms (zero or space left-filled, e.g,\n000042) and then run \"ordinary\" TermRangeQuery on them, and should see\ngood improvements in index size, indexing time, search performance vs\nNumericRangeFilter. ",
+            "date": "2014-09-11T23:15:51+0000"
+        },
+        {
+            "id": "comment-14131593",
+            "author": "Michael McCandless",
+            "content": "Hmm, one problem here is ... with this patch we are inserting\nauto-prefix terms for numeric fields which is sort of silly (prefix\nterms of prefix terms).  Not sure if/how to prevent that... I guess we\ncould do something hacky and try to detect when writing the postings\nthat it's a numeric field ... hmm.\n\nI removed the DEBUG nocommits and ran a trunk vs patch perf test on\nall English wikipedia \"medium\" docs (33.3M) and it didn't look like\nthere was any real change, just noise. ",
+            "date": "2014-09-12T14:22:59+0000"
+        },
+        {
+            "id": "comment-14135189",
+            "author": "Michael McCandless",
+            "content": "New patch: I added an option (default off) to FieldType\nfor the application to \"hint\" that the field should be\nindexed for range querying/filtering if possible.\nIt's experimental, only allowed if the field is DOCS_ONLY, and the\njavadocs explain that this is just a hint (postings format can\nignore it entirely).\n\nThis value is propagated to \"auto write-once schema\" FieldInfo.getIndexRanges(),\nwhich has same semantics as omitNorms (\"once off always off\").  This\nmeans if you want to try out this new feature on a field you must\nfully re-index (or use FilterAtomicReader to reprocess your entire\nindex).\n\nSince this is now an \"opt-in\" feature, I also made the defaults more\naggressive (25/48: same defaults for pinching off a block of terms,\ni.e. one prefix term per leaf term block).\n\nAt these defaults index is 52% larger for random longs (187.08 MB vs\nbaseline 123.4) but 48 % smaller than default (precStep=16) numeric\nfield, and search time is 45% faster (5790 msec vs 10466 with NF\nprecStep=16).  Indexing speed is about the same as NF...\n\nSeparately I also tested the \"sequential IDs\" case, indexing 100M ids in\nleft-zero-prefixed sequential form (0001, 0002, ...); normally one\nwouldn't enable indexRanges for such a field (the \"normal\" use case is\njust PK lookup) but I still wanted to see how auto-prefix terms behave\non such a \"dense\" term space:\n\n\n\tIndex was 14.1% larger (874 MB to 997 MB)\n\n\n\n\n\tIndexing time was 2.5X slower (227 sec to 562 sec)\n\n\n\nNet/net I think sequential IDs / densely packed terms is an \"easy\"\ncase since block tree can easily hit the max (default now 48) terms in\neach auto-prefix term.  Also the postings compress very well since the\ndocIDs are all adjacent (I indexed with a single thread).\n\nTests pass, \"ant precommit\" passes, I think it's ready. ",
+            "date": "2014-09-16T09:28:36+0000"
+        },
+        {
+            "id": "comment-14135289",
+            "author": "Robert Muir",
+            "content": "Can experimental please be added to indexablefieldtype and everywhere else?\n\nI am afraid if even a single spot is missed, it could prevent a future refactoring or cleanup that removes this (which really in the future belongs as a codec parameter, but this is good for now). ",
+            "date": "2014-09-16T11:08:12+0000"
+        },
+        {
+            "id": "comment-14135389",
+            "author": "Michael McCandless",
+            "content": "Can experimental please be added to indexablefieldtype and everywhere else?\n\nWoops I missed that one; I'll add it, and double check all the other places this boolean crawls to... ",
+            "date": "2014-09-16T12:56:43+0000"
+        },
+        {
+            "id": "comment-14140477",
+            "author": "Michael McCandless",
+            "content": "I plan to commit this soon to 5.0... we can iterate on the \"phase 2\" items (making it easier during indexing to note that this field will be used for range searching). ",
+            "date": "2014-09-19T13:37:25+0000"
+        },
+        {
+            "id": "comment-14140858",
+            "author": "Uwe Schindler",
+            "content": "And how about NRQ? The same? Currently its unsupported, because we have to figure out how to auto-disable trie terms and how to make NRQ autorewrite to a simple TermRange if no trie terms available and instead only autoprefix terms... ",
+            "date": "2014-09-19T16:51:16+0000"
+        },
+        {
+            "id": "comment-14140916",
+            "author": "Robert Muir",
+            "content": "We should think about a migration plan for numerics? \n\nThis should be a followup issue.\n\nHere are some thoughts.\n1. keep current trie \"Encoding\" for terms, it just uses precision step=Inf and lets the term dictionary do it automatically.\n2. create a filteratomicreader, that for a previous trie encoded field, removes \"fake\" terms on merge.\n\nUsers could continue to use NumericRangeQuery just with the infinite precision step, and it will always work, just execute slower for old segments as it doesnt take advantage of the trie terms that are not yet merged away.\n\nOne issue to making it really nice, is that lucene doesnt know for sure that a field is numeric, so it cannot be \"full-auto\". Apps would have to use their schema or whatever to wrap with this reader in their merge policy.\n\nMaybe we could provide some sugar for this, such as a wrapping merge policy that takes a list of field names that are numeric, or sugar to pass this to IWC in IndexUpgrader to force it, and so on.\n\nI think its complicated enough for a followup issue though. ",
+            "date": "2014-09-19T17:24:45+0000"
+        },
+        {
+            "id": "comment-14140925",
+            "author": "David Smiley",
+            "content": "Wow, awesome work Mike!  And fantastic idea Adrien!\n\nI just read through the comments but don't have time to dig into the source yet.\n\n\tIs the auto-prefixing done on a per-segment basis or is it something different that has to do with Codec internals?  It appears to be the latter.\n\tIs this applicable to variable-length String fields that you might want to do range queries on for whatever reason? Such as... A*, B*, C*   or A-G, H-P, ... etc. ?  It appears this is applicable.\n\tWould any CompiledAutomaton (e.g. a wildcard query) that has a leading prefix benefit from this or is it strictly Prefix & Range queries?  Mike's comments suggest it will sometime but not yet. Can you create an issue for it, Mike?  This would be especially useful in Lucene-spatial; I'm excited at the prospects!\n\tWhen you iterate a TermsEnum, will the prefix terms be exposed or is it internal to the Codec?\n\n ",
+            "date": "2014-09-19T17:28:47+0000"
+        },
+        {
+            "id": "comment-14140942",
+            "author": "David Smiley",
+            "content": "Is the auto-prefixing done on a per-segment basis or is it something different that has to do with Codec internals? It appears to be the latter.\n\nI asked that in a confusing way.  I mean, are the intervals that are computed from the data determined and fixed within a given segment, or is it variable throughout the segment? ",
+            "date": "2014-09-19T17:39:08+0000"
+        },
+        {
+            "id": "comment-14141048",
+            "author": "Michael McCandless",
+            "content": "I like that plan Rob, except the term encoding that numeric field uses is somewhat wasteful: 1 byte used to encode the \"shift\", and then only 7 of 8 bits use for subsequent bytes ... but maybe we just live with that since it simplifies migration (both old and new can co-exist in one index).\n\nI'll open an issue for this. ",
+            "date": "2014-09-19T18:35:31+0000"
+        },
+        {
+            "id": "comment-14141061",
+            "author": "Michael McCandless",
+            "content": "OK I created LUCENE-5966 for the migration plan... ",
+            "date": "2014-09-19T18:40:45+0000"
+        },
+        {
+            "id": "comment-14141096",
+            "author": "Michael McCandless",
+            "content": "Wow, awesome work Mike! And fantastic idea Adrien!\n\nThanks David Smiley\n\nI mean, are the intervals that are computed from the data determined and fixed within a given segment, or is it variable throughout the segment?\n\nIt's per-segment, so each segment will look at how its terms fall and find \"good\" places to insert the auto-prefix terms.\n\nIs this applicable to variable-length String fields that you might want to do range queries on for whatever reason? Such as... A*, B*, C* or A-G, H-P, ... etc. ? It appears this is applicable.\n\nI don't quite understand the question ... the indexed terms can be any variable length.\n\nWould any CompiledAutomaton (e.g. a wildcard query) that has a leading prefix benefit from this or is it strictly Prefix & Range queries? Mike's comments suggest it will sometime but not yet. Can you create an issue for it, Mike? This would be especially useful in Lucene-spatial; I'm excited at the prospects!\n\nCurrently auto-prefix terms are only used for PrefixQuery and TermRangeQuery, or for any automaton query that \"becomes\" a PrefixQuery on rewrite (e.g. WildcardQuery(\"foo*\")).\n\nEnabling them for WildcardQuery and RegexpQuery should be fairly easy, however they will only kick in in somewhat exotic situations, where there is a portion of the term space accepted by the automaton which \"suddenly\" accepts any suffix.  E.g. foo*bar will never use auto-prefix terms, but foo?b* will.\n\nI'll open an issue!\n\nWhen you iterate a TermsEnum, will the prefix terms be exposed or is it internal to the Codec?\n\nNo, these auto-prefix terms are invisible in all APIs, except when you call Terms.intersect. ",
+            "date": "2014-09-19T19:02:40+0000"
+        },
+        {
+            "id": "comment-14141101",
+            "author": "Michael McCandless",
+            "content": "OK I opened LUCENE-5967 to allow Wildcard/RegexpQuery to use auto-prefix terms... ",
+            "date": "2014-09-19T19:05:22+0000"
+        },
+        {
+            "id": "comment-14141108",
+            "author": "David Smiley",
+            "content": "Is this applicable to variable-length String fields that you might want to do range queries on for whatever reason? Such as... A*, B*, C* or A-G, H-P, ... etc. ? It appears this is applicable.\n\nI don't quite understand the question ... the indexed terms can be any variable length.\n\nI simply mean is this useful outside of numeric fields?\n\nAnother question I have is, does the automatic prefix length calculation do it at byte boundaries or is it intra-byte? ",
+            "date": "2014-09-19T19:11:13+0000"
+        },
+        {
+            "id": "comment-14141114",
+            "author": "Michael McCandless",
+            "content": "I simply mean is this useful outside of numeric fields?\n\nOh, it's for any terms ... numeric or not.\n\nAnother question I have is, does the automatic prefix length calculation do it at byte boundaries or is it intra-byte?\n\nIt's currently byte-boundary only, though this is an impl detail and we could do e.g. nibbles in the future ... ",
+            "date": "2014-09-19T19:13:42+0000"
+        },
+        {
+            "id": "comment-14142425",
+            "author": "Michael McCandless",
+            "content": "New patch, folding in feedback from Rob.\n\nFirst off, nothing (!!) was testing that you could use one of the\nBOOLEAN_QUERY_REWRITE methods in MTQ when auto-prefix terms were\nenumeratd.\n\nWhen I added that, it trips this assert in ScoringRewrite:\n\n\n        assert reader.docFreq(term) == termStates[pos].docFreq();\n\n\n\nThis trips when the term returned by IntersectTermsEnum is an\nauto-prefix term, in which case reader.docFreq cannot find the term\nsince auto-prefix terms are invisible to all APIs except intersect.\n\nI fixed this by adding a hackish boolean isRealTerm to BlockTermState,\nand changed the assert to only check if it knows it's looking at real\nterms.\n\nHowever, I also had to fix AssertingAtomicReader.AssertingTermsEnum,\nto override seekExact(BytesRef, TermState) and termState() to delegate\nto the delegate (in) instead of to super ... super will fail because\nit falls back to seeking by term, which cannot work here because you\ncan't seek by an auto-prefix term.\n\nThis is a little scary ... because you are allowed to\nseekExact(BytesRef, TermState) for an auto-prefix term, meaning\nauto-prefix terms are in fact NOT invisible in this API.  This is a\npossibly nasty trap, for any FilterAtomicReaders out there, that rely\non super.... not sure what to do.\n\nAlso, Rob noticed that CheckIndex no longer checks all bits ... this\nis pretty bad ... I put a nocommit to think about what to do ... ",
+            "date": "2014-09-21T11:15:50+0000"
+        },
+        {
+            "id": "comment-14142590",
+            "author": "David Smiley",
+            "content": "Some more questions:\n\nIt's per-segment, so each segment will look at how its terms fall and find \"good\" places to insert the auto-prefix terms.\n\nSo for the whole segment, does it decide to insert auto-prefix'es at specific byte lengths (e.g. 3, 5, and 7)?   Or does it vary based on specific terms?  I'm hoping it's smart enough to vary based on specific terms.  For example if, hypothetically there were lots of terms that had this common prefix: \"BGA\" then it might decide \"BGA\" makes a good auto-prefix but not necessarily all terms at length 3 since many others might not make good prefixes.  Make sense?\n\nAt a low level, do I take advantage of this in the same way that I might do so at a high level using PrefixQuery and then getting the weight then getting the scorer to iterate docIds?  Or is there a lower-level path?  Although there is some elegance to not introducing new APIs, I think it's worth exploring having prefix & range capabilities be on the TermsEnum in some way.\n\nDo you envision other posting formats being able to re-use the logic here?  That would be nice.\n\nIn your future tuning, I suggest you give the ability to vary the conservative vs aggressive prefixing based on the very beginning and very end (assuming known common lengths).  In the FlexPrefixTree Varun (GSOC) worked on, the leaves per level is configurable at each level (i.e. prefix length)... and it's better to have little prefixing at the very top and little at the bottom too.  At the top, prefixes only help for queries span massive portions of the possible term space (which in spatial is rare; likely other apps too).  And at the bottom (long prefixes) just shy of the maximum length (say 7 bytes out of 8 for a double), there is marginal value because in the spatial search algorithm, the bottom detail is scan'ed over (e.g. TermsEnum.next()) instead of seek'ed, because the data is less dense and it's adjacent.  This principle may apply to numeric-range queries depending on how they are coded; I'm not sure. ",
+            "date": "2014-09-21T19:32:51+0000"
+        },
+        {
+            "id": "comment-14142766",
+            "author": "Robert Muir",
+            "content": "\n Although there is some elegance to not introducing new APIs, I think it's worth exploring having prefix & range capabilities be on the TermsEnum in some way.\n\nIts not that, its that there is absolutely no reason for making termsenum more complex in this way. it would accomplish nothing and would not make anything more efficient. \n\nThese apis really should be minimal ",
+            "date": "2014-09-21T23:12:53+0000"
+        },
+        {
+            "id": "comment-14143219",
+            "author": "Michael McCandless",
+            "content": "\nSo for the whole segment, does it decide to insert auto-prefix'es at specific byte lengths (e.g. 3, 5, and 7)? Or does it vary based on specific terms? I'm hoping it's smart enough to vary based on specific terms. For example if, hypothetically there were lots of terms that had this common prefix: \"BGA\" then it might decide \"BGA\" makes a good auto-prefix but not necessarily all terms at length 3 since many others might not make good prefixes. Make sense?\n\nIt's dynamic, based on how terms occupy the space.\n\nToday (and we can change this: it's an impl. detail) it assigns\nprefixes just like it assigns terms to blocks.  Ie, when it sees a\ngiven prefix matches 25 - 48 terms, it inserts a new auto-prefix\nterm.  That auto-prefix term replaces those 25 - 48 other terms with 1\nterm, and then the process \"recurses\", i.e. you can then have a\nshorter auto-prefix term matching 25 - 48 other normal and/or\nauto-prefix terms.\n\nAt a low level, do I take advantage of this in the same way that I might do so at a high level using PrefixQuery and then getting the weight then getting the scorer to iterate docIds? Or is there a lower-level path? Although there is some elegance to not introducing new APIs, I think it's worth exploring having prefix & range capabilities be on the TermsEnum in some way.\n\nWhat this patch does is generalize/relax Terms.intersect: that method\nno longer guarantees that you see \"true\" terms.  Rather, it now\nguarantees only that the docIDs you visit will be the same.\n\nSo to take advantage of it, you need to pass an Automaton to\nTerms.intersect and then not care about which terms you see, only the\ndocIDs after visiting the DocsEnum across all terms it returned to\nyou.\n\nDo you envision other posting formats being able to re-use the logic here?  That would be nice.\n\nI agree it would be nice ... and the index-time logic that identifies\nthe auto-prefix terms is quite standalone, so e.g. we could pull it\nout and have it \"wrap\" the incoming Fields to insert the auto-prefix\nterms.  This way it's nearly transparent to any postings format ...\n\nBut the problem is, at search time, there's tricky logic in\nintersect() to use these prefix terms ... factoring that out so other\nformats can use it is trickier I think... though maybe we could fold\nit into the default Terms.intersect() impl...\n\nIn your future tuning, I suggest you give the ability to vary the conservative vs aggressive prefixing based on the very beginning and very end (assuming known common lengths).  In the FlexPrefixTree Varun (GSOC) worked on, the leaves per level is configurable at each level (i.e. prefix length)... and it's better to have little prefixing at the very top and little at the bottom too.  At the top, prefixes only help for queries span massive portions of the possible term space (which in spatial is rare; likely other apps too).  And at the bottom (long prefixes) just shy of the maximum length (say 7 bytes out of 8 for a double), there is marginal value because in the spatial search algorithm, the bottom detail is scan'ed over (e.g. TermsEnum.next()) instead of seek'ed, because the data is less dense and it's adjacent.  This principle may apply to numeric-range queries depending on how they are coded; I'm not sure.\n\nI agree this (how auto-prefix terms are assigned) needs more control /\nexperimenting.  Really the best prefixes are a function not only of\nhow the terms were distributed, but also of how queries will \"likely\"\nask for ranges.\n\nI think it's similar to postings skip lists, where we have different\nfrequency of a skip pointer on the \"leaf\" level vs the \"upper\" skip\nlevels. ",
+            "date": "2014-09-22T13:53:49+0000"
+        },
+        {
+            "id": "comment-14153224",
+            "author": "Michael McCandless",
+            "content": "New patch, just resolving conflicts from recent trunk changes ...\n\nI have an idea on improving CheckIndex to ferret out these auto prefix terms .... I'll explore it. ",
+            "date": "2014-09-30T14:32:24+0000"
+        },
+        {
+            "id": "comment-14155243",
+            "author": "Michael McCandless",
+            "content": "New patch, enhancing CheckIndex to test term ranges of varying sizes\n(number of terms).  This uncovered back compat bug in the patch,\nnow fixed.  This isn't guaranteed to touch all auto-prefix terms but\nit should touch most.\n\nNet/net I think we should commit what we have here now, and get\njenkins testing it.  The new FieldType option is marked experimental\n(and has warnings in the javadocs) ... there are many things still to\nexplore, and we need to sort out the migration from NumericField, but\nI think it's important to get this starting point to where users can\ntry it out and then we iterate from there.\n\nTests pass, precommit passes.\n\nI plan to commit soon... ",
+            "date": "2014-10-01T18:23:37+0000"
+        },
+        {
+            "id": "comment-14155245",
+            "author": "Michael McCandless",
+            "content": "But the problem is, at search time, there's tricky logic in intersect() to use these prefix terms ...\n\nOne approach we might be able to take here is to more strongly\nseparate out the auto-prefix terms from the ordinary terms (e.g., so\nthey feel like two different fields, in the impl), such that intersect\nbecomes something like a merge between the postings format's \"normal\"\nintersect, with these auto-prefix terms pulling from a shadow field.\n\nIf we did this then other postings formats could also more easily add\nauto-prefix handling, and maybe even the default impl for\nTerms.intersect could use auto-prefix terms ...\n\nBut we can try this later; this is a big enough change already. ",
+            "date": "2014-10-01T18:24:18+0000"
+        },
+        {
+            "id": "comment-14155699",
+            "author": "Robert Muir",
+            "content": "\nOne approach we might be able to take here is to more strongly\nseparate out the auto-prefix terms from the ordinary terms (e.g., so\nthey feel like two different fields, in the impl), such that intersect\nbecomes something like a merge between the postings format's \"normal\"\nintersect, with these auto-prefix terms pulling from a shadow field.\n\nIf we did this then other postings formats could also more easily add\nauto-prefix handling, and maybe even the default impl for\nTerms.intersect could use auto-prefix terms ...\n\nBut we can try this later; this is a big enough change already.\n\nI agree it can be deferred, but I am worried if it gets dropped completely.\n\nHere, in order to make this easy to use, the feature is \"temporarily\" placed in fieldinfos with a warning.\nHowever, this is kind of screwed up when its currently a blocktree impl detail, and, well,\nits kinda complicated stuff to implement (no offense!). Realistically, if in 3 months, blocktree is still\nthe only impl, how will people feel if I want to nuke this fieldinfo and fieldtype?\n\nWill they be -1 that i break spatial/solr/whatever starts using it (possibly even their source code compile)?\nBecause I think the following situations are ok:\n\nResult #1\n\n\tfieldinfo option (so its a \"lucene feature\" not a codec-specific feature)\n\t\"generic\" impl so that all codecs actually support said feature, like everything else in fieldinfo\n\n\n\nResult #2\n\n\tcodec-specific option (so its just a blocktree option)\n\n\n\nBut the following is not an ok \"permanent situation\":\nResult #3\n\n\tfieldinfo option (so it advertises as a \"lucene feature\", not a codec-specific feature)\n\thowever, only blocktree actually supports the option\n\timpossible to move on to next-gen termsdict because it doesnt support it\n\timpossible to remove from fieldinfo because e.g. .document api/spatial/solr/old indexes/whatever rely upon it\n\n\n\n\n\nHow can we prevent this from happening? ",
+            "date": "2014-10-01T22:41:43+0000"
+        },
+        {
+            "id": "comment-14155732",
+            "author": "Robert Muir",
+            "content": "Patch looks good except for FixedBitSetTermsEnum. What is this doing? Can we remove it? I think its bogus how it does 'super(null)', its superclass should not even allow such a thing. ",
+            "date": "2014-10-01T22:55:23+0000"
+        },
+        {
+            "id": "comment-14156212",
+            "author": "Michael McCandless",
+            "content": "Thanks for reviewing Rob.\n\nHow can we prevent this from happening?\n\nI think we shouldn't add the FI option at this time?  We should only add it once we make it more generic so that all codec impls can easily support it? ",
+            "date": "2014-10-02T08:14:57+0000"
+        },
+        {
+            "id": "comment-14156222",
+            "author": "Michael McCandless",
+            "content": "Patch looks good except for FixedBitSetTermsEnum. What is this doing? Can we remove it? I think its bogus how it does 'super(null)', its superclass should not even allow such a thing.\n\nI agree it's abusing FilterTermsEnum ... I'll fix these FilterLeafReader.FilterXXX classes to barf if they get null.\n\nWe need this stub class because of the API the terms dict uses when asking the postings format to write one term's postings: we pass TermsEnum to PostingsWriterBase.writeTerm.  This is e.g. for PF's that may want to iterate docs/positions multiple times when writing one term ...\n\nI'll fix it to directly subclass TermsEnum and override all methods... ",
+            "date": "2014-10-02T08:23:56+0000"
+        },
+        {
+            "id": "comment-14156389",
+            "author": "Robert Muir",
+            "content": "\nWe need this stub class because of the API the terms dict uses when asking the postings format to write one term's postings: we pass TermsEnum to PostingsWriterBase.writeTerm. This is e.g. for PF's that may want to iterate docs/positions multiple times when writing one term ...\n\nI think thats the root of the problem causing my confusion? I guess TermsEnum is ok here, but its much more than \"docsEnum that you can rewind\" (and not obvious for that!). I think thats why i freaked out when i saw FixedBitSetTermsEnum passing null and only implementing one method, it just didnt make a lot of sense. ",
+            "date": "2014-10-02T11:33:16+0000"
+        },
+        {
+            "id": "comment-14156547",
+            "author": "Michael McCandless",
+            "content": "Maybe we can somehow change the PostingsWriterBase API, so it only gets a \"thingy that lets you pull docs/docsAndPositions as many times as you want\" ... but I don't think that should block committing here? ",
+            "date": "2014-10-02T13:04:35+0000"
+        },
+        {
+            "id": "comment-14156560",
+            "author": "Robert Muir",
+            "content": "I think its enough to just add a comment to explain what is happening. \n\nIts similar to seeing a \"BitsetHashMap\" or something. people are going to be very confused unless they have the 'rewind' explanation above. ",
+            "date": "2014-10-02T13:13:36+0000"
+        },
+        {
+            "id": "comment-14156579",
+            "author": "Michael McCandless",
+            "content": "OK I'll add a comment explaining it... ",
+            "date": "2014-10-02T13:36:57+0000"
+        },
+        {
+            "id": "comment-14157846",
+            "author": "Michael McCandless",
+            "content": "I think we shouldn't add the FI option at this time? \n\nNew patch with FieldType.setIndexRanges removed, but I don't think we\nshould commit this approach: the feature is basically so ridiculously\nexpert to use that only like 3 people in the world will figure out\nhow.\n\nSure, the servers built on top of Lucene can expose a simple API,\nsince they \"know\" the schema and can open up a \"index for range\nsearching\" boolean on a field and validate you are using a PF that\nsupports that... but I don't think it's right/fair to make new, strong\nfeatures of Lucene ridiculously hard to use by direct Lucene users.\n\nIt's wonderful Lucene has such pluggable codecs now, letting users\nexplore all sorts of custom formats, etc., but the nasty downside of\nall this freedom is that new, complex features like this one, which\noffer powerful improvements to the default codec that 99% of Lucene\nusers would have used, must either be implemented across the board for\nall codecs (a very tall order) in order to have an intuitive API, or\nmust be exposed only via ridiculously expert codec-specific APIs.\n\nI don't think either choice is acceptable.\n\nSo ... I tried exploring an uber helper/utility class, that lets you\nadd \"optimized for range/prefix\" fields to docs, and \"spies\" on you to\ndetermine which fields should then use a customized PF, and then gives\nyou sugar APIs to build range/prefix/equals queries... but even as\nbest/simple as I can make this class it still feels way too\nweird/heavy/external/uncomittable.\n\nMaybe we should just go back to the \"always index auto-prefix terms on\nDOCS_ONLY fields\" even though 1) I had to then choose \"weaker\"\ndefaults (less added index size; less performance gains), and 2) it's\na total waste to add such terms to NumericFields and probably spatial\nfields which already build their own prefixes outside of Lucene.  This\nis not a great solution either... ",
+            "date": "2014-10-03T09:57:05+0000"
+        },
+        {
+            "id": "comment-14157857",
+            "author": "Robert Muir",
+            "content": "\nbut the nasty downside of\nall this freedom is that new, complex features like this one, which\noffer powerful improvements to the default codec that 99% of Lucene\nusers would have used, must either be implemented across the board for\nall codecs (a very tall order) in order to have an intuitive API, or\nmust be exposed only via ridiculously expert codec-specific APIs.\n\nI don't think its a downside of the freedom, its just other problems.\n\nHowever, there are way way too many experimental codecs. These are even more costly to maintain than backwards ones in some ways: they are rotated in all tests! For many recent changes I have spent just as much time fixing those as i have on backwards codecs. If we ever want to provide backwards compatibility for experimental codecs (which seems to confuse users constantly that we can't do this), then we have to tone them down anyway.\n\nThe existing trie-encoding is difficult to use, too. I dont think it should serve as your example for this feature. Remember that simple numeric range queries dont work with QP without the user doing subclassing, and numerics dont really work well with the parser at all because the analyzer is completely unaware of them (because, for some crazy reason, it is implemented as a tokenstream/special fields rather than being a more \"ordinary\" analysis chain integration).\n\nThe .document API is overengineered. I dont understand why it needs to be so complicated. Because of it taking on more than it can chew already, its impossible to even think about how it could work with the codec api: and I think this is causing a lot of your frustration.\n\nThe whole way that \"lucene is schemaless\" is fucking bogus, and only means that its on you, the user, to record and manage and track all this stuff yourself. Its no freedom to anyone, just pain. For example, we don't even know which fields have trie-encoded terms here, to do any kind of nice migration strategy from \"old numerics\" to this at all. Thats really sad and will cause users just more pain and confusion.\n\nFieldInfo is a hardcore place to add an experimental option when we arent even sure how it should behave yet (e.g. should it really be limited to DOCS_ONLY? who knows?)\n\nI can keep complaining too, we can rant about this stuff on this issue, but maybe you should commit what you have (yes, with the crappy hard-to-use codec option) so we can try to do something on another issue instead. ",
+            "date": "2014-10-03T10:24:52+0000"
+        },
+        {
+            "id": "comment-14159483",
+            "author": "Michael McCandless",
+            "content": "I think we can salvage parts of this patch by crumbling it up and breaking out separately committable pre-cursors ... I opened LUCENE-5879 to make it easier to index a single byte[] token.\n\nAfter that maybe we could break out the CheckIndex improvements for testing the Codec's impl of .intersect, adding Automata.makeBinaryRange.\n\nBut there's still a huge gaping API hole, which is how the app can \"easily\"/\"cleanly\" notify Lucene that it intends to do range filtering on a given field: this is still a hard open question. ",
+            "date": "2014-10-05T09:13:11+0000"
+        },
+        {
+            "id": "comment-14367352",
+            "author": "Michael McCandless",
+            "content": "I think for now we should simply commit auto-prefix as a dark\nfeature (my last patch, which I hate!) ... progress not perfection.\n\nI.e. it's available only as an optional, disabled by default, postings\nformat, and if you want to use it in your app you must use PerFieldPF\nto enable it for certain fields.  You'll have to figure out how to\nindex byte[] tokens, etc.\n\nI modernized the last patch (tons of stuff had changed) and carried\nover a fix for an issue I hit in LUCENE-6005.  Patch applies to trunk,\nand bumps block tree's index format.\n\nWith auto-prefix, numeric fields can simply be indexed as their\nobvious byte[] encoding and you just use TermRangeQuery at search\ntime; TestAutoPrefix shows this.\n\nThere are maybe some problems with the patch: is it horrible to store\nCompiledAutomaton on PrefixQuery/TermRangeQuery because of query\ncaching...?  Should I instead recompute it for every segment in\n.getTermsEnum?  Or store it on the weight?  Hmm or in a shared\nattribute, like FuzzyQuery (what a hack)?\n\nIt allocates one FixedBitSet(maxDoc) at write time, per segment, to\nhold all docs matching each auto-prefix term ... maybe that's too\ncostly?  I could switch to more sparse impls (roaring, sparse,\nBitDocIdSet.Builder?) but I suspect typically we will require fairly\ndense bitsets anyway for the short prefixes.  We end up OR'ing many\nterms together at write time...\n\nI created a FixedBitPostingsEnum, FixedBitTermsEnum, both package\nprivate under oal.index, so I can send the bit set to PostingsConsumer\nat write time.  Maybe there's a cleaner way?\n\nMaybe the changes should be moved to lucene/misc or lucene/codecs, not\ncore?  But this would mean yet another fork of block tree...\n\nIt only works for IndexOptions.DOCS fields; I think that's fine?\n\nThe added auto-prefix terms are not seen by normal postings APIs, they\ndo not affect index stats, etc.  They only kick in, as an\nimplementation detail, when you call Terms.intersect(Automaton).  The\nreturned TermsEnum.term() can return an auto-prefix term, but\nLUCENE-5938 improves this since we now use\nMultiTermQueryConstantScoreWrapper by default. ",
+            "date": "2015-03-18T15:54:55+0000"
+        },
+        {
+            "id": "comment-14367385",
+            "author": "Robert Muir",
+            "content": "\nThere are maybe some problems with the patch: is it horrible to store\nCompiledAutomaton on PrefixQuery/TermRangeQuery because of query\ncaching...? Should I instead recompute it for every segment in\n.getTermsEnum? Or store it on the weight? Hmm or in a shared\nattribute, like FuzzyQuery (what a hack)?\n\nWhy would this be an issue? Its still index-independent, e.g. AutomatonQuery does this too.\n\n\nIt allocates one FixedBitSet(maxDoc) at write time, per segment, to\nhold all docs matching each auto-prefix term ... maybe that's too\ncostly? I could switch to more sparse impls (roaring, sparse,\nBitDocIdSet.Builder?) but I suspect typically we will require fairly\ndense bitsets anyway for the short prefixes. We end up OR'ing many\nterms together at write time...\n\nIf you use BitDocIdSet.Builder, I think it works well either way. SparseFixedBitSet also has optimized or(DISI).\n\n\nIt only works for IndexOptions.DOCS fields; I think that's fine?\n\nYes, I think so, since the user gets an exception if they screw this up. \n\n\nI created a FixedBitPostingsEnum, FixedBitTermsEnum, both package\nprivate under oal.index, so I can send the bit set to PostingsConsumer\nat write time. Maybe there's a cleaner way?\n\nI don't understand why these need to be tied to FixedBitSet. Seems like they can use the more generic Bitset api at least (nothing fixed-specific about them).\n\n\nMaybe the changes should be moved to lucene/misc or lucene/codecs, not\ncore? But this would mean yet another fork of block tree...\n\nAlternatively, code could stay where it is. Lucene50PF wires zeros and doesnt have any options for now. in codecs/ we could have AutoPrefixPF that exposes it and make it experimental or something? This way when we feel comfortable, we can \"expose\" in the default index format by adding ctors there and removing the experimental one. ",
+            "date": "2015-03-18T16:12:22+0000"
+        },
+        {
+            "id": "comment-14367397",
+            "author": "Robert Muir",
+            "content": "\nThe added auto-prefix terms are not seen by normal postings APIs, they\ndo not affect index stats, etc. They only kick in, as an\nimplementation detail, when you call Terms.intersect(Automaton). The\nreturned TermsEnum.term() can return an auto-prefix term, but\nLUCENE-5938 improves this since we now use\nMultiTermQueryConstantScoreWrapper by default.\n\nI can't parse this. if you use a scoring rewrite, it still \"works\" right? Its just that the generated termqueries will contain pseudo-terms, but their statistics etc are all correct? ",
+            "date": "2015-03-18T16:18:59+0000"
+        },
+        {
+            "id": "comment-14367407",
+            "author": "Robert Muir",
+            "content": "Can you fill in more detail about CompiledAutomaton.PREFIX? \n\nI definitely understand the RANGE case, its difficult to make the equiv automaton. But for the PREFIX case, its trivial. Why not just make PrefixQuery subclass AutomatonQuery? ",
+            "date": "2015-03-18T16:24:07+0000"
+        },
+        {
+            "id": "comment-14369723",
+            "author": "Michael McCandless",
+            "content": "Thanks Rob.\n\nIf you use BitDocIdSet.Builder, I think it works well either way. SparseFixedBitSet also has optimized or(DISI).\n\nI coded this up, but then this Builder is angry because FreqProxDocsEnum throws UOE from its cost method, because this is actually not easy to implement (we don't track docFreq for each term inside IW's RAM buffer).  I think for now we should just keep reusing a single FBS?\n\nLooking @ BitDocIdSet.Builder it looks like it could do better here?  E.g. use this cost as just an approximation, but then since it had to .or() the actual set bits, record that as the \"true\" cost? ",
+            "date": "2015-03-19T17:09:50+0000"
+        },
+        {
+            "id": "comment-14371401",
+            "author": "Michael McCandless",
+            "content": "I don't understand why these need to be tied to FixedBitSet\n\nI'll cutover to BitSet.\n\nAlternatively, code could stay where it is\n\nI'll leave it as is (dark addition to BlockTree).\n\nin codecs/ we could have AutoPrefixPF that exposes it and make it experimental or something?\n\nGood idea!  I'll do this... this way Lucene50PF is unchanged.\n\nI can't parse this. if you use a scoring rewrite, it still \"works\" right? \n\nIt does \"work\" (you get the right hits) ... TestPrefixQuery/TestTermRangeQuery \nrandomly use SCORING_BOOLEAN_REWRITE and\nCONSTANT_SCORE_BOOLEAN_REWRITE.\n\nIts just that the generated termqueries will contain pseudo-terms, but their statistics etc are all correct?\n\nRight: they will use the auto-prefix terms, which have \"correct\" stats\n(i.e. docFreq is number of docs containing any term with this\nprefix).  Is this too weird?  It means you get different scores than\nyou get today...\n\nWe could maybe turn off auto-prefix if you use these rewrite methods?\nBut this would need an API change to Terms, e.g. a new boolean\nallowAutoPrefix to Terms.intersect.\n\nI definitely understand the RANGE case, its difficult to make the equiv automaton.\n\nIt's not so bad; I added Operations.makeBinaryInterval in the patch\nfor this.  It's like the decimal ranges that Automata.makeInterval already does.\n\nWhy not just make PrefixQuery subclass AutomatonQuery?\n\nI explored this, but it turns out to be tricky, for those PFs that\ndon't have auto prefix terms (use block tree)...\n\nI.e., with the patch as it is now, PFs like SimpleText will use a\nPrefixTermsEnum for PrefixQuery, but if I fix PrefixQuery to subclass\nAutomatonQuery (and remove AUTOMATON_TYPE.PREFIX) then SimpleText\nwould use AutomatonTermsEnum (on a prefix automaton) which I think\nwill be somewhat less efficient?  Maybe it's not so bad in practice?  ATE\nwould realize it's in a \"linear\" part of the automaton...\n\nMaybe we can somehow simplify things here ... I agree both PrefixQuery\nand TermRangeQuery should ideally just subclass AutomatonQuery. ",
+            "date": "2015-03-20T14:51:47+0000"
+        },
+        {
+            "id": "comment-14371671",
+            "author": "Robert Muir",
+            "content": "\nI.e., with the patch as it is now, PFs like SimpleText will use a\nPrefixTermsEnum for PrefixQuery, but if I fix PrefixQuery to subclass\nAutomatonQuery (and remove AUTOMATON_TYPE.PREFIX) then SimpleText\nwould use AutomatonTermsEnum (on a prefix automaton) which I think\nwill be somewhat less efficient? Maybe it's not so bad in practice? ATE\nwould realize it's in a \"linear\" part of the automaton...\n\nWe cannot continue writing code in this way.\n\nPlease let intersect take care of how to intersect and get this shit out of the Query. The default Terms.intersect() method can specialize the PREFIX case with a PrefixTermsEnum if it is faster. ",
+            "date": "2015-03-20T17:23:14+0000"
+        },
+        {
+            "id": "comment-14372077",
+            "author": "Michael McCandless",
+            "content": "\nWe cannot continue writing code in this way.\n\nPlease let intersect take care of how to intersect and get this shit out of the Query. The default Terms.intersect() method can specialize the PREFIX case with a PrefixTermsEnum if it is faster.\n\nCan you maybe be more specific?    I'm having trouble following exactly what you're objecting to.\n\nTerms.intersect default impl is already specializing to PrefixTermsEnum in the patch.\n\nYou don't want the added ctor that takes a prefix term in CompiledAutomaton but you are OK with PREFIX/RANGE in CA.AUTOMATON_TYPE?\n\nIf I 1) remove the added ctor that takes the prefix term in CA, and 2) fix PrefixQuery to subclass AutomatonQuery (meaning CA must \"autodetect\" when it receives a prefix automaton), would that address your concerns?  Or something else...?\n\nI still wonder if just using AutomatonTermsEnum for prefix/range will be fine.  Then we don't need PREFIX nor RANGE in CA.AUTOMATON_TYPE.\n\nI'll open a separate issue for this... ",
+            "date": "2015-03-20T20:52:33+0000"
+        },
+        {
+            "id": "comment-14372159",
+            "author": "Robert Muir",
+            "content": "Yes, everything you propose makes sense (especially the last point you make, that would be fantastic!)\n\nHigh level I just feel here that we have the second use case where codec can do \"special\" stuff with intersect and we should be removing these specializations in our code, and just be passing the structure to the codec. I do realize this is already messy in trunk, but I think we need to remove a lot of this complexity. \n\nAt the very least I think PrefixQuery shouldn't be a \"backdoor automaton query\"  ",
+            "date": "2015-03-20T21:32:57+0000"
+        },
+        {
+            "id": "comment-14385570",
+            "author": "Michael McCandless",
+            "content": "New patch, folding in changes after LUCENE-6367, and also cutting over\nTermRangeQuery to AutomatonQuery.\n\nNow the changes to CompiledAutomaton are minimal, just the addition of\nthe sinkState.\n\nI have a few minor nocommits left ... otherwise I think this is\nready. ",
+            "date": "2015-03-28T23:47:09+0000"
+        },
+        {
+            "id": "comment-14387520",
+            "author": "Michael McCandless",
+            "content": "New patch, fixing the nocommits.  I think it's ready ... I'll beast tests for a while on it.\n\nI don't think we should rush this into 5.1. ",
+            "date": "2015-03-30T22:18:48+0000"
+        },
+        {
+            "id": "comment-14388339",
+            "author": "Adrien Grand",
+            "content": "+1 to the patch\n\nI don't think we should rush this into 5.1.\n\n+1 ",
+            "date": "2015-03-31T10:06:32+0000"
+        },
+        {
+            "id": "comment-14388500",
+            "author": "Robert Muir",
+            "content": "We should be able to add a trivial test to lucene/codecs that extends BasePostingsFormatTestCase for this new PF ? What about \"putting it into rotation\" in RandomCodec? These things would give us a lot of testing. ",
+            "date": "2015-03-31T13:12:43+0000"
+        },
+        {
+            "id": "comment-14388560",
+            "author": "Robert Muir",
+            "content": "+1 to the patch. I can add the tests later if you want. but they should be trivial. ",
+            "date": "2015-03-31T14:07:55+0000"
+        },
+        {
+            "id": "comment-14391534",
+            "author": "Michael McCandless",
+            "content": "Another iteration, adding a test case as Rob suggested.  It was somewhat tricky because BasePFTestCase tests all IndexOptions but this new PF only supports DOCS.\n\nSo, I factored out a RandomPostingsTester (in test-framework) from BasePFTestCase, which lets you specify which IndexOptions to test, and then added TestAutoPrefixPF to use that.\n\nThis process managed to find a couple latent bugs in BasePostingsFormatTestCase's SeedPostings!\n\nTests seem to pass ... I ran distributed beasting for 17 iters.\n\nI think it's ready. ",
+            "date": "2015-04-01T21:46:03+0000"
+        },
+        {
+            "id": "comment-14392701",
+            "author": "Robert Muir",
+            "content": "+1\n\nI thought those tests were gonna be easy... but the refactoring of the test is great. Thanks! ",
+            "date": "2015-04-02T13:29:36+0000"
+        },
+        {
+            "id": "comment-14392802",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1670918 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1670918 ]\n\nLUCENE-5879: add auto-prefix terms to block tree, and experimental AutoPrefixTermsPostingsFormat ",
+            "date": "2015-04-02T15:05:51+0000"
+        },
+        {
+            "id": "comment-14392803",
+            "author": "Michael McCandless",
+            "content": "I committed to trunk ... I'll let it bake a bit before backporting to 5.x (5.2). ",
+            "date": "2015-04-02T15:06:28+0000"
+        },
+        {
+            "id": "comment-14392815",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1670923 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1670923 ]\n\nLUCENE-5879: fix test compilation (this enum no longer exists) ",
+            "date": "2015-04-02T15:18:11+0000"
+        },
+        {
+            "id": "comment-14396152",
+            "author": "Michael McCandless",
+            "content": "Woops ... the \"term range checking\" I added to CheckIndex here is way, way too costly: https://people.apache.org/~mikemccand/lucenebench/checkIndexTime.html\n\nThat's on an index that has zero auto-prefix terms ...\n\nI'll turn this off for now and mull how to fix it.  We could at least skip this when that field has no auto-prefix terms, but it will still be costly when the field does have auto-prefix terms because it does a rather exhaustive comparison of the \"full\" term space iteration (does not use auto-prefix terms) against the Terms.intersect one (does use them).... ",
+            "date": "2015-04-05T08:31:58+0000"
+        },
+        {
+            "id": "comment-14396157",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1671380 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1671380 ]\n\nLUCENE-5879: turn off too-slow term range checking for now ",
+            "date": "2015-04-05T08:54:04+0000"
+        },
+        {
+            "id": "comment-14481095",
+            "author": "Michael McCandless",
+            "content": "I'll backport this to 5.2 soon ... trunk jenkins hasn't uncovered any serious issues so far ... ",
+            "date": "2015-04-06T09:53:39+0000"
+        },
+        {
+            "id": "comment-14482886",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1671765 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1671765 ]\n\nLUCENE-5879: add auto-prefix terms to block tree, and experimental AutoPrefixTermsPostingsFormat ",
+            "date": "2015-04-07T09:10:41+0000"
+        },
+        {
+            "id": "comment-14482887",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1671766 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1671766 ]\n\nLUCENE-5879: move CHANGES entry to 5.2.0 ",
+            "date": "2015-04-07T09:12:28+0000"
+        },
+        {
+            "id": "comment-14484968",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672037 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672037 ]\n\nLUCENE-5879: fix corner case in auto-prefix intersect ",
+            "date": "2015-04-08T09:04:38+0000"
+        },
+        {
+            "id": "comment-14484979",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672042 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1672042 ]\n\nLUCENE-5879: fix corner case in auto-prefix intersect ",
+            "date": "2015-04-08T09:19:14+0000"
+        },
+        {
+            "id": "comment-14486986",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672262 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1672262 ]\n\nLUCENE-5879: fix empty string corner case ",
+            "date": "2015-04-09T08:46:05+0000"
+        },
+        {
+            "id": "comment-14486988",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672263 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672263 ]\n\nLUCENE-5879: fix empty string corner case ",
+            "date": "2015-04-09T08:46:34+0000"
+        },
+        {
+            "id": "comment-14490288",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1672749 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1672749 ]\n\nLUCENE-5879: turn off too-slow term range checking for now ",
+            "date": "2015-04-10T20:10:47+0000"
+        },
+        {
+            "id": "comment-14491466",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1673009 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1673009 ]\n\nLUCENE-5879: fix finite case of Automata.makeBinaryIterval, improve tests ",
+            "date": "2015-04-12T13:29:03+0000"
+        },
+        {
+            "id": "comment-14491753",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1673075 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1673075 ]\n\nLUCENE-5879: fix ob1 that caused OOME in test when min and max auto-prefix terms was 2; attempt to simplify empty string case ",
+            "date": "2015-04-12T22:43:16+0000"
+        },
+        {
+            "id": "comment-14497809",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1674027 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1674027 ]\n\nLUCENE-5879: fix test bug: we cannot enforce max term count for empty-string prefix query since we [intentionally] do not create an empty-string auto-prefix term at index time ",
+            "date": "2015-04-16T09:17:44+0000"
+        },
+        {
+            "id": "comment-14497814",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1674029 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1674029 ]\n\nLUCENE-5879: fix test bug: we cannot enforce max term count for empty-string prefix query since we [intentionally] do not create an empty-string auto-prefix term at index time ",
+            "date": "2015-04-16T09:19:00+0000"
+        },
+        {
+            "id": "comment-14586882",
+            "author": "Anshum Gupta",
+            "content": "Bulk close for 5.2.0. ",
+            "date": "2015-06-15T21:43:55+0000"
+        }
+    ]
+}

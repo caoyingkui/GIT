@@ -1,0 +1,87 @@
+{
+    "id": "LUCENE-6336",
+    "title": "AnalyzingInfixSuggester needs duplicate handling",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "4.10.3,                                            5.0",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "Bug"
+    },
+    "description": "Spinoff from LUCENE-5833 but else unrelated.\n\nUsing AnalyzingInfixSuggester which is backed by a Lucene index and stores payload and score together with the suggest text.\n\nI did some testing with Solr, producing the DocumentDictionary from an index with multiple documents containing the same text, but with random weights between 0-100. Then I got duplicate identical suggestions sorted by weight:\n\n{\n  \"suggest\":{\"languages\":{\n      \"engl\":{\n        \"numFound\":101,\n        \"suggestions\":[{\n            \"term\":\"<b>Engl</b>ish\",\n            \"weight\":100,\n            \"payload\":\"0\"},\n          {\n            \"term\":\"<b>Engl</b>ish\",\n            \"weight\":99,\n            \"payload\":\"0\"},\n          {\n            \"term\":\"<b>Engl</b>ish\",\n            \"weight\":98,\n            \"payload\":\"0\"},\n---etc all the way down to 0---\n\n\n\nI also reproduced the same behavior in AnalyzingInfixSuggester directly. So there is a need for some duplicate removal here, either while building the local suggest index or during lookup. Only the highest weight suggestion for a given term should be returned.",
+    "attachments": {
+        "LUCENE-6336.patch": "https://issues.apache.org/jira/secure/attachment/12702463/LUCENE-6336.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14346866",
+            "author": "Jan H\u00f8ydahl",
+            "date": "2015-03-04T13:19:23+0000",
+            "content": "Attaching failing unit test "
+        },
+        {
+            "id": "comment-14346879",
+            "author": "Robert Muir",
+            "date": "2015-03-04T13:37:21+0000",
+            "content": "Not a bug: DocumentDictionary etc suggests documents, not terms. "
+        },
+        {
+            "id": "comment-14346900",
+            "author": "Jan H\u00f8ydahl",
+            "date": "2015-03-04T14:05:46+0000",
+            "content": "Not a bug: DocumentDictionary etc suggests documents, not terms.\n\nWhat you say implies that the field you use for the suggested terms must be 100% unique across the main document index. Suggesters are typically used to suggest e.g. authors, languages, categories... Indeed, the example in https://cwiki.apache.org/confluence/display/solr/Suggester does just this, suggesting categories using price field as weight, and DocumentDictionary. But FuzzySuggester is not index-based so it does not reveal this bug.\n "
+        },
+        {
+            "id": "comment-14356523",
+            "author": "Jan H\u00f8ydahl",
+            "date": "2015-03-11T09:26:25+0000",
+            "content": "Michael McCandless what's your view on this one? "
+        },
+        {
+            "id": "comment-14356754",
+            "author": "Shai Erera",
+            "date": "2015-03-11T11:38:38+0000",
+            "content": "So I wrote these two simple tests:\n\nFuzzySuggester\n\n  public void testDuplicateInput() throws Exception {\n    Input keys[] = new Input[] {\n        new Input(\"duplicate\", 8),\n        new Input(\"duplicate\", 12),\n        new Input(\"duplicate\", 12),\n    };\n    \n    Analyzer analyzer = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, true, MockTokenFilter.ENGLISH_STOPSET);\n    FuzzySuggester suggester = new FuzzySuggester(analyzer, analyzer,\n        AnalyzingSuggester.EXACT_FIRST | AnalyzingSuggester.PRESERVE_SEP, 256,\n        -1, false, FuzzySuggester.DEFAULT_MAX_EDITS,\n        FuzzySuggester.DEFAULT_TRANSPOSITIONS,\n        FuzzySuggester.DEFAULT_NON_FUZZY_PREFIX,\n        FuzzySuggester.DEFAULT_MIN_FUZZY_LENGTH,\n        FuzzySuggester.DEFAULT_UNICODE_AWARE);\n    suggester.build(new InputArrayIterator(keys));\n    \n    List<LookupResult> results = suggester.lookup(TestUtil.stringToCharSequence(\"dup\", random()), false, 1);\n    System.out.println(results);\n   \n    analyzer.close();\n  }\n\n\n\nThis prints:\n\n\n[duplicate/12]\n\n\n\nAnalyzingInfixSuggester\n\n  public void testDuplicateInput() throws Exception {\n    Input keys[] = new Input[] {\n        new Input(\"duplicate\", 8),\n        new Input(\"duplicate\", 12),\n        new Input(\"duplicate\", 12),\n    };\n    \n    Analyzer a = new MockAnalyzer(random(), MockTokenizer.WHITESPACE, false);\n    AnalyzingInfixSuggester suggester = new AnalyzingInfixSuggester(newDirectory(), a, a, 3, false);\n    suggester.build(new InputArrayIterator(keys));\n    \n    List<LookupResult> results = suggester.lookup(TestUtil.stringToCharSequence(\"dup\", random()), 10, true, true);\n    System.out.println(results);\n    \n    suggester.close();\n  }\n\n\n\nPrints:\n\n\n[duplicate/12, duplicate/12, duplicate/8]\n\n\n\nBoth tests use an InputArrayIterator and the same .buikd() API - the only thing that's different is the Suggester type. So if I think about a component in my software that gets a Lookup and uses the common API to populate values in it and lookup, it shouldn't care about the type of the Lookup instance (right?).\n\nWould be good if we can be consistent IMO, but I know that there is a fundamental difference between the two suggesters \u2013 Fuzzy builds an FST, which I think is the component that resolves the duplicates, while AnalyzingInfixSuggester builds an index. Perhaps in its createResult method it can add the results to a Set (or in addition to the List) to resolve the duplicates at lookup time. Of course it would be better if it can detect the lookups at build() or .add() time and avoid their matches in the first place.\n\nUsually suggesters handle unique values, and the question is who should ensure the values they are given as input is unique \u2013 is it the Suggester or the user. That that FuzzySuggester happens to use a data structure that resolves the duplicates is a side effect IMO. AnalyzingInfixSuggester also take a context with each value to suggest, so the value \"foo\" isn't the same if input twice with different contexts. Therefore it's more involved IMO with AnalyzingInfix vs Fuzzy ...\n\nI'm also not sure that the Suggester is the one that should take care of uniqueness because the added logic will be executed for all users, whether their input values are unique or not. But if for example we could have DocumentDictionary resolve duplicates, then we would leave the suggester do what it should do \u2013 suggest from a given list of values. I like that simplicity in responsibility. "
+        },
+        {
+            "id": "comment-14356985",
+            "author": "Michael McCandless",
+            "date": "2015-03-11T15:01:38+0000",
+            "content": "I think whether a given suggester dedups is really up to each impl.\n\nBut separately I think it makes sense to add enable dedup for AIS somehow.\n\nOr maybe we add a DedupDictionaryWrapper, which does an offline sort to remove dups?  This way we can dedup for any suggester that doesn't handle it itself... and we keep the \"simplicity in responsibility\" for AIS. "
+        },
+        {
+            "id": "comment-14357689",
+            "author": "Jan H\u00f8ydahl",
+            "date": "2015-03-11T21:56:03+0000",
+            "content": "Or maybe we add a DedupDictionaryWrapper, which does an offline sort to remove dups?...\nThis make sense. It would even allow an AvgScoreDedupDictionaryWrapper which dedupes entries returning the average score instead of max. "
+        },
+        {
+            "id": "comment-15193150",
+            "author": "Alessandro Benedetti",
+            "date": "2016-03-14T11:57:19+0000",
+            "content": "Initially I liked the idea of adding a component responsible of the de-duplication .\nBut I would like to raise some considerations, what about the number of the suggestions ?\n\nAt the moment the number of suggestions upbound the search in the auxiliary lucene index \n( see this \norg/apache/lucene/search/suggest/analyzing/AnalyzingInfixSuggester.java:591 .)\n\nThis means that retrieving a max of 5 suggestions could bring the return of 5 duplicates ( leaving other values in the remaining results) .\nThen the dedupe wrapper will dedupe  and return only 1 suggestion ( we forget about other 4 good suggestions that were low in the ranking)\nWe potentially risk to not cover the top N we wants in the configuration.\n\nI was thinking we should solve this Lucene side, building a better query using field collapsing.\nIn particular I think we should add a couple of parameters ( unique=true and weightCalculus =max|min|avg ect ) and play with something similar to : https://cwiki.apache.org/confluence/display/solr/Collapse+and+Expand+Results .\n\nWhat do you think Jan H\u00f8ydahl, Michael McCandless? I think with field collapsing we could be more consistent.\nI will study this more, please inform me if my reasoning lacks of some important assumption \n\n "
+        },
+        {
+            "id": "comment-15337696",
+            "author": "Michael McCandless",
+            "date": "2016-06-18T09:48:02+0000",
+            "content": "We could explore field collapsing / grouping, but that's maybe somewhat tricky to do with early termination (see LUCENE-7341) and it's somewhat wasteful ... it seems better to dedup once at indexing time?  And if it's a simple wrapper around the dictionary, other suggesters could just use that too "
+        },
+        {
+            "id": "comment-16676877",
+            "author": "Samuel Sol\u00eds",
+            "date": "2018-11-06T15:15:35+0000",
+            "content": "Hi,\n\nI'm a new\u00a0Solr user and this is my first comment in a issue. Sorry if my knowledge is not the best to report an issue.\n\nI'm created a suggest system like the described in the issue and the problem is exactly the same. I have configured a\u00a0BlendedInfixLookupFactory with a multivalue field and\u00a0\n\nDocumentExpressionDictionaryFactory as a dictionaryImpl. The problem is that the suggestions contain duplicates if the weight are different and it's a bad behavior I think. The idea\u00a0of remove duplicates using params like \"unique=true and weightCalculus =max|min|avg\" seems nice.\n\nI know that the issue is for a 5.0 version but I'm using 6.6 and it's still active and the problem is not resolved yet. how can I help? I'm not a Java developer (I'm developer but I don't use Java) but I can test something if you want or create tests or something. Or if somebody know a better solution just to discuss it.\n\n\u00a0\n\nThanks!\n\n\u00a0\n\n\u00a0 "
+        },
+        {
+            "id": "comment-16690571",
+            "author": "Mike Sokolov",
+            "date": "2018-11-17T14:30:42+0000",
+            "content": "I dug into this a bit - it seems that we already do provide SortedInputIterator in Lucene-land, but it is not used by DocumentExpressionDictionary and its factory. It seems to me that could expose an option for de-duping. Wouldn't want to make it the default, since your dictionary might already be unique and you wouldn't want to pay the penalty for sorting in that case. If we agree that is the solution, I think this issue should get moved over to Solr, and in that case the unit test in the patch isn't really pointing at the problem.\n\nIt's certainly possible to subclass DocumentExpressionDictionaryFactory.create(...) and  DocumentExpressionDictionary.getEntryIterator() to wrap the original iterator with  SortedInputIterator, but this does require some Java programming. "
+        }
+    ]
+}

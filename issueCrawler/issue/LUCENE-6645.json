@@ -1,0 +1,193 @@
+{
+    "id": "LUCENE-6645",
+    "title": "BKD tree queries should use BitDocIdSet.Builder",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.3",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "When I was iterating on BKD tree originally I remember trying to use this builder (which makes a sparse bit set at first and then upgrades to dense if enough bits get set) and being disappointed with its performance.\n\nI wound up just making a FixedBitSet every time, but this is obviously wasteful for small queries.\n\nIt could be the perf was poor because I was always .or'ing in DISIs that had 512 - 1024 hits each time (the size of each leaf cell in the BKD tree)?  I also had to make my own DISI wrapper around each leaf cell... maybe that was the source of the slowness, not sure.\n\nI also sort of wondered whether the SmallDocSet in spatial module (backed by a SentinelIntSet) might be faster ... though it'd need to be sorted in the and after building before returning to Lucene.",
+    "attachments": {
+        "LUCENE-6645-spatial.patch": "https://issues.apache.org/jira/secure/attachment/12745437/LUCENE-6645-spatial.patch",
+        "LUCENE-6645.patch": "https://issues.apache.org/jira/secure/attachment/12742913/LUCENE-6645.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14608723",
+            "author": "David Smiley",
+            "date": "2015-06-30T17:42:22+0000",
+            "content": "FYI I originally used FixedBitSet in the RPT based spatial filters (technically OpenBitSet originally) because at that time there was no Sparse impl with a builder.  That's also why SmallDocSet exists.  I'm curious to see what you find here regarding the performance; I'd like to use the bitset builder and remove SmallDocSet. "
+        },
+        {
+            "id": "comment-14608910",
+            "author": "Michael McCandless",
+            "date": "2015-06-30T19:26:17+0000",
+            "content": "Here's a patch, just restoring what I had in earlier iterations on the original BKD tree issue (LUCENE-6477) ... maybe I am doing something silly?\n\nThe BKD test passes ... I'll compare performance vs current trunk (FixedBitSet every time).\n\nI had to make little reusable DISI classes to pass to the BitDocIdSet.Builder.or method.\n\nIt could be if we made the BKD wasteful by indexing prefix terms so that the number of DISIs we need to or together are small, the perf hit wouldn't be so much ... "
+        },
+        {
+            "id": "comment-14608958",
+            "author": "Michael McCandless",
+            "date": "2015-06-30T19:52:15+0000",
+            "content": "The lat/lons to index are here:\n\n  http://people.apache.org/~mikemccand/latlon.subsetPlusAllLondon.txt.lzma\n\nit uncompresses to ~1.9 GB.\n\nThen run IndexAndSearchOpenStreetMaps.java in\nluceneutil/src/main/perf.  (You have to edit the hard path to this\nlat/lons input file).\n\nRun it first with that createIndex uncommented, then comment it out\n(you can just re-use that index to test searching).\n\nWhen I run this on trunk I get 1.54 sec for 225 \"bboxes around\nLondon\", and with the patch 3.89 seconds, or ~2.5 X slower ... "
+        },
+        {
+            "id": "comment-14613157",
+            "author": "Adrien Grand",
+            "date": "2015-07-03T12:13:22+0000",
+            "content": "I played a bit with the benchmark and have similar results (1.76 sec for trunk and more than 4 sec with the patch). It's a worst case for BitDocIdSetBuilder given that it always starts to build a SparseFixedBitSet to eventually upgrade it to a FixedBitSet. But still it's disappointing that it's so slow compared to building a FixedBitSet directly.\n\nI've experimented with a more brute-force approach (see attached patch) that uses a plain int[] instead of a SparseFixedBitSet for the sparse case, and it seems to perform better: the benchmark runs in 1.76 sec on trunk and 2.70 sec with the patch if the builder is configured to use an int[] up to number of docs of maxDoc / 128. It goes down to 1.96 with a threshold of maxDoc / 2048.  Maybe this is what we should use instead of BitDocIdSetBuilder?\n\nI tried to see how this affects our luceneutil benchmark and there is barely any change:\n\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                  Fuzzy1       74.41     (18.3%)       69.59     (19.4%)   -6.5% ( -37% -   38%)\n                 LowTerm      761.39      (2.4%)      749.20      (3.6%)   -1.6% (  -7% -    4%)\n            OrNotHighLow      877.81      (2.2%)      867.60      (5.3%)   -1.2% (  -8% -    6%)\n            OrHighNotMed       76.63      (2.1%)       75.89      (2.7%)   -1.0% (  -5% -    3%)\n                 MedTerm      309.75      (1.3%)      306.86      (2.6%)   -0.9% (  -4% -    2%)\n              OrHighHigh       26.86      (5.4%)       26.64      (3.3%)   -0.8% (  -9% -    8%)\n           OrNotHighHigh       67.94      (1.0%)       67.42      (2.0%)   -0.8% (  -3% -    2%)\n                HighTerm      132.28      (1.4%)      131.29      (1.7%)   -0.7% (  -3% -    2%)\n                 Respell       78.71      (2.8%)       78.14      (3.2%)   -0.7% (  -6% -    5%)\n               LowPhrase      121.23      (0.8%)      120.47      (1.3%)   -0.6% (  -2% -    1%)\n            OrHighNotLow      112.94      (2.3%)      112.25      (2.5%)   -0.6% (  -5% -    4%)\n            OrNotHighMed      223.81      (2.4%)      222.52      (3.8%)   -0.6% (  -6% -    5%)\n               OrHighLow       71.79      (4.3%)       71.39      (3.3%)   -0.6% (  -7% -    7%)\n             MedSpanNear       23.33      (1.1%)       23.21      (1.8%)   -0.5% (  -3% -    2%)\n             AndHighHigh       62.01      (1.9%)       61.71      (3.6%)   -0.5% (  -5% -    5%)\n               OrHighMed       41.79      (5.5%)       41.61      (3.6%)   -0.4% (  -9% -    9%)\n              AndHighMed       90.86      (2.0%)       90.61      (2.8%)   -0.3% (  -5% -    4%)\n        HighSloppyPhrase       47.43      (4.6%)       47.33      (4.8%)   -0.2% (  -9% -    9%)\n              HighPhrase       28.36      (1.6%)       28.30      (1.3%)   -0.2% (  -3% -    2%)\n               MedPhrase      147.25      (1.4%)      146.99      (1.6%)   -0.2% (  -3% -    2%)\n         LowSloppyPhrase       37.07      (2.2%)       37.03      (2.3%)   -0.1% (  -4% -    4%)\n         MedSloppyPhrase      156.95      (3.7%)      156.80      (3.6%)   -0.1% (  -7% -    7%)\n             LowSpanNear       29.05      (2.2%)       29.02      (2.0%)   -0.1% (  -4% -    4%)\n           OrHighNotHigh       61.13      (1.5%)       61.08      (1.6%)   -0.1% (  -3% -    3%)\n            HighSpanNear       15.36      (1.7%)       15.36      (1.8%)    0.0% (  -3% -    3%)\n                Wildcard      111.57      (3.1%)      113.05      (2.1%)    1.3% (  -3% -    6%)\n                  IntNRQ        7.49      (7.3%)        7.60      (5.2%)    1.4% ( -10% -   14%)\n                 Prefix3       72.81      (4.6%)       74.18      (4.1%)    1.9% (  -6% -   11%)\n              AndHighLow      974.36      (3.0%)      994.46      (2.9%)    2.1% (  -3% -    8%)\n                  Fuzzy2       47.42     (16.1%)       53.71     (16.5%)   13.3% ( -16% -   54%)\n\n\n\nI suspect this is because our multi-term queries in this benchmark match some high-frequency terms so the upgrade to a FixedBitSet happens quickly anyway. "
+        },
+        {
+            "id": "comment-14613403",
+            "author": "Michael McCandless",
+            "date": "2015-07-03T18:52:40+0000",
+            "content": "Thanks Adrien Grand, this is impressive!  A radix sorter, an Adder abstraction to skip hot loop if statements... looks like you had fun with hotspot \n\nDid the Adder make a substantial improvement over the more straightforward if-per-add?  Maybe we could just add a .grow which would pre-grow the int[] if necessary ... not sure.\n\nMost of the changes are in DocIdSetBuilder, and less so in BKDTreeReader.  You might get a bit more speedup if instead of prepareAdd(1), you did the prepareAdd up front outside the loop with the worst case count (number of docs in the leaf block)?  I.e. this would reserve for the worse case (all docs pass the filter).  These leaf blocks are smallish by default (up to 1024 docs), and worst case is this upgrades to a bitset a bit early?  Not sure it will help that much, since most of the cells are visited via addAll...\n\nIn each cell of the BKD tree the docIDs are sorted ... but we don't take advantage of that here (not sure how we would).\n\nMaybe we should try to contain the added hairiness to BKDTreeReader instead of DocIdSetBuilder if indeed this is the only user of this API that is so strange (or of tons of tiny sorted docID blocks) "
+        },
+        {
+            "id": "comment-14614654",
+            "author": "Adrien Grand",
+            "date": "2015-07-06T07:44:11+0000",
+            "content": "Thanks for having a look!\n\nNot sure it will help that much, since most of the cells are visited via addAll...\n\nIndeed I did not try to optimize here since my profiler did not see it as a hotspot.\n\nMaybe we should try to contain the added hairiness to BKDTreeReader instead of DocIdSetBuilder if indeed this is the only user of this API that is so strange (or of tons of tiny sorted docID blocks)\n\nI agree the API is a bit crazy now.  It was a way to avoid checking the array length on every call to add(). I'll see how much it costs to remove this 'Adder' class in favour of a grow() method . However, adding tons of tiny sorted doc ID blocks is something that MultiTermQueries can do all the time too so I'm quite happy that your benchmark revealed this inefficiency. "
+        },
+        {
+            "id": "comment-14616976",
+            "author": "Adrien Grand",
+            "date": "2015-07-07T16:56:08+0000",
+            "content": "Here is a patch with less API crazyness that should still provide similar performance. It removed the Adder intermediate and uses a grow() method instead as suggested. "
+        },
+        {
+            "id": "comment-14617527",
+            "author": "Michael McCandless",
+            "date": "2015-07-07T22:08:02+0000",
+            "content": "Thanks Adrien Grand!\n\nspatial module is angry w/ the patch... but I was able to run the \"2% of OpenStreetMap points\" benchmark.\n\nToday (FixedBitSet) it's 1.56 seconds to run 225 queries, and with the last patch it's 2.35 seconds which is a great improvement over where I started here (3.89 seconds)! "
+        },
+        {
+            "id": "comment-14617540",
+            "author": "Adrien Grand",
+            "date": "2015-07-07T22:20:13+0000",
+            "content": "woops I forgot to svn add a file, will upload a fixed patch tomorrow. Thanks for confirming it is faster now! "
+        },
+        {
+            "id": "comment-14618310",
+            "author": "Adrien Grand",
+            "date": "2015-07-08T09:55:59+0000",
+            "content": "Here is a fixed patch. "
+        },
+        {
+            "id": "comment-14620129",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-09T08:39:02+0000",
+            "content": "Commit 1690026 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1690026 ]\n\nLUCENE-6645: Optimized DocIdSet building for the \"many small postings lists\" case. "
+        },
+        {
+            "id": "comment-14620209",
+            "author": "Michael McCandless",
+            "date": "2015-07-09T09:46:27+0000",
+            "content": "Thanks Adrien Grand! "
+        },
+        {
+            "id": "comment-14620213",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-09T09:48:35+0000",
+            "content": "Commit 1690041 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1690041 ]\n\nLUCENE-6645: Optimized DocIdSet building for the \"many small postings lists\" case. "
+        },
+        {
+            "id": "comment-14620233",
+            "author": "Michael McCandless",
+            "date": "2015-07-09T10:03:48+0000",
+            "content": "I think with this small change to the builder, we can save one if check in the add method.\n\nIn the BKD test this gives a good gain ... from 3.08 sec in trunk down to 2.32 sec ... "
+        },
+        {
+            "id": "comment-14620241",
+            "author": "Adrien Grand",
+            "date": "2015-07-09T10:09:52+0000",
+            "content": "+1 I'm curious if you know what part makes it so much faster? Is it limiting the maximum array size to threshold at most, or the fact that some ArrayUtil logic is now inlined in the builder? "
+        },
+        {
+            "id": "comment-14621016",
+            "author": "Michael McCandless",
+            "date": "2015-07-09T18:29:07+0000",
+            "content": "Slightly improved patch: I moved an assert higher up, and made the calls to growBuffer consistently only call when < threshold.\n\nI'm not sure why the gains are so high, it must be hotspot silliness... "
+        },
+        {
+            "id": "comment-14621223",
+            "author": "Adrien Grand",
+            "date": "2015-07-09T20:40:50+0000",
+            "content": "+1 thanks for fixing the javadocs  "
+        },
+        {
+            "id": "comment-14621284",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-09T21:20:56+0000",
+            "content": "Commit 1690175 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1690175 ]\n\nLUCENE-6645: optimize DocIdSetBuilder a bit more "
+        },
+        {
+            "id": "comment-14621287",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-09T21:21:58+0000",
+            "content": "Commit 1690176 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1690176 ]\n\nLUCENE-6645: optimize DocIdSetBuilder a bit more "
+        },
+        {
+            "id": "comment-14621699",
+            "author": "David Smiley",
+            "date": "2015-07-10T04:25:35+0000",
+            "content": "I took a look at the code out of curiosity and I see that \"BitDocIdSetBuilder\" is the old implementation and that it's been kept around in the spatial module for the IntersectsRPTVerifyQuery.  I think that deserved mention in the commentary here.  Can't we remove it, and have IntersectsRPTVerifyQuery use the new DocIdSetBuilder?  I suspect this was done because of BitDocIdSetBuilder.isDefinitelyEmpty(); yes?  If so can't we add a similar method to DocIdSetBuilder?\n\nShouldn't QueryBitSetProducer in the \"join\" module use RoaringDocIdSet for it's cached docIdSets instead of the Fixed/Sparse choice chosen by the new BitSet.of method added in this patch?  RoaringDocIdSet is ideal for caches; no? "
+        },
+        {
+            "id": "comment-14621959",
+            "author": "Adrien Grand",
+            "date": "2015-07-10T08:17:17+0000",
+            "content": "Sorry David, indeed I should have mentionned it indeed. When I looked at IntersectsRPTVerifyQuery, I saw it was using the produced bits so I thought it actually need bit sets, but maybe it doesn't and we could just use advance()? Regarding isDefinitelyEmpty, I'm wondering if we could keep the builders initially empty and then instantiate them on the first time than we need to add data? Then we could use a null check to know whether they have any content at all, would it work?\n\nShouldn't QueryBitSetProducer in the \"join\" module use RoaringDocIdSet for it's cached docIdSets instead of the Fixed/Sparse choice chosen by the new BitSet.of method added in this patch? RoaringDocIdSet is ideal for caches; no?\n\nRoaringDocIdSet is indeed our best option for caching. However, the join module needs random access and in particular nextSetBit/prevSetBit operations which we can't provide with RoaringDocIdSet. RoaringDocIdSet could potentially use binary search on blocks that are represented with a short[] for random-access, which ought to be fast given that short[] blocks can only contain 4096 documents at most (when then are more docs, we use a bit set), but it was still much slower than random-access on SparseFixedBitSet and FixedBitSet so I preferred not to expose random access which might be a performance trap. "
+        },
+        {
+            "id": "comment-14623219",
+            "author": "David Smiley",
+            "date": "2015-07-11T04:15:01+0000",
+            "content": "When I looked at IntersectsRPTVerifyQuery, I saw it was using the produced bits so I thought it actually need bit sets, but maybe it doesn't and we could just use advance()?\n\nIt doesn't need bit sets (random-access).  I did a little playing around just now and saw DocIdSetBuilder plugged in easily except for isDefinitelyEmpty(). ...\n\nRegarding isDefinitelyEmpty, I'm wondering if we could keep the builders initially empty and then instantiate them on the first time than we need to add data? Then we could use a null check to know whether they have any content at all, would it work?\n\nWe could, but that's a little more error prone (null check) & more code than simply having an isDefinitelyEmpty() method.  In fact it would simply be isEmpty() for DocIdSetBuilder as it has a definitive answer.  Nonetheless if you feel this method is somehow a bad idea then we can proceed with your suggestion.  \n\nRE RoaringDocIdSet \u2013 that's very interesting; thanks for the background.  Perhaps a comment in QueryBitSetProducer would clarify why this choice is made. "
+        },
+        {
+            "id": "comment-14628008",
+            "author": "Adrien Grand",
+            "date": "2015-07-15T12:55:28+0000",
+            "content": "I gave it a try without adding a method to DocIdSetBuilder and by using iterators of the returned DocIdSets instead of using random-access. David, maybe you could have a look? "
+        },
+        {
+            "id": "comment-14628706",
+            "author": "David Smiley",
+            "date": "2015-07-15T20:51:32+0000",
+            "content": "Looks great Adrien!  I took a careful look at it.  +1 "
+        },
+        {
+            "id": "comment-14628737",
+            "author": "Adrien Grand",
+            "date": "2015-07-15T21:08:51+0000",
+            "content": "Thanks for reviewing David, I'll commit shortly. "
+        },
+        {
+            "id": "comment-14629442",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-16T08:49:56+0000",
+            "content": "Commit 1691335 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1691335 ]\n\nLUCENE-6645: Remove BitDocIdSetBuilder from lucene-spatial as well. "
+        },
+        {
+            "id": "comment-14629511",
+            "author": "ASF subversion and git services",
+            "date": "2015-07-16T09:56:56+0000",
+            "content": "Commit 1691344 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1691344 ]\n\nLUCENE-6645: Remove BitDocIdSetBuilder from lucene-spatial as well. "
+        },
+        {
+            "id": "comment-14713255",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-08-26T13:06:13+0000",
+            "content": "Bulk close for 5.3.0 release "
+        }
+    ]
+}

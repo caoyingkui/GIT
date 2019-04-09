@@ -25,8 +25,8 @@ public class GumTree {
 
         JdtTreeGenerator generator = new JdtTreeGenerator();
         try {
-            ITree r1 = generator.generateFromString(code1, ASTParser.K_CLASS_BODY_DECLARATIONS).getRoot();
-            ITree r2 = generator.generateFromString(code2, ASTParser.K_CLASS_BODY_DECLARATIONS).getRoot();
+            ITree r1 = generator.generateFromString(code1, ASTParser.K_STATEMENTS).getRoot();
+            ITree r2 = generator.generateFromString(code2, ASTParser.K_STATEMENTS).getRoot();
             Matcher m = Matchers.getInstance().getMatcher(r1, r2);
             m.match();
             MappingStore store = m.getMappings();

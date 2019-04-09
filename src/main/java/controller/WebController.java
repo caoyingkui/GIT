@@ -30,7 +30,7 @@ import java.util.Map;
 public class WebController {
     List<String> messageList = new ArrayList<>();
     int messageStart = 0;
-    GitAnalyzer analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
+    GitAnalyzer analyzer = new GitAnalyzer();
 
 
     int id = 0;
@@ -56,7 +56,7 @@ public class WebController {
         RevCommit com = analyzer.getCommit(commit);
 
         JSONObject object = new JSONObject();
-        String msg = DateTool.toString(com.getCommitTime()) + "\n" +
+        String msg = DateTool.toLocalTime(com.getAuthorIdent().getWhen().getTime()).toString() + "\n" +
                 com.getCommitTime() + "\n" +
                 com.getShortMessage();
         object.put("message", msg);
@@ -106,9 +106,8 @@ public class WebController {
         List<RevCommit> commits = analyzer.getCommits();
         JSONArray array = new JSONArray();
         for (RevCommit commit: commits) {
-            if (commit.getShortMessage().contains(issue.toUpperCase())) {
+            if (GitAnalyzer.findIssueId(commit.getShortMessage()).contains(issue))
                 array.put(commit.getName());
-            }
         }
         this.template.convertAndSend("/message/commit", array);
     }

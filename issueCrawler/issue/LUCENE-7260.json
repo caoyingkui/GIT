@@ -1,0 +1,81 @@
+{
+    "id": "LUCENE-7260",
+    "title": "StandardQueryParser is over 100 times slower in v5 compared to v3",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "5.4.1,                                            5.5.2,                                            6.3",
+        "components": [
+            "modules/queryparser"
+        ],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "Improvement"
+    },
+    "description": "The following test code times parsing a large query.\n\n\nimport org.apache.lucene.analysis.KeywordAnalyzer;\n//import org.apache.lucene.analysis.core.KeywordAnalyzer;\nimport org.apache.lucene.queryParser.standard.StandardQueryParser;\n//import org.apache.lucene.queryparser.flexible.standard.StandardQueryParser;\nimport org.apache.lucene.search.BooleanQuery;\n\npublic class LargeQueryTest {\n    public static void main(String[] args) throws Exception {\n        BooleanQuery.setMaxClauseCount(50_000);\n        StringBuilder builder = new StringBuilder(50_000*10);\n        builder.append(\"id:( \");\n        boolean first = true;\n        for (int i = 0; i < 50_000; i++) {\n            if (first) {\n                first = false;\n            } else {\n                builder.append(\" OR \");\n            }\n            builder.append(String.valueOf(i));\n        }\n        builder.append(\" )\");\n        String queryString = builder.toString();\n\n        StandardQueryParser parser2 = new StandardQueryParser(new KeywordAnalyzer());\n\n        for (int i = 0; i < 10; i++) {\n            long t0 = System.currentTimeMillis();\n            parser2.parse(queryString, \"nope\");\n            long t1 = System.currentTimeMillis();\n            System.out.println(t1-t0);\n        }\n    }\n}\n\n\n\nFor Lucene 3.6.2, the timings settle down to 200~300 with the fastest being 207.\nFor Lucene 5.4.1, the timings settle down to 20000~30000 with the fastest being 22444.\n\nSo at some point, some change made the query parser 100 times slower. I would suspect that it has something to do with how the list of children is now handled. Every time someone gets the children, it copies the list. Every time someone sets the children, it walks through to detach parent references and then reattaches them all again.\n\nIf it were me, I would probably make these collections immutable so that I didn't have to defensively copy them.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15261362",
+            "author": "Yonik Seeley",
+            "date": "2016-04-28T01:36:27+0000",
+            "content": "It may be BooleanQuery construction and not the parser.  Stuff like LUCENE-6305 made constructing one a more heavy-weight operation. "
+        },
+        {
+            "id": "comment-15261667",
+            "author": "Dawid Weiss",
+            "date": "2016-04-28T07:27:04+0000",
+            "content": "Do something with the result of the parsing, otherwise the result may be junk due to jvm optimizing out what it thinks is dead code. If this is indeed still the case it should be fairly easy to find by bisecting codebase between the two releases. "
+        },
+        {
+            "id": "comment-15261691",
+            "author": "Trejkaz",
+            "date": "2016-04-28T07:43:57+0000",
+            "content": "Well, this slowdown is also noticeable in our full application, where we are using the query for a search after doing the parsing. If it weren't, I wouldn't have even created this cut-down test. It is certainly a lot slower in the full application as well, but it's harder to produce timings for the full application and 3.6 without also accidentally including other factors. "
+        },
+        {
+            "id": "comment-15261695",
+            "author": "Dawid Weiss",
+            "date": "2016-04-28T07:47:55+0000",
+            "content": "But it's enough to just compute a rolling simple hash using the query object's hashCode returned from parsing and sysout it at the end (after the loop)? I don't negate the overall information, I'm just saying the numbers may be off by a significant factor. "
+        },
+        {
+            "id": "comment-15261697",
+            "author": "Dawid Weiss",
+            "date": "2016-04-28T07:48:48+0000",
+            "content": "Also, if this is so significantly slower it should be possible to find the hotspot causing the problem with a profiler (yourkit is excellent). "
+        },
+        {
+            "id": "comment-15261950",
+            "author": "Robert Muir",
+            "date": "2016-04-28T10:52:49+0000",
+            "content": "This also doesn't need to be fast: it returns an exception by default. You disable that safeguard, and then build a 50k term boolean query in the slowest possible way. "
+        },
+        {
+            "id": "comment-15262522",
+            "author": "Trejkaz",
+            "date": "2016-04-28T16:59:36+0000",
+            "content": "Is there a faster way to do it? Keeping in mind that it has to be something starting from a query string, since that's what the user originally entered who reported the issue to us. "
+        },
+        {
+            "id": "comment-15262648",
+            "author": "Trejkaz",
+            "date": "2016-04-28T18:07:17+0000",
+            "content": "Meanwhile I threw some hashCode() calls in on the query object, in this sort of fashion:\n\n        int temp = 0;\n        for (int i = 0; i < 10; i++)\n        {\n            long t0 = System.currentTimeMillis();\n            Query query = parser2.parse(queryString, \"nope\");\n            long t1 = System.currentTimeMillis();\n            temp ^= query.hashCode();\n            System.out.println(\"ignore: \" + temp);\n            System.out.println(\"dt: \" + (t1-t0));\n        }\n\n\n\nI'll take the ignore lines out because it just adds noise. Both tests run faster today but it looks like someone updated the JVM we're running against, so it could be related to that. These timings are for JDK 8u92. Interesting how whatever they did in the JVM has made one of the tests 1/3 faster!\n\n3.6:\n\ndt: 996\ndt: 659\ndt: 286\ndt: 393\ndt: 240\ndt: 257\ndt: 187\ndt: 529\ndt: 263\ndt: 183\n\n\n\n5.4:\n\ndt: 20213\ndt: 16613\ndt: 15311\ndt: 14633\ndt: 14925\ndt: 14571\ndt: 14008\ndt: 16320\ndt: 15211\ndt: 14881\n\n "
+        },
+        {
+            "id": "comment-15868916",
+            "author": "Trejkaz",
+            "date": "2017-02-16T01:07:41+0000",
+            "content": "Lucene 5.5 is an additional 50% slower.\n\n\ndt: 28105\ndt: 27394\ndt: 27947\ndt: 25959\ndt: 24957\ndt: 27461\ndt: 25734\ndt: 27295\ndt: 26739\ndt: 28613\n\n "
+        },
+        {
+            "id": "comment-15868920",
+            "author": "Trejkaz",
+            "date": "2017-02-16T01:12:12+0000",
+            "content": "Lucene 6.3:\n\n\ndt: 22307\ndt: 21190\ndt: 21004\ndt: 20972\ndt: 21435\ndt: 21802\ndt: 21487\ndt: 21282\ndt: 20886\ndt: 21386\n\n "
+        }
+    ]
+}

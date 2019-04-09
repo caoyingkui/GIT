@@ -11,15 +11,17 @@ import java.util.List;
 import java.util.regex.Pattern;
 
 public class Matcher {
-    public static List<Pair<Variation, Comment>> match(List<Variation> variations, Issue issue) {
+    public static List<Pair<Variation, Comment>> match(List<Variation> variations, List<Comment> comments) {
         List<Pair<Variation, Comment>> result = new ArrayList<>();
-        List<Comment> comments = issue.comments;
         comments.removeIf(item -> isNoise(item));
 
         for (Variation variation: variations) {
             double sim = 0, max = 0;
             int maxIndex = -1;
 
+            if (variation.methodName.contains("ensureCacheSize")) {
+                int a = 2;
+            }
             for (int i = 0; i < comments.size(); i ++) {
                 Comment comment = comments.get(i);
                 sim = getSimilarity(variation, comment);
@@ -29,30 +31,17 @@ public class Matcher {
                 }
             }
 
-            if (sim > 0) {
+            if (max > 0) {
                 result.add(new Pair<>(variation, comments.get(maxIndex)));
             }
         }
 
-
-        for (Comment comment: issue.comments) {
-            if(!isNoise(comment)) {
-                double sim = 0, max = 0;
-                int maxIndex = -1;
-                for (int i = 0; i < variations.size(); i ++) {
-                    Variation variation = variations.get(i);
-                    sim = getSimilarity(variation, comment);
-                    if (sim > max) {
-                        max = sim;
-                        maxIndex = i;
-                    }
-                }
-                if (sim > 0) {
-                    result.add(new Pair<>(variations.get(maxIndex), comment));
-                }
-            }
-        }
         return result;
+    }
+
+    public static List<Pair<Variation, Comment>> match(List<Variation> variations, Issue issue) {
+        List<Pair<Variation, Comment>> result = new ArrayList<>();
+        return match(variations, issue.comments);
     }
 
     private double compare(Variation variation, Comment comment) {

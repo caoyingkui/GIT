@@ -1,0 +1,133 @@
+{
+    "id": "LUCENE-5438",
+    "title": "add near-real-time replication",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "modules/replicator"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "6.0"
+        ]
+    },
+    "description": "Lucene's replication module makes it easy to incrementally sync index\nchanges from a master index to any number of replicas, and it\nhandles/abstracts all the underlying complexity of holding a\ntime-expiring snapshot, finding which files need copying, syncing more\nthan one index (e.g., taxo + index), etc.\n\nBut today you must first commit on the master, and then again the\nreplica's copied files are fsync'd, because the code operates on\ncommit points.  But this isn't \"technically\" necessary, and it mixes\nup durability and fast turnaround time.\n\nLong ago we added near-real-time readers to Lucene, for the same\nreason: you shouldn't have to commit just to see the new index\nchanges.\n\nI think we should do the same for replication: allow the new segments\nto be copied out to replica(s), and new NRT readers to be opened, to\nfully decouple committing from visibility.  This way apps can then\nseparately choose when to replicate (for freshness), and when to\ncommit (for durability).\n\nI think for some apps this could be a compelling alternative to the\n\"re-index all documents on each shard\" approach that Solr Cloud /\nElasticSearch implement today, and it may also mean that the\ntransaction log can remain external to / above the cluster.",
+    "attachments": {
+        "LUCENE-5438.patch": "https://issues.apache.org/jira/secure/attachment/12627611/LUCENE-5438.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13894467",
+            "author": "Michael McCandless",
+            "content": "Initial, very exploratory patch; it just contains a test case\n(TestNRTReplication), showing how NRT replication could work.  It's\nnot yet at all integrated with the replication module's existing\nAPIs... and I'm not sure how to do that.\n\nBut the test doesn't cheat, i.e. all index changes are pushed via\nbyte[] / file copy from master to replica, and it does pass... though\nthe CheckIndex that MDW.close calls is very slow, I think because of\nthe term vector / postings cross checking.\n\nFlushed segments are \"immediately\" pushed to the replica; merged\nsegments are first \"warmed\" by pre-copying to the replica with lower\npriority.  I also created a simple ReferenceManager<IS> that does the\nreopen from a provided SegmentInfos, which the app on the replica side\nwould use to obtain fresh searchers.  From that point it can use\nSearcherLifetimeManager \"as usual\" to track/expire past searchers. ",
+            "date": "2014-02-07T12:49:39+0000"
+        },
+        {
+            "id": "comment-13894645",
+            "author": "Mark Miller",
+            "content": "Very interesting - can't wait to see how the performance works out.\n\nTrying to move Solr over to the replication module is something I've briefly thought about here and there - and then stopped like touching an electric fence  It took so much work and effort to get the current replication code very stable with SolrCloud that I don't look forward to such a challenge in the near future.\n\nWe would def like to have the ability to only index once. Of course, if you are sending documents to replicas async while indexing on the leader (we don't yet), I wonder how much benefit you get?\n\nHopefully work like this gets some others interested in giving a replication overhaul a shot.  ",
+            "date": "2014-02-07T15:49:18+0000"
+        },
+        {
+            "id": "comment-13896779",
+            "author": "Michael McCandless",
+            "content": "New patch, improving the test case.  I added some abstraction (Replica class), and the test now randomly commits/stops/starts replicas. ",
+            "date": "2014-02-10T17:32:29+0000"
+        },
+        {
+            "id": "comment-13903366",
+            "author": "Shai Erera",
+            "content": "I reviewed the patch and looks like it can roughly be divided to two:\n\n\n\tInfrastructure: IndexWriter.flushAndIncRef(), SIS.write/read(DataOutput/Input), SDR being public...\n\tReplication: all in the test, in the form of Replica and the various threads\n\n\n\nWhat we need is to figure out how to tie the replication stuff with the Replicator API. I thought about it, discussed a bit with Mike, and here's a proposal:\n\n\n\tImplement NRTRevision which will list the NRT files (flushed segments) and the SIS-as-byte[] that we get from IW.flushAndIncRef().\n\tImplement NRTIndexUpdateHandler (replica side) to act on the special revision, and use the SIS.read() API and SDR().\n\t\n\t\tWe might also need the ReferenceManager that exists in the patch, which acts upon a SIS, rather than looking up commit points.\n\t\n\t\n\n\n\nThat will get NRT segments appear on the replicas easily, with some caveats:\n\n\n\tThe replicas will need to copy over merged segments, which can take a lot of time, and hurts the latency.\n\tThe replicas communicate w/ the primary node at their own leisure (well, configured interval), and for NRT we might want to notify the replicas of new files, to reduce latency.\n\n\n\nAs for merged segments, the patch includes the foundation for it already in the form of MergedSegmentWarmer, which holds on to the merged segments until all replicas successfully copied it. That way replicas copy the big segments and only after all of them are done, the merged segment is exposed to the SIS on the primary side, and a new NRTRevision will list it. There are still issues to take care of, such as replicas failing etc., but it's impl details I think.\n\nTo handle the push/pull issue we can offer another Replicator implementation - PushReplicator - which is given a list of replicas and every .publish() is communicated to all replicas so that they can start copying files immediately. Every replica will have an associated thread on the primary side to handle the replication logic and report on any failures that occurred with the replica. This will help w/ the bookkeeping that needs to be done on the primary side.\n\nThese are all just preliminary thoughts, I'm sure there are fun gotchas . ",
+            "date": "2014-02-17T16:57:59+0000"
+        },
+        {
+            "id": "comment-13904436",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1569488 from Michael McCandless in branch 'dev/branches/lucene5438'\n[ https://svn.apache.org/r1569488 ]\n\nLUCENE-5438: make branch ",
+            "date": "2014-02-18T19:20:33+0000"
+        },
+        {
+            "id": "comment-13904442",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1569489 from Michael McCandless in branch 'dev/branches/lucene5438'\n[ https://svn.apache.org/r1569489 ]\n\nLUCENE-5438: commit current state ",
+            "date": "2014-02-18T19:23:24+0000"
+        },
+        {
+            "id": "comment-13904449",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1569499 from Michael McCandless in branch 'dev/branches/lucene5438'\n[ https://svn.apache.org/r1569499 ]\n\nLUCENE-5438: fix javadoc ",
+            "date": "2014-02-18T19:28:59+0000"
+        },
+        {
+            "id": "comment-13905331",
+            "author": "Shai Erera",
+            "content": "I committed NRTIndexRevision and matching test:\n\n\n\tNRTIndexRevision lists the files in the SIS obtained from IW.flushAndIncrement() and holds a byte[] in memory of that SIS (by SIS.write(DataOutput)).\n\tThe segments_N is listed as segments_nrt_N, where N is SIS.getVersion() and in fact this file isn't materialized on any Directory, it's just listed so replica can request it.\n\tThere's a nocommit about how to handle commits, i.e. if you: addDoc(), commit(), addDoc(), publish(new NRTRev()), SIS.listFiles() contains segments_N as well\n\t\n\t\tOn one hand I think it's good to list that file as well, so that replica can replicate it and if it crashes, it can recover to the last known commit\n\t\tIt also simplifies how the app should integrate its NRT and commit() w/ replicator\n\t\tBut if we choose to pass that file as well, we should take care of it on the replica side, by e.g. sync'ing it (which we don't do for the in-memory SIS).\n\t\n\t\n\n\n\nI think it will be good if the framework allows the app to publish IndexRevision (commits) and NRTIndexRevision (NRT) seamlessly, so app can choose what to replicate. That way NRTIndexRevision doesn't need to know about SnapshotDeletionPolicy and its code path remains simple (IW.flushAndIncRef + IW.decRefDeleter). Once I add support on the replica side, I'll write a test which demonstrates how to mix commits/nrt w/ one replicator. ",
+            "date": "2014-02-19T12:02:32+0000"
+        },
+        {
+            "id": "comment-13914721",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1572653 from Michael McCandless in branch 'dev/branches/lucene5438'\n[ https://svn.apache.org/r1572653 ]\n\nLUCENE-5438: commit current [broken] state ",
+            "date": "2014-02-27T16:49:12+0000"
+        },
+        {
+            "id": "comment-13914724",
+            "author": "Michael McCandless",
+            "content": "I've committed my current [broken] state here, but I'm gonna moth ball this for now.\n\nI had made the test case more evil, by adding randomly shutting down a master and moving it to another node (promoting a replica to master).  It turns out this is very hard to do properly, because in this case, file names can be re-used (Lucene is no longer write-once) and detecting that is tricky, unless we can rely on some external global reliable storage (e.g. something stored in Zookeeper maybe) to record the last segments gen / segment name that was written on any node ... ",
+            "date": "2014-02-27T16:52:12+0000"
+        },
+        {
+            "id": "comment-13944463",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1580522 from Michael McCandless in branch 'dev/branches/lucene5438'\n[ https://svn.apache.org/r1580522 ]\n\nLUCENE-5438: test seems to pass now, even when master is migrated to an 'old' replica ",
+            "date": "2014-03-23T16:22:26+0000"
+        },
+        {
+            "id": "comment-13962764",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1585682 from mikemccand@apache.org in branch 'dev/branches/lucene5438'\n[ https://svn.apache.org/r1585682 ]\n\nLUCENE-5438: checkpoint current [broken] state ",
+            "date": "2014-04-08T10:43:03+0000"
+        },
+        {
+            "id": "comment-14342981",
+            "author": "Michael McCandless",
+            "content": "Here's a new patch based on trunk: recent progress with IDs and\nchecksums made things much easier here because now I can reliably\nidentify files across nodes.\n\nThis is still just a proof-of-concept test case and still has many\nnocommits, but I believe the core idea is finally working.\n\nThe test randomly starts N nodes, each with its own filesystem\ndirectory.  One node is primary, and the rest replicas. An indexing\nthread adds docs to the primary, and periodically a new NRT point is\nflushed and replicated out.\n\nThe test is quite evil: most of MDW's checks are left enabled.\nE.g. virus checker sometimes prevents deletion of files, unref'd files\nat close are caught, double-write to same filename is caught (except\nafter crash).  It uses RIW.  The replicas have random rate limiters so\nsome nodes are fast to copy and others are slow.  Replicas are\nrandomly crashed or gracefully closed, and restarted.  Primary is\nrandomly crashed/closed and a replica is promoted as new primary.\n\nA file is considered the \"same\" across primary and replica if its file\nname is the same, its full byte[] index header and footer are\nidentical, and it's in a \"known to be fsync'd\" state (e.g. not an\nunref'd file on init of replica/primary).\n\nA searching thread asserts that each searcher version always has the\nsame hit count across all nodes, and that there is no data loss.\n\nI also added a simplistic/restricted transaction log (sits logically\noutside of/above the cluster, not per-node) to show how NRT points can\nbe correlated back to locations in the xlog and used to replay\nindexing events on primary crash so no indexed documents are lost.\n\nVersions are consistent across replicas, so at any time if you have a\nfollow-on search needing a specific searcher version, you can use any\nreplica that has that version and it's guaranteed to be searching the\nsame point-in-time.\n\nI would love to get this into Jenkins soon, but one big problem here\nis I had to open up all sorts of ridiculous APIs in IW/SegmentInfos\n... I have to think about how to minimize this. ",
+            "date": "2015-03-02T09:42:56+0000"
+        },
+        {
+            "id": "comment-15138704",
+            "author": "Michael McCandless",
+            "content": "I got back to this issue and have been pushing changes here:\n\n  https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;a=shortlog;h=refs/heads/jira/lucene-5438-nrt-replication\n\nNet/net I think it's in pretty good shape ... I'd like to add this for\n6.0 as an experimental feature, as an alternative to document based\nreplication.\n\nI think there are complex tradeoffs between the two approaches to\ndistributing Lucene, but I think it's important users at least have\na choice.\n\nWith this change, multiple nodes (primary and replicas) have\nessentially the same transactional semantics that a single Lucene\nIndexWriter + NRT readers offers.  You have known point-in-time views\nthat are the consistent (long version) across nodes, you can commit\nany node (primary or replica), rollback etc.  When things crash, on\nrestart they are back to the last commit, etc.\n\nThe test cases are quite evil: they spawn sub-process JVMs, and\ncommunicate over a naive (thread-per-connection) TCP protocol to copy\nfiles, index documents, search, etc.  And they randomly crash (thank\nyou TestIndexWriterOnJRECrash!), commit, close, flip bits during\nfile copy, simulate slow networks, etc.\n\nI'll make an applyable patch from the current branch and post here. ",
+            "date": "2016-02-09T10:06:57+0000"
+        },
+        {
+            "id": "comment-15139115",
+            "author": "Michael McCandless",
+            "content": "Here's the latest applyable patch from the branch.  Tests patch but\nnot yet precommit... I'll work on it.\n\nI tried to keep the core changes to a minimum (simplified vs previous\niterations), but there were some additions that NRT replication needs,\nlike asking IW to write deletes to disk on opening the NRT reader.\nThe changes to SegmentInfos.java are not as scary as they look (just\nfactoring out methods to read/write from IndexInput/Output too).\n\nI've marked the new APIs experimental or internal, and put all\nthe new classes under o.a.l.replication.nrt.\n\nThe important classes are PrimaryNode (you create this on the JVM\nthat will index documents) and ReplicaNode (you create that on\nother JVMs to receive newly flushed files).  They are both abstract:\nyou must subclass and implement methods that actually do the work of\nmoving files, etc.  The tests do this using a simple TCP socket\nserver.\n\nBoth PrimaryNode and ReplicaNode expose a SearcherManager,\nwhich you use for searching.  They both have commit methods.\n\nThe primary node uses a merged segment warmer that pre-copies merged\nfiles before letting the local IW cutover.  This way NRT latency isn't\nblocked by copying merged files out (normally).  An alternative to\nthis would be to have the replicas do their own merging, but I think\nthat gets quite complex. ",
+            "date": "2016-02-09T16:06:51+0000"
+        },
+        {
+            "id": "comment-15143103",
+            "author": "Michael McCandless",
+            "content": "Hmm, I failed to insert LUCENE-5438 into the merge commit.\n\nHere's the commit: https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;a=commit;h=12b8721a44dbd1fbc7878fa37186c16cf6045401 ",
+            "date": "2016-02-11T17:26:26+0000"
+        },
+        {
+            "id": "comment-15391638",
+            "author": "ASF subversion and git services",
+            "content": "Commit 3daa82c6595387fd1bc9d78c2d2d7660dfc8b4b6 in lucene-solr's branch refs/heads/branch_6x from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3daa82c ]\n\nLUCENE-5438: make some APIs public so servers can actually use this feature ",
+            "date": "2016-07-25T10:00:29+0000"
+        },
+        {
+            "id": "comment-15391640",
+            "author": "ASF subversion and git services",
+            "content": "Commit 2d07ffd97fb4aec2a11aeddab40490044f3c2b49 in lucene-solr's branch refs/heads/master from Mike McCandless\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2d07ffd ]\n\nLUCENE-5438: make some APIs public so servers can actually use this feature ",
+            "date": "2016-07-25T10:01:09+0000"
+        }
+    ]
+}

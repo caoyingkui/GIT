@@ -1,0 +1,138 @@
+{
+    "id": "LUCENE-5938",
+    "title": "New DocIdSet implementation with random write access",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.0"
+        ]
+    },
+    "description": "We have a great cost API that is supposed to help make decisions about how to best execute queries. However, due to the fact that several of our filter implementations (eg. TermsFilter and BooleanFilter) return FixedBitSets, either we use the cost API and make bad decisions, or need to fall back to heuristics which are not as good such as RandomAccessFilterStrategy.useRandomAccess which decides that random access should be used if the first doc in the set is less than 100.\n\nOn the other hand, we also have some nice compressed and cacheable DocIdSet implementation but we cannot make use of them because TermsFilter requires a DocIdSet that has random write access, and FixedBitSet is the only DocIdSet that we have that supports random access.\n\nI think it would be nice to replace FixedBitSet in those filters with another DocIdSet that would also support random write access but would have a better cost?",
+    "attachments": {
+        "low_freq.tasks": "https://issues.apache.org/jira/secure/attachment/12668341/low_freq.tasks",
+        "LUCENE-5938.patch": "https://issues.apache.org/jira/secure/attachment/12668010/LUCENE-5938.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14129866",
+            "author": "Adrien Grand",
+            "content": "I have been trying to think about how to do it and here is a first iteration.\n\nThis DocIdSet, called SparseFixedBitSet is similar to FixedBitSet except that it only stores words that have at least one bit that is set. It is inspired from hash array mapped tries, and uses Long.bitCount/numberOfTrailingZeros operations in order to lookup words given an index.\n\nSome more notes:\n\n\tlike FixedBitSet it supports random access and implements the Bits interface\n\talthough not completely accurate, its cost() method should return numbers that are very close to the set cardinality, especially on sparse sets that have bits uniformly dispersed\n\tmemory usage is much better on sparse sets compared to FixedBitSet\n\tit supports random write access, so could be used eg. in TermsFilter\n\n\n\nI re-ran the benchmark that I had for our doc-id sets with this new impl and it seems to perform very well: http://people.apache.org/~jpountz/doc_id_sets2.html ",
+            "date": "2014-09-11T10:41:24+0000"
+        },
+        {
+            "id": "comment-14129937",
+            "author": "Robert Muir",
+            "content": "This also sounds like a very good candidate for MultiTermQueryWrapperFilter (used by \"filter\" rewrite)? \n\nI think last i looked, the main downside to filter rewrite is for sparse queries. Because of this, its faster for those queries to do a boolean rewrite, and there is complex logic (\"auto rewrite\") that first rewrites as booleanquery, then if it hits too many terms / too much density it \"starts over\" as filter rewrite. Perhaps we can just replace all of that with this bitset? ",
+            "date": "2014-09-11T12:06:37+0000"
+        },
+        {
+            "id": "comment-14129950",
+            "author": "Eks Dev",
+            "content": "Just a crazy idea.   Do you need to store words with all bits set? Did not look into implementation, but from your description it sounds like it might be as well possible to not store them without adding to many if-s at execution path. This way, it wold work better also for dense BS (like \"implicit inverting\" trick), and for all intermidate cases where you have some partial sorting (some sort of run length encoding)?  ",
+            "date": "2014-09-11T12:25:28+0000"
+        },
+        {
+            "id": "comment-14129957",
+            "author": "Adrien Grand",
+            "content": "Do you need to store words with all bits set?\n\nThat is a good question. For example WAH8DocIdSet detects dense sections of the set and has the ability to temporarily invert the encoding in such cases in order to save space (this is why you see memory usage for WAH8 decrease on dense bitsets on the benchmark). I like the idea but it doesn't look straightforward to me, so let's maybe pull this in and then work on improving efficiency on dense sets?\n\nPerhaps we can just replace all of that with this bitset?\n\nSounds good. I'll update the patch to use this new doc id set in relevant queries/filters. ",
+            "date": "2014-09-11T12:33:13+0000"
+        },
+        {
+            "id": "comment-14129959",
+            "author": "Robert Muir",
+            "content": "\nSounds good. I'll update the patch to use this new doc id set in relevant queries/filters.\n\nYeah I think the main benefit is if we go a little further than just replacing fixedbitset with it, it will be if we remove the CONSTANT_AUTO logic (just default to FILTER rewrite), so we don't do the boolean stuff at all. It will also be simpler. ",
+            "date": "2014-09-11T12:35:31+0000"
+        },
+        {
+            "id": "comment-14130099",
+            "author": "Adrien Grand",
+            "content": "Here is an updated patch:\n\n\tthis sparse set is used in MultiTermQueryWrapperFilter and TermsFilter\n\tconstant-score auto rewrite has been removed in favor of filter rewrite\n\n\n\nI didn't change BooleanFilter and ChainedFilter because I think they need more work. For example, it looks wrong to consume all documents of a filter when computing a conjunction instead of taking a leap-frog approach. Let's tackle this in another issue?\n\nTests pass. ",
+            "date": "2014-09-11T14:43:25+0000"
+        },
+        {
+            "id": "comment-14130248",
+            "author": "Uwe Schindler",
+            "content": "Very nice! Do we have performance numbers already? Especially a comparison with the auto rewrite for few terms. ",
+            "date": "2014-09-11T16:30:08+0000"
+        },
+        {
+            "id": "comment-14130251",
+            "author": "Adrien Grand",
+            "content": "I will try to run luceneutil tonight to see what the impact is on the multi-term queries that we have in the tasks file. ",
+            "date": "2014-09-11T16:32:54+0000"
+        },
+        {
+            "id": "comment-14130824",
+            "author": "Adrien Grand",
+            "content": "The results of the benchmark are a bit disappointing:\n\n\n                 Prefix3       44.93     (17.0%)       22.59      (2.4%)  -49.7% ( -59% -  -36%)\n                  IntNRQ       16.25     (17.1%)        9.13      (2.2%)  -43.8% ( -53% -  -29%)\n                Wildcard       68.48     (14.8%)       38.63      (4.6%)  -43.6% ( -54% -  -28%)\n\n\n\nI looked at the queries and the explanation is that quite a number of queries match a significant portion of the index (more than 1%), which makes FixedBitSet faster. I tried to play with some queries individually, and queries that match fewer docs are however faster with this set compared to the fixed bitset. The cutover seems to be around 1\u2030 of documents matched. ",
+            "date": "2014-09-11T22:42:53+0000"
+        },
+        {
+            "id": "comment-14131597",
+            "author": "Adrien Grand",
+            "content": "OK, I did something slightly different. It happens that all queries in the tasks file match a pretty large number of documents, which favors FixedBitSet. So now I've configured a threshold: FixedBitSet is used when more than maxDoc / 16384 docs match and SparseFixedBitSet is used otherwise. Since SparseFixedBitSet is much faster than FixedBitSet for such low densities, the cost to start by creating a SparseFixedBitSet and then upgrading to a FixedBitSet is negligible compared to starting with a FixedBitSet from the beginning (see http://people.apache.org/~jpountz/doc_id_sets2.html).\n\nSo now the benchmark looks better for those queries that match many documents:\n\n                  IntNRQ        7.10      (6.3%)        6.57      (9.6%)   -7.4% ( -21% -    9%)\n                 Prefix3      110.36     (14.8%)      109.88      (9.5%)   -0.4% ( -21% -   28%)\n                Wildcard       62.83     (14.5%)       66.93      (9.5%)    6.5% ( -15% -   35%)\n\n\n\nI don't think the improvement with Wildcard is noise, I can reproduce it easily. I think the reason is that since the default is filter rewrite now, we don't have to compute the terms intersection twice, which is costly with wildcard queries.\n\nI also wanted to see what happens with queries that match fewer documents compared to boolean rewrite, so I generated a set of wildcard queries that are expanded to a couple of terms and don't match too many documents (see tasks file attached):\n\n\n                Wildcard       99.90      (9.0%)      294.66     (30.6%)  194.9% ( 142% -  257%)\n\n\n\nFor such queries, the new default rewrite method looks much better. ",
+            "date": "2014-09-12T14:27:11+0000"
+        },
+        {
+            "id": "comment-14131609",
+            "author": "Adrien Grand",
+            "content": "And even if FixedBitSet would still be used, at least it would not be used on sparse sets anymore. ",
+            "date": "2014-09-12T14:36:18+0000"
+        },
+        {
+            "id": "comment-14151677",
+            "author": "Adrien Grand",
+            "content": "I updated the patch to recent trunk modifications and ran the benchmark again, I think it is ready. In summary this patch:\n\n\tintroduces a new doc-id set impl similar to FixedBitSet but which is much faster in the sparse case and a bit slower in the dense case (between 1.5x and 4x slower according to benchmarks).\n\tintroduces a doc-id set builder that supports random write access by starting with a sparse bit set and upgrading to a dense FixedBitSet when the cardinality of the set increases\n\tchanges MultiTermQueryWrapperFilter and TermsFilter to use this new builder\n\tremoves CONSTANT_SCORE_AUTO_REWRITE and makes CONSTANT_SCORE_FILTER_REWRITE the default\n\n\n\nFor queries that match many documents (wikimedium10m.tasks, the builder always ends up building a FixedBitSet), this new patch can be slower or faster depending on the cost to iterate the matching terms (since they are enumerated only once now) vs. the cost of building the doc-id set.\n\nFor queries that match few documents (low_freq.tasks, attached to this issue), this new patch makes things faster since it just sets a couple of bits in random order and then iterates over them instead of merging documents coming from several other iterators on the fly using a priority queue.\n\nIndependently of the benchmarks, I think it's a good simplification to remove the constant-score auto rewrite mode.\n\n\nwikimedium10m.tasks\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                  IntNRQ        8.79      (9.6%)        8.41      (3.4%)   -4.3% ( -15% -    9%)\n                  Fuzzy2       60.83     (11.1%)       58.34      (8.7%)   -4.1% ( -21% -   17%)\n            OrNotHighMed       98.35     (13.8%)       97.12     (10.9%)   -1.3% ( -22% -   27%)\n           OrHighNotHigh       18.88     (13.7%)       18.71     (11.1%)   -0.9% ( -22% -   27%)\n           OrNotHighHigh       17.10     (13.4%)       17.03     (11.2%)   -0.4% ( -22% -   27%)\n            OrNotHighLow      126.52     (13.6%)      126.85     (10.9%)    0.3% ( -21% -   28%)\n               OrHighMed       76.90     (14.0%)       77.25     (11.4%)    0.5% ( -21% -   30%)\n            OrHighNotLow       41.29     (14.3%)       41.51     (12.4%)    0.5% ( -22% -   31%)\n            OrHighNotMed       57.70     (13.6%)       58.03     (11.6%)    0.6% ( -21% -   29%)\n               OrHighLow       73.14     (14.7%)       73.74     (12.0%)    0.8% ( -22% -   32%)\n         LowSloppyPhrase      127.22      (8.6%)      128.43      (3.8%)    1.0% ( -10% -   14%)\n              OrHighHigh       29.11     (15.1%)       29.41     (12.2%)    1.0% ( -22% -   33%)\n        HighSloppyPhrase       12.83     (10.4%)       13.02      (5.3%)    1.4% ( -12% -   19%)\n                 Prefix3      113.92      (9.9%)      115.71      (2.4%)    1.6% (  -9% -   15%)\n                PKLookup      297.13      (9.2%)      302.03      (3.5%)    1.6% ( -10% -   15%)\n         MedSloppyPhrase       38.60      (8.8%)       39.26      (3.7%)    1.7% (  -9% -   15%)\n             AndHighHigh       71.39      (6.9%)       72.67      (0.9%)    1.8% (  -5% -   10%)\n                HighTerm       87.17      (7.9%)       88.85      (2.1%)    1.9% (  -7% -   12%)\n               MedPhrase       74.60      (9.3%)       76.10      (4.3%)    2.0% ( -10% -   17%)\n               LowPhrase       21.67      (9.6%)       22.12      (4.0%)    2.1% ( -10% -   17%)\n              AndHighMed      297.13      (9.4%)      303.73      (2.1%)    2.2% (  -8% -   15%)\n              HighPhrase       16.65      (8.2%)       17.04      (3.7%)    2.3% (  -8% -   15%)\n            HighSpanNear        4.56     (10.7%)        4.67      (6.1%)    2.4% ( -12% -   21%)\n                 LowTerm      769.53      (7.8%)      788.24      (2.0%)    2.4% (  -6% -   13%)\n              AndHighLow      726.76     (10.6%)      744.51      (4.2%)    2.4% ( -11% -   19%)\n             MedSpanNear       65.27      (9.3%)       67.00      (3.2%)    2.6% (  -9% -   16%)\n                Wildcard      114.28      (9.1%)      118.05      (7.4%)    3.3% ( -12% -   21%)\n             LowSpanNear      174.75     (10.3%)      180.83      (3.5%)    3.5% (  -9% -   19%)\n                  Fuzzy1       67.63     (11.3%)       70.08      (3.2%)    3.6% (  -9% -   20%)\n                 MedTerm      209.00      (9.3%)      216.71      (1.9%)    3.7% (  -6% -   16%)\n                 Respell       48.30     (10.6%)       50.58      (1.7%)    4.7% (  -6% -   18%)\n\nlow_freq.tasks\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                PKLookup      278.50      (8.8%)      297.48     (13.9%)    6.8% ( -14% -   32%)\n                Wildcard      124.50      (7.9%)      250.26     (19.3%)  101.0% (  68% -  139%)\n\n ",
+            "date": "2014-09-29T13:29:20+0000"
+        },
+        {
+            "id": "comment-14152040",
+            "author": "Michael McCandless",
+            "content": "This is a nice change; I like simplifying MTQ's rewrite methods, to\npush \"sparse/dense\" handling \"lower\".  It's hacky now how the auto\nmethod tries to switch from Query to FixedBitSet backed filter\ndepending on term/doc count...\n\nMaybe fix \"word\" to be \"long\" instead?  (In javadocs, variable names,\netc.).  \"word\" is kind of low-level, platform dependent term ... I\nfound SparseFixedBitSet somewhat hard to understand   Maybe rename\nwordCount to nonZeroLongCount or something?\n\napproximateCardinality / linear counting algorithm is cool ...  do we\nneed to guard against zeroWords being 0?  I guess this is allowed with\ndoubles in Java?  At least add a comment explaining this corner case\n\"works\", and I think add an explicit test case that sets a bit in\nevery long?\n\nSpelling: in TestSparseBitSet.copyOf, change sensible -> sensitive\n\nMaybe add some more comments around tricky parts of SparseFixedBitSet.\nE.g., the different branches inside set?  And, it looks strange doing\n1L << i, but in fact the JVM/processor make that 1L << (i % 64).  And\nIterator.currentOrNextDoc is scary looking... do we have enough tests\nhere?\n\nI hit this test failure, which reproduces with the patch, but not on\ntrunk ... not sure if it's somehow related ... but the test case seems\nbuggy (it doesn't try to unwrap an ExecutionException to get the ACE\nroot cause ... yet I can't get it to fail on trunk w/ beasting):\n\n\nNOTE: reproduce with: ant test  -Dtestcase=TestReaderClosed -Dtests.method=testReaderChaining -Dtests.seed=89DF4A597D3C8CB1 -Dtests.slow=true -Dtests.linedocsfile=/lucenedata/hudson.enwiki.random.lines.txt -Dtests.locale=sk -Dtests.timezone=America/Scoresbysund -Dtests.file.encoding=UTF-8\nNOTE: test params are: codec=HighCompressionCompressingStoredFields(storedFieldsFormat=CompressingStoredFieldsFormat(compressionMode=HIGH_COMPRESSION, chunkSize=248), termVectorsFormat=CompressingTermVectorsFormat(compressionMode=HIGH_COMPRESSION, chunkSize=248)), sim=RandomSimilarityProvider(queryNorm=true,coord=yes): {}, locale=sk, timezone=America/Scoresbysund\nNOTE: Linux 3.13.0-32-generic amd64/Oracle Corporation 1.7.0_55 (64-bit)/cpus=8,threads=1,free=453126896,total=518979584\nNOTE: All tests run in this JVM: [TestReaderClosed]\n\nTime: 0.485\nThere was 1 failure:\n1) testReaderChaining(org.apache.lucene.index.TestReaderClosed)\njava.lang.RuntimeException: java.util.concurrent.ExecutionException: org.apache.lucene.store.AlreadyClosedException: this IndexReader cannot be used anymore as one of its child readers was closed\n\tat __randomizedtesting.SeedInfo.seed([89DF4A597D3C8CB1:1EE91FD6CAA6CE7C]:0)\n\tat org.apache.lucene.search.IndexSearcher$ExecutionHelper.next(IndexSearcher.java:836)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:452)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:273)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:261)\n\tat org.apache.lucene.index.TestReaderClosed.testReaderChaining(TestReaderClosed.java:83)\n\tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n\tat sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)\n\tat sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n\tat java.lang.reflect.Method.invoke(Method.java:606)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner.invoke(RandomizedRunner.java:1618)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$6.evaluate(RandomizedRunner.java:827)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$7.evaluate(RandomizedRunner.java:863)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$8.evaluate(RandomizedRunner.java:877)\n\tat org.apache.lucene.util.TestRuleSetupTeardownChained$1.evaluate(TestRuleSetupTeardownChained.java:50)\n\tat org.apache.lucene.util.AbstractBeforeAfterRule$1.evaluate(AbstractBeforeAfterRule.java:46)\n\tat com.carrotsearch.randomizedtesting.rules.SystemPropertiesInvariantRule$1.evaluate(SystemPropertiesInvariantRule.java:55)\n\tat org.apache.lucene.util.TestRuleThreadAndTestName$1.evaluate(TestRuleThreadAndTestName.java:49)\n\tat org.apache.lucene.util.TestRuleIgnoreAfterMaxFailures$1.evaluate(TestRuleIgnoreAfterMaxFailures.java:65)\n\tat org.apache.lucene.util.TestRuleMarkFailure$1.evaluate(TestRuleMarkFailure.java:48)\n\tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n\tat com.carrotsearch.randomizedtesting.ThreadLeakControl$StatementRunner.run(ThreadLeakControl.java:365)\n\tat com.carrotsearch.randomizedtesting.ThreadLeakControl.forkTimeoutingTask(ThreadLeakControl.java:798)\n\tat com.carrotsearch.randomizedtesting.ThreadLeakControl$3.evaluate(ThreadLeakControl.java:458)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner.runSingleTest(RandomizedRunner.java:836)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$3.evaluate(RandomizedRunner.java:738)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$4.evaluate(RandomizedRunner.java:772)\n\tat com.carrotsearch.randomizedtesting.RandomizedRunner$5.evaluate(RandomizedRunner.java:783)\n\tat org.apache.lucene.util.AbstractBeforeAfterRule$1.evaluate(AbstractBeforeAfterRule.java:46)\n\tat org.apache.lucene.util.TestRuleStoreClassName$1.evaluate(TestRuleStoreClassName.java:42)\n\tat com.carrotsearch.randomizedtesting.rules.SystemPropertiesInvariantRule$1.evaluate(SystemPropertiesInvariantRule.java:55)\n\tat com.carrotsearch.randomizedtesting.rules.NoShadowingOrOverridesOnMethodsRule$1.evaluate(NoShadowingOrOverridesOnMethodsRule.java:39)\n\tat com.carrotsearch.randomizedtesting.rules.NoShadowingOrOverridesOnMethodsRule$1.evaluate(NoShadowingOrOverridesOnMethodsRule.java:39)\n\tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n\tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n\tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n\tat org.apache.lucene.util.TestRuleAssertionsRequired$1.evaluate(TestRuleAssertionsRequired.java:43)\n\tat org.apache.lucene.util.TestRuleMarkFailure$1.evaluate(TestRuleMarkFailure.java:48)\n\tat org.apache.lucene.util.TestRuleIgnoreAfterMaxFailures$1.evaluate(TestRuleIgnoreAfterMaxFailures.java:65)\n\tat org.apache.lucene.util.TestRuleIgnoreTestSuites$1.evaluate(TestRuleIgnoreTestSuites.java:55)\n\tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n\tat com.carrotsearch.randomizedtesting.ThreadLeakControl$StatementRunner.run(ThreadLeakControl.java:365)\n\tat java.lang.Thread.run(Thread.java:745)\nCaused by: java.util.concurrent.ExecutionException: org.apache.lucene.store.AlreadyClosedException: this IndexReader cannot be used anymore as one of its child readers was closed\n\tat java.util.concurrent.FutureTask.report(FutureTask.java:122)\n\tat java.util.concurrent.FutureTask.get(FutureTask.java:188)\n\tat org.apache.lucene.search.IndexSearcher$ExecutionHelper.next(IndexSearcher.java:832)\n\t... 41 more\nCaused by: org.apache.lucene.store.AlreadyClosedException: this IndexReader cannot be used anymore as one of its child readers was closed\n\tat org.apache.lucene.index.IndexReader.ensureOpen(IndexReader.java:279)\n\tat org.apache.lucene.index.ParallelLeafReader.getLiveDocs(ParallelLeafReader.java:204)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:611)\n\tat org.apache.lucene.search.AssertingIndexSearcher.search(AssertingIndexSearcher.java:94)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:483)\n\tat org.apache.lucene.search.IndexSearcher$SearcherCallableNoSort.call(IndexSearcher.java:722)\n\tat org.apache.lucene.search.IndexSearcher$SearcherCallableNoSort.call(IndexSearcher.java:699)\n\tat java.util.concurrent.FutureTask.run(FutureTask.java:262)\n\tat java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:471)\n\tat java.util.concurrent.FutureTask.run(FutureTask.java:262)\n\tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)\n\tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)\n\t... 1 more\n\n ",
+            "date": "2014-09-29T18:40:57+0000"
+        },
+        {
+            "id": "comment-14152472",
+            "author": "Adrien Grand",
+            "content": "Thanks for the review Mike, here is a new patch that tries to address your concerns.\n\nMaybe fix \"word\" to be \"long\" instead\n\nDone.\n\ndo we need to guard against zeroWords being 0?\n\nI added a comment as well as a test as you suggested.\n\n\nMaybe add some more comments around tricky parts of SparseFixedBitSet.\nE.g., the different branches inside set? And, it looks strange doing\n1L << i, but in fact the JVM/processor make that 1L << (i % 64). And\nIterator.currentOrNextDoc is scary looking... do we have enough tests\nhere?\n\nI added more comments, hopefully they make sense. Please let me know if there are still things that are not clear. currentOrNextDoc is a bit complicated because of the different cases that need to be handled but the structure is actually quite simple so at least get and set should be easy to understand. I extracted the insertion of a new long to a separate method, this should make set easier to read?\n\nRegarding the shift, indeed it relies on the fact that shifts are mod 64 (FixedBitSet does the same). I added some comments about it.\n\nRegarding the tests, BaseDocIdSetTestCase.testAgainstBitSet tests various densities and assertEquals checks nextDoc(), docId(), interleaved calls to nextDoc() and advance(), and that the oal.util.Bits representation is consistent with the iterator. I think that is good?\n\nI hit this test failure, which reproduces with the patch\n\nI dug that one, and the reason is that the searcher is created with threads, so the exception is indeed wrapped into an ExecutionException, which is in turn wrapped into a RuntimeException to by-pass the fact that ExecutionException is checked. It doesn't reproduce on trunk because the default rewrite method reads data from the index in MultiTermQuery.rewrite (collectTerms) which does not run in a thread pool. You can reproduce the issue on trunk by setting the rewrite method of the term range query to CONSTANT_SCORE_FILTER_REWRITE. I fixed the test in the patch to walk down the causes of the exception that is thrown. ",
+            "date": "2014-09-29T22:59:13+0000"
+        },
+        {
+            "id": "comment-14153036",
+            "author": "Michael McCandless",
+            "content": "Thanks Adrien Grand, new patch looks great!  +1 to commit.  Thank you for explaining that test failure! ",
+            "date": "2014-09-30T10:15:10+0000"
+        },
+        {
+            "id": "comment-14153100",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1628402 from Adrien Grand in branch 'dev/trunk'\n[ https://svn.apache.org/r1628402 ]\n\nLUCENE-5938: Add a new sparse fixed bit set and remove ConstantScoreAutoRewrite. ",
+            "date": "2014-09-30T11:52:24+0000"
+        },
+        {
+            "id": "comment-14153101",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1628406 from Adrien Grand in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1628406 ]\n\nLUCENE-5938: Add a new sparse fixed bit set and remove ConstantScoreAutoRewrite. ",
+            "date": "2014-09-30T11:59:45+0000"
+        },
+        {
+            "id": "comment-14153107",
+            "author": "Adrien Grand",
+            "content": "Thanks Mike! ",
+            "date": "2014-09-30T12:05:22+0000"
+        },
+        {
+            "id": "comment-14332641",
+            "author": "Anshum Gupta",
+            "content": "Bulk close after 5.0 release. ",
+            "date": "2015-02-23T05:01:06+0000"
+        }
+    ]
+}

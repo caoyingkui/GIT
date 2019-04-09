@@ -1,0 +1,125 @@
+{
+    "id": "LUCENE-7410",
+    "title": "Make cache keys and closed listeners less trappy",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "7.0"
+        ],
+        "priority": "Major",
+        "status": "Resolved",
+        "type": "Bug"
+    },
+    "description": "IndexReader currently exposes getCoreCacheKey(), getCombinedCoreAndDeletesKey(), addCoreClosedListener() and addReaderClosedListener(). They are typically used to manage resources whose lifetime needs to mimic the lifetime of segments/indexes, typically caches.\n\nI think this is trappy for various reasons:\n\nMemory leaks\n\nWhen maintaining a cache, entries are added to the cache based on the cache key and then evicted using the cache key that is given back by the close listener, so it is very important that both keys are the same.\n\nBut if a filter reader happens to delegate get*Key() and not add*ClosedListener() or vice-versa then there is potential for a memory leak since the closed listener will be called on a different key and entries will never be evicted from the cache.\n\nLifetime expectations\n\nThe expectation of using the core cache key is that it will not change in case of deletions, but this is only true on SegmentReader and LeafReader impls that delegate to it. Other implementations such as composite readers or parallel leaf readers use the same key for \"core\" and \"combined core and deletes\".\n\nThrow-away wrappers cause cache trashing\n\nAn application might want to either expose more (with a ParrallelReader or MultiReader) or less information (by filtering fields/docs that can be seen) depending on the user who is logged in. In that case the application would typically maintain a DirectoryReader and then wrap it per request depending on the logged user and throw away the wrapper once the request is completed.\n\nThe problem is that these wrappers have their own cache keys and the application may build something costly and put it in a cache to throw it away a couple milliseconds later. I would rather like for such readers to have a way to opt out from caching on order to avoid this performance trap.\n\nType safety\n\nThe keys that are exposed are plain java.lang.Object instances, which requires caches to look like a Map<Object, ?> which makes it very easy to either try to get, put or remove on the wrong object since any object would be accepted.",
+    "attachments": {
+        "LUCENE-7410.patch": "https://issues.apache.org/jira/secure/attachment/12823009/LUCENE-7410.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15414942",
+            "author": "Robert Muir",
+            "date": "2016-08-10T08:53:27+0000",
+            "content": "getCombinedCoreAndDeletesKey(): what uses this one? Can we remove it? "
+        },
+        {
+            "id": "comment-15414994",
+            "author": "Adrien Grand",
+            "date": "2016-08-10T09:16:59+0000",
+            "content": "Agreed. I'm also looking into removing the ability to remove closed listeners. "
+        },
+        {
+            "id": "comment-15415140",
+            "author": "Adrien Grand",
+            "date": "2016-08-10T11:27:54+0000",
+            "content": "I have a patch which makes the situation better I think:\n\n\tthe ability to remove a listener is gone\n\tthere is no \"core\" cache key or listener on IndexReader anymore, only on LeafReader\n\tcache key and listener registration have moved to the IndexReader.CacheHelper class so that it is clear which key relates to which listener. It also makes it very hard to propagate the cache key from a filtered reader without propagating the listener registration or vice versa, you cannot do it by mistake anymore.\n\tIndexReader.addReaderClosedListener and IndexReader.getCombinedCoreAndDeletesKey have been replaced by IndexReader.getReaderCacheHelper, which returns null by default, meaning that the reader is not suited for caching\n\tIndexReader.addCoreClosedListener and IndexReader.getCoreCacheKey() have been replaced by LeafReader.getCoreCacheHelper, which returns null by default, meaning that this leaf reader has no concept of \"core\" data\n\tthere is only one impl that actually implements LeafReader.getCoreCacheHelper: SegmentReader. All other impls either delegate to it or do not support caching on a core key.\n\tthere are only two impls that actually implement IndexReader.getReaderCacheHelper: SegmentReader and StandardDirectoryReader. All other impls either delegate to it or do not support caching.\n\tthe query cache and BitSetProducer for joins skip caching when LeafReader.getCoreCacheHelper returns null. Other APIs like segment-based replication or FieldCache fail with an exception since not being able to cache is a problem/performance trap in those cases.\n\tIndexReader.CacheKey is used as a cache key to avoid type safety issues.\n\n\n\nOn the cons side, I removed insanity checking since I could not implement it anymore with the new API but maybe it is not that much of an issue since cache insanity is not really possible anymore unless you really want it? I also found some usage of cache keys in Solr which can be dangerous since cache keys are shared between readers that have different content, I think it should be fine given how these readers are used (I left notes in the patch), but that is something we might still want to look into since it could cause very subtle bugs. "
+        },
+        {
+            "id": "comment-15419055",
+            "author": "Adrien Grand",
+            "date": "2016-08-12T16:00:06+0000",
+            "content": "Any opinions? "
+        },
+        {
+            "id": "comment-15419068",
+            "author": "Robert Muir",
+            "date": "2016-08-12T16:11:13+0000",
+            "content": "At a glance a lot of these ideas sound great, but i need some time to look at the patch in detail, i only glanced thru it.\n\nthings like switching the filterreader default to not caching at all, well thats arguably less trappy, but at the same time a risky change. Are all of our filter readers really correct/optimal now? Maybe its just better for these classes to redeclare the method as 'abstract', forcing implementations to deal with it? Personally I think thats the best solution for this case.\n\nNot a huge fan of the name CacheHelper, at the same time I don't have a better suggestion. "
+        },
+        {
+            "id": "comment-15424152",
+            "author": "Adrien Grand",
+            "date": "2016-08-17T08:58:17+0000",
+            "content": "Thanks for having a look. I agree the name is not ideal, but could not come up with a better alternative either.\n\nHere is an updated patch that makes these methods abstract in IndexReader/LeafReader and not extended by the Filter* impls so that every singe implementation needs to decide what to do. "
+        },
+        {
+            "id": "comment-15854474",
+            "author": "Adrien Grand",
+            "date": "2017-02-06T18:12:36+0000",
+            "content": "I rebased this patch to current master. I would appreciate if someone can have a look as I think it'd be nice to make caching less trappy for 7.0. "
+        },
+        {
+            "id": "comment-15856733",
+            "author": "Michael McCandless",
+            "date": "2017-02-07T20:37:19+0000",
+            "content": "+1, this is a great infrastructure API improvement, thanks Adrien Grand.  I only saw some minor issues:\n\nCan/should we ensureOpen in the getReaderCacheHelper and\naddClosedListener impls?  Just seems like it'd be some good extra\nsafety to catch accidental mis-use?\n\nThere is a typo (like -> live) here:\n\n\n+    // TODO: this is trappy as the expectation is that core keys like for a long\n\n\n\nAnd a missing d in StandarDirectoryReader in the exception message here:\n\n\n+    if (cacheHelper == null) {\n+      throw new IllegalStateException(\"StandarDirectoryReader must support caching\");\n+    }\n\n\n\nAnd extra s here:\n\n+   * valuess updates may be considered equal. Consider using\n\n "
+        },
+        {
+            "id": "comment-15888102",
+            "author": "ASF subversion and git services",
+            "date": "2017-02-28T14:26:52+0000",
+            "content": "Commit df6f83072303b4891a296b700a50c743284d3c30 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=df6f830 ]\n\nLUCENE-7410: Make cache keys and close listeners less trappy. "
+        },
+        {
+            "id": "comment-15888159",
+            "author": "Adrien Grand",
+            "date": "2017-02-28T14:59:57+0000",
+            "content": "Thanks Mike. "
+        },
+        {
+            "id": "comment-15890516",
+            "author": "Steve Rowe",
+            "date": "2017-03-01T16:38:55+0000",
+            "content": "My Jenkins found a reproducing seed for a TestReaderClosed.testReaderChaining() failure, and git bisect running the repro line says:\n\n\ndf6f83072303b4891a296b700a50c743284d3c30 is the first bad commit\ncommit df6f83072303b4891a296b700a50c743284d3c30\nAuthor: Adrien Grand <jpountz@gmail.com>\nDate:   Tue Feb 28 14:21:30 2017 +0100\n\n    LUCENE-7410: Make cache keys and close listeners less trappy.\n\n\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestReaderClosed -Dtests.method=testReaderChaining -Dtests.seed=C4374342D2D99B8F -Dtests.slow=true -Dtests.locale=hi -Dtests.timezone=America/Dominica -Dtests.asserts=true -Dtests.file.encoding=US-ASCII\n   [junit4] FAILURE 0.04s J1 | TestReaderClosed.testReaderChaining <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError: Query failed, but not due to an AlreadyClosedException\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([C4374342D2D99B8F:530116CD6543D942]:0)\n   [junit4]    > \tat org.apache.lucene.index.TestReaderClosed.testReaderChaining(TestReaderClosed.java:96)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene70): {field=PostingsFormat(name=LuceneVarGapFixedInterval)}, docValues:{}, maxPointsInLeafNode=1885, maxMBSortInHeap=6.663525927605304, sim=RandomSimilarity(queryNorm=true): {}, locale=hi, timezone=America/Dominica\n   [junit4]   2> NOTE: Linux 4.1.0-custom2-amd64 amd64/Oracle Corporation 1.8.0_77 (64-bit)/cpus=16,threads=1,free=82013152,total=289931264\n\n "
+        },
+        {
+            "id": "comment-15890523",
+            "author": "Adrien Grand",
+            "date": "2017-03-01T16:44:50+0000",
+            "content": "Thanks, I'll dig! "
+        },
+        {
+            "id": "comment-15890721",
+            "author": "ASF subversion and git services",
+            "date": "2017-03-01T18:13:07+0000",
+            "content": "Commit 540a23723104e250a4fce94042fb90c86fcf3720 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=540a237 ]\n\nLUCENE-7410: Make TestReaderClosed pass if the IndexSearcher wraps a threadpool. "
+        },
+        {
+            "id": "comment-15890723",
+            "author": "Adrien Grand",
+            "date": "2017-03-01T18:13:54+0000",
+            "content": "It was a test bug introduced by this change, which happens when the created IndexSearcher wraps a threadpool. I just pushed a fix. "
+        },
+        {
+            "id": "comment-15894320",
+            "author": "Steve Rowe",
+            "date": "2017-03-03T13:16:02+0000",
+            "content": "Policeman Jenkins found a reproducing seed for a test method introduced on this issue https://jenkins.thetaphi.de/job/Lucene-Solr-master-Linux/19092/ (at https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=df6f830 - seed reproduces with this hash):\n\n\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestSlowCompositeReaderWrapper -Dtests.method=testOrdMapsAreCached -Dtests.seed=ED06E16D2F7E2C9F -Dtests.multiplier=3 -Dtests.slow=true -Dtests.locale=en-BS -Dtests.timezone=Asia/Kashgar -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n   [junit4] FAILURE 0.01s J2 | TestSlowCompositeReaderWrapper.testOrdMapsAreCached <<<\n   [junit4]    > Throwable #1: java.lang.AssertionError\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([ED06E16D2F7E2C9F:B1C7CA871734CF6C]:0)\n   [junit4]    > \tat org.apache.solr.index.TestSlowCompositeReaderWrapper.testOrdMapsAreCached(TestSlowCompositeReaderWrapper.java:111)\n   [junit4]    > \tat java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n   [junit4]    > \tat java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)\n   [junit4]    > \tat java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n   [junit4]    > \tat java.base/java.lang.reflect.Method.invoke(Method.java:547)\n   [junit4]    > \tat java.base/java.lang.Thread.run(Thread.java:844)\n   [junit4]   2> NOTE: test params are: codec=Asserting(Lucene70): {}, docValues:{sorted=DocValuesFormat(name=Lucene70), sorted_set=DocValuesFormat(name=Lucene70)}, maxPointsInLeafNode=1289, maxMBSortInHeap=5.014157490710387, sim=RandomSimilarity(queryNorm=true): {}, locale=en-BS, timezone=Asia/Kashgar\n   [junit4]   2> NOTE: Linux 4.4.0-53-generic amd64/Oracle Corporation 9-ea (64-bit)/cpus=12,threads=1,free=204857864,total=518979584\n\n "
+        },
+        {
+            "id": "comment-15894691",
+            "author": "ASF subversion and git services",
+            "date": "2017-03-03T16:44:17+0000",
+            "content": "Commit fbc844d33439efc1c5c6fee5547715d1a1b0db83 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fbc844d ]\n\nLUCENE-7410: Fix test bug. "
+        },
+        {
+            "id": "comment-15894692",
+            "author": "Adrien Grand",
+            "date": "2017-03-03T16:44:31+0000",
+            "content": "Thanks Steve, it was a test bug, I just pushed a fix. "
+        }
+    ]
+}

@@ -1,0 +1,185 @@
+{
+    "id": "LUCENE-5584",
+    "title": "Allow FST read method to also recycle the output value when traversing FST",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [
+            "core/FSTs"
+        ],
+        "affect_versions": "4.7.1",
+        "status": "Open",
+        "fix_versions": []
+    },
+    "description": "The FST class heavily reuses Arc instances when traversing the FST. The output of an Arc however is not reused. This can especially be important when traversing large portions of a FST and using the ByteSequenceOutputs and CharSequenceOutputs. Those classes create a new byte[] or char[] for every node read (which has an output).\nIn our use case we intersect a lucene Automaton with a FST<BytesRef> much like it is done in org.apache.lucene.search.suggest.analyzing.FSTUtil.intersectPrefixPaths() and since the Automaton and the FST are both rather large tens or even hundreds of thousands of temporary byte array objects are created.\n\nOne possible solution to the problem would be to change the org.apache.lucene.util.fst.Outputs class to have two additional methods (if you don't want to change the existing methods for compatibility):\n\n  /** Decode an output value previously written with {@link\n   *  #write(Object, DataOutput)} reusing the object passed in if possible */\n  public abstract T read(DataInput in, T reuse) throws IOException;\n\n  /** Decode an output value previously written with {@link\n   *  #writeFinalOutput(Object, DataOutput)}.  By default this\n   *  just calls {@link #read(DataInput)}. This tries to  reuse the object   \n   *  passed in if possible */\n  public T readFinalOutput(DataInput in, T reuse) throws IOException {\n    return read(in, reuse);\n  }\n\n\nThe new methods could then be used in the FST in the readNextRealArc() method passing in the output of the reused Arc. For most inputs they could even just invoke the original read(in) method.\n\nIf you should decide to make that change I'd be happy to supply a patch and/or tests for the feature.",
+    "attachments": {
+        "fst-itersect-benchmark.tgz": "https://issues.apache.org/jira/secure/attachment/12640073/fst-itersect-benchmark.tgz"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13964088",
+            "author": "David Smiley",
+            "content": "+1 I noticed the same problem when I was doing a lot of FST work. ",
+            "date": "2014-04-09T12:39:58+0000"
+        },
+        {
+            "id": "comment-13964384",
+            "author": "Michael McCandless",
+            "content": "It would be nice to allow reuse of outputs, for types are are re-usable (e.g. BytesRef, not Long).\n\nThe methods wouldn't need to be abstract right?  They could by default fallback to the non-reuse method (i.e. ignore the incoming reuse parameter).\n\nUsing this API might be a bit tricky, e.g. Util.get accumulates the output as it goes, and it needs both the current output, and the new one it just read from the arc, to be available simultaneously so that it can call Outputs.add.  I wonder if we could do the re-use there, e.g. allow add to return modify one of its incoming arguments?\n\nBut one thing to remember here: this garbage is very short-lived and modern JVMs are usually very fast at collecting such garbage.  Also, if you have an FST that has longish byte[] outputs, this is going to be possibly very slow even if we enable re-use, because it's at heart O(N^2) to accumulate the outputs, because it copies the entire byte[] each time it needs to append a bit more onto the end.  (It's like concatenating String instead of using StringBuilder).  So if that's the root cause of the slowness you are seeing, re-use alone won't fix it, unless we can do something with add and e.g. have a ByteArrayBuilder sort of output? ",
+            "date": "2014-04-09T17:03:57+0000"
+        },
+        {
+            "id": "comment-13964403",
+            "author": "Karl Wright",
+            "content": "Hi Mike,\n\nI'll let Christian comment on the details.  Suffice it to say that we did hack our way around this problem for the moment, but it is (was) a significant source of heap churn that was slowing things down for us fairly dramatically.  So whether or not Christian's fix is in fact the best possible one or not, it's certainly not the case that the objects involved are all short-lived. ",
+            "date": "2014-04-09T17:13:34+0000"
+        },
+        {
+            "id": "comment-13964504",
+            "author": "Michael McCandless",
+            "content": "Karl, do you have a test case showing the non-short-lived garbage?  As far as I can tell, all usage in Lucene very quickly drops references to all the intermediate outputs, and then saves/returns only the final \"result\" from an FST traversal.\n\nOr, maybe you meant to say that all the short-lived garbage was slowing down your JVM?\n\nIn either case, net/net I agree it would be nice to not create so much garbage. ",
+            "date": "2014-04-09T18:22:28+0000"
+        },
+        {
+            "id": "comment-13964513",
+            "author": "Karl Wright",
+            "content": "Once again, I'll wait for Christian to answer fully; I only know the result.  It may well be that all the garbage was short-lived by caused a lot of churn nonetheless.\n ",
+            "date": "2014-04-09T18:27:27+0000"
+        },
+        {
+            "id": "comment-13964516",
+            "author": "Dawid Weiss",
+            "content": "If it fits in a tlab (thread local allocation buffers) you basically shouldn't see it counted as GC activity... You'd need to share a bit more details about the jvm in question, GC settings, tlab buffers used, etc. ",
+            "date": "2014-04-09T18:29:47+0000"
+        },
+        {
+            "id": "comment-13965215",
+            "author": "Christian Ziech",
+            "content": "Thx for the very quick and helpful replies. It seems that I owe you some more hard and concrete information on our use case, what we exactly do and our environment.\nAbout the environment - the tests were run with\n\njava version \"1.7.0_45\"\nOpenJDK Runtime Environment (rhel-2.4.3.4.el6_5-x86_64 u45-b15)\nOpenJDK 64-Bit Server VM (build 24.45-b08, mixed mode)\non a CentOS 6.5. Our vm options don't enable the tlab right now but I'm definitely consider using it for other reasons. Currently we are running with the following (gc relevant) arguments: -Xmx6g -XX:MaxNewSize=700m -XX:+UseConcMarkSweepGC -XX:MaxDirectMemorySize=35g. \n\nI'm not so much worried about the get performance although that could be improved as well. We are using lucenes LevenshteinAutomata class to generate a couple of Levenshtein automatons with edit distance 1 or 2 (one for each search term), build the union of them and intersect them with our FST using a modified version of the method org.apache.lucene.search.suggest.analyzing.FSTUtil.intersectPrefixPaths() which uses a callback method to push every matched entry instead of returning the whole list of paths (for efficiency reasons as well: we don't actually need the byte arrays but we want to parse them into a value object, hence reusing the output byte array is ok for us).\nOur FST has about 500M entires and each entry has a value of approx. 10-20 bytes. That produces for a random query with 4 terms (and hence a union of 4 levenshtein automatons) an amount of ~2M visited nodes with output (hence 2M created temporary byte []) and a total size ~7.5M for the temporary byte arrays (+ the overhead per instance). In that experiment I matched about 10k terms in the FST. Those numbers are taking into account that we already used our own add implementation that writes to always the same BytesRef instance when adding outputs.\nThe overall impact on the GC and also the execution speed of the method was rather significant in total - I can try to dig up numbers for that but they would be rather application specific.\n\nDoes this help and answers all the questions so far?\n\nBtw: Experimenting a little with the change I noticed that things may be a slightly more complicated since the output of a node is often overwritten with \"NO_OUTPUT\" from the Outputs - so that method would need to recycle the current output as well if possible but that may have interesting side effects - but hopefully that should be manageable. ",
+            "date": "2014-04-10T10:47:09+0000"
+        },
+        {
+            "id": "comment-13965282",
+            "author": "Karl Wright",
+            "content": "Hi Christian,\n\nI think at this point, posting a proposed diff would be the best thing to do, with also maybe a snippet of code demonstrating our particular use case. ",
+            "date": "2014-04-10T12:08:48+0000"
+        },
+        {
+            "id": "comment-13965316",
+            "author": "Christian Ziech",
+            "content": "Trying to assemble the patch I came across the FST.Arc.copyFrom(Arc) method which unfortunately seems to implicitly assumes that the output of a node is immutable (which it would not be any longer). Is this immutability intended? If not I think that copyFrom() method would need to be moved into the FST class so that it can make use of the Outputs of the FST to clone the output of the copied arc if it is mutable ... however that would increase the size of the patch and possibly impact other users too ... ",
+            "date": "2014-04-10T12:59:52+0000"
+        },
+        {
+            "id": "comment-13966443",
+            "author": "Christian Ziech",
+            "content": "Modifying the existing ByteSequenceOutputs and CharSequenceOutputs to actually modify the output passed in upon read turns out to be rather complex since a lot in lucene indexing is actually relying on the immutability of arc outputs. \nWould it be ok for you guys to have a new \"mutable\" ByteSequenceOutput that could then be used for e.g. the AnalyzingSuggester? Then the patch would mostly be adding the extension points required and only using them in the special cases that would benefit from it. ",
+            "date": "2014-04-11T11:51:45+0000"
+        },
+        {
+            "id": "comment-13967591",
+            "author": "Robert Muir",
+            "content": "\nwe don't actually need the byte arrays but we want to parse them into a value object, hence reusing the output byte array is ok for us.\n\nIf this is the case, then I am not sure you are using the correct datastructure: it seems to me that a byte sequence output is not appropriate. Since you do not care about the intermediate outputs, but have a \"complicated\" intersection with the FST, why not use a numeric output, pointing to the result data somewhere else? ",
+            "date": "2014-04-12T17:27:13+0000"
+        },
+        {
+            "id": "comment-13967752",
+            "author": "Christian Ziech",
+            "content": "\nIf this is the case, then I am not sure you are using the correct datastructure: it seems to me that a byte sequence output is not appropriate. Since you do not care about the intermediate outputs, but have a \"complicated\" intersection with the FST, why not use a numeric output, pointing to the result data somewhere else?\n\nThat is what we do right now. This however has the downside that we loose the prefix compression capability of the FST for the FST values which is significant in our case. The single FST with the values attached was roughly 1.2G large and now with the referenced byte arrays (we load them into a DirectByteBuffer) we spend about 2.5G for the values alone. Of course we could try to implement the same prefix compression as the FST does on our own and fill a byte array while traversing the FST but that feels like copying something that is already almost there. If we could just get the extension points I mentioned into Lucene without actually changing the actual behavior of (most or any) of lucenes code that would be a huge help.\n\nEdit: Also with numeric outputs we still suffer from quite a few unwanted long references that are created temporarily by the VM just as the byte arrays were before. This problem is far less severe and actually manageable though. ",
+            "date": "2014-04-13T07:02:18+0000"
+        },
+        {
+            "id": "comment-13967796",
+            "author": "Robert Muir",
+            "content": "But this is the right thing to do. you can compress it however you want, you can move it to disk (since its like \"stored fields\" for your top-N), you can do all kinds of things with it.\n\nAs for numeric outputs being a problem at all, I do not believe you. a benchmark is required. ",
+            "date": "2014-04-13T11:23:35+0000"
+        },
+        {
+            "id": "comment-13968421",
+            "author": "Christian Ziech",
+            "content": "Sorry it took me quite some time to assemble a benchmark that I can attach here. I basically copied the FST and other required classes to the project and modified the FST so that it supports reusing of value object of Arcs. As said: the overhead with the long instances is quite manageable (about 3-5% for the overall execution time in the benchmark) - but there is still some. The main advantage we get from putting the values into the FST was the total space requirement. Right now I don't see an easy way to implement the prefix compression without the FST ourselves - but I need to think about that more carefully.\n\nTo run the benchmark yourself you first have to generate a FST using the RandomFstBuilder class and afterwards you can use the BenchmarkMutableFst class to execute the benchmark. \n\nPS: I also included a variant that uses the intersect implementation of the analyzers package but I don't think that the numbers are really a fair comparison since the analyzers variant takes a shortcut we afaik cannot take with our automaton. ",
+            "date": "2014-04-14T15:05:05+0000"
+        },
+        {
+            "id": "comment-13969523",
+            "author": "Karl Wright",
+            "content": "Just to answer Robert's comment clearly...\n\n\nBut this is the right thing to do. you can compress it however you want, you can move it to disk (since its like \"stored fields\" for your top-N), you can do all kinds of things with it.\n\nOur requirement is to be able to track complex arc information (kept now as values) that corresponds to the text \"keys\".  The problem is how to achieve the same common-prefix compression as we get out of the box using BytesRef instances as values, but also still meet our requirement that we be able to properly assemble the complex information, whether stored directly as values, or stored in an array indexed by a Long.  With an FST<BytesRef>, Lucene stores the common prefix of all child node values with the parent node, which allows for complete reconstruction of the value sequence.  But with an FST<Long>, Lucene stores the Math.min of the child node values with the parent node, which cannot be unique and thus does not permit the complex information to be reconstructed, unless we are missing something.\n\nWhat we have right now is a workaround, which does not use common-prefix compression because it can't.  This costs us some 2GB of memory in our use case, and performance loss on the order of 3-5%.  If you have a proposal to use FST<Long> in a manner that meets our constraints and also allows common-prefix compression, please let us know what that may be.\n\n ",
+            "date": "2014-04-15T13:11:47+0000"
+        },
+        {
+            "id": "comment-13969588",
+            "author": "Robert Muir",
+            "content": "It depends on your app, but usually something like a Monotonic packed ints storing address to every Nth term, and prefix coding within that block will work well. There are examples of this kind of stuff all over the lucene codebase. Its probably even better compression too, because the compression of the FST here for these sequence outputs is not very efficient (and traversal for large number of bytes as you see, is not really either, unless you are using the intermediate values and actually drive efficiency from that). ",
+            "date": "2014-04-15T14:41:53+0000"
+        },
+        {
+            "id": "comment-13969687",
+            "author": "Karl Wright",
+            "content": "Ok, we'll see if we can find another way with comparable results.  But it is still not clear to me what is wrong with our original proposal. ",
+            "date": "2014-04-15T16:24:14+0000"
+        },
+        {
+            "id": "comment-13993701",
+            "author": "Karl Wright",
+            "content": "Mike McCandless wonders if, instead of explicit outputs, we create a custom operation class, and override the \"add\" operator to just modify the value in place.  Apparently Lucene only cares about the add operation for the kinds of things we are doing, and we can likely \"fake it out\" by this method.  This would have nearly the same effect, he thinks, provided he actually understands what we are trying to do.\n\nI'm hoping Mike will comment also... ",
+            "date": "2014-05-09T16:59:45+0000"
+        },
+        {
+            "id": "comment-13993715",
+            "author": "Karl Wright",
+            "content": "More info: Christian is apparently doing precisely what Mike proposes.  His ThreadLocal hack is only in a small narrow area having to do with output selection.  But he will post further on Monday. ",
+            "date": "2014-05-09T17:18:47+0000"
+        },
+        {
+            "id": "comment-13994934",
+            "author": "Christian Ziech",
+            "content": "Optimizing our code for intersecting an automaton with an FST (inspired by org.apache.lucene.search.suggest.analyzing.FSTUtil#intersectPrefixPaths) I came across the following locations that create objects that actually could do without:\n\n\tthe \"scratchArc\" is created for every node in the automaton\n\tfor every state in the Automaton an iterator is created implicitly when iterating over the Transitions of the state\n\toutputs.add() creates a new outputs value object for every state of the automaton if the corresponding FST state had an output\n\tfor every transition visited a new IntsRef instance is created\n\tfor every FST node read a new outputs value object is created\n\n\n\nAll except the last allocation location was fixed easily:\n\n\twe keep the scratch arcs in a Stack and hence only create one per level of the automaton (about 10-15 levels for us)\n\twe iterate over the states using an int index in the transitions array\n\twe replaced outputs add by our own method that just appends the outputs of the FST Arc to a single outputs value per intersect call and then upon exiting the recursion just removes it again\n\tsame goes for the input IntsRef - we have one instance that is just modified as we traverse the automaton/FST\n\n\n\nFor the last allocation location we now have gone with a special Outputs implementation that uses a rather ugly construct to always return the very same outputs instance for the iterate case per Thread. Thinking about the problem again I came to think of another (easier) solution to that problem. If the outputs of the FST wouldn't actually be a field of the FST itself but if they would be under control of the caller of the FST read*Arc methods just like the BytesReader is, we wouldn't have the problem (maybe instead of the BytesReader). That way we could just create a new Outputs instance for each of our intersection runs and wouldn't need to resort that construct which attaches a state to something that is not meant to have a state. ",
+            "date": "2014-05-12T08:40:02+0000"
+        },
+        {
+            "id": "comment-13996240",
+            "author": "Michael McCandless",
+            "content": "Mike McCandless wonders if, instead of explicit outputs, we create a custom operation class, \n\nMy idea was a custom Outputs impl whose add method \"secretly\" reuses the incoming argument, e.g. something like this:\n\n\n  public BytesRef add(BytesRef a, BytesRef b) {\n    a.append(b);\n    return a;\n  }\n\n\n\nIf you do this, it's likely/possible Lucene methods like Util.get and Util.getShortestPaths etc. may not work, but for your usage it seems like this wouldn't be a problem since you have your own intersect algo on top?  Ie, you can fix that algo to deal with this \"secret\" re-use if it's a problem. ",
+            "date": "2014-05-13T10:11:54+0000"
+        },
+        {
+            "id": "comment-13996246",
+            "author": "Michael McCandless",
+            "content": "Optimizing our code for intersecting an automaton with an FST (inspired by org.apache.lucene.search.suggest.analyzing.FSTUtil#intersectPrefixPaths) I came across the following locations that create objects that actually could do without:\n\nI'm having trouble following here ...\n\nI think you mean, unrelated to the current issue (recycling outputs), you found places in intersectPrefixPaths where we can create fewer objects?  I think this is a separate, good, less risky change?  (Since it's not a change to FST APIs but rather the impl of getShortestPaths)?  Could you open a separate issue to iterate on that? ",
+            "date": "2014-05-13T10:18:17+0000"
+        },
+        {
+            "id": "comment-13996247",
+            "author": "Michael McCandless",
+            "content": "If the outputs of the FST wouldn't actually be a field of the FST itself but if they would be under control of the caller of the FST read*Arc methods just like the BytesReader is, we wouldn't have the problem (maybe instead of the BytesReader).\n\nThis would essentially push thread-privateness of the Outputs out to the caller.  It's true we did this for the BytesReader (and we've wondered in the past about using a ThreadPrivate instead), but it makes me nervous also pushing thread-privateness of Outputs to the caller.\n\nI'm also confused on why a custom Outputs impl that \"secretly\" reuses isn't sufficient here.\n\nActually, let me ammend the suggestion I made before, to this:\n\n\n  public BytesRef add(BytesRef a, BytesRef b) {\n    BytesRef result;\n    if (a == NO_OUTPUT) {\n      result = new BytesRef();\n    } else {\n      result = a;\n    }\n    result.append(b);\n    return result;\n  }\n\n\n\n(Not tested).  I think something like this would not require any thread-privateness yet would allow multiple threads to work correctly because each thread would first do that \"result = new BytesRef()\" and then re-use that output from then on, without requiring explicit ThreadLocal anywhere? ",
+            "date": "2014-05-13T10:22:50+0000"
+        },
+        {
+            "id": "comment-13996249",
+            "author": "Christian Ziech",
+            "content": "\nI'm also confused on why a custom Outputs impl that \"secretly\" reuses isn't sufficient here.\n\nThe problem is that Outputs.add() is just one of the locations that would create a new output-value instance. We do the reusing you suggested for the target of the add operation in our implementation and it works fine but it only fixes 50% of the allocation sites. The other half of the sites is in the Outputs.read() method. To fix this site was the reason for this ticket.\n\nBasically it would be fine for us that if every call to Outputs.read() would return the very same output-value since we only use it to add to the result we build internally (and throw it away thereafter). Since however multiple threads use the same FST in parallel this can only be achieved by a hack that uses a ThreadLocal to prevent threading issues with multiple threads using the same output-value instance. This also has the stench of adding a (hidden) state to a supposedly stateless class.  ",
+            "date": "2014-05-13T10:35:26+0000"
+        },
+        {
+            "id": "comment-13997622",
+            "author": "Michael McCandless",
+            "content": "The other half of the sites is in the Outputs.read() method. To fix this site was the reason for this ticket.\n\nAhhh, I see.\n\nMaybe we could add an expert ctor to FST that took another FST and a new outputs impl and made a shallow clone?  Ie the two FSTs would share the underlying byte[] but use different Outputs impls.  But, I'm not sure that really helps you: it just pushes the required ThreadLocal one level higher?  Or maybe it would help; it would be like BytesReader, where you make one at the start of your intersect method... ",
+            "date": "2014-05-14T15:03:10+0000"
+        },
+        {
+            "id": "comment-13998560",
+            "author": "Christian Ziech",
+            "content": "The additional ctor would be a solution as well, yes. We then could keep the FSTs in some cache and use one per thread.  ",
+            "date": "2014-05-15T08:00:22+0000"
+        },
+        {
+            "id": "comment-13998740",
+            "author": "Karl Wright",
+            "content": "Mike, do you want us to propose a patch along these lines? ",
+            "date": "2014-05-15T12:59:02+0000"
+        }
+    ]
+}

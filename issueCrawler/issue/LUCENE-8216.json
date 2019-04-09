@@ -1,0 +1,77 @@
+{
+    "id": "LUCENE-8216",
+    "title": "Better cross-field scoring",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "status": "Open",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "master (8.0)"
+        ]
+    },
+    "description": "I'd like Lucene to have better support for scoring across multiple fields. Today we have BlendedTermQuery which tries to help there but it probably tries to do too much on some aspects (handling cross-field term queries AND synonyms) and too little on other ones (it tries to merge index-level statistics, but not per-document statistics like tf and norm).\n\nMaybe we could implement something like BM25F so that queries across multiple fields would retain the benefits of BM25 like the fact that the impact of the term frequency saturates quickly, which is not the case with BlendedTermQuery if you have occurrences across many fields.",
+    "attachments": {
+        "LUCENE-8216.patch": "https://issues.apache.org/jira/secure/attachment/12948541/LUCENE-8216.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16406346",
+            "date": "2018-03-20T13:48:25+0000",
+            "content": "cc Diego Ceccarelli - I think you were working on this a while back? ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16689906",
+            "date": "2018-11-16T19:13:55+0000",
+            "content": "Here is a first patch that implements the simple version of BM25F described in\u00a0http://www.staff.city.ac.uk/~sb317/papers/foundations_bm25_review.pdf.\u00a0The patch adds a BM25Query that blends different fields and terms in a single stream. Norms are also summed per document but since they represent the number of unique words we could also take the max. However this patch is just a WIP, there are a lot things we can do better. For instance the second version described in the paper allows to change the parameter b per stream/field. I didn't change similarities, instead the new query forces a similarity (BM25) and applies the formula with the pseudo field statistics and ignores the per-field similarity. It would be nice to handle this kind of blending in all similarities but I wanted to start simple. Lastly the performance could be improved by implementing the max score optimization in the same manner than the SynonymQuery. Although it might not be as efficient because the merging of the norms in the impacts could lead to an upper bound that is much greater than the real max score (we don't know the minimum sum of norms because fields are disjoint). ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-16691717",
+            "date": "2018-11-19T13:49:03+0000",
+            "content": "Woohoo. +1 to start with a dedicated query and then look into folding this into similarities instead, adding built-in support for this in query parsers, etc. This is targeting sandbox, so I have no problem merging it as-is and iterating from there. Some thoughts that I had while reviewing the patch:\n\n\tapplyWeight casts to an int, should it keep a float instead? The similarity API already allows to pass term frequencies as a float. That would avoid the issue that you could otherwise end up with a term frequency that is equal to 0, which is illegal.\n\tCreating a FilterLeafReader feels a bit heavy given that everything that LeafSimScorer does with it is pulling norms. Forking LeafSimScorer might make things a bit easier (and later maybe refactoring LeafSimScorer)?\n\tIt looks like removing `field` from CollectionStatistics would help support such a change without having to use fake field names.\n\tMaybe advanceExact on merged norms should return `value != 0` rather than true all the time? I know it shouldn't be an issue in practice since we only get the norm on fields that have a value when scoring, but I would like it better if it behaved correctly. Also nextDoc() looks wrong too as I don't think it would skip over documents that don't have a value or return NO_MORE_DOCS when maxDoc is reached?\n\n\n\nNorms are also summed per document but since they represent the number of unique words we could also take the max.\n\nHmm I don't think this is correct. If a field value consists of twice the same term then the length of the field will be 2. Maybe you got confused because the length discards synonyms so that if two terms occur at the same position then this only adds one to the length by default. Summing up lengths sounds like a sensible approach to me. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16693090",
+            "date": "2018-11-20T11:35:22+0000",
+            "content": "Thanks Adrien Grand.\nI attached a new patch that fixes most of the issues you spotted:\n\n\napplyWeight casts to an int, should it keep a float instead? The similarity API already allows to pass term frequencies as a float. That would avoid the issue that you could otherwise end up with a term frequency that is equal to 0, which is illegal.\n\nYes the frequency should be a float. \n\n\nCreating a FilterLeafReader feels a bit heavy given that everything that LeafSimScorer does with it is pulling norms. Forking LeafSimScorer might make things a bit easier (and later maybe refactoring LeafSimScorer)?\n\nI removed the filter and forked LeafSimScorer in the new patch. +1 to refactor in a follow up.\n\n\nIt looks like removing `field` from CollectionStatistics would help support such a change without having to use fake field names.\n\nYes\n\n\nAlso nextDoc() looks wrong too as I don't think it would skip over documents that don't have a value or return NO_MORE_DOCS when maxDoc is reached?\n\nThanks, I removed the nextDoc() impl, it is unused.\n\n\nHmm I don't think this is correct. If a field value consists of twice the same term then the length of the field will be 2. Maybe you got confused because the length discards synonyms so that if two terms occur at the same position then this only adds one to the length by default. Summing up lengths sounds like a sensible approach to me.\n\nI certainly got confused, sorry . I changed the last patch to use a weighted sum when computing the norm. ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-16693232",
+            "date": "2018-11-20T13:28:01+0000",
+            "content": "+1 to push to sandbox as a start\nShould we require that weights are greater than or equal to 1 so that ttf is guaranteed to be greater than or equal to df? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16693255",
+            "date": "2018-11-20T13:49:37+0000",
+            "content": "This looks great!\n\nIn BM25Query.rewrite(), I think you need to put the 'single field, single term' case before the 'single field' case? ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16694443",
+            "date": "2018-11-21T09:22:30+0000",
+            "content": "\n\nShould we require that weights are greater than or equal to 1 so that ttf is guaranteed to be greater than or equal to df?\n\n\nYes this is required because we keep the max of the df and the sum of the ttf. I'll add a check.\n\n\u00a0\n\n\n\nIn BM25Query.rewrite(), I think you need to put the 'single field, single term' case before the 'single field' case?\n\n\n\u00a0\n\nGood catch, thanks.\n\n\u00a0\n\n\u00a0 ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-16694447",
+            "date": "2018-11-21T09:24:40+0000",
+            "content": "Commit fd96bc5ca6b1cf0c24953fb7b35937e403846440 in lucene-solr's branch refs/heads/master from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fd96bc5 ]\n\nLUCENE-8216: Added a new BM25FQuery in sandbox to blend statistics across several fields using the BM25F formula ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16694458",
+            "date": "2018-11-21T09:27:59+0000",
+            "content": "Commit 08dd681f0febcf73af94b47ea742294bf4dd8701 in lucene-solr's branch refs/heads/master from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=08dd681 ]\n\nLUCENE-8216: improve error message when field weight is invalid ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

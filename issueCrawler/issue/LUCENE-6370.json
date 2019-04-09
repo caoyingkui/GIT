@@ -1,0 +1,57 @@
+{
+    "id": "LUCENE-6370",
+    "title": "UninvertingReader cannot be used with ControlledRealTimeReopenThread",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "5.0",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "Bug"
+    },
+    "description": "In order to sort over non-DocValues fields in 5.0 we need to use an UninvertingReader to get the old FieldCache behavior back. However, UninvertingReader cannot be (easily) used with a ControlledRealTimeReopenThread.\n\nSpecifically, the easiest way to construct a ControlledRealTimeReopenThread is with a SearcherManager. The only way I found to wire an UninvertingReader into SearcherManager is to implement a SearcherFactory that  wraps the passed-in reader. Unfortunately, that runs afoul of the check in SearcherManager.getSearcher that requires \"SearcherFactory must wrap exactly the provided reader\". So, as long as this check is there, I simply don't see a way to use UninvertingReader with NRT functionality.\n\nI think this is a serious issue for programs that need to be able to use NRT search features on indexes created with previous Lucene versions, for whom upgrading the index is not an easy option. If they were previously relying on sorting implicitly via FieldCache, the only ways to upgrade are:\na) rebuild the index using DocValues fields, or\nb) use UninvertingReader\nRight now there's a catch-22, as (a) is assumed to be not an option and (b) is broken due to this bug.\n\nI have a hacky workaround for Gerrit Code Review up for review here:\nhttps://gerrit-review.googlesource.com/#/c/66613/6/gerrit-lucene/src/main/java/com/google/gerrit/lucene/WrappableSearcherManager.java@191\nBasically, it loosens the restriction on the newSearcher result to allow Filtered\n{Directory,Leaf}\nReaders that wrap the original reader. This appears to work fine for us, and I don't see anything in UninvertingReader that would cause me to believe it doesn't work. However, I'm no expert on Lucene internals and I don't know why that identity check was there in the first place, so I may be missing something.\n\nPlease do not take that patch directly until I have gotten permission from my employer to contribute it.",
+    "attachments": {
+        "LUCENE-6370.patch": "https://issues.apache.org/jira/secure/attachment/12707315/LUCENE-6370.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14380730",
+            "author": "Dave Borowitz",
+            "date": "2015-03-25T20:42:35+0000",
+            "content": "My patch as used in Gerrit, which I've gotten approval to contribute. "
+        },
+        {
+            "id": "comment-14381169",
+            "author": "Hoss Man",
+            "date": "2015-03-26T01:13:37+0000",
+            "content": "I don't know enough about SearchManager to comment on the specifics of that assertion or your patch, but regarding this comment...\n\nI think this is a serious issue for programs that need to be able to use NRT search features on indexes created with previous Lucene versions, for whom upgrading the index is not an easy option. If they were previously relying on sorting implicitly via FieldCache, the only ways to upgrade are:\n\nI believe there is a third option here, which is to open an UnivertingReader on the original index, and use that reader to addIndex() into a new writer, creating the docvalues in the process.\n\nI know Toke has used an approach similar to this (in his case he used the stored fields, not hte indexed values - not sure why off the top of my head) on a non-trivial index, and made his code available under the ASL2...\n\nhttps://sbdevel.wordpress.com/2014/12/15/changing-field-type-in-lucenesolr/\nhttps://github.com/netarchivesuite/dvenabler "
+        },
+        {
+            "id": "comment-14382033",
+            "author": "Michael McCandless",
+            "date": "2015-03-26T15:18:56+0000",
+            "content": "Thanks Dave.\n\nI fear with the patch, ref counts on IndexReaders will run amuck?\n\nBecause, we incRef the original DirectoryReader (inside openIfChanged), but later decRef the UninvertingReader?\n\nBut I'm baffled why you don't see problems (e.g. readers being closed while still in use) when you use your patch.\n\nAnother simple option would be to make your own UninvertingSearcherManager that overrides the necessary methods from the super class (there are not so many) to do all operations on the same reader?  ControlledRTReopenThread accepts any ReferenceManager<T>... "
+        },
+        {
+            "id": "comment-14382164",
+            "author": "Dave Borowitz",
+            "date": "2015-03-26T16:34:06+0000",
+            "content": "I didn't take refcounting into account, that's a good point. We haven't run this patch in production, so there might be some issues. But we do have a pretty good integration test suite that depends heavily on NRT searching.\n\nBasically what I did in the original Gerrit patch I linked to was implement my own ReferenceManager<T> that was a fork of SearcherManager. Is there a way I should tweak that fork that would avoid the refcounting problems you anticipate? (Extending SearcherManager is not an option unfortunately as that class is final.)\n\nDo you think the refcounting problems would show up in a simple test? We could add a NRT case to TestUninvertingReader without too much work, I think. "
+        },
+        {
+            "id": "comment-14382195",
+            "author": "Dave Borowitz",
+            "date": "2015-03-26T16:47:02+0000",
+            "content": "I think we might be ok on refcounts? Here's my thinking.\n\nSearcherManager.refreshIfNeeded calls DirectoryReader.openIfChanged on the result of referenceToRefresh.getIndexReader(). But I think that particular IndexReader is always the UninvertingReader, or more precisely, the result of getSearcher(searcherFactory, reader).getIndexReader(). I don't think we ever touch the refcount of the original reader. (Except in the failure case from getSearcher--should that be changed to wrapped.decRef() perhaps?) "
+        },
+        {
+            "id": "comment-14382956",
+            "author": "Michael McCandless",
+            "date": "2015-03-26T23:42:36+0000",
+            "content": "Hmm, I see.  The original DirectoryReader (from DirectoryReader.open, or that you passed into SearcherManager's ctor) has a +1 ref count, that I'm not sure ever gets decRef'd because we decRef getSearcher(searcherFactory, reader).getIndexReader() (the wrapped reader)?\n\nHowever, that decRef won't result in over-decRef, I think, because it has a +1 ref count from when the wrapped reader was created?\n\nSo maybe it's only the first originally opened (not wrapped) DirectoryReader that will have an extra refCount?  Maybe double check that all file descriptors are in fact being closed?\n\nIs your wrapped reader a new DirectoryReader where you wrapped each leaf in UninvertingReader?\n\nExcept in the failure case from getSearcher--should that be changed to wrapped.decRef() perhaps?\n\nHmm but searcher may not be initialized, if the exc happened inside newSearcher?  Also, with the check as it is now, reader == searcher.getIndexReader(). "
+        }
+    ]
+}

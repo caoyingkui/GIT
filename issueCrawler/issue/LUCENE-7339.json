@@ -1,0 +1,84 @@
+{
+    "id": "LUCENE-7339",
+    "title": "Bring back RandomAccessFilterStrategy",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.2",
+            "7.0"
+        ],
+        "priority": "Minor",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "FiteredQuery had 3 ways of running conjunctions: leap-frog, query first and random-access filter. We still use leap-frog for conjunctions and we now have a better \"query-first\" strategy through two-phase iteration. However, we don't have any equivalent for the random-access filter strategy.",
+    "attachments": {
+        "LUCENE-7339.patch": "https://issues.apache.org/jira/secure/attachment/12811048/LUCENE-7339.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15333478",
+            "author": "Adrien Grand",
+            "date": "2016-06-16T09:47:05+0000",
+            "content": "Here is a patch: it looks at the iterators to intersect and applies all of them that are an instance of BitSetIterator in a random-access fashion. There is one exception: if the iterator that has the minimum cost in the list is a BitSetIterator, then this iterator will still be consumed using the regular nextDoc/advance DISI API. This makes the optimization safe since we still use the iterator with the least cost in order to \"lead\" the iteration.\n\nI also changed the query cache to use a FixedBitSet rather than a RoaringDocIdSet when the density is greater than 1% (which was the cut-off used by RandomAccessFilterStrategy). This should help both because FixedBitSet is faster on dense sets (1% is -2 on the x axis at http://people.apache.org/~jpountz/doc_id_sets6.html) and also because it will enable this random-access optimization more often.\n\nI had to hack a bit luceneutil in order to generate conjunctions with an iterator over a BitSet, which I did by creating a conjunction over a term query and a numeric range. Here is the patch I applied to luceneutil:\n\ndiff --git a/src/main/perf/TaskParser.java b/src/main/perf/TaskParser.java\nindex 8397b3a..2365159 100644\n--- a/src/main/perf/TaskParser.java\n+++ b/src/main/perf/TaskParser.java\n@@ -244,6 +244,29 @@ class TaskParser {\n         query = IntPoint.newRangeQuery(nrqFieldName, start, end);\n         sort = null;\n         group = null;\n+      } else if (text.startsWith(\"filtered_nrq//\")) {\n+        // field start end\n+        final int spot3 = text.indexOf(' ');\n+        if (spot3 == -1) {\n+          throw new RuntimeException(\"failed to parse query=\" + text);\n+        }\n+        final int spot4 = text.indexOf(' ', spot3+1);\n+        if (spot4 == -1) {\n+          throw new RuntimeException(\"failed to parse query=\" + text);\n+        }\n+        final int spot5 = text.indexOf(' ', spot4+1);\n+        if (spot5 == -1) {\n+          throw new RuntimeException(\"failed to parse query=\" + text);\n+        }\n+        final String nrqFieldName = text.substring(\"filtered_nrq//\".length(), spot3);\n+        final int start = Integer.parseInt(text.substring(1+spot3, spot4));\n+        final int end = Integer.parseInt(text.substring(1+spot4, spot5));\n+        query = new BooleanQuery.Builder()\n+            .add(new TermQuery(new Term(\"body\", text.substring(1+spot5))), Occur.MUST)\n+            .add(IntPoint.newRangeQuery(nrqFieldName, start, end), Occur.FILTER)\n+            .build();\n+        sort = null;\n+        group = null;\n       } else if (text.startsWith(\"datetimesort//\")) {\n         throw new IllegalArgumentException(\"use lastmodndvsort instead\");\n       } else if (text.startsWith(\"titlesort//\")) {\ndiff --git a/tasks/wikimedium.10M.nostopwords.tasks b/tasks/wikimedium.10M.nostopwords.tasks\nindex 342070c..983361f 100644\n--- a/tasks/wikimedium.10M.nostopwords.tasks\n+++ b/tasks/wikimedium.10M.nostopwords.tasks\n@@ -13361,3 +13361,20 @@ OrNotHighLow: -do necessities # freq=511178 freq=1195\n OrHighNotLow: do -necessities # freq=511178 freq=1195\n OrNotHighLow: -had halfback # freq=1246743 freq=1205\n OrHighNotLow: had -halfback # freq=1246743 freq=1205\n+FilteredIntNRQ: filtered_nrq//timesecnum 6207 55832 ref\n+FilteredIntNRQ: filtered_nrq//timesecnum 53 85622 http\n+FilteredIntNRQ: filtered_nrq//timesecnum 2669 66142 from\n+FilteredIntNRQ: filtered_nrq//timesecnum 9936 85687 name\n+FilteredIntNRQ: filtered_nrq//timesecnum 23189 61377 title\n+FilteredIntNRQ: filtered_nrq//timesecnum 7624 69351 date\n+FilteredIntNRQ: filtered_nrq//timesecnum 15733 85583 which\n+FilteredIntNRQ: filtered_nrq//timesecnum 8791 69420 also\n+FilteredIntNRQ: filtered_nrq//timesecnum 6125 46693 first\n+FilteredIntNRQ: filtered_nrq//timesecnum 8006 80120 his\n+FilteredIntNRQ: filtered_nrq//timesecnum 11514 45063 cite\n+FilteredIntNRQ: filtered_nrq//timesecnum 6342 72089 he\n+FilteredIntNRQ: filtered_nrq//timesecnum 10670 66864 new\n+FilteredIntNRQ: filtered_nrq//timesecnum 2896 83864 1\n+FilteredIntNRQ: filtered_nrq//timesecnum 8947 64612 s\n+FilteredIntNRQ: filtered_nrq//timesecnum 2808 75217 2\n+FilteredIntNRQ: filtered_nrq//timesecnum 388 84762 one\n\n\n\nI got a ~6% speedup when testing it on wikimedium10m:\n\n                    TaskQPS baseline      StdDev   QPS patch      StdDev                Pct diff\n                 LowTerm      686.83      (7.6%)      677.34      (8.5%)   -1.4% ( -16% -   15%)\n        HighSloppyPhrase       19.29      (4.3%)       19.03      (4.5%)   -1.3% (  -9% -    7%)\n                 Prefix3      159.38      (5.0%)      157.87      (5.0%)   -0.9% ( -10% -    9%)\n            OrNotHighMed      191.55      (2.2%)      189.74      (2.3%)   -0.9% (  -5% -    3%)\n                Wildcard       99.07      (5.9%)       98.18      (5.9%)   -0.9% ( -11% -   11%)\n             MedSpanNear       38.50      (3.1%)       38.15      (3.2%)   -0.9% (  -7% -    5%)\n               MedPhrase       88.65      (2.6%)       87.88      (1.8%)   -0.9% (  -5% -    3%)\n         LowSloppyPhrase       59.35      (2.8%)       58.95      (2.9%)   -0.7% (  -6% -    5%)\n           OrHighNotHigh       49.32      (4.0%)       49.00      (4.2%)   -0.7% (  -8% -    7%)\n            OrHighNotMed       86.14      (4.8%)       85.60      (5.4%)   -0.6% ( -10% -   10%)\n            OrHighNotLow       50.89      (6.1%)       50.58      (5.7%)   -0.6% ( -11% -   11%)\n         MedSloppyPhrase       76.49      (2.0%)       76.05      (1.9%)   -0.6% (  -4% -    3%)\n             AndHighHigh      119.69      (1.2%)      119.07      (2.1%)   -0.5% (  -3% -    2%)\n            OrNotHighLow     1060.23      (3.2%)     1055.14      (3.9%)   -0.5% (  -7% -    6%)\n             LowSpanNear      229.73      (2.9%)      228.70      (3.0%)   -0.4% (  -6% -    5%)\n               LowPhrase      151.17      (2.2%)      150.49      (3.0%)   -0.4% (  -5% -    4%)\n              HighPhrase       43.96      (1.7%)       43.79      (2.3%)   -0.4% (  -4% -    3%)\n            HighSpanNear        2.23      (7.1%)        2.22      (7.4%)   -0.4% ( -13% -   15%)\n                  IntNRQ       12.11      (8.9%)       12.07      (8.9%)   -0.3% ( -16% -   19%)\n           OrNotHighHigh       67.08      (3.9%)       66.92      (3.9%)   -0.2% (  -7% -    7%)\n                 MedTerm      157.87      (5.6%)      157.54      (5.1%)   -0.2% ( -10% -   11%)\n                HighTerm       76.31      (5.8%)       76.16      (5.5%)   -0.2% ( -10% -   11%)\n                 Respell       74.16      (2.3%)       74.01      (3.2%)   -0.2% (  -5% -    5%)\n              AndHighMed      144.89      (1.8%)      144.62      (1.5%)   -0.2% (  -3% -    3%)\n              OrHighHigh       31.12      (6.2%)       31.18      (5.7%)    0.2% ( -11% -   12%)\n               OrHighMed       38.73      (6.0%)       38.84      (5.4%)    0.3% ( -10% -   12%)\n               OrHighLow      102.78      (4.0%)      103.09      (4.0%)    0.3% (  -7% -    8%)\n                  Fuzzy1       75.62     (16.4%)       76.64     (12.7%)    1.4% ( -23% -   36%)\n              AndHighLow      785.48      (4.2%)      796.18      (3.5%)    1.4% (  -6% -    9%)\n                  Fuzzy2       45.30     (16.5%)       47.03     (19.4%)    3.8% ( -27% -   47%)\n          FilteredIntNRQ       10.57      (4.0%)       11.20      (4.4%)    5.9% (  -2% -   14%)\n\n "
+        },
+        {
+            "id": "comment-15333525",
+            "author": "Uwe Schindler",
+            "date": "2016-06-16T10:22:07+0000",
+            "content": "Thanks for reimplementing! I am trying to understand it, will report later!\n\n\n} else if (disi.getClass() == BitSetConjunctionDISI.class) {\n\n\n\nWhy not instanceof? "
+        },
+        {
+            "id": "comment-15333572",
+            "author": "Adrien Grand",
+            "date": "2016-06-16T11:07:47+0000",
+            "content": "Thanks for looking Uwe! I guess the class comparison is mainly me being paranoid. In that case it does not matter since BitSetConjunctionDISI is final, but otherwise instanceof might also match sub classes. I can change it if you like instanceof better. "
+        },
+        {
+            "id": "comment-15341293",
+            "author": "Adrien Grand",
+            "date": "2016-06-21T07:30:20+0000",
+            "content": "Uwe Schindler Have you had a chance to give it a deeper look? "
+        },
+        {
+            "id": "comment-15341306",
+            "author": "Uwe Schindler",
+            "date": "2016-06-21T07:43:13+0000",
+            "content": "Hi,\nyes. I checked the createConjunction code, looks fine to me.\n\nI have just a minor \"simplification\". Finding the minCost can be done with Java 8 streams very easily:\n\nInstead of:\n\nlong minCost = Long.MAX_VALUE;\nfor (DocIdSetIterator iterator : allIterators) {\n  minCost = Math.min(minCost, iterator.cost());\n}\n\n\n\nDo in a one-liner with method-references and streams:\n\n\nlong minCost = allIterators.stream().mapToLong(DocIdSetIterator::cost).min().getAsLong();\n\n\n\nTest with the anonymous class looks fine! "
+        },
+        {
+            "id": "comment-15343822",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-22T07:09:00+0000",
+            "content": "Commit 60dcef6c61b0a72f4a7bb6e9b27a0073464f53c5 in lucene-solr's branch refs/heads/branch_6x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=60dcef6 ]\n\nLUCENE-7339: Specialize conjunction with bit sets. "
+        },
+        {
+            "id": "comment-15343823",
+            "author": "ASF subversion and git services",
+            "date": "2016-06-22T07:09:01+0000",
+            "content": "Commit 7afa3333c654b6423563e6dd1cd5478812924148 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7afa333 ]\n\nLUCENE-7339: Specialize conjunction with bit sets. "
+        },
+        {
+            "id": "comment-15343835",
+            "author": "Adrien Grand",
+            "date": "2016-06-22T07:19:15+0000",
+            "content": "Thanks Uwe, I applied the simplification you suggested. "
+        },
+        {
+            "id": "comment-15343853",
+            "author": "Uwe Schindler",
+            "date": "2016-06-22T07:41:33+0000",
+            "content": "All fine  Thanks for committing! "
+        },
+        {
+            "id": "comment-15439061",
+            "author": "Michael McCandless",
+            "date": "2016-08-26T14:00:53+0000",
+            "content": "Bulk close resolved issues after 6.2.0 release. "
+        }
+    ]
+}

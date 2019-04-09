@@ -1,0 +1,75 @@
+{
+    "id": "LUCENE-6828",
+    "title": "Speed up requests for many rows",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "4.10.4,                                            5.3",
+        "components": [
+            "core/search"
+        ],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Minor",
+        "status": "Open",
+        "type": "Improvement"
+    },
+    "description": "Standard relevance ranked searches for top-X results uses the HitQueue class to keep track of the highest scoring documents. The HitQueue is a binary heap of ScoreDocs and is pre-filled with sentinel objects upon creation.\n\nBinary heaps of Objects in Java does not scale well: The HitQueue uses 28 bytes/element and memory access is scattered due to the binary heap algorithm and the use of Objects. To make matters worse, the use of sentinel objects means that even if only a tiny number of documents matches, the full amount of Objects is still allocated.\n\nAs long as the HitQueue is small (< 1000), it performs very well. If top-1M results are requested, it performs poorly and leaves 1M ScoreDocs to be garbage collected.\n\nAn alternative is to replace the ScoreDocs with a single array of packed longs, each long holding the score and the document ID. This strategy requires only 8 bytes/element and is a lot lighter on the GC.\n\nSome preliminary tests has been done and published at https://sbdevel.wordpress.com/2015/10/05/speeding-up-core-search/\nThese indicate that a long[]-backed implementation is at least 3x faster than vanilla HitDocs for top-1M requests.\n\nFor smaller requests, such as top-10, the packed version also seems competitive, when the amount of matched documents exceeds 1M. This needs to be investigated further.\n\nGoing forward with this idea requires some refactoring as Lucene is currently hardwired to the abstract PriorityQueue. Before attempting this, it seems prudent to discuss whether speeding up large top-X requests has any value? Paging seems an obvious contender for requesting large result sets, but I guess the two could work in tandem, opening up for efficient large pages.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14945088",
+            "author": "Adrien Grand",
+            "date": "2015-10-06T14:19:18+0000",
+            "content": "Since you opened this issue, I'm wondering if you have more information about the use-case of users that use such large pages? I think that some of our users that execute such requests are in fact trying to export a subset of their indexes, in which case they don't even need sorted results so we don't need a priority queue? And I'd be curious to understand more about the other ones.\n\nAlso since you're playing with priority queues at the moment, I remember getting better results at sorting with a ternary heap than a regular heap, I assume because it has better cache efficiency in spite of a worse runtime. And some people experimented with making priority queues more cache-efficient, eg. http://playfulprogramming.blogspot.it/2015/08/cache-optimizing-priority-queue.html "
+        },
+        {
+            "id": "comment-14945131",
+            "author": "Toke Eskildsen",
+            "date": "2015-10-06T14:48:21+0000",
+            "content": "I do not know if you can do deep paging without sorting? For a single shard you could use the docID to keep track of progress (assuming they are collected in order), but that would not work for SolrCloud? Maybe I missed a trick here? Or are you describing a streaming scenario where the full result set is exported in one go?\n\nIgnoring the details, you raise a fair point: Is there a need for large top-X results, where the X is not equal to the full amount of documents in the index? It would seems like a rare case - the times I have encountered the large-result problem (helping random people on IRC and working with Net Archiving) it has always been about the full result.\n\nThank you for the link to the cache-efficient queue. It looks so nifty I'll probably write an implementation even if LUCENE-6828 proves to be irrelevant. "
+        },
+        {
+            "id": "comment-14945199",
+            "author": "Adrien Grand",
+            "date": "2015-10-06T15:33:44+0000",
+            "content": "I do not know if you can do deep paging without sorting? For a single shard you could use the docID to keep track of progress (assuming they are collected in order), but that would not work for SolrCloud? Maybe I missed a trick here? Or are you describing a streaming scenario where the full result set is exported in one go?\n\nThis is the way elasticsearch's scans work: it obtains a IndexReader lease for each shard and then uses doc ids to track progress (resuming where it had previously stopped and throwing a CollectionTerminatedException when enough documents were collected) across consecutive requests. Streaming could be an option too... "
+        },
+        {
+            "id": "comment-14945860",
+            "author": "Ramkumar Aiyengar",
+            "date": "2015-10-06T21:31:19+0000",
+            "content": "You still need to do old fashioned deep paging if you are paging with grouping. Grouping requires you to have context of groups and docs with any higher sort value than what you are returning. "
+        },
+        {
+            "id": "comment-14946187",
+            "author": "Shai Erera",
+            "date": "2015-10-07T03:53:52+0000",
+            "content": "I read the post Toke Eskildsen, very interesting! I've got a couple of comments. First, if you want to avoid the micro benchmark, you could implement your own Collector, copying most of TopScoreDocsCollector's logic and use the packed HitQueue version. That will compare end-to-end query performance, which is better than the micro benchmark in that I believe the majority of the time spent during search is at traversing posting lists, reading up DocValues values and computing the scores, and not sorting the heap. So I think it'd be nice to see how all 3 compare in an end-to-end query. I don't know how easy it is to implement it in Solr (that is, how a custom Collector can easily be plugged-in), but in Lucene it's straightforward. In Solr though you will be able to compare other facets such as deep paging and grouping, that others mentioned on this issue.\n\nAbout Sentinel values: those were added in LUCENE-1593 with the purpose of avoiding the \"is the queue full\" checks in the collector's code. At the time it showed improvements, but the code has changed a lot since. Also, once any ScoreDoc object is added to the queue, it stays there and its values are modified in case a better ScoreDoc should replace it. Therefore GC-wise, there are only X ScoreDoc objects allocated (where X is the same as top-X). In your post I wasn't sure if you thought that the sentinel values are discarded and new ones allocated instead, so just wanted to clarify that.\n\nI also think that we may not need to choose a one-queue-to-rule-them-all solution here. What about adding a VeryLargeTopScoreDocsCollector which Solr, and maybe even Lucene's searcher.search(q, numHits) API can do so automatically, uses when X is too large (100K taking an example from your post). It will use a packed HitQueue, it can even just throw the results in unsorted and heap-sort them if needed (or merge-sort in the end). It only needs to expose a TopDocs-like API. If we need to, let's make it so it can extend TopDocsCollector directly (such that you won't have to use a PQ at all).\n\nThat is all still pending end-to-end query benchmark results. If the Sentinel approach is better for small X, and the packed for large X, let's make the choice dynamically in the code, so users get the best performance per their search request. "
+        },
+        {
+            "id": "comment-14946317",
+            "author": "Toke Eskildsen",
+            "date": "2015-10-07T05:56:29+0000",
+            "content": "Shai: That all sounds very right. Great idea with the custom collector test. I was aware of the sentinels being re-used in-search, but thank you for making sure. The garbage collection I talk about is between searches as the HitQueue themselves are not re-used.\n\nRegarding sentinels then they do seem to give a boost, compared to no-sentinels-but-still-objects, when the queue size is small and the number of hits is large. I have not investigated this is much detail and I suspect it would help to visualize the performance of the different implementations with some graphs. As queue-size, hits, threads and implementation are all relevant knobs to try and tweak, that task will have to wait a bit.\n\nRamkumar: Large result sets with grouping is very relevant for us. However, the current packed queue implementation only handles floats+docIDs. If the comparator key can be expressed as a numeric, it should be possible to have fast heap-ordering (a numeric array to hold the key and a parallel object array for the values, where the values themselves are only accessed upon export). "
+        },
+        {
+            "id": "comment-14947328",
+            "author": "Tom Burton-West",
+            "date": "2015-10-07T18:29:04+0000",
+            "content": "We have a use case where some our users want set-based results. They don't care about relevance ranking or sorting, they just want a list of all unique ids (external, not Lucene ids) that meet some search criteria. Sometimes these sets are in the millions.  We distribute our index over many shards, so an efficient method of grabbing all the result ids for large result sets would be extremely useful.\n\nTom Burton-West\nhttps://www.hathitrust.org/blogs/large-scale-search "
+        },
+        {
+            "id": "comment-14947390",
+            "author": "Erick Erickson",
+            "date": "2015-10-07T19:06:48+0000",
+            "content": "Tom:\n\nThis sounds like it can currently be handled by the export functionality (starting in 4.10), see: https://cwiki.apache.org/confluence/display/solr/Exporting+Result+Sets. Note two restrictions:\n1> the fl list must all be docValues\n2> the /export handler doesn't support distributed OOB.\n\nSome of the newer (5.2?) Streaming operations/classes remove having to deal with the second restriction yourself.\n\nAnd note one very important bit: By restricting to docValues, the export functionality does not have to go to disk, uncompress docs etc., since all the returned fields can be read from memory. So the export target rate is 400K rows/second..... "
+        },
+        {
+            "id": "comment-14947487",
+            "author": "Tom Burton-West",
+            "date": "2015-10-07T20:08:17+0000",
+            "content": "Thanks Erick,\n\nI plan to add a docValues id field the next time we re-index all 14 million volumes.  After we do our next re-index, I'll give it a try, but I'll have to write some code to get the counts from all the shards.  I'll also look at the 5.x streaming stuff.\n\nToke, sorry if this is off-topic\n\nTom "
+        }
+    ]
+}

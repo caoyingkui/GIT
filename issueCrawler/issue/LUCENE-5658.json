@@ -1,0 +1,93 @@
+{
+    "id": "LUCENE-5658",
+    "title": "IllegalArgumentException from ByteBufferIndexInput.buildSlice",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [
+            "core/store"
+        ],
+        "affect_versions": "4.8",
+        "status": "Open",
+        "fix_versions": []
+    },
+    "description": "I've received an email with the following stacktrace:\n\n\nException in thread \"Lucene Merge Thread #73\" org.apache.lucene.index.MergePolicy$MergeException: java.lang.IllegalArgumentException\n\tat org.apache.lucene.index.ConcurrentMergeScheduler.handleMergeException(ConcurrentMergeScheduler.java:545)\n\tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:518)\nCaused by: java.lang.IllegalArgumentException\n\tat java.nio.Buffer.limit(Buffer.java:278)\n\tat org.apache.lucene.store.ByteBufferIndexInput.buildSlice(ByteBufferIndexInput.java:259)\n\tat org.apache.lucene.store.ByteBufferIndexInput.buildSlice(ByteBufferIndexInput.java:230)\n\tat org.apache.lucene.store.ByteBufferIndexInput.clone(ByteBufferIndexInput.java:187)\n\tat org.apache.lucene.store.MMapDirectory$1.openFullSlice(MMapDirectory.java:211)\n\tat org.apache.lucene.store.CompoundFileDirectory.readEntries(CompoundFileDirectory.java:138)\n\tat org.apache.lucene.store.CompoundFileDirectory.<init>(CompoundFileDirectory.java:105)\n\tat org.apache.lucene.index.SegmentReader.readFieldInfos(SegmentReader.java:209)\n\tat org.apache.lucene.index.SegmentReader.<init>(SegmentReader.java:99)\n\tat org.apache.lucene.index.ReadersAndUpdates.getReader(ReadersAndUpdates.java:142)\n\tat org.apache.lucene.index.ReadersAndUpdates.getReaderForMerge(ReadersAndUpdates.java:624)\n\tat org.apache.lucene.index.IndexWriter.mergeMiddle(IndexWriter.java:4068)\n\tat org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3728)\n\tat org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:405)\n\tat org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:482)\n\n\n\nAccording to the email, it happens randomly while indexing Wikipedia, on 4.8.0. As far as I understood, the indexer creates 4 indexes in parallel, by a total of 48 threads. Each index is created in a separate directory, and there's no sharing of MP or MS instances between the writers (in fact, default settings are used). This could explain the Lucene Merge Thread #73. The indexing process ends w/ a forceMerge(1). If that call is omitted, the exception doesn't reproduce. Also, since it doesn't happen always, there's no simple testcase which reproduces.\n\nI've asked the reporter to add more info to the issue, but opening the issue now so we could check and hopefully fix before 4.8.1.\n\nI checked the stacktrace against trunk, but not all the lines align (e.g. at org.apache.lucene.store.MMapDirectory$1.openFullSlice(MMapDirectory.java:211) is only in 4.8), but I haven't dug deeper yet...",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13993087",
+            "author": "Robert Muir",
+            "content": "It seems to me that the user should never get such an exception. Perhaps there is a missing bounds check in the slicing logic!\n\nWe should check all directories. Maybe make a TestBogusSlicing... ",
+            "date": "2014-05-08T20:44:26+0000"
+        },
+        {
+            "id": "comment-13993113",
+            "author": "Shai Erera",
+            "content": "An update, after a short chat with the guy, turns out he creates the index on a distributed file system (GPFS, like HDFS only POSIX). So I asked him to try reproducing using SimpleFS/NIO, and if it still fails try MMap on a local file system, and also test w/ an Oracle JVM (he uses J9). Could be that it's a file-system issue (e.g. maybe it reports bad length()). ",
+            "date": "2014-05-08T21:09:12+0000"
+        },
+        {
+            "id": "comment-13993117",
+            "author": "Uwe Schindler",
+            "content": "Perhaps there is a missing bounds check in the slicing logic!\n\nActually, this bug does not happen while slicing. It calls openFullSlice, which delegates to clone() on the indexinput, a well tested standard function. Clone() then duplicates all buffers after checking the bounds already:\n\n\n  @Override\n  public final ByteBufferIndexInput clone() {\n    final ByteBufferIndexInput clone = buildSlice(0L, this.length);\n\n// ...\n\n  private ByteBufferIndexInput buildSlice(long offset, long length) {\n    if (buffers == null) {\n      throw new AlreadyClosedException(\"Already closed: \" + this);\n    }\n    if (offset < 0 || length < 0 || offset+length > this.length) {\n      throw new IllegalArgumentException(\"slice() \" + sliceDescription + \" out of bounds: offset=\" + offset + \",length=\" + length + \",fileLength=\"  + this.length + \": \"  + this);\n    }\n\n\n\nIn that case the bounds are correct. It then calls the slicing logic which sets the limit on the last buffer. And this seems to get out of bounds because this.length and last file buffers limit are not synchronous.\n\nThis can only happen if the underlying JVM has a bug (J9???) or the underlying filesystem reports another file length after opening than it really is (maybe file was truncated).\n\nWe have a good slicer test already that opens a smaller file and uses a smaller buffer size for the byte buffers and randomly tests all stuff including opening a full slice. This code is unchanged since more than a year and we never had any bug, here, this is really strange. ",
+            "date": "2014-05-08T21:12:58+0000"
+        },
+        {
+            "id": "comment-13993128",
+            "author": "Uwe Schindler",
+            "content": "I checked the stacktrace against trunk, but not all the lines align (e.g. at org.apache.lucene.store.MMapDirectory$1.openFullSlice(MMapDirectory.java:211) is only in 4.8), but I haven't dug deeper yet...\n\nWe removed that on trunk, because it just calls IndexInput.clone(). We will remove the whole Slicer in trunk (I think Robert has a patch) and just provide a method on IndexInput to clone a a slice.\n\nThe issue here is not slicing, its happening on openFullSlice() delegating to clone(). This method is called millions of times while searching an index for opening TermsEnums,... ",
+            "date": "2014-05-08T21:22:19+0000"
+        },
+        {
+            "id": "comment-13993133",
+            "author": "Uwe Schindler",
+            "content": "This can only happen if the underlying JVM has a bug (J9???) or the underlying filesystem reports another file length after opening than it really is (maybe file was truncated).\n\nThe first is more obviously the problem. If the file length() reported by the OS is incorrect, the original mmap should have failed already. openFullSlice/clone just clones the ByteBuffers. And this cannot change the length, unless the JVM corrumpts the clones. ",
+            "date": "2014-05-08T21:24:17+0000"
+        },
+        {
+            "id": "comment-13993344",
+            "author": "Greg Visotski",
+            "content": "Hi All, I'm the one that originally brought this up.  Let me apologize now for my ignorance. \n\nAs Shai said, I'm indexing Wikipedia into 4 indexes using 12 threads per index.  I'm building from scratch and not updating anything pre existing - so no updating DocValues.  I am, however, storing a lot of additional data in the index - such as annotations, sentence boundaries, and other random metadata.  Enough that the final output is ~39GB.\n\nEven though the stack trace has MMapDirectory , I'm explicitly using NIOFSDirectory:\nFSDirectory f = NIOFSDirectory.open(file);\nIndexWriterConfig c = new IndexWriterConfig(Version.LUCENE_48, analyzers[i]);\nc.setOpenMode(OpenMode.CREATE);\nwriters[i] = new IndexWriter(f,c);\n\nAt the end of processing, if I call IndexWriter.forceMerge(1) I'll get this error about three in five times.  If I remove it, maybe one in five.  I'll report back with what happens running with SimpleFSDirectory and with a local file system rather than GPFS. ",
+            "date": "2014-05-09T03:08:12+0000"
+        },
+        {
+            "id": "comment-13993457",
+            "author": "Uwe Schindler",
+            "content": "FSDirectory f = NIOFSDirectory.open(file);\n\nThis does not use NIOFSDir! open() is a static factory method on FSDirectory, just inherited to NIOFSDirectory. This static method uses the default directory impl for your operating system and bitness.\n\nTo use NIOFSDirectory explicit, use the constructor to create it: FSDirectory f = new NIOFSDirectory(file); ",
+            "date": "2014-05-09T07:54:47+0000"
+        },
+        {
+            "id": "comment-13993462",
+            "author": "Uwe Schindler",
+            "content": "At the end of processing, if I call IndexWriter.forceMerge(1) I'll get this error about three in five times. If I remove it, maybe one in five. I'll report back with what happens running with SimpleFSDirectory and with a local file system rather than GPFS.\n\nAs I analyzed already: It is more likely that the bug is caused by IBM J9. If you change to NIOFSDirectory or SimpleFSDirectory you are just hiding the bug, because you don't use the code anymore. We are testing Lucene with many JVMs in our nightly builds, and unfortunately IBM J9 is causing crazy bugs from time to time, because it miscompiles code in its JVM optimizer (AOT or how it is called). It looks like the contents of fields in the bytebuffers and the directory get out of sync.\n\nSo most important to me would be: Does it happen with Oracle Java 7u55?\n\nIf the bug would be caused by the filesystem, the problem would look different: The mmap would fail ealier (see above).  ",
+            "date": "2014-05-09T08:08:10+0000"
+        },
+        {
+            "id": "comment-13993677",
+            "author": "Robert Muir",
+            "content": "\nThis does not use NIOFSDir! open() is a static factory method on FSDirectory, just inherited to NIOFSDirectory. \n\nI think this is confusing in the API. I opened LUCENE-5663 ",
+            "date": "2014-05-09T16:29:49+0000"
+        },
+        {
+            "id": "comment-13993756",
+            "author": "Robert Muir",
+            "content": "\nIn that case the bounds are correct. It then calls the slicing logic which sets the limit on the last buffer. And this seems to get out of bounds because this.length and last file buffers limit are not synchronous.\n\nI know its not applicable to this issue, but we should check for overflow somehow (offset+length < 0) ",
+            "date": "2014-05-09T17:56:28+0000"
+        },
+        {
+            "id": "comment-14015079",
+            "author": "Uwe Schindler",
+            "content": "Hi,\n\nI found the bug while debugging LUCENE-5722: The issue here is the limit on the last chunk, which is calculated in a wrong way if the slice ends exactly at the boundary of chunkSize.\n\nBut I am still not sure if this is the same bug... ",
+            "date": "2014-06-01T20:37:06+0000"
+        },
+        {
+            "id": "comment-14015110",
+            "author": "Uwe Schindler",
+            "content": "No it is not the same bug, the code is correct! ",
+            "date": "2014-06-01T22:39:33+0000"
+        }
+    ]
+}

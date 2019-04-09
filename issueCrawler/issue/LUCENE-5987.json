@@ -1,0 +1,108 @@
+{
+    "id": "LUCENE-5987",
+    "title": "Make indexwriter a mere mortal when exceptions strike",
+    "details": {
+        "type": "Task",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [],
+        "affect_versions": "None",
+        "status": "Open",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ]
+    },
+    "description": "IndexWriter's exception handling is overly complicated. Every method in general reads like this:\n\n\ntry {\n  try {\n    try { \n     ...\n     // lock order: COMPLICATED\n     synchronized(this or that) {\n     }\n     ...\n   } finally {\n     if (!success5) {\n       deleter.deleteThisFileOrThat();\n     }\n    ...\n  }\n}\n\n\n\nPart of the problem is it acts like its an invincible superhero, e.g. can take a disk full on merge or flush to the face and just keep on trucking, and you can somehow fix the root cause and then just go about making commits on the same instance.\n\nBut we have a hard enough time ensuring exceptions dont do the wrong thing (e.g. cause corruption), and I don't think we really test this crazy behavior anywhere: e.g. making commits AFTER hitting disk full and so on.\n\nIt would probably be simpler if when such things happen, IW just considered them \"tragic\" just like OOM and rolled itself back, instead of doing all kinds of really scary stuff to try to \"keep itself healthy\" (like the little dance it plays with IFD in mergeMiddle manually deleting CFS files).\n\nBesides, without something like a WAL, Indexwriter isn't really fit to be a superhero anyway: it can't prevent you from losing data in such situations. It just doesn't have the right tools for the job.\n\nedit: just to be clear I am referring to abort (low level exception during flush) and exceptions during merge. For simple non-aborting cases like analyzer errors, of course we can deal with this. We already made great progress on turning a lot of BS exceptions that would cause aborts into non-aborting ones recently.",
+    "attachments": {
+        "LUCENE-5987.patch": "https://issues.apache.org/jira/secure/attachment/12685095/LUCENE-5987.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14159478",
+            "author": "Michael McCandless",
+            "content": "+1, let's not be heroic here: IW's exc handling is terrifying. ",
+            "date": "2014-10-05T09:00:54+0000"
+        },
+        {
+            "id": "comment-14230302",
+            "author": "Michael McCandless",
+            "content": "I'll try to tackle this (make abort a tragedy): it's a ridiculous situation, today, that IW can throw an exception and it turns out that exception silently just deleted tons of previously indexed documents and when you close/commit the IW, they are gone. ",
+            "date": "2014-12-01T19:35:49+0000"
+        },
+        {
+            "id": "comment-14234108",
+            "author": "Michael McCandless",
+            "content": "Patch.  I added new AbortIndexWriterException; it is package private,\nand is only used to communicate internally in IndexWriter (other\napproaches I tried kept leading to deadlock).  I removed the\n\"andReset\" from DocumentsWriterPerThread.checkAndResetHasAborted: I\nthink it's dangerous to ever set hasAborted back to false.  It's like\nunplugging your carbon monoxide detector because it's making too much\nnoise.\n\nThis is an important behavior change.\n\nFirst off, an aborting exception, which is an exception that strikes\nat a \"bad\" time (e.g. when appending to stored fields or term vector\nfiles) such that the entire segment is now unusable, will now\nforcefully close the IndexWriter.  This is so you know you lost any\nuncommitted data.\n\nSecond off, when this happens, I don't think IndexWriter should try to\nbe so crazy about deleting every last unref'd file when disaster\nstrikes: if your house is burning down, you don't worry about washing\nthe dirty dishes.\n\nThis change made a number of tests angry (IW suddenly closing, and\nalso leaving unref'd files), and I did distributed beasting to try to\nferret them out, but I expect we'll have a long tail of Jenkins\nfailures after committing this. ",
+            "date": "2014-12-04T10:38:19+0000"
+        },
+        {
+            "id": "comment-14234137",
+            "author": "Robert Muir",
+            "content": "awesome!\n\nCan we shorten the name of the exception? I don't like AbortIndexWriterException for an internal one, i think its too complicated. Can it either be AbortingException or IndexWriter.AbortingException? Can we use try-multi-catch instead of java 1.6-style? I will take a deeper look after coffee. ",
+            "date": "2014-12-04T11:28:51+0000"
+        },
+        {
+            "id": "comment-14234175",
+            "author": "Robert Muir",
+            "content": "Here is patch with my suggestions. I didn't like having two tragicEvent methods on IndexWriter, to me thats confusing. so the single one just unboxes AbortingException and there is one codepath to worry about there, and for each case.\n\nI am still confused about the logic in various places in DocumentsWriter (I didnt try to tackle this here). It seems wierd we are both catching exception/handlign stuff in finally block but then \"asking\" the dwpt if it has aborted. Is there a cleaner way?\n\nI am happy AbortingException is a checked one, its a good use here. Its fine if it nests in IndexWriter.java to be clear too. But its already a terminology used in the codebase so i think its the right name. ",
+            "date": "2014-12-04T12:38:42+0000"
+        },
+        {
+            "id": "comment-14234198",
+            "author": "Robert Muir",
+            "content": "What is happening with TestIndexWriterAbort? I only added that recently to test we were doing the right thing\nso that abort() could be removed from the codec API (LUCENE-6082). \n\nBut with this patch, the unreferenced files check is disabled (and should be?), so the patch doesnt offer anything \nthat TestIndexWriterExceptions2 isn't already checking. \n\nWhat is happening with TestIndexWriterDelete.testErrorInDocsWriterAdd(), it still causes aborting exceptions\nand checks that unreferenced files are removed. Why is it passing?\n ",
+            "date": "2014-12-04T13:36:12+0000"
+        },
+        {
+            "id": "comment-14234726",
+            "author": "Michael McCandless",
+            "content": "New patch, iterating from Rob's last patch.\n\nI cleaned up the exc handling somewhat, and fixed the places that \"want to abort\" to simply throw AbortingException instead of settings confusing booleans which are checked in finally clauses up the stack.\n\nTests seem to be passing under some distributed beasting ... ",
+            "date": "2014-12-04T22:30:22+0000"
+        },
+        {
+            "id": "comment-14235705",
+            "author": "Robert Muir",
+            "content": "Overall looks good. I have not nitpicked, but we could stare at it for days and maybe not see bugs. I would rather us get it in jenkins sooner and iterate on adding more testing around this to really harden indexwriter for good, and not feel so scared in the future when trying to do cleanups.\n\nWhat is IgnoreAlreadyClosedExceptionConcurrentMergeScheduler? This is a little awkward and I can't figure out why we need it, or if we could do something else better instead. ",
+            "date": "2014-12-05T16:38:18+0000"
+        },
+        {
+            "id": "comment-14235974",
+            "author": "Michael McCandless",
+            "content": "What is IgnoreAlreadyClosedExceptionConcurrentMergeScheduler? \n\nIt's for tests that use CMS and also abort the IW, since CMS can hit ACE in such cases and it's \"ok\".\n\nWe will likely need to use it in more tests... ",
+            "date": "2014-12-05T19:37:33+0000"
+        },
+        {
+            "id": "comment-14236098",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1643432 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1643432 ]\n\nLUCENE-5987: IndexWriter forcefully closes itself on hitting aborting exception ",
+            "date": "2014-12-05T21:04:46+0000"
+        },
+        {
+            "id": "comment-14236268",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1643466 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1643466 ]\n\nLUCENE-5987: IndexWriter forcefully closes itself on hitting aborting exception ",
+            "date": "2014-12-05T23:06:26+0000"
+        },
+        {
+            "id": "comment-14237114",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1643661 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1643661 ]\n\nLUCENE-5987: remove dead code ",
+            "date": "2014-12-07T11:09:43+0000"
+        },
+        {
+            "id": "comment-14239495",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1644072 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1644072 ]\n\nLUCENE-5987: don't double-wrap AbortingException ",
+            "date": "2014-12-09T14:59:43+0000"
+        },
+        {
+            "id": "comment-14239502",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1644075 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1644075 ]\n\nLUCENE-5987: don't double-wrap AbortingException ",
+            "date": "2014-12-09T15:02:16+0000"
+        }
+    ]
+}

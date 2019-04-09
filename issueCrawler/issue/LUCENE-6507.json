@@ -1,0 +1,397 @@
+{
+    "id": "LUCENE-6507",
+    "title": "NativeFSLock.close() can invalidate other locks",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.2",
+            "6.0"
+        ],
+        "priority": "Blocker",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "the lock API in Lucene is super trappy since the lock that we return form this API must first be obtained and if we can't obtain it the lock should not be closed since we might ie. close the underlying channel in the NativeLock case which releases all lock for this file on some operating systems. I think the makeLock method should try to obtain and only return a lock if we successfully obtained it. Not sure if it's possible everywhere but we should at least make the documentation clear here.",
+    "attachments": {
+        "LUCENE-6507-410x.patch": "https://issues.apache.org/jira/secure/attachment/12736146/LUCENE-6507-410x.patch",
+        "LUCENE-6507.patch": "https://issues.apache.org/jira/secure/attachment/12735862/LUCENE-6507.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14562625",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T10:12:31+0000",
+            "content": "The naming of this method was always trappy. I did not touch that last year when I refactored the lock factories.\n\nThe method is just a factory to create an instance of the Lock class. Maybe it should be called \"newLockInstance\", then it would be clear what happens. "
+        },
+        {
+            "id": "comment-14562630",
+            "author": "Simon Willnauer",
+            "date": "2015-05-28T10:17:17+0000",
+            "content": "why don't we just hide the obtain call behind it? I mean we can have makeLock() and makeLock(long timeout) and only return the lock once it's obtained to prevent the trappyness? "
+        },
+        {
+            "id": "comment-14562640",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T10:25:12+0000",
+            "content": "Changing the behaviour of this already existing method would be an unexpected change, code outside Lucene would fall over that (like Infinispan directory,...). So we should break hard and invent a new name for the method, especially if we change behaviour. So code that wants to lock a directory fails to compile. I think we have 2 possibilities:\n\n\n\tnewLockInstance() with the current behaviour\n\tlockDirectory() or aquireLock() or whatever to do the actual locking, returning the Lock instance\n\n\n\nmakeLock() should be removed so existing code fails to compile\n\nI am sorry that I did not fix that before release of Lucene 5.0. This was on my list but I missed to fix the name or change behaviour.\n\nThis change here should also be reflected in the LockFactory class (not just in directory)... "
+        },
+        {
+            "id": "comment-14562643",
+            "author": "Simon Willnauer",
+            "date": "2015-05-28T10:29:06+0000",
+            "content": "yeah this seems to go into the right direction here IMO. I like acquireLock best and deprecate or delete the newLock method? "
+        },
+        {
+            "id": "comment-14562649",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T10:34:47+0000",
+            "content": "Yeah. I would like the new behaviour, more. Unfortunately there is some code in IndexWriter currently that gets the Lock instance just to check if it is locked. We have to review this. Maybe we can simplify the whole thing.\n\nIn any case, I will make (\u00e4hm aquire) a proposal! Maybe the Backwards Compatibility Policeman has a good solution \n\nI also found dead code: the abstract class Lock.With class is dead (no longer used). So we should remove. "
+        },
+        {
+            "id": "comment-14562707",
+            "author": "Robert Muir",
+            "date": "2015-05-28T11:30:47+0000",
+            "content": "I disagree with the synopsis. The problem here has nothing to do with Directory or the lock API at all... this is all bugs in NativeFSLockFactory, around this behavior in the JDK:\n\n\nOn some systems, closing a channel releases all locks held by the Java virtual machine on the underlying file regardless of whether the locks were acquired via that channel or via another channel open on the same file. It is strongly recommended that, within a program, a unique channel be used to acquire all locks on any given file. \n\n\n\n-1 to changing the Directory/lock API, when it will not even fix the problem: even attempting to obtain() means you are screwed.\n\nTo me the correct solution is to fix NativeFSLockFactory to follow the \"strong recommendations\". Today it already has a global map to try to workaround issues:\n\n\nprivate static final Set<String> LOCK_HELD = Collections.synchronizedSet(new HashSet<String>());\n\n\n\nSeems that this is wrong, and needs to be a map with unique file channels as the 'value'. "
+        },
+        {
+            "id": "comment-14562733",
+            "author": "Robert Muir",
+            "date": "2015-05-28T11:51:10+0000",
+            "content": "Also, LockStressTest from our ant task is not exercising the intra-JVM case, it has never failed on these things.\n\nWe should be seeing test failures.\n\nBut just staring at code, you can see the bugs/races:\n\n// obtain()\nif (obtained == false) { // not successful - clear up and move out\n  clearLockHeld(path);                                                  // #1 clear global map\n  final FileChannel toClose = channel;\n  channel = null;\n  IOUtils.closeWhileHandlingException(toClose);       // #2 close channel\n}\n...\n\n// close()\ntry {\n  if (lock != null) {\n    try {\n      lock.release();\n      lock = null;\n    } finally {\n      clearLockHeld(path);                    // #1 clear global map\n    }\n  }\n} finally {\n  IOUtils.close(channel);                    // #2 close channel\n  channel = null;\n}\n\n\n\n#1 and #2 happen in the wrong order. \n\nWe must close the channel first for the current code to even stand a chance of working.\n\nIMO this should block the release. "
+        },
+        {
+            "id": "comment-14562760",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T11:59:29+0000",
+            "content": "Hi Robert,\nI agree, but that is another problem. From reading Simon's issue description, this issue is not about the bug you are talking about.\n\nThe problem described here is the following problem: if you call makeLock() on a directory it just creates a lock instance, but does not actually lock. This is a bit confusing regarding the naming of the method. makeLock() makes you think that this method aquires the lock and returns an instance of the lock. Simon then had the problem that because of the stupid naming, he unlocked the unlocked (not yet locked) lock. This should be a no-op, so the bug may be there.\n\nThis is why my initial response was to rename the stupid named makeLock() to newLockInstance(). makeLock sounds like \"this already creates the lock\". "
+        },
+        {
+            "id": "comment-14562769",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T12:05:00+0000",
+            "content": "In any case, it would be nice to get a reference here to the failed Elasticsearch test or an example of code broken by this, because it looks like Robert and Simon are talking about something completely different, than described here in the issue description. To me the issue description is quite clear: \"Directory#makeLock only creates lock instance but does not lock directory.\"\n\nThe bugs in NativeFSLockFactory should please be moved to a new issue, its completely unrelated to the current issue. Sorry. "
+        },
+        {
+            "id": "comment-14562770",
+            "author": "Robert Muir",
+            "date": "2015-05-28T12:05:11+0000",
+            "content": "The main missing thing i see, hopefully it will provoke the fail, is a simple multi-threaded unit test for lockfactories that tests them directly.\n\nThe current stress test with a best chance of provoking bugs here (_testStressLocks) is @Nightly, not sure how much real action it sees... and is more of an integration test, and opens indexwriters and indexreaders. Additionally it uses MockDirectoryWrapper, so there is additional stuff happening, including locks being wrapped with mocks and so on. "
+        },
+        {
+            "id": "comment-14562775",
+            "author": "Robert Muir",
+            "date": "2015-05-28T12:06:02+0000",
+            "content": "Its precisely the same issue Uwe. See Simon's description, and i quote:\n\n\nif we can't obtain it the lock should not be closed since we might ie. close the underlying channel in the NativeLock case which releases all lock for this file on some operating systems "
+        },
+        {
+            "id": "comment-14562783",
+            "author": "Simon Willnauer",
+            "date": "2015-05-28T12:12:02+0000",
+            "content": "I agree with rob that there is a bug in this code but honest. Once we opened that channel we have to close it again but that might release another processes lock. so I wonder how we can fix that ? "
+        },
+        {
+            "id": "comment-14562786",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T12:16:39+0000",
+            "content": "Robert,\nthats another bug not related to the summary of this issue - its just \"mentioned\" here in Simon's issue (sorry the issue description is un-understandable). it is not makeLock() that's buggy, it is NativeFSLock#close() thats buggy.\n\nThis issue is about bad naming and documentation of this method and that is how I understood Simon Willnauer.\n\nCould we please split this issue into 2?:\n\n\tthis issue about bad naming: I agree with Simon here\n\ta new issue to fix the NativeFSLock#close() method.\n\n "
+        },
+        {
+            "id": "comment-14562787",
+            "author": "Simon Willnauer",
+            "date": "2015-05-28T12:18:51+0000",
+            "content": "oh nevermind - this is only within the same JVM .... "
+        },
+        {
+            "id": "comment-14562788",
+            "author": "Robert Muir",
+            "date": "2015-05-28T12:18:52+0000",
+            "content": "The separate process is not an issue. see the javadocs for FileLock again, its for the given java virtual machine.\n\nNativeFSLockFactory is buggy within the same JVM, that needs to be fixed here. Then close() has no crazy side effects.\n "
+        },
+        {
+            "id": "comment-14562794",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T12:23:23+0000",
+            "content": "As you both don't want to split this issue, I updated the summary/title. "
+        },
+        {
+            "id": "comment-14562809",
+            "author": "Robert Muir",
+            "date": "2015-05-28T12:29:16+0000",
+            "content": "Well, I think we should try to simplify the API, as always. But to me that is polishing the silverware when the house is burning down. We need to fix the bugs first.\n\nAs far as simplifying the API, it would be great if it was just one single method that returned an obtained-lock, and then these locks wouldn't need any mutable state. I'm not sure if all the crazy methods we have are really needed, we should see what is the minimal thing we can get away with. "
+        },
+        {
+            "id": "comment-14562847",
+            "author": "Robert Muir",
+            "date": "2015-05-28T12:56:33+0000",
+            "content": "Here is a patch fixing the bugs i could see. \n\nExisting tests pass but we should try to make one that fails without the fixes. "
+        },
+        {
+            "id": "comment-14562857",
+            "author": "Robert Muir",
+            "date": "2015-05-28T13:04:26+0000",
+            "content": "I still don't like that clearLockHeld calls toRealPath() which can throw an exception / does IO. And we already do this canonicalization to toRealPath in obtain() which is synced, so i think we can just save it as an instance variable and simplify this further. I will look into this. "
+        },
+        {
+            "id": "comment-14562889",
+            "author": "Robert Muir",
+            "date": "2015-05-28T13:27:22+0000",
+            "content": "updated patch to avoid calling toRealPath() in this map-clearing. "
+        },
+        {
+            "id": "comment-14562922",
+            "author": "Simon Willnauer",
+            "date": "2015-05-28T13:51:52+0000",
+            "content": "here is a patch that reproduces the problem on linux. I also fixed several other lock impls that relied on the fact that we dont' close if obtain fails. Yet, I didn't fix NativeFSLock yet. "
+        },
+        {
+            "id": "comment-14562932",
+            "author": "Robert Muir",
+            "date": "2015-05-28T14:07:16+0000",
+            "content": "Thanks Simon. Attached is a combined patch (mine + simon).\n\nWithout the fix, simon's test triggers the NativeFSLockFactory bug on linux, tripping system assertions in sun.nio.ch.SharedFileLockTable. It passes with the patch.\n\n\n   [junit4]   2> Caused by: java.lang.AssertionError\n   [junit4]   2> \tat sun.nio.ch.SharedFileLockTable.removeKeyIfEmpty(FileLockTable.java:167)\n   [junit4]   2> \tat sun.nio.ch.SharedFileLockTable.removeAll(FileLockTable.java:222)\n   [junit4]   2> \tat sun.nio.ch.FileChannelImpl.implCloseChannel(FileChannelImpl.java:118)\n   [junit4]   2> \t... 23 more\n   [junit4]   2> \n\n\n\nThe other small fixes look good to me as well. I will test this patch on windows and mac but I think we are in good shape. "
+        },
+        {
+            "id": "comment-14562956",
+            "author": "Robert Muir",
+            "date": "2015-05-28T14:26:20+0000",
+            "content": "I opened a separate issue for API discussion: LUCENE-6508\n\nAnd i really agree that should happen, but this is a serious bug we need to fix. "
+        },
+        {
+            "id": "comment-14563000",
+            "author": "Robert Muir",
+            "date": "2015-05-28T14:41:54+0000",
+            "content": "Updated patch. Fixes a test bug in AssertingLock, it can't assert on close either, for the NoLockFactory case.\n\ne.g. TestIndexWriter.testNoSegmentFile use this intentionally to create more than one IW on the same dir... this should be cleaned up later, I don't understand why tests need to do that. "
+        },
+        {
+            "id": "comment-14563044",
+            "author": "Robert Muir",
+            "date": "2015-05-28T15:10:04+0000",
+            "content": "Updated patch, fixing SimpleFSLock.close() to be safe as well.\n\nIt passed before because tests never use SimpleFSLock. I fixed them to randomize between Native and Simple in all tests.\n\nThis uncovers some new stuff, like this:\n\n   [junit4] Suite: org.apache.lucene.index.TestCrashCausesCorruptIndex\n   [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=TestCrashCausesCorruptIndex -Dtests.method=testCrashCorruptsIndexing -Dtests.seed=8DBA6BF430E29A48 -Dtests.locale=no_NO_NY -Dtests.timezone=SystemV/PST8 -Dtests.asserts=true -Dtests.file.encoding=US-ASCII\n   [junit4] ERROR   1.37s | TestCrashCausesCorruptIndex.testCrashCorruptsIndexing <<<\n   [junit4]    > Throwable #1: org.apache.lucene.store.LockObtainFailedException: Lock obtain timed out: org.apache.lucene.store.MockDirectoryWrapper$AssertingLock@17e1509f\n   [junit4]    > \tat __randomizedtesting.SeedInfo.seed([8DBA6BF430E29A48:FA3DFBC572D35AA3]:0)\n   [junit4]    > \tat org.apache.lucene.store.Lock.obtain(Lock.java:89)\n   [junit4]    > \tat org.apache.lucene.index.IndexWriter.<init>(IndexWriter.java:775)\n   [junit4]    > \tat org.apache.lucene.index.TestCrashCausesCorruptIndex.indexAfterRestart(TestCrashCausesCorruptIndex.java:98)\n   [junit4]    > \tat org.apache.lucene.index.TestCrashCausesCorruptIndex.testCrashCorruptsIndexing(TestCrashCausesCorruptIndex.java:50)\n   [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n   [junit4]   2> NOTE: leaving temporary files on disk at: /home/rmuir/workspace/trunk-iw/lucene/build/core/test/J0/temp/lucene.index.TestCrashCausesCorruptIndex 8DBA6BF430E29A48-001\n   [junit4]   2> NOTE: test params are: codec=HighCompressionCompressingStoredFields(storedFieldsFormat=CompressingStoredFieldsFormat(compressionMode=HIGH_COMPRESSION, chunkSize=32683, maxDocsPerChunk=8, blockSize=6), termVectorsFormat=CompressingTermVectorsFormat(compressionMode=HIGH_COMPRESSION, chunkSize=32683, blockSize=6)), sim=RandomSimilarityProvider(queryNorm=false,coord=crazy): {text=DFR GL1}, locale=no_NO_NY, timezone=SystemV/PST8\n   [junit4]   2> NOTE: Linux 3.13.0-49-generic amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=8,threads=1,free=208117928,total=253231104\n   [junit4]   2> NOTE: All tests run in this JVM: [TestCrashCausesCorruptIndex]\n   [junit4] Completed [1/1] in 1.55s, 1 test, 1 error <<< FAILURES!\n\n\n\nI have not looked into that one yet. "
+        },
+        {
+            "id": "comment-14563088",
+            "author": "Robert Muir",
+            "date": "2015-05-28T15:31:56+0000",
+            "content": "The last fail i understand now. its a test bug, because i randomized lockfactories in newDirectory().\n\nThis test calls newDirectory() over the same existing index, but switches up lockfactories. Native doesn't delete its file (for obvious reasons), but simple depends on the existence of the file, so it times out.\n\nI will fix the patch... "
+        },
+        {
+            "id": "comment-14563111",
+            "author": "Robert Muir",
+            "date": "2015-05-28T15:41:50+0000",
+            "content": "Here is a simpler approach for this bugfix. Don't randomize lockfactory in all tests, just in simon's new one.\n\nDefer randomization across all tests to https://issues.apache.org/jira/browse/LUCENE-6509, where we can prevent test bugs.\n\nI don't want to totally destabilize tests in this way right now. "
+        },
+        {
+            "id": "comment-14563147",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T15:54:36+0000",
+            "content": "Hi Robert, thanks for fixing and opening the new issues. Sorry for the confusing discussion today. This was actually 2 bugs: an API naming inconsistency and the mutable Locks in combination with the broken clone() behaviour on the Lock instance.\n\nI will look into your fixes and test them, but until the locks get immutable (I will work on this, for sure, I just have to prepare my talk for next week) this is a good fix. Thanks. "
+        },
+        {
+            "id": "comment-14563247",
+            "author": "Robert Muir",
+            "date": "2015-05-28T16:58:35+0000",
+            "content": "I tested the latest patch on linux, mac, and windows.  Mike also helped with some distributed beasting of tests. I think its ready. "
+        },
+        {
+            "id": "comment-14563267",
+            "author": "Robert Muir",
+            "date": "2015-05-28T17:13:17+0000",
+            "content": "Updated patch removing my changes to SimpleFSLockFactory.isLocked()\n\nI didn't mean to change the semantics for this totally unnecessary method (unused by lucene).\n\nOf course, no tests fail either way, and this is bogus unnecessary stuff in our locking api. \n\nIts a search engine library, not a filelocking library.. IndexWriter.isLocked needs to die, like, as fast as possible, as well as Lock.isLocked.\n\nWe cant even get the basics right, i dont know why we have stupid methods like this. "
+        },
+        {
+            "id": "comment-14563293",
+            "author": "Michael McCandless",
+            "date": "2015-05-28T17:27:36+0000",
+            "content": "114 iterations of all Lucene core+module tests and no failures ...  "
+        },
+        {
+            "id": "comment-14563367",
+            "author": "Michael McCandless",
+            "date": "2015-05-28T18:03:37+0000",
+            "content": "New patch, fixing SingleInstanceLF to not set obtained to false if you try to obtain it twice, plus a failing test.\n\nI also had to fix/relax MockDirectoryWrapper.AssertingLock's behavior if you call .obtain twice on a single lock ... it was clearing its obtained member, but I don't think it should. "
+        },
+        {
+            "id": "comment-14563379",
+            "author": "Robert Muir",
+            "date": "2015-05-28T18:08:48+0000",
+            "content": "\nI also had to fix/relax MockDirectoryWrapper.AssertingLock's behavior if you call .obtain twice on a single lock ... it was clearing its obtained member, but I don't think it should.\n\nIMO we should deliver an exception if you do this. There is no need for leniency that returns false.  "
+        },
+        {
+            "id": "comment-14563417",
+            "author": "Michael McCandless",
+            "date": "2015-05-28T18:22:55+0000",
+            "content": "IMO we should deliver an exception if you do this.\n\nGood idea, I changed it to throw LockObtainFailedExc if you (stupidly) try to call .obtain twice on a single instance, and added test cases for the 3 core LockFactory impls (minus NoLockFactory). "
+        },
+        {
+            "id": "comment-14563452",
+            "author": "Michael McCandless",
+            "date": "2015-05-28T18:47:21+0000",
+            "content": "Another iteration:\n\n\tAlso throw exc on double obtain to HdfsLockFactory\n\tPut back accidental test change in my last patch\n\tOther minor cleanups\n\n\n\nI think patch is ready; that's a good catch in VerifyingLockFactory: it should NOT be trusting the LockFactory's isLocked impl... "
+        },
+        {
+            "id": "comment-14563570",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T19:52:34+0000",
+            "content": "+1 much better "
+        },
+        {
+            "id": "comment-14563630",
+            "author": "Robert Muir",
+            "date": "2015-05-28T20:29:29+0000",
+            "content": "Thanks for the additional cleanups mike! +1 from me. "
+        },
+        {
+            "id": "comment-14563637",
+            "author": "Michael McCandless",
+            "date": "2015-05-28T20:31:27+0000",
+            "content": "Thanks guys, I'll commit & backport... "
+        },
+        {
+            "id": "comment-14563644",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-28T20:36:32+0000",
+            "content": "Commit 1682327 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1682327 ]\n\nLUCENE-6507: don't let NativeFSLock.close release other locks "
+        },
+        {
+            "id": "comment-14563649",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-28T20:39:07+0000",
+            "content": "Commit 1682329 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1682329 ]\n\nLUCENE-6507: don't let NativeFSLock.close release other locks "
+        },
+        {
+            "id": "comment-14563672",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-28T20:52:09+0000",
+            "content": "Commit 1682335 from Michael McCandless in branch 'dev/branches/lucene_solr_5_2'\n[ https://svn.apache.org/r1682335 ]\n\nLUCENE-6507: don't let NativeFSLock.close release other locks "
+        },
+        {
+            "id": "comment-14563790",
+            "author": "Steve Rowe",
+            "date": "2015-05-28T22:22:45+0000",
+            "content": "I see an HdfsLockFactoryTest failure on 5.2 after this commit: http://jenkins.sarowe.net/job/Lucene-Solr-tests-5.2-Java8/3/.\n\n\n  [junit4] Suite: org.apache.solr.store.hdfs.HdfsLockFactoryTest\n  [junit4]   2> Creating dataDir: /var/lib/jenkins/jobs/Lucene-Solr-tests-5.2-Java8/workspace/solr/build/solr-core/test/J5/temp/solr.store.hdfs.HdfsLockFactoryTest B48BC404BF6BB3F1-001/init-core-data-001\n  [junit4]   2> 123149 T2061 oas.SolrTestCaseJ4.buildSSLConfig Randomized ssl (false) and clientAuth (false)\n  [junit4]   2> 124356 T2061 oahu.NativeCodeLoader.<clinit> WARN Unable to load native-hadoop library for your platform... using builtin-java classes where applicable\n  [junit4]   1> Formatting using clusterid: testClusterID\n  [junit4]   2> 125343 T2061 oahmi.MetricsConfig.loadFirst WARN Cannot locate configuration: tried hadoop-metrics2-namenode.properties,hadoop-metrics2.properties\n  [junit4]   2> 125705 T2061 oml.Slf4jLog.info Logging to org.slf4j.impl.Log4jLoggerAdapter(org.mortbay.log) via org.mortbay.log.Slf4jLog\n  [junit4]   2> 125714 T2061 oahh.HttpRequestLog.getRequestLog WARN Jetty request log can only be enabled using Log4j\n  [junit4]   2> 126082 T2061 oml.Slf4jLog.info jetty-6.1.26\n  [junit4]   2> 126200 T2061 oml.Slf4jLog.info Extract jar:file:/var/lib/jenkins/.ivy2/cache/org.apache.hadoop/hadoop-hdfs/tests/hadoop-hdfs-2.6.0-tests.jar!/webapps/hdfs to ./temp/Jetty_localhost_45038_hdfs____jfnzfi/webapp\n  [junit4]   2> 126577 T2061 oml.Slf4jLog.info NO JSP Support for /, did not find org.apache.jasper.servlet.JspServlet\n  [junit4]   2> 127704 T2061 oml.Slf4jLog.info Started HttpServer2$SelectChannelConnectorWithSafeStartup@localhost:45038\n  [junit4]   2> 129764 T2061 oahh.HttpRequestLog.getRequestLog WARN Jetty request log can only be enabled using Log4j\n  [junit4]   2> 129777 T2061 oml.Slf4jLog.info jetty-6.1.26\n  [junit4]   2> 129841 T2061 oml.Slf4jLog.info Extract jar:file:/var/lib/jenkins/.ivy2/cache/org.apache.hadoop/hadoop-hdfs/tests/hadoop-hdfs-2.6.0-tests.jar!/webapps/datanode to ./temp/Jetty_localhost_60765_datanode____fxr31f/webapp\n  [junit4]   2> 130228 T2061 oml.Slf4jLog.info NO JSP Support for /, did not find org.apache.jasper.servlet.JspServlet\n  [junit4]   2> 131028 T2061 oml.Slf4jLog.info Started HttpServer2$SelectChannelConnectorWithSafeStartup@localhost:60765\n  [junit4]   2> 131767 T2061 oahh.HttpRequestLog.getRequestLog WARN Jetty request log can only be enabled using Log4j\n  [junit4]   2> 131769 T2061 oml.Slf4jLog.info jetty-6.1.26\n  [junit4]   2> 131799 T2061 oml.Slf4jLog.info Extract jar:file:/var/lib/jenkins/.ivy2/cache/org.apache.hadoop/hadoop-hdfs/tests/hadoop-hdfs-2.6.0-tests.jar!/webapps/datanode to ./temp/Jetty_localhost_45594_datanode____xb8eu/webapp\n  [junit4]   2> 132058 T2061 oml.Slf4jLog.info NO JSP Support for /, did not find org.apache.jasper.servlet.JspServlet\n  [junit4]   2> 132856 T2061 oml.Slf4jLog.info Started HttpServer2$SelectChannelConnectorWithSafeStartup@localhost:45594\n  [junit4]   2> 135493 T2088 oahhsb.BlockManager.processReport BLOCK* processReport: from storage DS-c7286d21-0c75-425a-b32a-cda888b89811 node DatanodeRegistration(127.0.0.1, datanodeUuid=183b04a7-dc21-4d3e-ad8c-52569c645c0d, infoPort=60765, ipcPort=36559, storageInfo=lv=-56;cid=testClusterID;nsid=349984326;c=0), blocks: 0, hasStaleStorages: true, processing time: 2 msecs\n  [junit4]   2> 135501 T2088 oahhsb.BlockManager.processReport BLOCK* processReport: from storage DS-2cbc54c3-5182-44c8-b80a-a4af3d3bea02 node DatanodeRegistration(127.0.0.1, datanodeUuid=183b04a7-dc21-4d3e-ad8c-52569c645c0d, infoPort=60765, ipcPort=36559, storageInfo=lv=-56;cid=testClusterID;nsid=349984326;c=0), blocks: 0, hasStaleStorages: false, processing time: 0 msecs\n  [junit4]   2> 135493 T2097 oahhsb.BlockManager.processReport BLOCK* processReport: from storage DS-3c1bd938-8f62-4608-a6d4-63f576e970cd node DatanodeRegistration(127.0.0.1, datanodeUuid=3e441a70-defc-4b2f-bf7f-95c351d97a39, infoPort=45594, ipcPort=58299, storageInfo=lv=-56;cid=testClusterID;nsid=349984326;c=0), blocks: 0, hasStaleStorages: true, processing time: 1 msecs\n  [junit4]   2> 135511 T2097 oahhsb.BlockManager.processReport BLOCK* processReport: from storage DS-7b0f0027-583c-462f-9b9c-e6f13ca8a160 node DatanodeRegistration(127.0.0.1, datanodeUuid=3e441a70-defc-4b2f-bf7f-95c351d97a39, infoPort=45594, ipcPort=58299, storageInfo=lv=-56;cid=testClusterID;nsid=349984326;c=0), blocks: 0, hasStaleStorages: false, processing time: 0 msecs\n  [junit4]   2> 135786 T2061 oas.SolrTestCaseJ4.setUp ###Starting testBasic\n  [junit4]   2> 135956 T2061 oassh.HdfsDirectory.<init> WARN The NameNode is in SafeMode - Solr will wait 5 seconds and try again.\n  [junit4]   2> 141161 T2061 oas.SolrTestCaseJ4.tearDown ###Ending testBasic\n  [junit4]   2> NOTE: reproduce with: ant test  -Dtestcase=HdfsLockFactoryTest -Dtests.method=testBasic -Dtests.seed=B48BC404BF6BB3F1 -Dtests.slow=true -Dtests.locale=de_GR -Dtests.timezone=Antarctica/Vostok -Dtests.asserts=true -Dtests.file.encoding=ISO-8859-1\n  [junit4] ERROR   5.48s J5  | HdfsLockFactoryTest.testBasic <<<\n  [junit4]    > Throwable #1: org.apache.lucene.store.LockObtainFailedException: this lock instance was already obtained\n  [junit4]    > \tat __randomizedtesting.SeedInfo.seed([B48BC404BF6BB3F1:1F71D91160B735DF]:0)\n  [junit4]    > \tat org.apache.solr.store.hdfs.HdfsLockFactory$HdfsLock.obtain(HdfsLockFactory.java:71)\n  [junit4]    > \tat org.apache.solr.store.hdfs.HdfsLockFactoryTest.testBasic(HdfsLockFactoryTest.java:75)\n  [junit4]    > \tat java.lang.Thread.run(Thread.java:745)\n  [junit4]   2> 141271 T2061 oas.SolrTestCaseJ4.setUp ###Starting testDoubleObtain\n  [junit4]   2> 141393 T2061 oassh.HdfsDirectory.close Closing hdfs directory hdfs://localhost:40796/basedir/lock\n  [junit4]   2> 141394 T2061 oas.SolrTestCaseJ4.tearDown ###Ending testDoubleObtain\n  [junit4]   2> 141394 T2061 oahhsd.DirectoryScanner.shutdown WARN DirectoryScanner: shutdown has been called\n  [junit4]   2> 141435 T2061 oml.Slf4jLog.info Stopped HttpServer2$SelectChannelConnectorWithSafeStartup@localhost:0\n  [junit4]   2> 141436 T2133 oahh.HttpServer2$SelectChannelConnectorWithSafeStartup.isRunning WARN HttpServer Acceptor: isRunning is false. Rechecking.\n  [junit4]   2> 141437 T2133 oahh.HttpServer2$SelectChannelConnectorWithSafeStartup.isRunning WARN HttpServer Acceptor: isRunning is false\n  [junit4]   2> 141538 T2143 oahhsd.BPServiceActor.offerService WARN BPOfferService for Block pool BP-1715631016-127.0.1.1-1432850493139 (Datanode Uuid 3e441a70-defc-4b2f-bf7f-95c351d97a39) service to localhost/127.0.0.1:40796 interrupted\n  [junit4]   2> 141538 T2143 oahhsd.BPServiceActor.run WARN Ending block pool service for: Block pool BP-1715631016-127.0.1.1-1432850493139 (Datanode Uuid 3e441a70-defc-4b2f-bf7f-95c351d97a39) service to localhost/127.0.0.1:40796\n  [junit4]   2> 141542 T2061 oahhsd.DirectoryScanner.shutdown WARN DirectoryScanner: shutdown has been called\n  [junit4]   2> 141559 T2061 oml.Slf4jLog.info Stopped HttpServer2$SelectChannelConnectorWithSafeStartup@localhost:0\n  [junit4]   2> 141559 T2109 oahh.HttpServer2$SelectChannelConnectorWithSafeStartup.isRunning WARN HttpServer Acceptor: isRunning is false. Rechecking.\n  [junit4]   2> 141571 T2109 oahh.HttpServer2$SelectChannelConnectorWithSafeStartup.isRunning WARN HttpServer Acceptor: isRunning is false\n  [junit4]   2> 141580 T2116 oahhsd.BPServiceActor.offerService WARN BPOfferService for Block pool BP-1715631016-127.0.1.1-1432850493139 (Datanode Uuid 183b04a7-dc21-4d3e-ad8c-52569c645c0d) service to localhost/127.0.0.1:40796 interrupted\n  [junit4]   2> 141588 T2116 oahhsd.BPServiceActor.run WARN Ending block pool service for: Block pool BP-1715631016-127.0.1.1-1432850493139 (Datanode Uuid 183b04a7-dc21-4d3e-ad8c-52569c645c0d) service to localhost/127.0.0.1:40796\n  [junit4]   2> 141598 T2087 oahhsb.DecommissionManager$Monitor.run WARN Monitor interrupted: java.lang.InterruptedException: sleep interrupted\n  [junit4]   2> 141616 T2061 oml.Slf4jLog.info Stopped HttpServer2$SelectChannelConnectorWithSafeStartup@localhost:0\n  [junit4]   2> 141722 T2061 oahml.MethodMetric$2.snapshot ERROR Error invoking method getBlocksTotal java.lang.reflect.InvocationTargetException\n  [junit4]   2> \tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n  [junit4]   2> \tat sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)\n  [junit4]   2> \tat sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n  [junit4]   2> \tat java.lang.reflect.Method.invoke(Method.java:497)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.lib.MethodMetric$2.snapshot(MethodMetric.java:111)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.lib.MethodMetric.snapshot(MethodMetric.java:144)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.lib.MetricsRegistry.snapshot(MetricsRegistry.java:387)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.lib.MetricsSourceBuilder$1.getMetrics(MetricsSourceBuilder.java:79)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSourceAdapter.getMetrics(MetricsSourceAdapter.java:195)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSourceAdapter.updateJmxCache(MetricsSourceAdapter.java:172)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSourceAdapter.getMBeanInfo(MetricsSourceAdapter.java:151)\n  [junit4]   2> \tat com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.getClassName(DefaultMBeanServerInterceptor.java:1804)\n  [junit4]   2> \tat com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.safeGetClassName(DefaultMBeanServerInterceptor.java:1595)\n  [junit4]   2> \tat com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.checkMBeanPermission(DefaultMBeanServerInterceptor.java:1813)\n  [junit4]   2> \tat com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.exclusiveUnregisterMBean(DefaultMBeanServerInterceptor.java:430)\n  [junit4]   2> \tat com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.unregisterMBean(DefaultMBeanServerInterceptor.java:415)\n  [junit4]   2> \tat com.sun.jmx.mbeanserver.JmxMBeanServer.unregisterMBean(JmxMBeanServer.java:546)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.util.MBeans.unregister(MBeans.java:81)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSourceAdapter.stopMBeans(MetricsSourceAdapter.java:227)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSourceAdapter.stop(MetricsSourceAdapter.java:212)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSystemImpl.stopSources(MetricsSystemImpl.java:461)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSystemImpl.stop(MetricsSystemImpl.java:212)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.impl.MetricsSystemImpl.shutdown(MetricsSystemImpl.java:592)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.lib.DefaultMetricsSystem.shutdownInstance(DefaultMetricsSystem.java:72)\n  [junit4]   2> \tat org.apache.hadoop.metrics2.lib.DefaultMetricsSystem.shutdown(DefaultMetricsSystem.java:68)\n  [junit4]   2> \tat org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics.shutdown(NameNodeMetrics.java:145)\n  [junit4]   2> \tat org.apache.hadoop.hdfs.server.namenode.NameNode.stop(NameNode.java:822)\n  [junit4]   2> \tat org.apache.hadoop.hdfs.MiniDFSCluster.shutdown(MiniDFSCluster.java:1720)\n  [junit4]   2> \tat org.apache.hadoop.hdfs.MiniDFSCluster.shutdown(MiniDFSCluster.java:1699)\n  [junit4]   2> \tat org.apache.solr.cloud.hdfs.HdfsTestUtil.teardownClass(HdfsTestUtil.java:197)\n  [junit4]   2> \tat org.apache.solr.store.hdfs.HdfsLockFactoryTest.afterClass(HdfsLockFactoryTest.java:52)\n  [junit4]   2> \tat sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n  [junit4]   2> \tat sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)\n  [junit4]   2> \tat sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n  [junit4]   2> \tat java.lang.reflect.Method.invoke(Method.java:497)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.RandomizedRunner.invoke(RandomizedRunner.java:1627)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.RandomizedRunner$5.evaluate(RandomizedRunner.java:799)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.SystemPropertiesRestoreRule$1.evaluate(SystemPropertiesRestoreRule.java:57)\n  [junit4]   2> \tat org.apache.lucene.util.AbstractBeforeAfterRule$1.evaluate(AbstractBeforeAfterRule.java:46)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n  [junit4]   2> \tat org.apache.lucene.util.TestRuleStoreClassName$1.evaluate(TestRuleStoreClassName.java:42)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.NoShadowingOrOverridesOnMethodsRule$1.evaluate(NoShadowingOrOverridesOnMethodsRule.java:39)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.NoShadowingOrOverridesOnMethodsRule$1.evaluate(NoShadowingOrOverridesOnMethodsRule.java:39)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n  [junit4]   2> \tat org.apache.lucene.util.TestRuleAssertionsRequired$1.evaluate(TestRuleAssertionsRequired.java:54)\n  [junit4]   2> \tat org.apache.lucene.util.TestRuleMarkFailure$1.evaluate(TestRuleMarkFailure.java:48)\n  [junit4]   2> \tat org.apache.lucene.util.TestRuleIgnoreAfterMaxFailures$1.evaluate(TestRuleIgnoreAfterMaxFailures.java:65)\n  [junit4]   2> \tat org.apache.lucene.util.TestRuleIgnoreTestSuites$1.evaluate(TestRuleIgnoreTestSuites.java:55)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.rules.StatementAdapter.evaluate(StatementAdapter.java:36)\n  [junit4]   2> \tat com.carrotsearch.randomizedtesting.ThreadLeakControl$StatementRunner.run(ThreadLeakControl.java:365)\n  [junit4]   2> \tat java.lang.Thread.run(Thread.java:745)\n  [junit4]   2> Caused by: java.lang.NullPointerException\n  [junit4]   2> \tat org.apache.hadoop.hdfs.server.blockmanagement.BlocksMap.size(BlocksMap.java:198)\n  [junit4]   2> \tat org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.getTotalBlocks(BlockManager.java:3291)\n  [junit4]   2> \tat org.apache.hadoop.hdfs.server.namenode.FSNamesystem.getBlocksTotal(FSNamesystem.java:6223)\n  [junit4]   2> \t... 54 more\n  [junit4]   2> \n  [junit4]   2> 141730 T2061 oas.SolrTestCaseJ4.deleteCore ###deleteCore\n  [junit4]   2> NOTE: leaving temporary files on disk at: /var/lib/jenkins/jobs/Lucene-Solr-tests-5.2-Java8/workspace/solr/build/solr-core/test/J5/temp/solr.store.hdfs.HdfsLockFactoryTest B48BC404BF6BB3F1-001\n  [junit4]   2> 18586 T2060 ccr.ThreadLeakControl.checkThreadLeaks WARNING Will linger awaiting termination of 2 leaked thread(s).\n  [junit4]   2> NOTE: test params are: codec=CheapBastard, sim=DefaultSimilarity, locale=de_GR, timezone=Antarctica/Vostok\n  [junit4]   2> NOTE: Linux 4.0.2 amd64/Oracle Corporation 1.8.0_45 (64-bit)/cpus=16,threads=3,free=274346960,total=521142272\n  [junit4]   2> NOTE: All tests run in this JVM: [TestDistributedMissingSort, TestRandomMergePolicy, TestSolrConfigHandlerCloud, TestSweetSpotSimilarityFactory, TestSolrJ, TestStressLucene, TestBinaryResponseWriter, TestIndexSearcher, HdfsLockFactoryTest]\n  [junit4] Completed [164/497] on J5 in 28.44s, 2 tests, 1 error <<< FAILURES!\n\n "
+        },
+        {
+            "id": "comment-14563792",
+            "author": "Steve Rowe",
+            "date": "2015-05-28T22:23:41+0000",
+            "content": "Also the seed repros for me, on OS X. "
+        },
+        {
+            "id": "comment-14563809",
+            "author": "Anshum Gupta",
+            "date": "2015-05-28T22:35:02+0000",
+            "content": "I can reproduce the same issue too. Hit this while creating the RC. "
+        },
+        {
+            "id": "comment-14563837",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-28T23:00:42+0000",
+            "content": "Commit 1682352 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1682352 ]\n\nLUCENE-6507: fix test bug to not double-obtain. testDoubleObtain already tests that "
+        },
+        {
+            "id": "comment-14563844",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-28T23:02:45+0000",
+            "content": "Commit 1682353 from Robert Muir in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1682353 ]\n\nLUCENE-6507: fix test bug to not double-obtain. testDoubleObtain already tests that "
+        },
+        {
+            "id": "comment-14563852",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-28T23:05:26+0000",
+            "content": "Commit 1682354 from Robert Muir in branch 'dev/branches/lucene_solr_5_2'\n[ https://svn.apache.org/r1682354 ]\n\nLUCENE-6507: fix test bug to not double-obtain. testDoubleObtain already tests that "
+        },
+        {
+            "id": "comment-14563869",
+            "author": "Mark Miller",
+            "date": "2015-05-28T23:17:10+0000",
+            "content": "I can reproduce the same issue too. Hit this while creating the RC.\n\nJust a change in API behavior. Previously a double obtain was returning false and now it's throwing an exception. "
+        },
+        {
+            "id": "comment-14563874",
+            "author": "Robert Muir",
+            "date": "2015-05-28T23:21:03+0000",
+            "content": "I wouldnt go that far: it was discussed here, see the comments above.\n\nAny code doing this is really broken/stupid (example: the test in question). There is not a use-case.\n\nPreviously you already had to be prepared for obtain() to throw IOException anyway for other stupid cases (the test did not do this), so its not a problem that we detect this and give you a helpful exception that your code is broken. "
+        },
+        {
+            "id": "comment-14563878",
+            "author": "Mark Miller",
+            "date": "2015-05-28T23:22:19+0000",
+            "content": "Nope, I stand by that assessment  "
+        },
+        {
+            "id": "comment-14563882",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T23:28:17+0000",
+            "content": "Double obtains were not really supported and the behaviour was.... mhm.... undefined. So I think it's better that Robert and Mike fixed it to be consistent.\n\nUnfortunately we just missed to fix this test, but thats already fixed! "
+        },
+        {
+            "id": "comment-14563883",
+            "author": "Robert Muir",
+            "date": "2015-05-28T23:28:31+0000",
+            "content": "Feel free to propose your use case, where there is valid code not handling the previous IOException, with some valid use case for calling obtain() on an already-obtained lock.\n\nJust test bugs. "
+        },
+        {
+            "id": "comment-14563885",
+            "author": "Mark Miller",
+            "date": "2015-05-28T23:29:03+0000",
+            "content": "You guys are just howling into the air...please reread and or get a clue. "
+        },
+        {
+            "id": "comment-14563893",
+            "author": "Anshum Gupta",
+            "date": "2015-05-28T23:33:33+0000",
+            "content": "I think all's sorted for now. Thanks everyone \n\nP.S: I've started the 5.2 RC2 build. "
+        },
+        {
+            "id": "comment-14563894",
+            "author": "Robert Muir",
+            "date": "2015-05-28T23:33:49+0000",
+            "content": "On the contrary, I already fixed the test (and mike had already added an explicit separate test for double-obtain for HDFS).\n\nLooks like the ones howling into the air are... the peanut gallery, not the do-ers. "
+        },
+        {
+            "id": "comment-14563896",
+            "author": "Mark Miller",
+            "date": "2015-05-28T23:34:15+0000",
+            "content": "I'll lend a hand and spell it out.\n\nAnshum asked if I'd look at this issue as it involves hdfs and the release.\n\nI looked at it. I found that:\n\nJust a change in API behavior. Previously a double obtain was returning false and now it's throwing an exception.\n\nThis is true. I don't care how smart you think you are.\n\nBy then, Robert had made a further commit.\n\nBeyond that, not much to see here. Chill out. "
+        },
+        {
+            "id": "comment-14563897",
+            "author": "Uwe Schindler",
+            "date": "2015-05-28T23:35:00+0000",
+            "content": "With LUCENE-6508, double obtains will be impossible in the future: you just get a Lock instance if you have actually locked the directory (using Directory#obtainLock(name)). This lock class is immutable and once released with close() its gone. Because the new Lock class has no \"obtain\" anymore, double obtains are impossible.\n\nBut as this new issue takes longer, we just did a \"quick\" fix to make 5.2 release-able. "
+        },
+        {
+            "id": "comment-14563899",
+            "author": "Mark Miller",
+            "date": "2015-05-28T23:35:08+0000",
+            "content": "Looks like the ones howling into the air are... the peanut gallery, not the do-ers.\n\nNah, you are just being a dick for no reason as usual. Normal day in Lucene land. "
+        },
+        {
+            "id": "comment-14564367",
+            "author": "Michael McCandless",
+            "date": "2015-05-29T07:51:51+0000",
+            "content": "Argh, thank you for fixing the HDFSLockFactory failure. "
+        },
+        {
+            "id": "comment-14564869",
+            "author": "Michael McCandless",
+            "date": "2015-05-29T14:13:50+0000",
+            "content": "So ... here's a 4.10.x backport patch, but it was kinda messy: lots of\nconflicts because we've basically already rewritten locking once in 5.x.\n\nI stuck with java.io APIs (File) instead of converting to NIO.2 apis\n(Path).  I also back-ported AssertingLock to MockDirectoryWrapper.\n\nThis patch breaks NativeFSLockFactory.clearLock: its impl \"relied\" on\nthis \"when I close I nuke any other locks\" behavior, and I had to\nremove one test case that in facets module that was doing this.  The\nAPI is deprecated (gone in 5.x) but still feels wrong to break it on\nsuch an old bugfix branch...\n\nNet/net this is a biggish change, and I don't think we should backport\nthis to 4.10.x: this branch is very old now, and this change is a too risky. "
+        },
+        {
+            "id": "comment-14564875",
+            "author": "Robert Muir",
+            "date": "2015-05-29T14:18:16+0000",
+            "content": "Thanks for investigating mike. I looked at the backport patch and saw some corner case bugs still, like calling getCanonicalPath before ensuring the file is created already (not truly canonical). I agree, this seems too risky. Lets just proceed with 5.x and leave it broken there. "
+        },
+        {
+            "id": "comment-14586830",
+            "author": "Anshum Gupta",
+            "date": "2015-06-15T21:43:07+0000",
+            "content": "Bulk close for 5.2.0. "
+        }
+    ]
+}

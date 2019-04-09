@@ -1,0 +1,137 @@
+{
+    "id": "LUCENE-7638",
+    "title": "Optimize graph query produced by QueryBuilder",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "6.5"
+        ]
+    },
+    "description": "The QueryBuilder creates a graph query when the underlying TokenStream contains token with PositionLengthAttribute greater than 1.\nThese TokenStreams are in fact graphs (lattice to be more precise) where synonyms can span on multiple terms. \nCurrently the graph query is built by visiting all the path of the graph TokenStream. For instance if you have a synonym like \"ny, new york\" and you search for \"new york city\", the query builder would produce two pathes:\n\"new york city\", \"ny city\"\nThis can quickly explode when the number of multi terms synonyms increase. \nThe query \"ny ny\" for instance would produce 4 pathes and so on.\nFor boolean queries with should or must clauses it should be more efficient to build a boolean query that merges all the intersections in the graph. So instead of \"new york city\", \"ny city\" we could produce:\n\"+((+new +york) ny) +city\"\n\nThe attached patch is a proposal to do that instead of the all path solution.\nThe patch transforms multi terms synonyms in graph query for each intersection in the graph. This is not done in this patch but we could also create a specialized query that gives equivalent scores to multi terms synonyms like the SynonymQuery does for single term synonyms.\nFor phrase query this patch does not change the current behavior but we could also use the new method to create optimized graph SpanQuery.\n\nMatt Weber I think this patch could optimize a lot of cases where multiple muli-terms synonyms are present in a single request. Could you take a look ?",
+    "attachments": {
+        "LUCENE-7638.patch": "https://issues.apache.org/jira/secure/attachment/12847636/LUCENE-7638.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15824229",
+            "date": "2017-01-16T16:30:42+0000",
+            "content": "Maybe TermAutomatonQuery would be a good fit for that problem? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15824319",
+            "date": "2017-01-16T17:18:54+0000",
+            "content": "I think the problem here is that we lose minimum should match support as that is applied AFTER query generation by building a new boolean query.  Same thing for phrase slop even though that would not be affected by this patch.  If we can move this logic into rewrite method of GraphQuery then we could take all that information into consideration to build a more efficient query. ",
+            "author": "Matt Weber"
+        },
+        {
+            "id": "comment-15824337",
+            "date": "2017-01-16T17:30:58+0000",
+            "content": "\nMaybe TermAutomatonQuery would be a good fit for that problem?\n\n\nFor pure phrase query it's a good fit because it's a proximity query but for boolean queries the problem is different. We cannot build the TermAutomatonQuery directly, first we need to find the start and end state of each multi-term synonyms in the graph. That's what the attached patch is doing lazily, for each intersection point it creates a multi-term synonym query. Currently the multi-term synonym query is a boolean query but we could change the logic and use the TermAutomatonQuery instead or even create a PhaseQuery for each path in the multi-term synonym. This patch also handles nested multi-term synonyms which makes the detection of intersection points harder. \nBottom point is that if we are able to extract the multi-term synonyms of the graph then we can choose more easily how we want to search and score these inner graph. Does this makes sense ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15824358",
+            "date": "2017-01-16T17:43:53+0000",
+            "content": "Matt Weber I don't think we lose minimum should match support. It will be different but interestingly it would also solve some problems. For instance with the all path solution, a synonym like \"ny, new york\" with a minimum should match of 1, searching for \"ny\" would not return documents matching \"new york\". With the proposed solution each multi-term synonyms is considered as a single clause so \"ny\" and \"new york\" count for 1.\nI like the finite strings solution because expressing the minimum should match in percentage gives you correct hits. This is great though it requires to duplicate a lot of terms so I wonder if this is something that we should really target. By considering each multi-term synonyms as 1 clause we could simplify the problem and produce more optimized query ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15824462",
+            "date": "2017-01-16T19:24:35+0000",
+            "content": "Jim Ferenczi I have mixed feelings about that as I can see plus and minus of both.  When I was originally working on this I essentially decided that everything should be passed to each path as if it was the original query.  What do you think Michael McCandless?  Also, there are additional use cases that we handle in elasticsearch that have not made their way into Lucene yet that might be affected by this.  Boolean with cutoff frequency, prefix queries, etc.   ",
+            "author": "Matt Weber"
+        },
+        {
+            "id": "comment-15825894",
+            "date": "2017-01-17T11:31:32+0000",
+            "content": "This is an impressive patch!  Thanks Jim Ferenczi.\n\nI agree the combinatoric explosion is a serious problem/vulnerability/adversary and I love how this patch solves it.\n\nCan this handle \"side paths on side paths\" graph structure (I think you called this \"nested multi-term synonyms\")?  While no analysis chain can naturally produce this today (that I know of!), the TokenStream attributes can easily express it.  And you could imagine it happening in the future, e.g. if you use Kuromoji tokenizer or WordDelimiterGraphFilter followed by a SynonymGraphFilter (except we'd need to e.g. use the synonym graph filter from LUCENE-5012, which can correctly consume a graph).  If this is expected to work maybe we should add a test case showing that?\n\nIt seems like you don't need to be using Term here, except at the end to pass to the newXXXQuery, since everything is in a single field here, and we are hoping to move away from Term entirely (LUCENE-7632)?\n\nHoles are challenging for graph token streams ... can you add a test case that encounters holes, e.g. simulated StopFilter?  There are at least two \"fun\" cases: a hole that cuts the graph entirely into two partitions, and a synonym spanning over a hole ... CannedTokenStream is useful for feeding such \"interesting\" cases.\n\nThe Path.id seems to be used only for tie-breaking on compare, not for lookup in the TreeSet as the comment suggests?\n\nOn minShouldMatch: I feel it's actually more correct to define its semantics as operating on whole synonyms, not the individual tokens in each synonym, as this patch does.  Really, had you done the same synonym reduction at indexing time instead, so that \"new york\" in a document caused \"ny\" to be indexed as well, and then searched on \"ny\", this is the behavior you would see (\"new york\" counts as the 1 minShouldMatch).\n\nOf course, in general I think we are in new (to Lucene) territory here, on how graph structured queries should be matched/scored \"properly\", and I don't really know what the answer should be. TermAutomatonQuery faces similar challenges.  Maybe there are some IR papers out there that have studied this?\n\nI even think it's odd that we don't use a PhraseQuery to match that syn-expanded \"new york\" even when the user didn't put double quotes around the query: had you done that syn at index time, it would \"act like\" a PhraseQuery ... but this is an unrelated issue! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15826085",
+            "date": "2017-01-17T14:00:18+0000",
+            "content": "Thanks for taking a look Matt Weber and Michael McCandless\n\n\nCan this handle \"side paths on side paths\" graph structure (I think you called this \"nested multi-term synonyms\")? While no analysis chain can naturally produce this today (that I know of!), the TokenStream attributes can easily express it. And you could imagine it happening in the future, e.g. if you use Kuromoji tokenizer or WordDelimiterGraphFilter followed by a SynonymGraphFilter (except we'd need to e.g. use the synonym graph filter from LUCENE-5012, which can correctly consume a graph). If this is expected to work maybe we should add a test case showing that?\n\nI'll add a test case because it's expected to work  . This is also the reason why this patch does not produce \n\nPhraseQuery\n\n for synonyms.   For simple \"side paths\" this is easy to do but we would need to switch to Span queries for \"side paths on side paths\" so I though that it could be done in another issue. \n\n\nIt seems like you don't need to be using Term here, except at the end to pass to the newXXXQuery, since everything is in a single field here, and we are hoping to move away from Term entirely (LUCENE-7632)?\n\nThanks, I'll simplify the patch.\n\n\nHoles are challenging for graph token streams ... can you add a test case that encounters holes, e.g. simulated StopFilter? There are at least two \"fun\" cases: a hole that cuts the graph entirely into two partitions, and a synonym spanning over a hole ... CannedTokenStream is useful for feeding such \"interesting\" cases.\n\nI though that holes would not be a problem for boolean queries but now I am not sure. I'll test that.\n\n\nThe Path.id seems to be used only for tie-breaking on compare, not for lookup in the TreeSet as the comment suggests?\n\nThe comment is misleading. It is needed because I use \n\nTreeSet#remove\n\n which uses compare to check object equality. So the \n\nPath.id\n\n is the unique identifier for the path.\n\n\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15826311",
+            "date": "2017-01-17T16:08:41+0000",
+            "content": "Ok this is great.  So going forward we should assume that synonyms are to treated together (single token or multi-token) and ideally multi-token synonyms as a phrase.  Would it be best to move this logic into GraphQuery itself?  This would make it so we can still detect when we are working with graph related queries and be easier to make the various optimizations talked about here.  Maybe make GraphQuery store the graph token stream instead of the processed queries and then do the graph processing / query generation when rewrite it called? ",
+            "author": "Matt Weber"
+        },
+        {
+            "id": "comment-15848433",
+            "date": "2017-02-01T14:35:02+0000",
+            "content": "I pushed a new patch that changes how we build boolean graph query with multi-term synonyms. It first finds the articulation points of the graph and builds a boolean query for each point. The articulation points (or cut vertices) are computed using the algorithm described in:\nhttps://en.wikipedia.org/wiki/Biconnected_component\nThis means that each time we find a state where side paths of different lengths start, we generate all path that start at this state and end at the next articulation points. If QueryBuilder#autoGenerateMultiTermSynonymsPhraseQuery is set to true, a phrase query is generated for each path, otherwise a boolean query. \n\nMatt Weber Michael McCandless can you take a look ?\n ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15849996",
+            "date": "2017-02-02T14:43:34+0000",
+            "content": "+1, the new patch looks great!  Thanks Jim Ferenczi. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15853329",
+            "date": "2017-02-05T19:32:17+0000",
+            "content": "Thanks Michael McCandless.\nJust to be clear this patch creates a BooleanQuery with MUST clauses (or a PhraseQuery if autoGenerateMultiTermSynonymsPhraseQuery is set to true) for each synonym path. \nI'll commit shortly if there are no objections. ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15855707",
+            "date": "2017-02-07T10:28:26+0000",
+            "content": "Commit e764d3e0590e998676a18f2b11364cecced4a8ad in lucene-solr's branch refs/heads/master from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e764d3e ]\n\nLUCENE-7638: Query parsers now analyze the token graph for articulation points (or cut vertices) in order to create more efficient queries for multi-token synonyms. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15855842",
+            "date": "2017-02-07T12:01:17+0000",
+            "content": "Commit 5386116e9a3b54db4674b21e39a41cc4d43553f8 in lucene-solr's branch refs/heads/branch_6x from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=5386116 ]\n\nLUCENE-7638: Query parsers now analyze the token graph for articulation points (or cut vertices) in order to create more efficient queries for multi-token synonyms. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15856188",
+            "date": "2017-02-07T15:18:49+0000",
+            "content": "Jim Ferenczi Sorry so late been swamped.  Anyways, this is great!  I really like this approach, awesome job man! ",
+            "author": "Matt Weber"
+        },
+        {
+            "id": "comment-15861913",
+            "date": "2017-02-10T22:08:24+0000",
+            "content": "Jim Ferenczi can this be closed now? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15863338",
+            "date": "2017-02-13T08:47:21+0000",
+            "content": "Sure, thanks Michael McCandless and Matt Weber ! ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-15875182",
+            "date": "2017-02-21T00:37:16+0000",
+            "content": "Jim Ferenczi Michael McCandless Could we apply the same articulation points logic in analyzeGraphPhrase but generate span queries to essentially act like a phrase? \n\n\nSpanNear[\n  SpanOr[\n    SpanNear[SpanTerm[new], SpanTerm[york]]\n    SpanTerm[ny]\n  ],\n  SpanTerm[city]\n]\n\n ",
+            "author": "Matt Weber"
+        },
+        {
+            "id": "comment-16021245",
+            "date": "2017-05-23T14:20:04+0000",
+            "content": "This ticket is missing fix versions, but it looks like there were commits.  ",
+            "author": "Michael Braun"
+        },
+        {
+            "id": "comment-16021381",
+            "date": "2017-05-23T15:54:44+0000",
+            "content": "Michael Braun looks like from CHANGES and commits this was 6.5 so I marked it as so.   ",
+            "author": "Erik Hatcher"
+        }
+    ]
+}

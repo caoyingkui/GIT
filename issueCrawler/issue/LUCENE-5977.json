@@ -1,0 +1,79 @@
+{
+    "id": "LUCENE-5977",
+    "title": "IW should safeguard against token streams returning invalid offsets for multi-valued fields",
+    "details": {
+        "type": "Bug",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [],
+        "affect_versions": "4.9,                                            4.9.1,                                            4.10,                                            4.10.1",
+        "status": "Closed",
+        "fix_versions": [
+            "4.10.2",
+            "5.0",
+            "6.0"
+        ]
+    },
+    "description": "We have a custom token stream that emits information about offsets of each token. My (wrong) assumption was that for multi-valued fields a token stream's offset information is magically shifted, much like this is the case with positions. It's not the case \u2013 offsets should be increasing and monotonic across all instances of a field, even if it has custom token streams. So, something like this:\n\n\n        doc.add(new Field(\"field-foo\", new CannedTokenStream(token(\"bar\", 1, 150, 160)), ftype));\n        doc.add(new Field(\"field-foo\", new CannedTokenStream(token(\"bar\", 1,  50,  60)), ftype));\n\n\n\nwhere the token function is defined as:\n\n\ntoken(String image, int positionIncrement, int startOffset, int endOffset)\n\n\n\nwill result in either a cryptic assertion thrown from IW:\n\n\nException in thread \"main\" java.lang.AssertionError\n\tat org.apache.lucene.index.FreqProxTermsWriterPerField.writeOffsets(FreqProxTermsWriterPerField.java:99)\n\n\n\nor nothing (or a codec error) if run without assertions.\n\nObviously returning non-shifted offsets from subsequent token streams makes little sense but I wonder if it could be made more explicit (or asserted) that offsets need to be increasing between multiple-values. The minimum is to add some documentation to OffsetAttribute. I don't know if offsets should be shifted automatically, as it's the case with positions \u2013 this would change the semantics of existing tokenizers and filters which implement such shifting internally already.",
+    "attachments": {
+        "LUCENE-5977.patch": "https://issues.apache.org/jira/secure/attachment/12671778/LUCENE-5977.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14151567",
+            "author": "Dawid Weiss",
+            "content": "A full example which shows the problem. Run it with -ea \u2013 you'll get the assertion. Run it without assertions and it'll pass.\n\n\nimport org.apache.lucene.analysis.Token;\nimport org.apache.lucene.analysis.core.WhitespaceAnalyzer;\nimport org.apache.lucene.codecs.Codec;\nimport org.apache.lucene.codecs.simpletext.SimpleTextCodec;\nimport org.apache.lucene.document.Document;\nimport org.apache.lucene.document.Field;\nimport org.apache.lucene.document.FieldType;\nimport org.apache.lucene.index.FieldInfo.IndexOptions;\nimport org.apache.lucene.index.IndexWriter;\nimport org.apache.lucene.index.IndexWriterConfig;\nimport org.apache.lucene.store.Directory;\nimport org.apache.lucene.store.RAMDirectory;\nimport org.apache.lucene.util.Version;\nimport org.apache.lucene.analysis.CannedTokenStream;\n\npublic class OffsetIndexingBug {\n  \n  public static void main(String[] args) throws Exception {\n    Codec.setDefault(new SimpleTextCodec());\n    Version version = Version.LUCENE_CURRENT;\n    IndexWriterConfig conf = new IndexWriterConfig(version, new WhitespaceAnalyzer(version));\n    conf.setUseCompoundFile(false);\n    try (Directory d = new RAMDirectory()) {\n      try (IndexWriter iw = new IndexWriter(d, conf)) {\n        Document doc = new Document();\n\n        FieldType ftype = new FieldType();\n        ftype.setIndexed(true);\n        ftype.setStored(false);\n        ftype.setOmitNorms(true);\n        \n        ftype.setStoreTermVectors(true);\n        ftype.setStoreTermVectorPositions(true);\n        ftype.setStoreTermVectorOffsets(true);\n\n        ftype.setTokenized(true);\n        ftype.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);\n        ftype.freeze();\n\n        // note \"use\"'s offset is negative with respect to the first field value. \n        doc.add(new Field(\"field-foo\", new CannedTokenStream(token(\"use\", 1, 150, 160)), ftype));\n        doc.add(new Field(\"field-foo\", new CannedTokenStream(token(\"use\", 1,  50,  60)), ftype));\n        iw.addDocument(doc);\n      }\n    }\n  }\n\n  private static Token token(String image, int positionIncrement, int soffset, int eoffset) {\n    Token t = new Token();\n    t.setPositionIncrement(positionIncrement);\n    t.setOffset(soffset, eoffset);\n    t.append(image);\n    return t;\n  }\n}\n\n ",
+            "date": "2014-09-29T10:16:14+0000"
+        },
+        {
+            "id": "comment-14151584",
+            "author": "Dawid Weiss",
+            "content": "I looked a bit more closely at the logic of updating offsets in the DefaultIndexingChain and I see offsets are propagated for multiple fields, here:\n\n\n        // trigger streams to perform end-of-stream operations\n        stream.end();\n\n        // TODO: maybe add some safety? then again, its already checked \n        // when we come back around to the field...\n        invertState.position += invertState.posIncrAttribute.getPositionIncrement();\n        invertState.offset += invertState.offsetAttribute.endOffset();\n\n\n\nSo the problem with my implementation was that it should have set offsets properly in end(). I still feel this should be verified / asserted cleaner somehow, so I'll leave this issue open looking for suggestions. ",
+            "date": "2014-09-29T10:54:21+0000"
+        },
+        {
+            "id": "comment-14151598",
+            "author": "Robert Muir",
+            "content": "The bug is older than 4.9 actually: it existed in the previous indexing chain, too.\n\nI ran the test program against 4.8, even with assertingcodec, it just silently \"succeeds\".\n\nBut if you add checkindex call:\n\nSegments file=segments_1 numSegments=1 version=4.8 format=\n  1 of 1: name=_0 docCount=1\n    codec=Asserting\n    compound=false\n    numFiles=12\n    size (MB)=0.001\n    diagnostics = {timestamp=1411990327375, os=Linux, os.version=3.13.0-24-generic, source=flush, lucene.version=4.8-SNAPSHOT, os.arch=amd64, java.version=1.7.0_55, java.vendor=Oracle Corporation}\n    no deletions\n    test: open reader.........OK\n    test: check integrity.....OK\n    test: check live docs.....OK\n    test: fields..............OK [1 fields]\n    test: field norms.........OK [0 fields]\n    test: terms, freq, prox...ERROR: java.lang.RuntimeException: term [75 73 65]: doc 0: pos 1: startOffset -2147483597 is out of bounds\njava.lang.RuntimeException: term [75 73 65]: doc 0: pos 1: startOffset -2147483597 is out of bounds\n\tat org.apache.lucene.index.CheckIndex.checkFields(CheckIndex.java:944)\n\tat org.apache.lucene.index.CheckIndex.testPostings(CheckIndex.java:1278)\n\tat org.apache.lucene.index.CheckIndex.checkIndex(CheckIndex.java:626)\n\tat org.apache.lucene.util.TestUtil.checkIndex(TestUtil.java:199)\n\tat org.apache.lucene.util.TestUtil.checkIndex(TestUtil.java:191)\n\tat org.apache.lucene.OffsetIndexingBug.main(OffsetIndexingBug.java:48)\n    test: stored fields.......OK [0 total field count; avg 0 fields per doc]\n    test: term vectors........ERROR [vector term=[75 73 65] field=field-foo doc=0: startOffset=51 differs from postings startOffset=-2147483597]\njava.lang.RuntimeException: vector term=[75 73 65] field=field-foo doc=0: startOffset=51 differs from postings startOffset=-2147483597\n\tat org.apache.lucene.index.CheckIndex.testTermVectors(CheckIndex.java:1748)\n\tat org.apache.lucene.index.CheckIndex.checkIndex(CheckIndex.java:632)\n\tat org.apache.lucene.util.TestUtil.checkIndex(TestUtil.java:199)\n\tat org.apache.lucene.util.TestUtil.checkIndex(TestUtil.java:191)\n\tat org.apache.lucene.OffsetIndexingBug.main(OffsetIndexingBug.java:48)\n    test: docvalues...........OK [0 docvalues fields; 0 BINARY; 0 NUMERIC; 0 SORTED; 0 SORTED_SET]\nFAILED\n    WARNING: fixIndex() would remove reference to this segment; full exception:\njava.lang.RuntimeException: Term Index test failed\n\tat org.apache.lucene.index.CheckIndex.checkIndex(CheckIndex.java:641)\n\tat org.apache.lucene.util.TestUtil.checkIndex(TestUtil.java:199)\n\tat org.apache.lucene.util.TestUtil.checkIndex(TestUtil.java:191)\n\tat org.apache.lucene.OffsetIndexingBug.main(OffsetIndexingBug.java:48)\n\nWARNING: 1 broken segments (containing 1 documents) detected\n\n ",
+            "date": "2014-09-29T11:35:22+0000"
+        },
+        {
+            "id": "comment-14151609",
+            "author": "Robert Muir",
+            "content": "The bug is some validation checks rely on lastStartOffset/lastPosition, but this is currently reset to 0 on each field instance.\n\nWe should instead track it across all instances of the field. I converted Dawid's test to a case in TestPostingsOffsets and moved these two state variables to FieldInvertState. ",
+            "date": "2014-09-29T11:50:33+0000"
+        },
+        {
+            "id": "comment-14151639",
+            "author": "Adrien Grand",
+            "content": "+1 ",
+            "date": "2014-09-29T12:33:22+0000"
+        },
+        {
+            "id": "comment-14151730",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1628192 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1628192 ]\n\nLUCENE-5977: Fix tokenstream safety checks in IndexWriter to work across multi-valued fields ",
+            "date": "2014-09-29T14:27:16+0000"
+        },
+        {
+            "id": "comment-14151743",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1628196 from Robert Muir in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1628196 ]\n\nLUCENE-5977: Fix tokenstream safety checks in IndexWriter to work across multi-valued fields ",
+            "date": "2014-09-29T14:41:37+0000"
+        },
+        {
+            "id": "comment-14151763",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1628200 from Robert Muir in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1628200 ]\n\nLUCENE-5977: Fix tokenstream safety checks in IndexWriter to work across multi-valued fields ",
+            "date": "2014-09-29T15:00:00+0000"
+        },
+        {
+            "id": "comment-14151764",
+            "author": "Robert Muir",
+            "content": "Thank you for debugging this Dawid! ",
+            "date": "2014-09-29T15:00:35+0000"
+        }
+    ]
+}

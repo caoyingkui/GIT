@@ -1,0 +1,107 @@
+{
+    "id": "LUCENE-8010",
+    "title": "fix or sandbox similarities in core with problems",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Resolved",
+        "type": "Bug",
+        "components": [],
+        "fix_versions": [
+            "master (8.0)"
+        ]
+    },
+    "description": "We want to support scoring optimizations such as LUCENE-4100 and LUCENE-7993, which put very minimal requirements on the similarity impl. Today similarities of various quality are in core and tests. \n\nThe ones with problems currently have warnings in the javadocs about their bugs, and if the problems are severe enough, then they are also disabled in randomized testing too.\n\nIMO lucene core should only have practical functions that won't return NaN scores at times or cause relevance to go backwards if the user's stopfilter isn't configured perfectly. Also it is important for unit tests to not deal with broken or semi-broken sims, and the ones in core should pass all unit tests.\n\nI propose we move the buggy ones to sandbox and deprecate them. If they can be fixed we can put them back in core, otherwise bye-bye.\n\nFWIW tests developed in LUCENE-7997 document the following requirements:\n\n\tscores are non-negative and finite.\n\tscore matches the explanation exactly.\n\tinternal explanations calculations are sane (e.g. sum of: and so on actually compute sums)\n\tscores don't decrease as term frequencies increase: e.g. score(freq=N + 1) >= score(freq=N)\n\tscores don't decrease as documents get shorter, e.g. score(len=M) >= score(len=M+1)\n\tscores don't decrease as terms get rarer, e.g. score(term=N) >= score(term=N+1)\n\tscoring works for floating point frequencies (e.g. sloppy phrase and span queries will work)\n\tscoring works for reasonably large 64-bit statistic values (e.g. distributed search will work)\n\tscoring works for reasonably large boost values (0 .. Integer.MAX_VALUE, e.g. query boosts will work)\n\tscoring works for parameters randomized within valid ranges",
+    "attachments": {
+        "LUCENE-8010.patch": "https://issues.apache.org/jira/secure/attachment/12901117/LUCENE-8010.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16282276",
+            "date": "2017-12-07T18:29:03+0000",
+            "content": "I could get all similarities to pass current tests with some tweaks:\n\n\tAxiomatic similarities add 1 to the freq, is it ok? Otherwise we'll need to take freq = max(freq, 1) but this means sloppy phrase queries will produce the same score on all documents whose sloppy freq is less than 1\n\tAxiomaticF3* Similarities have their score truncated to 0 when the gamma component would cause scores to be less than 0. This means they could produce low-quality scores but I don't have ideas how to fix it otherwise.\n\tLambda impls use a nextUp/nextDown to make sure they never produce lambda=1, which doesn't work with DistributionSPL\n\tDistributionSPL also makes use of some calls to nextUp/nextDown to avoid producing infinite/NaN scores while still guaranteeing that scores do not decrease when tfn increases\n\n ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16282650",
+            "date": "2017-12-07T22:50:20+0000",
+            "content": "Thanks for hacking on these! I can run some relevance tests on the proposed changes, if you can wait a few days, so we have a better idea of the impact. Obviously not concerned about nextUp/nextDown-type fixes. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16303846",
+            "date": "2017-12-26T13:23:32+0000",
+            "content": "I'd like to get these changes in so that we can reenable tests on these similarities. I'll merge later this week if there are no objections, we can still look into improving the hacks later if this hurts relevance? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16304092",
+            "date": "2017-12-27T00:10:35+0000",
+            "content": "Sorry for the long delay, here is a really rough test (short queries only, no stopwords). I think we should go for it. This is similar to changes you see with e.g. modifying BM25's idf formula to prevent negatives. It will definitely change results but its not clear it hurts for at least the common case. The SPL changes don't do anything.\n\n\n0     new AxiomaticF1EXP()\nmap   0.4375 -> 0.3919\nbpref 0.5056 -> 0.4915\n\n1     new AxiomaticF1LOG()\nmap   0.4495 -> 0.4076\nbpref 0.5089 -> 0.4955\n\n2     new AxiomaticF2EXP()\nidentical search results\n\n3     new AxiomaticF2LOG()\nidentical search results\n\n4     new AxiomaticF3EXP(0.25f, 1)\nmap   0.4305 -> 0.4000\nbpref 0.5016 -> 0.5007\n\n5     new AxiomaticF3LOG(0.25f, 1)\nmap   0.4470 -> 0.4153\nbpref 0.5069 -> 0.5060\n\n6        new IBSimilarity(new DistributionSPL(), new LambdaDF(), new NormalizationH2())\nmap   0.4319 -> 0.4319\nbpref 0.4943 -> 0.4943\n(exact score magnitude gets changed e.g. 24.1899 vs 24.1850 but ranking seems to be the same?)\n\n7        new IBSimilarity(new DistributionSPL(), new LambdaTTF(), new NormalizationH2())\nidentical search results\n\n ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16304098",
+            "date": "2017-12-27T00:30:40+0000",
+            "content": "And the TODOs about randomizing parameters are kinda serious for these. For the other sims we randomize parameters within the range it will accept and then fixed sim's checks to match. We should issue IAE if a parameter is out of range rather than silently screw up later, this fixed a lot of possible bugs.\n\nIts just important as some of these sims dont even have a default ctor (not sure if this is intentional) and we fixed this everywhere else. We can make it a followup issue though. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16304100",
+            "date": "2017-12-27T00:36:44+0000",
+            "content": "\n+    // Not adding the AxiomaticF3 similarities since they can generate scores\n+    // equal to 0 due to their gamma component, which could confuse tests which\n+    // expect the score to increase with the freq or decrease with the length\n\nThese are disabled but the patch enables Dirichlet, which does the same thing. Also DFI is similar but its enabled too. Finally, I think we should enable Boolean too at this point. We have dedicated sim tests and more formally ensure these are well-behaved now, we don't need to rely on other tests making such assumptions. And code shouldn't be making this assumption now, it can assume things are non-decreasing but it cannot assume increase (due to norms quantization and other reasons too). ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16306124",
+            "date": "2017-12-29T09:06:56+0000",
+            "content": "Commit b2f248164c1a3ddf213a56778d55c9252a022f18 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=b2f2481 ]\n\nLUCENE-8010: Fix similarities so that they pass tests. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16306129",
+            "date": "2017-12-29T09:08:47+0000",
+            "content": "I suspect we fixed at least some of those since I could run the entire test suite 3 times without scoring-related issues after enabling AxiomaticF3 and BooleanSimilarity. I'll watch the build. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16306323",
+            "date": "2017-12-29T15:00:23+0000",
+            "content": "Commit 8dfb0190762922ea2e61dc565616e17aa02ebb5a in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=8dfb019 ]\n\nLUCENE-8010: Axiomatic similarities must incorporate the boost as a multiplicative factor. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16306324",
+            "date": "2017-12-29T15:00:25+0000",
+            "content": "Commit deb7644912f6339e0647795c732049af2e60fc75 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=deb7644 ]\n\nLUCENE-8010: TestGrouping expects that longer fields produce lower scores. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16306496",
+            "date": "2017-12-29T19:52:39+0000",
+            "content": "I opened LUCENE-8112 for a reproducing failure that, according to git bisect, started with b2f2481 on this issue. ",
+            "author": "Steve Rowe"
+        },
+        {
+            "id": "comment-16306804",
+            "date": "2017-12-30T14:47:12+0000",
+            "content": "Commit fbc8508e11ce80343d1052e5b05ee0e922c5bad7 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fbc8508 ]\n\nLUCENE-8010: Remove assumptions about how the similarity orders hits from FastVectorHighlighterTest. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16307888",
+            "date": "2018-01-02T11:07:14+0000",
+            "content": "Commit 6dd9dbf2758c1fad2f10f0eba96998411aa43fd0 in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6dd9dbf ]\n\nLUCENE-8010: GroupingSearchTest assumes longer fields = lower scores ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16322602",
+            "date": "2018-01-11T17:33:03+0000",
+            "content": "I opened SOLR-11846 for a failure that git bisect says started at the b2f24816 commit on this issue. ",
+            "author": "Steve Rowe"
+        }
+    ]
+}

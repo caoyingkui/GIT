@@ -1,0 +1,69 @@
+{
+    "id": "LUCENE-5875",
+    "title": "Default page/block sizes in the FST package can cause OOMs",
+    "details": {
+        "type": "Improvement",
+        "priority": "Minor",
+        "labels": "",
+        "resolution": "Unresolved",
+        "components": [
+            "core/FSTs"
+        ],
+        "affect_versions": "4.9",
+        "status": "Open",
+        "fix_versions": []
+    },
+    "description": "We are building some fairly big FSTs (the biggest one having about 500M terms with an average of 20 characters per term) and that works very well so far.\nThe problem is just that we can use neither the \"doShareSuffix\" nor the \"doPackFST\" option from the builder since both would cause us to get exceptions. One beeing an OOM and the other an IllegalArgumentException for a negative array size in ArrayUtil.\n\nThe thing here is that we in theory still have far more than enough memory available but it seems that java for some reason cannot allocate byte or long arrays of the size the NodeHash needs (maybe fragmentation?).\n\nReducing the constant in the NodeHash from 1<<30 to e.g. 27 seems to fix the issue mostly. Could e.g. the Builder pass through its bytesPageBits to the NodeHash or could we get a custom parameter for that?\n\nThe other problem we run into was a NegativeArraySizeException when we try to pack the FST. It seems that we overflowed to 0x80000000. Unfortunately I accidentally overwrote that exception but I remember it was triggered by the GrowableWriter for the inCounts in line 728 of the FST. If it helps I can try to reproduce it.",
+    "attachments": {},
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14089366",
+            "author": "Christian Ziech",
+            "content": "Oh there is another OOM we get: At the time the exception was thrown we were indexing for 5-6 hours and have closed the IndexWriter already. Now we only want to store the special terms we gathered during indexing into a custom FST. At the point in time the Exception was thrown effectively one one thread was active in the VM the last attempt of a GC printed the following:\nEden: 0B(4021M)>0B(4021M) Survivors: 75M>75M Heap: 9615M(30720M)->9615M(30720M)\nThose values are also pretty much in line with the numbers we get from the runtime if we add custom debug statements.\n\njava.lang.OutOfMemoryError: Java heap space\n\tat org.apache.lucene.util.packed.Packed64.<init>(Packed64.java:73)\n\tat org.apache.lucene.util.packed.PackedInts.getMutable(PackedInts.java:1034)\n\tat org.apache.lucene.util.packed.PackedInts.getMutable(PackedInts.java:1001)\n\tat org.apache.lucene.util.packed.GrowableWriter.<init>(GrowableWriter.java:46)\n\tat org.apache.lucene.util.packed.GrowableWriter.resize(GrowableWriter.java:98)\n\tat org.apache.lucene.util.fst.FST.addNode(FST.java:845)\n\tat org.apache.lucene.util.fst.Builder.compileNode(Builder.java:200)\n\tat org.apache.lucene.util.fst.Builder.freezeTail(Builder.java:289)\n\tat org.apache.lucene.util.fst.Builder.add(Builder.java:394)\n\tat com.nokia.search.candgen.spelling.AtomicFSTBuilder$FSTWriter.put(AtomicFSTBuilder.java:358)\n\tat com.nokia.search.candgen.spelling.AtomicFSTBuilder$WriteTask.run(AtomicFSTBuilder.java:156)\n\tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1145)\n\tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:615)\n\tat java.lang.Thread.run(Thread.java:724)\n\n ",
+            "date": "2014-08-07T15:53:43+0000"
+        },
+        {
+            "id": "comment-14092709",
+            "author": "Karl Wright",
+            "content": "Hi Christian,\n\nDoesn't look like anyone has commented yet on this ticket.  Would you be willing to attach a patch, to demonstrate what you would like to change?\n\nThanks! ",
+            "date": "2014-08-11T12:01:42+0000"
+        },
+        {
+            "id": "comment-14092802",
+            "author": "Michael McCandless",
+            "content": "Hmm, we could simply decrease the PagedGrowableWriter from 1<<30 (1B values in each packed array) to 1<<27 (128M values)?  Asking for a single contiguous packed array with 1 B values and a highish bpv can easily be a lot of RAM (8 GB in the worst case).\n\nOne thing to try is enabling doShareSuffix, but then try setting doShareNonSingletonNodes to false; this should be a big reduction on RAM required, while making the resulting FST a big larger than minimal.  If that's still too much RAM, try decreasing shareMaxTailLength from Integer.MAX_VALUE to smallish numbers, e.g. maybe 10 or 5 or 4 or so.  As that number gets smaller, the RAM required to build will decrease, and the FST will grow in size.\n\nOn packing, it looks like the FST code cannot handle > 2.1 B nodes when packing is enabled, but this looks like something we could fix (it was just skipped when we did LUCENE-3298).  However, you should have hit IllegalStateException, not NegativeArraySizeException.  Oh, actually, I suspect this was due to LUCENE-5844, which will be fixed in 4.10, at which point you really should hit IllegalStateException.  The thing is, even if we fix packing to allow > 2.1 B nodes, packing is additionally RAM intensive (i.e., adds to the RAM required for normal FST building) ... and I'm not sure how much shrinkage packing actually buys these days (we've made some improvements to the unpacked format).  Do you have any numbers from your large FSTs? ",
+            "date": "2014-08-11T14:17:00+0000"
+        },
+        {
+            "id": "comment-14092849",
+            "author": "Christian Ziech",
+            "content": "Exactly - when the PagedGrowableWriter in the NodeHash used 1<<27 bytes for a page things worked like a charm (with maxint as suffix length, doShareNonSingletonNodes set to true and both of the min suffix counts set to 0).\n\nWhat numbers are you interested in? With \"doShareSuffix\" enabled the FST takes 3.1 GB of disk space: I quickly fetched the following numbers:\n\n\tarcCount: 561802889\n\tnodeCount: 291569846\n\tarcWithOutputCount: 201469018\n\n\n\nWhile in theory the nodeCount should hence be lower than 2.1B I think we also got an exception when enabling packing. But I'm not sure if we tried it in conjunction with doShareSuffix.  ",
+            "date": "2014-08-11T14:59:57+0000"
+        },
+        {
+            "id": "comment-14092890",
+            "author": "Michael McCandless",
+            "content": "OK I'll drop the constant to 1<<27.\n\nWhat numbers are you interested in?\n\nI was just wondering what reduction in FST size you see from packing (when you can get it to succeed...), i.e. whether it's really worth investing in fixing packing to handle big FSTs.\n\nWhile in theory the nodeCount should hence be lower than 2.1B I think we also got an exception when enabling packing.\n\nHmm, something else is wrong then ... or was this just an OOME?  If not, can you reproduce the non-OOME when turning on packing despite node count being well below 2.1B? ",
+            "date": "2014-08-11T15:31:15+0000"
+        },
+        {
+            "id": "comment-14092930",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1617315 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1617315 ]\n\nLUCENE-5875: reduce page size of backing packed array used by NodeHash when building an FST from 1B to 128M values ",
+            "date": "2014-08-11T16:07:25+0000"
+        },
+        {
+            "id": "comment-14092932",
+            "author": "Christian Ziech",
+            "content": "\nHmm, something else is wrong then ... or was this just an OOME? If not, can you reproduce the non-OOME when turning on packing despite node count being well below 2.1B?\n\nSure - give me 1-2 days and I'll paste it here.  ",
+            "date": "2014-08-11T16:10:38+0000"
+        },
+        {
+            "id": "comment-14092936",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1617318 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1617318 ]\n\nLUCENE-5875: reduce page size of backing packed array used by NodeHash when building an FST from 1B to 128M values ",
+            "date": "2014-08-11T16:15:31+0000"
+        }
+    ]
+}

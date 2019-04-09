@@ -1,0 +1,91 @@
+{
+    "id": "LUCENE-8145",
+    "title": "UnifiedHighlighter should use single OffsetEnum rather than List<OffsetEnum>",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [
+            "modules/highlighter"
+        ],
+        "fix_versions": [
+            "7.3"
+        ]
+    },
+    "description": "The UnifiedHighlighter deals with several different aspects of highlighting: finding highlight offsets, breaking content up into snippets, and passage scoring.\u00a0 It would be nice to split this up so that consumers can use them separately.\n\nAs a first step, I'd like to change the API of FieldOffsetStrategy to return a single unified OffsetsEnum, rather than a collection of them.\u00a0 This will make it easier to expose the OffsetsEnum of a document directly from the highlighter, bypassing snippet extraction and scoring.",
+    "attachments": {
+        "LUCENE-8145.patch": "https://issues.apache.org/jira/secure/attachment/12908599/LUCENE-8145.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16347059",
+            "date": "2018-01-31T16:03:47+0000",
+            "content": "This patch\u00a0renames `FieldOffsetStrategy#getOffsetsEnums()` to `FieldOffsetStrategy#getOffsetsEnum`, and changes the return value from `List<OffsetsEnum>` to `OffsetsEnum` directly.\n\nFieldHighlighter is simplified a bit, particularly in terms of handling OffsetsEnum as a closeable resource.\u00a0 Scoring is delegated to the Passage itself, which now keeps track of the within-passage frequencies of its highlighted terms and phrases.\u00a0 A new MultiOffsetsEnum class deals with combining multiple OffsetsEnums using a priority queue.\u00a0 Because all offsets are iterated in order, Passage no longer needs to worry about sorting its internal hits.\n\nThe APIs for FieldOffsetStrategy, Passage and OffsetEnum have all changed slightly, but they're all pretty expert so I think this could be targeted at 7.3?\n\ncc David Smiley Jim Ferenczi ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16347062",
+            "date": "2018-01-31T16:05:51+0000",
+            "content": "I should add that this is just a refactoring, and in particular passage scores are not changed. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16347433",
+            "date": "2018-01-31T19:23:46+0000",
+            "content": "This is a really nice improvement Alan!  I once thought about replacing List<OffsetsEnum> with a PriorityQueue based one as you did here but I didn't follow through because I didn't know how the OffsetsEnum.weight would accommodate that.  Here you've shifted that tracking to the Passage.\n\nWe can go further with your refactoring \u2013 making CompositeOffsetsPostingsEnum obsolete.  Delete it and then change FieldOffsetStrategy.createOffsetsEnumsForAutomata so that it's final loop looks like this:\n\n    for (int i = 0; i < automata.length; i++) {\n      CharacterRunAutomaton automaton = automata[i];\n      List<PostingsEnum> postingsEnums = automataPostings.get(i);\n      if (postingsEnums.isEmpty()) {\n        continue;\n      }\n      // Build one OffsetsEnum exposing the automata.toString as the term, and the sum of freq\n      BytesRef wildcardTerm = new BytesRef(automaton.toString());\n      int sumFreq = 0;\n      for (PostingsEnum postingsEnum : postingsEnums) {\n        sumFreq += postingsEnum.freq();\n      }\n      for (PostingsEnum postingsEnum : postingsEnums) {\n        results.add(new OffsetsEnum.OfPostings(wildcardTerm, sumFreq, postingsEnum));\n      }\n    }\n\n\nAnd then overload the OfPostings constructor to take a manual \"freq\". Or Subclass OfPostings in-kind (e.g. OfPostingsWithFreqc ould be inner class even (I played with this a little; it was annoying that sumFreq couldn't be final but no biggie).\n\nUnfortunately it seems we have no test that ensures the \"freq\" is correct for a highlighted wildcard query whose wildcard matches multiple terms of varying frequencies each in the document.  We should add such a test.\n\nI definitely like how FieldHighlighter is simpler.  You can go further and remove FieldHighlighter.EMPTY too \u2013 Rob had used that to simplify the queue initial state logic that is now obsoleted with your change (you chose a boolean \"started\" flag instead).\n\nIt's a shame Passage is now fairly heavy with a BytesRefHash on it.  I want to think about that a bit more.\n\nThe first place maybeAddPassage is called, it's guarded by an if condition. But that if condition can be removed as it is redundant with the same logic that maybeAddPassage starts with.  You should copy along the comment that explains what -1 means.\n\nNitpicks:\n\nFieldHighlighter:\n\n\thighlightOffsetsEnums:  Add braces to the \"if\" block that returns early.  The \"while\" of do-while should be on the same line as the close bracket.\n\tmaybeAddPassage: passage ought to be the first parameter IMO.  And add braces to the \"if\" block.\n\n\n\nFieldOffsetStrategy: the javadocs on getOffsetsEnum should not say \"remember to close them all\" since it just returns one.  so maybe \"remember to close it\"\n\nMultiOffsetsEnum.close: I see it calls close on all the remaining OffsetsEnums on the queue... but at this point it's likely empty.  Based on our implementations of OffsetsEnum this won't be an issue but I think it's bad to leave it this way.  I think nextPosition could be modified to close the \"top\" item when it reaches the end.  close would then have a comment to mentioned the others have been closed already in nextPosition.\n\nTestUnifiedHighlighterExtensibility: you removed calling p.setScore but I think we want to ensure all such methods are exposed thus enabling someone to fully use this Passage. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16347602",
+            "date": "2018-01-31T21:03:34+0000",
+            "content": "Thanks for the review David!\u00a0 I'll put up another patch shortly with your suggestions.\n\nre Automata - I agree that we can replace CompositeOffsetsPostingsEnum, but I wonder if we need to bother with the frequency summing?\u00a0 It would make more sense I think to\u00a0preserve the freqs of\u00a0the individual term matches, so that a rarer term is more relevant than a more frequent one.\u00a0 We don't do this with wildcard queries in general because of performance, but that's not an issue here.\n\nPassage is heavier now, but the objects are re-used, and only n-fragments + 1 are build for each highlighted doc, so I'm not too concerned. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16347692",
+            "date": "2018-01-31T22:15:54+0000",
+            "content": "but I wonder if we need to bother with the frequency summing?\nIt's debatable. Consider an aggressive MTQ like st* that hypothetically matches a lot of terms that each occur one time. Passages with those terms will be scored\u00a0higher than a\u00a0term query that matched twice.\n\nIt would be cool if we could further affect the passage score by a term's string-distance to the automata string. For example if \"st\" would have it's score dampened quite a bit if it matches \"strangelyLongWord\" but say only a small dampening for \"stir\". Artificially increasing the frequency would be one way, albeit less flexible than some other hook. If we had something like this, it'd probably matter less how accurate the frequency is since I think people would want to dampen the score for any MTQ.\n\nHmmm. With if Passage.setScore remains a simple setter, but we add PassageScorer.computeScore(Passage, int contentLength)? \u00a0We'd need to expose more data from\u00a0Passage that you added, granted, but it sure adds some flexibility!\n\nCC Timothy M. Rodriguez ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16347823",
+            "date": "2018-02-01T00:39:21+0000",
+            "content": "Thanks for the CC David Smiley.\n\nAlan Woodward really nice change!\u00a0 Definitely simplifies things quite a bit and conceptually one meta OffsetEnum over the field makes more sense than the list from previous.\n\nI'm in favor of keeping the summed frequency on MTQ or at least preserving a mechanism to keep it on.\u00a0 The extra occurrences may not always seem spurious in all cases.\u00a0 For example, consider \"expert\" systems where users are accustomed to using wildcards for stemming-like expressions.\u00a0 E.g. purchas* for getting variants of the word purchase.\u00a0 In those cases, the extra frequency counts would hopefully select a better passage.\n\n\n\nI'm not so sure about setScore being passed in a scorer and content length to set the score though. That feels awkward to me.\u00a0 If we were to keep it this way, I'd argue a Passage should receive the PassageScorer and content length at construction instead of via the setScore method.\u00a0 If we did that, I think we could incrementally build the score instead of tracking terms and frequencies for a later score calculation?\u00a0 Another choice is to move a lot of scoring behavior and perhaps introduce another class that's tracking the terms and score in a passage analagous to Weight?\n\n\u00a0\n\n\u00a0 ",
+            "author": "Timothy M. Rodriguez"
+        },
+        {
+            "id": "comment-16348629",
+            "date": "2018-02-01T14:13:54+0000",
+            "content": "I've opened a pull request on github: https://github.com/apache/lucene-solr/pull/317\n\nMuch easier to review than a series of patches... ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16348653",
+            "date": "2018-02-01T14:39:52+0000",
+            "content": "Thanks Alan, I left some comments in the pull request.\u00a0 ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-16350087",
+            "date": "2018-02-02T10:01:02+0000",
+            "content": "Commit aa5c3a5c222aef4cab7a4fe0c2f95a3eef7f4bd7 in lucene-solr's branch refs/heads/branch_7x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=aa5c3a5 ]\n\nLUCENE-8145: FieldOffsetStrategy.getOffsetEnum() now returns a single MultiOffsetsEnum\n\nCloses #317 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16350088",
+            "date": "2018-02-02T10:01:03+0000",
+            "content": "Commit 9422609a5d4dc2838256c743d480f472740dfd25 in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9422609 ]\n\nLUCENE-8145: FieldOffsetStrategy.getOffsetEnum() now returns a single MultiOffsetsEnum\n\nCloses #317 ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16350092",
+            "date": "2018-02-02T10:02:54+0000",
+            "content": "Thanks for the comments and reviews everyone! ",
+            "author": "Alan Woodward"
+        }
+    ]
+}

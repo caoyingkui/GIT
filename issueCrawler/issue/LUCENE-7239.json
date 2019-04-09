@@ -1,0 +1,84 @@
+{
+    "id": "LUCENE-7239",
+    "title": "Speed up LatLonPoint's polygon queries when there are many vertices",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.1",
+            "7.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Improvement"
+    },
+    "description": "This is inspired by the \"reliability and numerical stability\" recommendations at the end of http://www-ma2.upc.es/geoc/Schirra-pointPolygon.pdf.\n\nBasically our polys need to answer two questions that are slow today:\ncontains(point)\ncrosses(rectangle)\n\nBoth of these ops only care about a subset of edges: the ones overlapping a y interval range. We can organize these edges in an interval tree to be practical and speed things up a lot. Worst case is still O but those solutions are more complex to do.",
+    "attachments": {
+        "LUCENE-7239.patch": "https://issues.apache.org/jira/secure/attachment/12800065/LUCENE-7239.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15252602",
+            "author": "Robert Muir",
+            "date": "2016-04-21T20:23:47+0000",
+            "content": "Here is a patch for the sandbox. Ultimately, I think we should just yank the slower polygon support out of Polygon.java, make it a pure holder class. Feels wrong to do stuff like this when e.g. spatial3d does not care.\n\nBut for now lets improve it here.\n\nSynthetic polygons from luceneUtil\n\n\n\nvertices\nold QPS\nnew QPS\n\n\n5\n24.4\n38.4\n\n\n50\n21.7\n29.7\n\n\n500\n14.4\n27.5\n\n\n5000\n3.3\n18.8\n\n\n\n\nReal polygons (33 london districts: http://data.london.gov.uk/2011-boundary-files)\n\n\n\nvertices\nold QPS\nnew QPS\n\n\navg 5.6k\n8.6\n73.0\n\n\n\n\n\nSince relations are much faster, startup cost is reduced substantially: e.g. for those real polygons it drops from 85ms to 3ms. We keep our grid for now (its still a decent speedup and now has a cheap cost). Less complex polygons get a nice speedup too since we are less trappy and the two-phase iteration doesn't buy us stuff anymore (similar to distance case). "
+        },
+        {
+            "id": "comment-15252697",
+            "author": "Ryan Ernst",
+            "date": "2016-04-21T20:50:52+0000",
+            "content": "+1, nice speed up!! "
+        },
+        {
+            "id": "comment-15252755",
+            "author": "Karl Wright",
+            "date": "2016-04-21T21:12:57+0000",
+            "content": "Indeed, very impressive speed-up.  Are you using the same borough polygons I am looking at, where the total vertex count is 186,000 or thereabouts?\n\nFor geo3d, I would love to be able to do some similar edge tree construction, but I don't yet have a firm idea what the tree hierarchy criteria would be.  Can't split on latitude, that's for sure.  Maybe the z in (x,y,z)? "
+        },
+        {
+            "id": "comment-15252776",
+            "author": "Robert Muir",
+            "date": "2016-04-21T21:23:50+0000",
+            "content": "\nIndeed, very impressive speed-up. Are you using the same borough polygons I am looking at, where the total vertex count is 186,000 or thereabouts?\nYes, I'm using -points -polyMedium from the luceneutil benchmark. Total vertex count is 186318.\n\nNote that this solution is still sandy. Imagine the russia polygon from geonames where you have 1000 components (one for each island). This will still be slow, because we don't yet \"squash\" the polygon all into one gon with separators. Our algorithms support that, but we'd still have to keep an additional tree of just the holes to answer CELL_OUTSIDE_QUERY when its fully contained in the holes. Also i want to make sure it doesn't blow the tree all to hell. Followup \n\n\nFor geo3d, I would love to be able to do some similar edge tree construction, but I don't yet have a firm idea what the tree hierarchy criteria would be. Can't split on latitude, that's for sure. Maybe the z in (x,y,z)?\n\nSee https://en.wikipedia.org/wiki/Interval_tree#Higher_dimensions_2 for some discussion. I am not as familiar with how the 3D polygon algorithms work though to offer anything intelligent. I'm still fighting with 2D  "
+        },
+        {
+            "id": "comment-15252821",
+            "author": "Karl Wright",
+            "date": "2016-04-21T21:49:36+0000",
+            "content": "So here's a quick brain-dump of the geo3d technology, which may help.  First, the basic component of membership is what's called a \"sided plane\", which is a single plane where one side of the plane is in-set and the other side is out-of-set.  Being on the plane is considered in-set.  This is computed with an inherent level of accuracy, e.g. anything within a perpendicular distance of epsilon from the plane is considered to sit on the plane.  This is also extremely fast: three multiplications, two additions, and a comparison.  The second technology is finding intersections of two planes on the surface of the ellipsoid.  Since planes intersect along a line, there is also some requirement of \"membership\", which is typically a set of sided planes that the intersection point must lie within.  Slightly less fast but still pretty good; there's a square root involved but otherwise its comparable to sided plane computation.  This is also how we detect intersections between edges.  Finally, there's the ability to find the bounds of any plane's intersection with the ellipsoid.  That's useful but considerably slower and less accurate.\n\nAll of the geo3d shapes are built using these technologies.  For polygons, though, because the inherent limitation of sided planes that go through the center of the ellipsoid is that they describe 1/2 of the ellipsoid, we can only effectively build convex or concave polygons, where concave polygons are just the complement of a convex polygon.  The current code therefore breaks an arbitrary messy polygon down into a set of convex and concave polygon tiles that are well-behaved.\n\nThe problem is that for polygons that have lots of edges, even after you construct a tiled representation, all queries about relationships/intersection and membership are O(N).  This would have to become O(log(N)) to be practical.  In addition, the borough data has very closely spaced points that are essentially co-linear as far as geo3d is concerned: if you construct a plane with any two adjacent borough points you have a pretty good chance that the adjacent points on either side also sit on the plane.  So, unless some cleaning up is done, sided planes are useless for the borough polygons.  I've worked, therefore, on the cleanup problem, and (I think) solved it, but it still doesn't fix the O(N) issue.\n\nNow, we could do the following kind of thing instead: build edges from simple planes (not sided planes), and use only plane intersection to compute membership.  Then, there would be a chance of ordering planes hierarchically to acheive O(log(N)) time.  But, two caveats: (1) don't know how to do the ordering yet, and (2) there may be similar numerical issues with computing intersections for very short edges.\n\nAnyhow, let's keep kicking these ideas around. "
+        },
+        {
+            "id": "comment-15252856",
+            "author": "Robert Muir",
+            "date": "2016-04-21T22:07:09+0000",
+            "content": "I think most of the logN solutions are too tricky: of course if we can implement one for 2D and it outperforms this, we can throw this stuff out for it.\n\nBut the logN datastructures i looked at involved tricky calculations (and I don't want to introduce error): whereas this one is doing \"obviously\" the same thing as the slower versions it replaces: since the optimizatation is only based on comparisons, which are exact, and its the same comparisons the slow versions do in the iteration of each loop.  \n\nI also have the concerns about those complicated logN datastructures introducing a high overhead (echoed here in \"Faster Tests\": http://erich.realtimerendering.com/ptinpoly/) that might mean they are impractical. Another thing i really am trying to keep is \"one codepath\" without specialization for different types of polygons in any way. This makes it easier to understand what the adversaries are.\n\nWe just have to keep in mind this stuff here is still linear time, but I think its a practical improvement. So maybe there is a similar more 1980s approach for geo3d that is \"good enough\" but not too complicated there as well. "
+        },
+        {
+            "id": "comment-15253034",
+            "author": "Robert Muir",
+            "date": "2016-04-22T00:02:26+0000",
+            "content": "I added minor cleanups and comments to make this less sandy. Its passed 100 beast rounds. I will test some more and get it in jenkins and followup with other improvements. "
+        },
+        {
+            "id": "comment-15254237",
+            "author": "Robert Muir",
+            "date": "2016-04-22T17:13:00+0000",
+            "content": "Just as a followup: the still-sluggish performance of the synthetic polys in the benchmarks here versus the \"real\" ones is mostly due to the actual luceneutil poly generation code in the benchmark itself: this is very slow. I will try to fix it so we can have a better understanding of when/where/how things degrade. "
+        },
+        {
+            "id": "comment-15255413",
+            "author": "Michael McCandless",
+            "date": "2016-04-23T22:51:27+0000",
+            "content": "Ultimately, I think we should just yank the slower polygon support out of Polygon.java, make it a pure holder class. \n\n+1 "
+        },
+        {
+            "id": "comment-15277227",
+            "author": "Hoss Man",
+            "date": "2016-05-09T22:46:03+0000",
+            "content": "\nManually correcting fixVersion per Step #S5 of LUCENE-7271\n\nFWIW: This issue has no commits linked in comments, so I'm only assuming \"fix=6.0\" should be replaced with \"fix=master\" based on the timeframe the issue was created/resolved in. "
+        }
+    ]
+}

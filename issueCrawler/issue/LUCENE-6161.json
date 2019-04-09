@@ -1,0 +1,156 @@
+{
+    "id": "LUCENE-6161",
+    "title": "Applying deletes is sometimes dog slow",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.1",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "I hit this while testing various use cases for LUCENE-6119 (adding auto-throttle to ConcurrentMergeScheduler).\n\nWhen I tested \"always call updateDocument\" (each add buffers a delete term), with many indexing threads, opening an NRT reader once per second (forcing all deleted terms to be applied), I see that BufferedUpdatesStream.applyDeletes sometimes seems to take a loooong time, e.g.:\n\n\nBD 0 [2015-01-04 09:31:12.597; Lucene Merge Thread #69]: applyDeletes took 339 msec for 10 segments, 117 deleted docs, 607333 visited terms\nBD 0 [2015-01-04 09:31:18.148; Thread-4]: applyDeletes took 5533 msec for 62 segments, 10989 deleted docs, 8517225 visited terms\nBD 0 [2015-01-04 09:31:21.463; Lucene Merge Thread #71]: applyDeletes took 1065 msec for 10 segments, 470 deleted docs, 1825649 visited terms\nBD 0 [2015-01-04 09:31:26.301; Thread-5]: applyDeletes took 4835 msec for 61 segments, 14676 deleted docs, 9649860 visited terms\nBD 0 [2015-01-04 09:31:35.572; Thread-11]: applyDeletes took 6073 msec for 72 segments, 13835 deleted docs, 11865319 visited terms\nBD 0 [2015-01-04 09:31:37.604; Lucene Merge Thread #75]: applyDeletes took 251 msec for 10 segments, 58 deleted docs, 240721 visited terms\nBD 0 [2015-01-04 09:31:44.641; Thread-11]: applyDeletes took 5956 msec for 64 segments, 15109 deleted docs, 10599034 visited terms\nBD 0 [2015-01-04 09:31:47.814; Lucene Merge Thread #77]: applyDeletes took 396 msec for 10 segments, 137 deleted docs, 719914 visit\n\n\n\nWhat this means is even though I want an NRT reader every second, often I don't get one for up to ~7 or more seconds.\n\nThis is on an SSD, machine has 48 GB RAM, heap size is only 2 GB.  12 indexing threads.\n\nAs hideously complex as this code is, I think there are some inefficiencies, but fixing them could be hard / make code even hairier ...\n\nAlso, this code is mega-locked: holds IW's lock, holds BD's lock.  It blocks things like merges kicking off or finishing...\n\nE.g., we pull the MergedIterator many times on the same set of sub-iterators.  Maybe we can create the sorted terms up front and reuse that?\n\nMaybe we should go \"term stride\" (one term visits all N segments) not \"segment stride\" (visit each segment, iterating all deleted terms for it).  Just iterating the terms to be deleted takes a sizable part of the time, and we now do that once for every segment in the index.\n\nAlso, the \"isUnique\" bit in LUCENE-6005 should help here, since if we know the field is unique, we can stop seekExact once we found a segment that has the deleted term, we can maybe pass false for removeDuplicates to MergedIterator...",
+    "attachments": {
+        "LUCENE-6161.patch": "https://issues.apache.org/jira/secure/attachment/12690303/LUCENE-6161.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14264815",
+            "author": "ASF subversion and git services",
+            "date": "2015-01-05T17:53:20+0000",
+            "content": "Commit 1649599 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1649599 ]\n\nLUCENE-6161: reuse DocsEnum when resolving deleted terms/queries to doc id "
+        },
+        {
+            "id": "comment-14264817",
+            "author": "Michael McCandless",
+            "date": "2015-01-05T17:54:57+0000",
+            "content": "I committed a fix for a silly performance bug: we were failing to reuse DocsEnum, so for every deleted term that had docs, we were making a new DocsEnum.  This is awful!\n\nBut ... it was not the particular source of slowness in my test since most terms did not result in deletions (I was randomly generating IDs over 100M space, on an index with not too many docs). "
+        },
+        {
+            "id": "comment-14264818",
+            "author": "ASF subversion and git services",
+            "date": "2015-01-05T17:55:06+0000",
+            "content": "Commit 1649600 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1649600 ]\n\nLUCENE-6161: reuse DocsEnum when resolving deleted terms/queries to doc id "
+        },
+        {
+            "id": "comment-14264832",
+            "author": "ASF subversion and git services",
+            "date": "2015-01-05T18:06:24+0000",
+            "content": "Commit 1649601 from Michael McCandless in branch 'dev/branches/lucene_solr_4_10'\n[ https://svn.apache.org/r1649601 ]\n\nLUCENE-6161: reuse DocsEnum when resolving deleted terms/queries to doc id "
+        },
+        {
+            "id": "comment-14265894",
+            "author": "Michael McCandless",
+            "date": "2015-01-06T09:31:25+0000",
+            "content": "OK I think in fact this performance bug was what I was hitting, because I can't repro the dog-slowness (it's still slow-ish).\n\nI must have been using a smaller ID space for the updates than I thought (I can tell by the actual delete counts in the above SOPs).\n\nI've backported to 4.10.x ... the bug is quite severe in the case when many deletes to in fact resolve to a doc id. "
+        },
+        {
+            "id": "comment-14265922",
+            "author": "Michael McCandless",
+            "date": "2015-01-06T10:01:37+0000",
+            "content": "Here's a hackish start at a prototype patch.  Really, this is the same\nproblem as intersecting doc id lists, but with sorted terms instead.\n\nThe patch pre-builds FSTs for the deleted terms to be intersected, and then picks\none of three methods (drive by segment's terms, drive by deleted\nterms, simple merge sort) to do the intersection.\n\nReally what would be best is if we could pass the FST to\nTerms.intersect (it only takes automaton today...).  I could try\nbuilding an automaton instead, but this may be a too RAM heavy....\n\nTests pass, so I think it's correct, but the code is ugly/prototype.\nThe logic of \"when to pre-build FST\" needs improving...\n\nI ran a test, indexing first 10M wikipedia docs using updateDocument\nover a random ID space of 100M.  8 indexing threads, CMS, 32 MB\nindexing buffer (frequent small segments written, stressing delete\npackets).\n\nTrunk applyDeletes took aggregate 159 sec (vs 117 sec with patch), and\noverall indexing time for trunk was 310 sec (vs 290 sec with patch).\n\nHowever, with 350 MB indexing ram buffer, applyDeletes took aggregate\n129 sec (vs 94 sec with patch), yet overall indexing time was 263 sec\n(vs 272 sec with patch: slower).\n\nI may need to index with single thread, SMS, to reduce noise... but\nthis is slow. "
+        },
+        {
+            "id": "comment-14268611",
+            "author": "Michael McCandless",
+            "date": "2015-01-08T00:42:33+0000",
+            "content": "Another patch, this one using DaciukMihovAutomatonBuilder to create an automaton from the terms to delete, and then using Terms.intersect.\n\nThis one spends even less time applying deletes (46 sec vs 129 sec on trunk) yet overall indexing time is still a bit slower (272 sec vs 263 on trunk).\n\nI also fixed Automaton to implement Accountable ... "
+        },
+        {
+            "id": "comment-14272554",
+            "author": "Yonik Seeley",
+            "date": "2015-01-10T15:42:48+0000",
+            "content": "This one spends even less time applying deletes (46 sec vs 129 sec on trunk) yet overall indexing time is still a bit slower (272 sec vs 263 on trunk).\n\nThat's pretty strange... were the same number of merges completed? "
+        },
+        {
+            "id": "comment-14273881",
+            "author": "Michael McCandless",
+            "date": "2015-01-12T18:18:43+0000",
+            "content": "Here's a less risky change that shows sizable reduction in total time applying deletes (and opening NRT readers)... I think with some polishing the approach is committable.\n\nIt just makes the merged iterator more efficient (don't check for a field change on every term; don't merge if there's only 1 sub), and side-steps O(N^2) seekExact cost for smaller segments.\n\nOn an \"index all wikipedia docs, 4 indexing threads, 350 MB IW buffer, opening NRT reader every 5 secs\", total time to get 199 NRT readers went from 501 seconds in trunk to 313 seconds with the patch.  Overall indexing rate is essentially the same (still strange!)... "
+        },
+        {
+            "id": "comment-14273886",
+            "author": "Michael McCandless",
+            "date": "2015-01-12T18:22:12+0000",
+            "content": "were the same number of merges completed?\n\nIn my last test it was very close: trunk did 83 merges and patch did 84.\n\nIt is strange, because in my test I hijack one of the indexing threads to open an NRT reader periodically, and it's that thread that pays the cost of applying deletes.  So I would expect a big reduction in applyDeletes to show some gains in overall indexing ...\n\nI could run everything with one thread, SMS, etc.  Would just take sooo long. "
+        },
+        {
+            "id": "comment-14273897",
+            "author": "Otis Gospodnetic",
+            "date": "2015-01-12T18:27:17+0000",
+            "content": "I'd assume that while merges are now faster, they are using more of the computing resources (than before) needed for the rest of what Lucene is doing, hence no improvement in overall indexing time. "
+        },
+        {
+            "id": "comment-14281273",
+            "author": "Michael McCandless",
+            "date": "2015-01-17T10:33:32+0000",
+            "content": "New dirty-but-working patch, this one finally showing sizable gains\nin some cases.  The gains vary depending on how frequently NRT reader\nis opened and how large IW's RAM buffer is.\n\nThis patch does a merge sort of the segments TermsEnums, like\nMultiTermsEnum, intersecting with the merged deleted terms iterator,\ninstead of visiting each segment separately.\n\nWith NRT reader once per second, with 350 MB IW RAM buffer, trunk\nspends 93 seconds applying deletes and patch spends 66 seconds but no\nreal difference in overall indexing speed.\n\nBut with default 16 MB RAM buffer, never opening NRT reader, trunk\nspends 146 seconds applying deletes but patch spends 26 seconds, and\noverall indexing rate goes from 91 to 121 GB/hr.\n\nThis patch adds an advance method on the PrefixCodedTerms iterator,\nhowever it never seems to help in my testing, so I'm posting here for\nposterity but I'll remove it next, as I try to clean up the patch...\n\nI think building an automaton and using Terms.intersect is too risky\nat this point: our automaton builder (DaciukMihovAutomatonBuilder) is\nRAM heavy (keeps a HashMap of size number of states in the final\nautomaton).  I briefly looked at pulling out a common interface\nbetween FST and Automaton so that we could pass an FST to\nTerms.intersect ... this looked promising at first, but then\nAutomatonTermsEnum stopped me since it requires the \"int state\" be\ncompact for it's long[] visited path tracking / cycle detection \"linear\"\noptimization. "
+        },
+        {
+            "id": "comment-14285639",
+            "author": "Michael McCandless",
+            "date": "2015-01-21T13:57:33+0000",
+            "content": "Final patch, I think it's ready.\n\nI removed the unfortunately-not-any-faster advance method on\nPrefix/MergedTermsIterator, cleaned up nocommits, fixed a tricky bug\nin DV updates, and cutover a couple deletes test to randomly sometimes\nuse delete-by-query.  I ran distributed test beasting for a while and\nno failures...\n\nThe gist of the change is we now make a single pass through all terms\nto be deleted, and all segments's TermsEnums, doing a merge sort\nbetween them, instead of making a full pass through the merged deleted\nterms for every segment.  In cases that heavily apply deletes this is\na good speedup. "
+        },
+        {
+            "id": "comment-14286421",
+            "author": "Robert Muir",
+            "date": "2015-01-21T22:26:12+0000",
+            "content": "Just a few minor thoughts:\n\nSome of the iteration is more awkward now, it might be nice to open a followup to clean this up.\ndelGen is awkward to see being held in PrefixCodedTerms, and we have an iterator api that ... is neither termsenum or iterable but another one instead.\nI wonder if we could have the same logic, but using a more natural one. if it would just make the code even more awkward, then screw it \n\nWe should fix the issue though for now I think. "
+        },
+        {
+            "id": "comment-14287195",
+            "author": "Michael McCandless",
+            "date": "2015-01-22T10:15:59+0000",
+            "content": "Thanks Rob, I'll commit the current patch to 5.1 / trunk so Jenkins chews on it, and then see if I can simplify the iterator... "
+        },
+        {
+            "id": "comment-14287535",
+            "author": "ASF subversion and git services",
+            "date": "2015-01-22T14:54:16+0000",
+            "content": "Commit 1653891 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1653891 ]\n\nLUCENE-6161: speed up resolving deleted terms to doc ids "
+        },
+        {
+            "id": "comment-14287608",
+            "author": "ASF subversion and git services",
+            "date": "2015-01-22T15:28:56+0000",
+            "content": "Commit 1653914 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1653914 ]\n\nLUCENE-6161: speed up resolving deleted terms to doc ids "
+        },
+        {
+            "id": "comment-14361989",
+            "author": "Ralph Tice",
+            "date": "2015-03-14T19:32:16+0000",
+            "content": "Michael McCandless\nFirst of all, thank you SO much for back porting this to 4.10.4.  I just applied this to one of our medium sized SolrClouds (13,676,545,570 documents) that was experiencing issues on merging.  Empirically this has raised our ceiling on deletes per minute by almost triple, but more importantly indexing throughput stays steady.\n\nBlue lines in the graphs here are a sum of the red/green. Pink line on the top graph is the raw rate of the inbound data source we're indexing, so we're keeping up if blue is at that line or catching up if it's above. \n\nhttp://imgur.com/ZaXjiCI\n\nI've also included what I think are some relevant log lines, since we still see some 20-60 second pauses in indexing on occasion.\nhttps://gist.github.com/ralph-tice/268a7984cd701fe1252a\n\nCheers! "
+        },
+        {
+            "id": "comment-14362553",
+            "author": "Michael McCandless",
+            "date": "2015-03-15T21:02:43+0000",
+            "content": "Thanks for reporting this impressive speedup!\n\nThe attached log is hard to read, because the timestamp is \"computer\" readable (timestamp seconds) ... "
+        },
+        {
+            "id": "comment-14364652",
+            "author": "Ralph Tice",
+            "date": "2015-03-17T06:11:56+0000",
+            "content": "Sorry, the timestamp is a long representing Java Date, but it's millis not seconds, what would you prefer?  My logs are generated by https://github.com/abdulkadiryaman/logback-kafka/blob/master/src/main/java/org/clojars/canawar/logback/formatter/JsonFormatter.java#L22-L31\n and I usually parse them through https://github.com/stedolan/jq\n\nI've been thinking a lot about how to get better metrics out of Solr, maybe we should take this to the list for more discussion. "
+        },
+        {
+            "id": "comment-14372081",
+            "author": "Michael McCandless",
+            "date": "2015-03-20T20:54:58+0000",
+            "content": "what would you prefer? \n\nIn this context, just something easily human readable   E.g. a float showing seconds... "
+        },
+        {
+            "id": "comment-14495431",
+            "author": "Timothy Potter",
+            "date": "2015-04-15T00:31:06+0000",
+            "content": "Bulk close after 5.1 release "
+        }
+    ]
+}

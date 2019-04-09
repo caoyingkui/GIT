@@ -1,0 +1,104 @@
+{
+    "id": "LUCENE-7897",
+    "title": "RangeQuery optimization in IndexOrDocValuesQuery",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "trunk,                                            7.0",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [
+            "core/search"
+        ],
+        "fix_versions": [
+            "7.1",
+            "master (8.0)"
+        ]
+    },
+    "description": "For range queries, Lucene uses either Points or Docvalues based on cost estimation (https://lucene.apache.org/core/6_5_0/core/org/apache/lucene/search/IndexOrDocValuesQuery.html). Scorer is chosen based on the minCost here: https://github.com/apache/lucene-solr/blob/master/lucene/core/src/java/org/apache/lucene/search/Boolean2ScorerSupplier.java#L16\n\nHowever, the cost calculation for TermQuery and IndexOrDocvalueQuery seems to have same weightage. Essentially, cost depends upon the docfreq in TermDict, number of points visited and number of docvalues. In a situation where docfreq is not too restrictive, this is lot of lookups for docvalues and using points would have been better.\n\nFollowing query with 1M matches, takes 60ms with docvalues, but only 27ms with points. If I change the query to \"message:*\", which matches all docs, it choses the points(since cost is same), but with message:xyz it choses docvalues eventhough doc frequency is 1million which results in many docvalue fetches. Would it make sense to change the cost of docvalues query to be higher or use points if the docfreq is too high for the term query(find an optimum threshold where points cost < docvalue cost)?\n\n\n{\n  \"query\": {\n    \"bool\": {\n      \"must\": [\n        {\n          \"query_string\": {\n            \"query\": \"message:xyz\"\n          }\n        },\n        {\n          \"range\": {\n            \"@timestamp\": {\n              \"gte\": 1498652400000,\n              \"lte\": 1498905000000,\n              \"format\": \"epoch_millis\"\n            }\n          }\n        }\n      ]\n    }\n  }\n}",
+    "attachments": {
+        "LUCENE-7897.patch": "https://issues.apache.org/jira/secure/attachment/12879830/LUCENE-7897.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16073691",
+            "date": "2017-07-04T14:04:20+0000",
+            "content": "Right, we sometimes make the wrong decision, finding the optimal threshold is hard!\n\nFor this particular query, I'm wondering that there might be another issue: does your range query match more than 50% of the index content? If yes, then LUCENE-7641 probably kicks in, which makes the scorer much cheaper to create than what IndexOrDocValuesQuery assumes. If you look at the charts at https://www.elastic.co/blog/better-query-planning-for-range-queries-in-elasticsearch, LUCENE-7641 is what makes points become fast again (faster than doc values in some cases) when the range query matches most documents of the index. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16074350",
+            "date": "2017-07-05T07:34:38+0000",
+            "content": "Adrien, range query matches only 13% of the docs here, most likely that the negative range query won't kick in.\n\nI agree it is going to be hard to figure out the threshold. I am trying to make sense of the cost calculation in IndexOrDocValuesQuery and Boolean2ScorerSupplier. To select points or docvalues, there are 3 costs being considered:\n1. TermQuery cost -> docfreq (from other scorers)\n2. PointsQuery cost -> estimatePointcount\n3. DocvalueQuery cost -> maxDoc\n\n2&3 are part of IndexOrDocValuesQuery and it returns min of those 2 as it's cost. But choice of points or docvalues is not done based on this cost. It is considering the minCost across all scorers to decide that. If the cost of IndexOrDocValuesQuery > minCost, it choses docvalues. This is bit counter-intuitive for me,  I was thinking IndexOrDocValuesQuery would take a hint of the matches from other scorers and calculate the cost accordingly. It seems like that happens in score supplier by comparing with minScore. \n\nHere is a proposal based on my understanding: Consider a situation of fetching N docs via IndexOrDocvaluesQuery:\n1. Points: Would cost estimatePointcount/1024. This is to consider the cost of reads(1024 is the docids in a point block), we probably need to factor in cost of sorting the docids across multiple point splits as well.\n2. Docvalues: N (assumes 1 read for each doc from the columnar store). Given the various encodings and sequential read, N may not be the right approach though(thoughts?). Currently this cost from DocValueProducer seems to be maxDoc (or #value if it is sparse) for the entry irrespective of how many we are actually fetching. But this cost is probably not getting considered as the condition currently in most cases would translate to \"docfreq < pointEstimate ? docvalues : points\".\n\nLet me know whether this approach of reducing cost of points in IndexOrDocvaluesQuery makes sense. I know we might endup with wrong decision on other side now. We could probably benchmark by changing the queries to make docfreq match different percentages of points.  ",
+            "author": "Murali Krishna P"
+        },
+        {
+            "id": "comment-16074487",
+            "date": "2017-07-05T09:29:29+0000",
+            "content": "Thanks for checking how many documents match the range query. Your understanding of the way things are working today is correct.\n\nBut choice of points or docvalues is not done based on this cost. It is considering the minCost across all scorers to decide that. If the cost of IndexOrDocValuesQuery > minCost, it chooses docvalues. This is bit counter-intuitive for me, I was thinking IndexOrDocValuesQuery would take a hint of the matches from other scorers and calculate the cost accordingly. It seems like that happens in score supplier by comparing with minScore.\n\nWould it more more intuitive if IndexOrDocValuesQuery returned indexScorerSupplier.cost() directly? This is what should happen in practice anyway. Taking the min only helps when the approximation of estimatePointCount returns a number that is greater than the number of docs that have a value in the index but we could easily remove it and it should not hurt.\n\nPoints: Would cost estimatePointcount/1024\n\nRight now the cost we are using is an estimation of the number of matches. You are right that a more interesting metric would be the cost of building the scorer, but as you wrote this becomes more complicated as we need to fold in the cost of sorting the documents, etc.  I am a bit afraid of opening a can of worms if we start doing something like this.  However you have a point that for a similar value of the cost, the index query can be expected to be more efficient than the doc-values based query because it can more easily amortize the cost of matching documents across documents. As a first step, maybe it would make sense to give an arbitrary penalty for doc-values queries and only use them if we only need to check something like 1/8th of matching documents? Like you said this kind of things might end up with a wrong decision on the other side, but maybe it is better as queries that provide good iterators are a safer bet under doubt? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16074818",
+            "date": "2017-07-05T14:10:18+0000",
+            "content": "Would it more more intuitive if IndexOrDocValuesQuery returned indexScorerSupplier.cost() directly?\nDefinitely, that is more sensible. It is very unlikely that doc values will be less than point estimation. If the docvalue returned a smaller score than the docfreq(from the term scorer), it would have used points anyway as per code.\n\narbitrary penalty for doc-values queries\n theoretically yes. The problem is currently we are ignoring the docvalue cost and comparing the cost of original scorer with that of points. So if original term had 1M match and estimatepoints is even 1M+1, we would endup with docvalue. That is why I was suggesting reducing the cost of points. May be we could refactor this if we can pass the \"#matchingdocs or minScore\" to the place where we decide the scorer.\n\n          public Scorer get(boolean randomAccess) throws IOException {\n            return (randomAccess ? dvScorerSupplier : indexScorerSupplier).get(randomAccess);\n          }\n\n ",
+            "author": "Murali Krishna P"
+        },
+        {
+            "id": "comment-16076368",
+            "date": "2017-07-06T11:09:24+0000",
+            "content": "Sorry, I should have called out my test setup as well. The latency numbers are as reported by elasticsearch query.\n \"version\" : \n{\n    \"number\" : \"6.0.0-alpha3\",\n    \"build_hash\" : \"3261586\",\n    \"build_date\" : \"2017-07-06T10:55:29.178Z\",\n    \"build_snapshot\" : true,\n    \"lucene_version\" : \"7.0.0\"\n  }\n,\n\nlatency of 60ms->27ms was using NIOFSDirectory with a 100KB buffer. Testing it with MMAPDirectory gave: 34ms->15ms when i switched from doc to dim.  ",
+            "author": "Murali Krishna P"
+        },
+        {
+            "id": "comment-16080551",
+            "date": "2017-07-10T15:58:28+0000",
+            "content": "May be we could refactor this if we can pass the \"#matchingdocs or minScore\" to the place where we decide the scorer.\n\nWould you like to give it a try? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16108900",
+            "date": "2017-08-01T13:37:10+0000",
+            "content": "I tried to implement some of your ideas:\n\n\tThe boolean randomAccess parameter has been replaced with long leadCost which gives the cost of the scorer that will be used to lead iteration. This way we could move the decision making of whether the query should run with points or doc values from Boolean2ScorerSupplier to IndexOrDocValuesQuery.\n\tThe cost of IndexOrDocValuesQuery is now the cost of the wrapped indexQuery, it ignores the doc values query.\n\tI gave doc values queries an arbitrary 8x penalty, meaning that when intersecting a term query with a range query, we will only use doc values for the range if it seems to match more than 8x more documents than the term query (vs. 1x before this patch).\n\n\n\nI had not though about it before writing this patch, but it should also make the situation better for disjunctions in conjunctions, since the sparse clauses will now use sequential access, reducing balancing operations on the priority queue. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16112398",
+            "date": "2017-08-03T08:18:09+0000",
+            "content": "Thanks Adrien for the patch. The changes look good from my perspective. However, it would be better if someone who is more familiar with this part of the code also reviews it. For example, I am not very sure about he opt() method where you removed the pq which was ordering the optionalScorers in a particular way earlier.\n\nDoes the daily benchmark have the right dataset and query to track the improvement? ",
+            "author": "Murali Krishna P"
+        },
+        {
+            "id": "comment-16112818",
+            "date": "2017-08-03T14:28:55+0000",
+            "content": "Patched this into my elasticsearch setup and saw expected 2x improvement  (15ms instead of 30ms for 126476 hits), thanks a lot Adrien! ",
+            "author": "Murali Krishna P"
+        },
+        {
+            "id": "comment-16116270",
+            "date": "2017-08-07T08:40:29+0000",
+            "content": "Thanks for checking! The opt implementation changed because before we only knew about whether random or sequential access was required. So we tried to use random access for the most costly scorers since they would be unlikely to drive iteration for the MinShouldMatchScorer. The priority queue was used to select those most costly scorers. Now that we know about the lead cost, we can just use random access for clauses that have a 8x higher cost and sequential access otherwise. We will still be more likely to random access on the most costly clauses than on the least costly ones, but in a safer way. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16121395",
+            "date": "2017-08-10T10:12:42+0000",
+            "content": "Commit 4c23d06d79286f8304a0fe182f57ec31ce16554d in lucene-solr's branch refs/heads/branch_7x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4c23d06 ]\n\nLUCENE-7897: IndexOrDocValuesQuery now requires the range cost to be more than 8x greater than the cost of the lead iterator in order to use doc values. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16121396",
+            "date": "2017-08-10T10:12:44+0000",
+            "content": "Commit 9c83d025e401bb0d454e9de9b40572e47d5da317 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9c83d02 ]\n\nLUCENE-7897: IndexOrDocValuesQuery now requires the range cost to be more than 8x greater than the cost of the lead iterator in order to use doc values. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16207377",
+            "date": "2017-10-17T11:03:48+0000",
+            "content": "Bulk close after 7.1.0 release ",
+            "author": "Shalin Shekhar Mangar"
+        }
+    ]
+}

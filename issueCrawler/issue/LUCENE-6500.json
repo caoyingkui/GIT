@@ -1,0 +1,180 @@
+{
+    "id": "LUCENE-6500",
+    "title": "ParallelCompositeReader does not always call closed listeners",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.3",
+            "6.0"
+        ],
+        "priority": "Minor",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "CompositeParallelReader misses to call closed listeners when the reader which is provided at construction time does not wrap leaf readers directly, such as a multi reader over directory readers.",
+    "attachments": {
+        "LUCENE-6500.patch": "https://issues.apache.org/jira/secure/attachment/12735278/LUCENE-6500.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14558849",
+            "author": "Adrien Grand",
+            "date": "2015-05-26T08:24:27+0000",
+            "content": "Here is a patch: it does not prevent closing sub readers anymore in the composite case, so that closed listeners will be called on the underlying parallel leaf readers which are exposed through leaves() and may be used to register closed listeners.\n\nUwe Schindler svn blame indicates that you should be quite familiar with this class, would you mind having a look? Thanks! "
+        },
+        {
+            "id": "comment-14558853",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T08:29:18+0000",
+            "content": "Oh oh, yes I completely rewrote this class in 4.0... I'll take a look. "
+        },
+        {
+            "id": "comment-14558874",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T08:47:53+0000",
+            "content": "The anonymous subclassing was added to explicitely don't call closelisteners on the \"synthetic\" readers. The same code is there 2 times... (for composites and for atomics).\n\nClosing all subreaders is done in ParallelCompositeReader's doClose() where it iterates over all \"real childs\" which are passed in ctor.\n\nI think the new problem is that (as you say) the close listeners may be registered on the synthetic leaves... I have to think about how to better handle this, with your patch it may now happen that a reader is closed multiple times. Which is not a problem in your test, but could be in reality.\n\nIn addition there is now (after your patch) an assymetry between atomic leaves and composite sub readers... Does't the same problem apply to atomic readers?\n\nUnfrotuentaly my Eclipse strikes like Deutsche Bahn and says \"GC overhead limit\". I am unable to dig... "
+        },
+        {
+            "id": "comment-14558887",
+            "author": "Ryan Ernst",
+            "date": "2015-05-26T08:56:45+0000",
+            "content": "Which is not a problem in your test, but could be in reality\n\nIsn't the java contract for Closeable that close() is idempotent? "
+        },
+        {
+            "id": "comment-14558892",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T09:01:20+0000",
+            "content": "It should be, but indexReaders call decRef() on close() and that complains if it gets < 0. "
+        },
+        {
+            "id": "comment-14558896",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T09:05:09+0000",
+            "content": "Sorry, you are right. It's idempoent! But there is still some problem. I have to debug through the code to understand why it was written like that. I just remember, it was tricky... "
+        },
+        {
+            "id": "comment-14558906",
+            "author": "Adrien Grand",
+            "date": "2015-05-26T09:13:49+0000",
+            "content": "In addition there is now (after your patch) an assymetry between atomic leaves and composite sub readers... Does't the same problem apply to atomic readers?\n\nSince prepareSubReaders wraps leaves recursively with ParallelCompositeReader in the composite case, I was thinking it should be fine, since at least the lower-level which is wrapping leaf readers would wrap with a ParallelLeafReader that prevents closing of sub readers?\n\nFor the record, no existing tests failed with the change I made. "
+        },
+        {
+            "id": "comment-14558911",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T09:20:48+0000",
+            "content": "Here is the problem, why the patch is problematic:\nThe current logic is fine, but fails - as Adrien says - when you have a ParallelMultiReader on a MultiReader of another CompositeReaders.\nHis fix works fine in the test because the test's MultiReader has closeSubReaders=true - so it does no refcounting. If you have closeSubReader=false on the parallel on and also on the child MultiReader. in that case it will fail with too many decRefs (haven't tried).\nI am not sure how the best fix looks like. It this issue urgent? I have to think a night about it  I would prefer to have a better solution alltgether, this refcounting is horrible... "
+        },
+        {
+            "id": "comment-14558926",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T09:53:16+0000",
+            "content": "Another solution to fix this would be to also add all those deeper nested synthetic subreaders to the completeReaderSet (see last line of ctor). In that case they can stay with docClose() empty (to not affect refcount). I will try this out. I will also add a test for the case I mentioned before. "
+        },
+        {
+            "id": "comment-14558930",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T09:56:42+0000",
+            "content": "A second solution would be to give up on completely mirroring the whole nested structure. We could simply create a ParallelCompositeReader with a ParallelLeafReader for each leave(), leaving out all inner composites. This would simplify the whole thing completely. There is (in my opinion) no reason to not flatten the structure. The alignment of readers would still match. "
+        },
+        {
+            "id": "comment-14559022",
+            "author": "Adrien Grand",
+            "date": "2015-05-26T12:02:39+0000",
+            "content": "It this issue urgent?\n\nNo, I don't think it's urgent. The reason I opened it is just that we hit a test failure in Elasticsearch which was due to core closed listeners not being called, and the root cause was this issue. But we don't use ParallelCompositeReader, it was introduced by LuceneTestCase.newSearcher.\n\nYou removed this test:\n\nI think it's still here, I just refactored the test to make it easier to test all combinations of `closeSubReaders` and whether sub readers are leaf or composite readers. You can try to revert changes in src/test and TestParallelCompositeReader will still pass.\n\nAnother solution to fix this would be to also add all those deeper nested synthetic subreaders to the completeReaderSet (see last line of ctor). In that case they can stay with docClose() empty (to not affect refcount). I will try this out.\n\nOh I see, so the bug is that we are not adding all created synthetic readers to this set currently. This sounds like a good fix to me.\n\nI liked the fact that you mentioned the second option would simplify the whole thing but I'm also afraid this would be a more significant change. So maybe we can first apply your first idea to fix the bug and later think about whether it would make sense to flatten the whole IndexReader structure to simplify this class. "
+        },
+        {
+            "id": "comment-14559025",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T12:04:12+0000",
+            "content": "Hi I implemented the last approach. Makes code much simpler. The ParallelComposite Reader now has the same leaves, but the structure was flattened. By that, the inner composite readers are never wrapped. We just build a new reader with the same leaves as the original, but flattened structure. I will now just add a test that it also works with MultiReaders that are marked as non-closed (which are incRefed and decRefed on close). "
+        },
+        {
+            "id": "comment-14559086",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T13:13:02+0000",
+            "content": "Here is my patch. The code that builds the reader got much easier (as nice side effect). This is also much easier to understand.\n\nAdrien Grand: what do you think?\n\nWe can also open a new issue that takes care of flattening and this one just says \"broken by the new one\". "
+        },
+        {
+            "id": "comment-14559140",
+            "author": "Adrien Grand",
+            "date": "2015-05-26T14:09:37+0000",
+            "content": "Thank you Uwe for the patch, I see how it fixes the issue. I'm just wondering if returning the list of leaves instead of sub readers now in getSequentialSubReaders could break anything? "
+        },
+        {
+            "id": "comment-14559156",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T14:20:26+0000",
+            "content": "We would need to announce that change in the CHANGES.txt (that we flatten the reader structure). This would only be a problem for those people that rely on the fact that the reader structure is preserved...\n\nThis is why I said we should open new issue and delay this one until the other one is fixed. The fix for this one would be a no-op. "
+        },
+        {
+            "id": "comment-14559164",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T14:24:19+0000",
+            "content": "getSequentialSubReaders is protected... It cannot be called from outside! I did this change for 4.0, because I wanted to hide the \"real\" reader structure from search APIs. It makes no difference to IndexSearchers how the readers are built. It is an implementation detail.\n\nYou can of course get the reader structure from the context, but I don't think anybody would rely on its real structure after warpping. "
+        },
+        {
+            "id": "comment-14559176",
+            "author": "Adrien Grand",
+            "date": "2015-05-26T14:30:26+0000",
+            "content": "OK, then +1 on your plan to open another issue to flatten the structure and make it close this one. I suppose the only point in keeping the tree structure like MultiReader does is to still be able to call closed listeners on intermediate readers too, which ParallelCompositeReader also supports but by creating this completeReaderSet. "
+        },
+        {
+            "id": "comment-14559181",
+            "author": "Adrien Grand",
+            "date": "2015-05-26T14:35:03+0000",
+            "content": "You can of course get the reader structure from the context, but I don't think anybody would rely on its real structure after warpping.\n\nThen maybe we should stop exposing it in IndexReaderContext? "
+        },
+        {
+            "id": "comment-14559185",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T14:37:26+0000",
+            "content": "I think the complexity to preserve reader structure was done in ParallelCompositeReader before the change with getSequentialSubs. This was a large refactoring (I also made the whole thing unmodifiable lists, to make sure MultiReaders cannot be modified afterwards).\n\nThe main reason for MultiReaders is to make it possible for users to combine readers as they like. But that is only during \"construction\" time. At \"usage\" time, the structure is no longer interesting.\n\nThe problem with ParallelCompositeReader was just because it used this API, because Java allows to call protected methods from same package... (which is a bug in my opinion). Protected methods are just there for subclasses and should be hidden to the outside! (my personal opinion). "
+        },
+        {
+            "id": "comment-14559190",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T14:39:40+0000",
+            "content": "My personal opinion: We should hide ParallelLeafReader completely as impl detail. ParallelCompositeReader should just take any IndexReader in its ctor... (just an idea). Maybe it could be ParallelReader like it was back in early times... "
+        },
+        {
+            "id": "comment-14559193",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T14:43:49+0000",
+            "content": "Then maybe we should stop exposing it in IndexReaderContext?\n\nI just checked it: Its called nowhere! So +1, just needs to be maybe protected. I think this goes in line with the separate issue to nuke the IndexReaderContext at all... "
+        },
+        {
+            "id": "comment-14559645",
+            "author": "Uwe Schindler",
+            "date": "2015-05-26T19:09:35+0000",
+            "content": "I opened LUCENE-6501. "
+        },
+        {
+            "id": "comment-14560878",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-27T12:34:08+0000",
+            "content": "Commit 1681998 from Uwe Schindler in branch 'dev/trunk'\n[ https://svn.apache.org/r1681998 ]\n\nLUCENE-6501: Flatten subreader structure in ParallelCompositeReader (fixes close listener bug LUCENE-6500) "
+        },
+        {
+            "id": "comment-14560887",
+            "author": "ASF subversion and git services",
+            "date": "2015-05-27T12:39:32+0000",
+            "content": "Commit 1682000 from Uwe Schindler in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1682000 ]\n\nMerged revision(s) 1681998 from lucene/dev/trunk:\nLUCENE-6501: Flatten subreader structure in ParallelCompositeReader (fixes close listener bug LUCENE-6500) "
+        },
+        {
+            "id": "comment-14560889",
+            "author": "Uwe Schindler",
+            "date": "2015-05-27T12:41:26+0000",
+            "content": "Fixed through subreader flattening in LUCENE-6501. Thanks Adrien for reporting! "
+        },
+        {
+            "id": "comment-14713122",
+            "author": "Shalin Shekhar Mangar",
+            "date": "2015-08-26T13:05:49+0000",
+            "content": "Bulk close for 5.3.0 release "
+        }
+    ]
+}

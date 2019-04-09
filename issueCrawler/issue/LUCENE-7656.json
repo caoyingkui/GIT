@@ -1,0 +1,96 @@
+{
+    "id": "LUCENE-7656",
+    "title": "Implement geo box and distance queries using doc values.",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "6.5",
+            "7.0"
+        ]
+    },
+    "description": "Having geo box and distance queries available as both point and doc-values-based queries means we could use them with IndexOrDocValuesQuery.",
+    "attachments": {
+        "LUCENE-7656.patch": "https://issues.apache.org/jira/secure/attachment/12849261/LUCENE-7656.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15837574",
+            "date": "2017-01-25T11:05:16+0000",
+            "content": "Here is a patch. I did not want the doc-values distance query to perform distance computations all the time so I ended up working on a way to split the bounding box around the distance circle into 4096 smaller boxes, and pre-computing how they relate to the distance query (I reused the logic that we already had in LatLonPointDistanceQuery for the inner nodes). I also switched LatLonPointDistanceQuery to it (for the leaf nodes that return Relation.CELL_CROSSES_QUERY), and interestingly it yielded a 8% speedup when tested with IndexAndSearchOpenStreetMaps.\n\nI would appreciate if someone who is more comfortable with geo could review as maybe the way LatLonPointDistanceQuery computes relations between a box and a circle relies on assumptions that are not met in this new code? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15837575",
+            "date": "2017-01-25T11:06:13+0000",
+            "content": "For the record, I also made sure that the factory methods for these new dv-based queries refer to IndexOrDocValuesQuery. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15837588",
+            "date": "2017-01-25T11:26:26+0000",
+            "content": "Same patch as previously, but making LatLonPointDistanceQuery implement the scorerSupplier API so that IndexOrDocValuesQuery would work with it. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15837594",
+            "date": "2017-01-25T11:32:52+0000",
+            "content": "Very cool!   I will have a look at the patch ... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15838767",
+            "date": "2017-01-25T23:07:31+0000",
+            "content": "I like this change!  It's nice you see a perf gain on the OSM benchmarks.  I suppose it would help \"big\" distance queries more and maybe hurt \"tiny\" distance queries, since it does the up front work (the DistancePredicate, but that's the right tradeoff.\n\nIt's a bit annoying that, if you use the IndexOrDocValuesQuery, all the same up front work is done twice, and one of them won't be used; maybe we could make it lazy?  But that can wait, it's just an opto.\n\nSince you use bit shifting, it looks like the number of effective cells may be anywhere between 1024 and 4096 right?  Do you think two straight integer divisions instead, which could get us usually to 4096 cells, is too costly per hit?\n\nmaybe the way LatLonPointDistanceQuery computes relations between a box and a circle relies on assumptions that are not met in this new code\n\nI believe you are using it in essentially the same way as before, just different sized cells, so this should be fine. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15838949",
+            "date": "2017-01-26T01:04:32+0000",
+            "content": "I suppose it would help \"big\" distance queries more and maybe hurt \"tiny\" distance queries, since it does the up front work\n\nI think the only scenario that gets worse is when the distance is so tiny that the distance range is always contained in a single BKD cell. As soon as you start having crossing cells, that cost is quickly amortized. For instance, say your index has 30 segments with one crossing cell each (which is still a best-case scenario), we already need to perform 30*1024~=30k distance computations. On the other hand, this change needs to do 4096*4~=16k up-front distance computations (regardless of the number of segments since it is computed for a whole query) so if it allows to save 1/2 distance computations, its cost is already amortized.\n\nthe same up front work is done twice, and one of them won't be used\n\nTrue, this should be easy to fix!\n\nSince you use bit shifting, it looks like the number of effective cells may be anywhere between 1024 and 4096 right? Do you think two straight integer divisions instead, which could get us usually to 4096 cells, is too costly per hit?\n\nYou are right about the fact that there are lost cells. Avoiding integer divisions was one reason in favor of bit shifting, but there was another one, which is that they do not create boxes that cross the dateline.\n\nThat said, you make a good point that we should not have to both store and compute relations for those lost cells, let me look into fixing that. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15839544",
+            "date": "2017-01-26T10:39:45+0000",
+            "content": "Here is an updated patch that should address your comments:\n\n\tIt still uses shifting, but there are no lost cells anymore. As a side-effect, this also means we do not compute geo distances for those lost cells at initialization time so it initialization might have got a bit faster.\n\tI wanted to look into initializing the distance predicate lazily but remembered that IndexSearcher might call Weight.scorer from multiple threads so this has some complexity that I'd like to delay to another issue. I did more benchmarking to check how much of an issue that is, and initialization constantly runs in less than half a millisecond on my machine, so it is not that annoying to do it twice I think.\n\tI moved the distance predicate from Query to Weight. It has some memory footprint, so it is better if queries do not hold a reference to it (eg. if they are used as cache keys).\n\tI replaced the Relation[] array with a byte[] that stores ordinals of the enum constants. This looked like a safe win as this 4x smaller array could be more friendly with the cpu cache.\n\n ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15839578",
+            "date": "2017-01-26T11:18:01+0000",
+            "content": "I wanted to look into initializing the distance predicate lazily but remembered that IndexSearcher might call Weight.scorer from multiple threads so this has some complexity that I'd like to delay to another issue.\n\nAhh, yes, hairy ... that's fine to postpone!  The amortized cost of that initialization approaches zero as the index grows ...\n\n+1, patch looks great! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-15839666",
+            "date": "2017-01-26T13:33:44+0000",
+            "content": "Commit cd1be78e2cb9a9bc2e65d5adcc7cecca997330b4 in lucene-solr's branch refs/heads/branch_6x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cd1be78 ]\n\nLUCENE-7656: Implement geo box/distance queries using doc values. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15839667",
+            "date": "2017-01-26T13:33:45+0000",
+            "content": "Commit cf943c545478e01a2c76013f1c31b96786cdd165 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=cf943c5 ]\n\nLUCENE-7656: Implement geo box/distance queries using doc values. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-15842905",
+            "date": "2017-01-27T14:10:46+0000",
+            "content": "For the record, the nightly benchmarks confirm the speedup. http://people.apache.org/~mikemccand/geobench.html#search-distance ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-15843148",
+            "date": "2017-01-27T17:23:08+0000",
+            "content": "For the record, the nightly benchmarks confirm the speedup.\n\nNice! ",
+            "author": "Michael McCandless"
+        }
+    ]
+}

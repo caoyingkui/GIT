@@ -1,0 +1,95 @@
+{
+    "id": "LUCENE-5495",
+    "title": "Boolean Filter does not handle FilterClauses with only bits() implemented",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Invalid",
+        "components": [
+            "core/search"
+        ],
+        "affect_versions": "4.6.1",
+        "status": "Closed",
+        "fix_versions": []
+    },
+    "description": "Some Filter implementations produce DocIdSets without the iterator() implementation, such as o.a.l.facet.range.Range.getFilter().\n\nCurrently, such filters cannot be added to a BooleanFilter because BooleanFilter expects all FilterClauses with Filters that have iterator() implemented.\n\nThis patch improves the behavior by taking Filters with bits() implemented and treat them separately.\n\nThis behavior would be faster in the case for Filters with a forward index as the underlying data structure, where there would be no need to scan the index to build an iterator.\n\nSee attached unit test, which fails without this patch.",
+    "attachments": {
+        "LUCENE-5495.patch": "https://issues.apache.org/jira/secure/attachment/12633176/LUCENE-5495.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13922940",
+            "author": "Lei Wang",
+            "content": " \n+  public BitsDocIdSet(Bits bits, int length) {\n+    this.bits = bits;\n+    this.length = length;\n+  }\n \n\n\nWe can assert bits is not a DocIdSet here. if it is, this adds overhead only.\n\n \n+    final List<Bits> mustBitsList = new ArrayList<Bits>();\n+    final List<Bits> mustNotBitsList = new ArrayList<Bits>();\n \n\n\nMay need a SHOULD list also?\n\n \n+        if (bits != null) {\n+          mustNotBitsList.add(bits);\n+        }\n \n\n\nif bits is already a FixedBitSet or OpenBitSet, merge them into res might be faster? same for other lists (Not necessary, please drop this one)\n ",
+            "date": "2014-03-06T19:34:02+0000"
+        },
+        {
+            "id": "comment-13924224",
+            "author": "Lei Wang",
+            "content": "please drop my FixedBitSet or OpenBitSet suggestion. for the FixedBitSet or OpenBitSet, which way is faster depends on the use case i think. without merging should be ok. ",
+            "date": "2014-03-07T19:11:59+0000"
+        },
+        {
+            "id": "comment-13925466",
+            "author": "John Wang",
+            "content": "Thanks Lei! Comments addressed, see new patch. ",
+            "date": "2014-03-10T05:47:07+0000"
+        },
+        {
+            "id": "comment-13925516",
+            "author": "Uwe Schindler",
+            "content": "Some Filter implementations produce DocIdSets without the iterator() implementation, such as o.a.l.facet.range.Range.getFilter().\n\nThe Lucene contract requires that every filter implements iterator() in the DocIdSet. So the bug is in that filter. If it does not implement iterator(), it is the non-matching filter. The bits() call is only used as an addon to improve performance. - Which filters do this?\n\nE.g., FilteredQuery first gets the DocIdSetIteraor and only if it is not null, it eventually uses bits(). But if its null, it returns no scorer. In your patch the logic is the other way round.\n\nWe might improve BooleanFilter to use bits() if available, but the contract must be respected.\n\nif bits is already a FixedBitSet or OpenBitSet, merge them into res might be faster? same for other lists (Not necessary, please drop this one)\n\nThis is already done (not easy visible to the reader of the code), because FixedBitSet.or(disi) (and others) shortcut for iterators from other FixedBitSets. ",
+            "date": "2014-03-10T07:32:21+0000"
+        },
+        {
+            "id": "comment-13925517",
+            "author": "Uwe Schindler",
+            "content": "I checked the Facet filters. Those violate the contract, but as far as I see, they are not intended to be used outside of the facets. Those will also break if you use them with FilteredQuery or ConstantScoreQuery. ",
+            "date": "2014-03-10T07:34:59+0000"
+        },
+        {
+            "id": "comment-13925676",
+            "author": "Michael McCandless",
+            "content": "Unfortunately, it's intentional that the filters returned by\nRange.getFilter are not \"general purpose\" and throw UOE from their\niterator methods.\n\nThe Range.getFilter javadocs state that you must either 1) do post\nfiltering (use FilteredQuery with QUERY_FIRST_FILTER_STRATEGY), or 2)\npass the Filter to DrillSideways (which is careful to do \"post\nfiltering\").\n\nThe problems is these filters can in general be very costly,\ne.g. backed by a \"costly\" expression like Haversin distance\ncomputation.\n\nReally, this is all one giant hack/workaround, because Lucene is\nunable to properly/generally handle the \"post filter\" use case\n(something Solr has had for some time).  I think we should fix that;\ni.e., we need some way for a Filter to express that 1) it's random-access\n(supports Bits), and 2) it's very costly.  This is the mirror image\ncase to \"random access filter down low\", which we do for random-access\nfilters that have very low cost.\n\nIdeally, we would absorb BooleanFilter and FilteredQuery into\nBooleanQuery, e.g. so you can BQ.add(Filter) and then BooleanQuery\nworks out which filters/queries should be applied \"random access down\nlow\", \"random access up high\", \"leap frog\" or even \"use a temporary\nbit set\" (like MultiTermQueryWrapperFilter, BooleanFilter).  These all\nshould just be implementation details on how the hits are matched,\nworked out by BooleanQuery, not by the user having to invoke cryptic\noptions across three classes.  It's crazy we have such code\nduplication across these classes today.\n\nI think we should also have a \"random access up high\" for queries\n(LUCENE-5460); if we had that and BQ could be trusted to do the right\nthing we could e.g. rewrite a PhraseQuery(\"a b c\") into +a +b +c\n+positions(a b c) to solve LUCENE-1252. ",
+            "date": "2014-03-10T11:35:55+0000"
+        },
+        {
+            "id": "comment-13925923",
+            "author": "John Wang",
+            "content": "Hi Uwe:\n\n    Looking at the Filter doc, I don't see the stated contract to always check iterator before bits. It does say however, bits is not always implemented, and if it is, indicates this has random access.\n\n    In the current BooleanFilter implementation, it is essentially converting iterators from Filters into a FixedBitSet by iterating. So in the case with Filters with a forward index backing, it is scanning the entire index, e.g. 0 to maxDoc for each filter clause. So this patch checks for bits() and treat them differently, if bits() returning null, then checks for iterator, this logic does follow the contract as it states, bits is not always implemented, but iterator must be. So IMO, even if the facets filter do have iterator() implemented, this is still an optimization.\n\n -John ",
+            "date": "2014-03-10T17:30:23+0000"
+        },
+        {
+            "id": "comment-13926111",
+            "author": "Uwe Schindler",
+            "content": "John,\nI was about to improve the documentation. The problem is as you explain:\n\n\tbits() is mentioning optional\n\titerator() does not mention optional, so it is a requirement\n\n\n\nAnd code in FilteredQuery behaves like this:\n\n\tGet iterator(), if iterator returns null, no documents match -> exit\n\tThe code then tries to get bits(), if this returns something != null and some other conditions apply (depending on FilterStrategy) it switches to pass the bits() down low (means as liveDocs to the query)\n\totherwise it uses the iterator to leap-frog (or similar) with the query.\n\n\n\nConstantScoreQuery always uses the iterator (because it is a query, that needs a scorer, which is a subclass of DocIdSetIterator). bits() are never checked.\n\nBooleanFilter works exactly like that. It addtionally also transforms iterator-only filters to bits() filters, because it uses a FixedBitSet to cache.\n\nIn addition BooleanFilter uses FixedBitSet.or(Iterator), which shortcuts the case, where the iterator is derieved from another FixedBitset. ",
+            "date": "2014-03-10T19:48:58+0000"
+        },
+        {
+            "id": "comment-13926140",
+            "author": "Uwe Schindler",
+            "content": "By the way: One trick to maybe improve speed if you want chanined AND-Filters. There is no need to use BooleanFilter here, just chain FilteredQuery. This will automatically (depending on filterstrategy) do exactly what you want:\n\n\tuse new FilteredQuery(new FilteredQuery(query, filter2), filter1)\n\tset a filter strategy according to your needs. If bits() has faaaaaast random access, use the default one. In that case, the resulting bits() instance of filter1 will passed as acceptDocs to filter2.getDocIdSet() and the result of this will be passed as acceptDocs to query's scorer().\n\n\n\nBut all this depends on your caching needs and performance of your random access impls. ",
+            "date": "2014-03-10T20:07:14+0000"
+        },
+        {
+            "id": "comment-13926222",
+            "author": "John Wang",
+            "content": "Thanks Uwe for the feedback.\n\nIn FilteredQuery, depending on the FilterStrategy, iterator() checked/called after bits(). I think if bits() is optional, and iterator() is not, then checking bits() first actually does make sense, otherwise, since iterator() impl is mandatory, bits() impl would be ignored. Maybe I am missing something...\n\nThis patch can be think of fixing a shortcoming in BooleanFilter.\n\nAre we discouraging use of BooleanFiilter?\n\nThanks for the suggestion with FilteredQuery, that makes sense! ",
+            "date": "2014-03-10T21:10:21+0000"
+        },
+        {
+            "id": "comment-13926281",
+            "author": "Uwe Schindler",
+            "content": "In FilteredQuery, depending on the FilterStrategy, iterator() checked/called after bits(). I think if bits() is optional, and iterator() is not, then checking bits() first actually does make sense, otherwise, since iterator() impl is mandatory, bits() impl would be ignored. Maybe I am missing something...\n\n\n\tRandomAccessFilterStrategy first calls iterator() and cancels collection if iterator is null. Then it asks for bits() and uses them, if available, otherwise falls back to good old LeapFrog approach. RandomAccessFilterStrategy only chooses to use random access, if the useRandomAccess() method returns true. In general it only does this if the iterator is not too sparse (it checks first filter doc). This can be configured by the user with other heuristics (e.g. cost() function).\n\tLeapFrogFilterStrategy always uses iterator() (it's scorer is also the fall back for all other cases, where bits() returns null)\n\tQueryFirstFilterStrategy first calls bits(), but if those are null it falls back to the iterator()\n\n\n\nThe default is RandomAccessFilterStrategy.\n\nThis patch can be think of fixing a shortcoming in BooleanFilter. Are we discouraging use of BooleanFiilter?\n\nI just complained about the algo. bits() must be purely optional. If it returns null, you must also check the iterator(). If the iterator() also returns null, no documents match.\n\nBut your patch should in no case try to \"emulate\" the iterator by the BitsDocIdSetIterator! iterator() is mandatory and is used as fallback if the bits() return null. But definitely not the other way round. iterator() has to be implemented, otherwise its not a valid filter.\n\nThe UOE by the Facet filters is intentional, because those should never ever be used as a filter in queries. Because of the way how FilteredQuery or ConstantScoreQuery works, the user will get the UOE. I know this is a hack, but Michael McCandless did this intentionally (earlier versions used the same scorer you added in your patch to emulate, but that made users use that filters and slow down their queries).\n\nIn my opinion, if we want to improve this, it should use a strategy like FilteredQuery, too. We can improve maybe depending on cases like:\n\n\tall filters are AND'ed together and some support random access -> use the same approach like FilteredQuery and pass down the bits of those filter's output as acceptDocs input for the next filter\n\tsome flters support random access, few of them only iterators. In that case the filter with the iterator could drive the query and use bits() of other filters to filter out some documents. The result can be handled as FixedBitSet, but improved that bits() is used partially (if available).\n\tmany more strategies...\n\n\n\nBut on the other hand, as Mike says: Filters should be Queries without score and be handled by BooleanQuery, BooleanFilter will go away then (or subsumed inside some BooleanQuery optimizations choosen automatically depending on cost factors,...). We have a GSoC issue open. This is one of the big priorities fixing the broken and unintuitive APIs around Query+Filter. ",
+            "date": "2014-03-10T21:48:50+0000"
+        },
+        {
+            "id": "comment-15125687",
+            "author": "David Smiley",
+            "content": "Closing since Filters are going away and we have TwoPhaseIterator for some of the concepts discussed. ",
+            "date": "2016-02-01T03:24:27+0000"
+        }
+    ]
+}

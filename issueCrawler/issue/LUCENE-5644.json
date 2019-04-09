@@ -1,0 +1,297 @@
+{
+    "id": "LUCENE-5644",
+    "title": "ThreadAffinityDocumentsWriterThreadPool should clear the bindings on flush",
+    "details": {
+        "type": "Bug",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [
+            "core/index"
+        ],
+        "affect_versions": "None",
+        "status": "Resolved",
+        "fix_versions": [
+            "4.8.1",
+            "4.9",
+            "6.0"
+        ]
+    },
+    "description": "This class remembers which thread used which DWPT, but it never clears\nthis \"affinity\".  It really should clear it on flush, this way if the\nnumber of threads doing indexing has changed we only use as many DWPTs\nas there are incoming threads.",
+    "attachments": {
+        "LUCENE-5644.patch": "https://issues.apache.org/jira/secure/attachment/12643297/LUCENE-5644.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-13989155",
+            "author": "Michael McCandless",
+            "content": "Patch w/ test & fix.  I also noticed we were not recording a thread\nbinding when we had an uncontended minThreadState, causing an\nunnecessary call to minContentedThreadState for each doc. ",
+            "date": "2014-05-04T21:12:19+0000"
+        },
+        {
+            "id": "comment-13989768",
+            "author": "Simon Willnauer",
+            "content": "I think in general this looks good to me. There is a small chance that the thread affinity will not work corretly if we reset while some other thread is already calling \"minThreadState.lock()\"  we need to put the thread / state binding back into the map if the locked state is not initialized like:\n\n\nminThreadState.lock();\nif (minThreadState.isInitialized() == false) {\n  threadBindings.put(requestingThread, minThreadState); // make sure we get the same state next time \n}\nreturn minThreadState;\n\n\n ",
+            "date": "2014-05-05T17:55:29+0000"
+        },
+        {
+            "id": "comment-13989784",
+            "author": "Michael McCandless",
+            "content": "Ahh, good catch Simon; I'll add that & commit shortly. ",
+            "date": "2014-05-05T18:04:47+0000"
+        },
+        {
+            "id": "comment-13989884",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1592620 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1592620 ]\n\nLUCENE-5644: clear IW's thread state bindings on flush ",
+            "date": "2014-05-05T19:37:13+0000"
+        },
+        {
+            "id": "comment-13989889",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1592621 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1592621 ]\n\nLUCENE-5644: clear IW's thread state bindings on flush ",
+            "date": "2014-05-05T19:40:39+0000"
+        },
+        {
+            "id": "comment-13989894",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1592623 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1592623 ]\n\nLUCENE-5644: clear IW's thread state bindings on flush ",
+            "date": "2014-05-05T19:44:25+0000"
+        },
+        {
+            "id": "comment-13990721",
+            "author": "Michael McCandless",
+            "content": "I'm reopening this, something is wrong with the fix ... when I index Geonames with 2 threads I sometimes see strange sized segments on flush, e.g.:\n\n\nDWPT 0 [Tue May 06 10:45:11 EDT 2014; main]: flush postings as segment _26 numDocs=1\nDWPT 0 [Tue May 06 10:45:11 EDT 2014; Thread-0]: flush postings as segment _25 numDocs=15872\n\n ",
+            "date": "2014-05-06T15:09:38+0000"
+        },
+        {
+            "id": "comment-13991746",
+            "author": "Michael McCandless",
+            "content": "After struggling for some time trying to fix the thread hazards\nbetween flush & getAndLock, I decided to simply remove\nThreadAffinityDocumentsWriterThreadPool.\n\nI think it's too hairy/complex.  The original motivation for this was\nfor when apps use a different thread to index different content\nsources; this way we send similar docs to the same thread state and\nshould get better RAM efficiency.\n\nBut, 1) I think it's uncommon for apps to do this (they typically use\na \"blind\" thread pool) so it's fragile, 2) it's not clear really how\nmuch perf gain this is (likely minor), and 3) it's too hard to get this working\ncorrectly (this issue).\n\nSo instead I made DocumentsWriterPerThreadPool final, and I impl'd a\nsimple LIFO queue, and fixed the two places (in DW) that obtain a\nthread state for indexing to use a new DWPTP.release API that puts the\nstate back into the free list & notifies for any waiting threads to\nwake up.\n\nNote that other places that lock a thread state (e.g. flush/abort)\ndon't use this free list; I think this is OK?\n\nLucene tests pass, but this is a big change, and we need to scrutinize\n/ test it more.\n\nIt seems to behave properly when I index Geonames w/ N threads, i.e. I\nget N segments flushed by getReader, but I'll test more ... I'll also\nmake a standalone test case that validates this.\n\nThis is just an initial patch quickly coded up ... javadocs are wrong, etc. ",
+            "date": "2014-05-07T11:20:46+0000"
+        },
+        {
+            "id": "comment-13991798",
+            "author": "Michael McCandless",
+            "content": "I suspect on abort I need to wake up any indexing threads waiting on the pool... ",
+            "date": "2014-05-07T13:18:50+0000"
+        },
+        {
+            "id": "comment-13991853",
+            "author": "Shai Erera",
+            "content": "\nBut, 1) I think it's uncommon for apps to do this (they typically use\na \"blind\" thread pool) so it's fragile\n\nI don't know how uncommon it is ... I'm thinking crawlers, where each thread crawls a separate data source. Of course there are crawlers that operate on a pool of resources too. So basically if an app has a thread-affinity logic, with this patch it cannot take advantage of it at all.\n\nAnother usecase where I thought about thread-affinity is if you want to e.g. create an index in a special manner, for instance a pre-sorted index. So say that you aggregate a bunch of documents, then pre-sort them and add them one at a time, with the intention to have a pre-sorted segment. With this patch it's impossible right?\n\nI agree that we need something simple in Lucene, and if thread-affinity is hard to write/understand/maintain, I'm all for removing it in favor of this simpler model. But I also think this should be pluggable, even if it's uber-expert, package-private plugin. So maybe we can factor out a simple interface/abstract class DWThreadPool and have a concrete final LIFOThreadPool implementation? This will allow apps to specialize if they want?\n\nI reviewed the patch and I think it's good. But I want to scrutinize it more. ",
+            "date": "2014-05-07T14:29:58+0000"
+        },
+        {
+            "id": "comment-13991854",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593023 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1593023 ]\n\nLUCENE-5644: add test case ",
+            "date": "2014-05-07T14:33:48+0000"
+        },
+        {
+            "id": "comment-13991857",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593024 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1593024 ]\n\nLUCENE-5644: add test case ",
+            "date": "2014-05-07T14:35:06+0000"
+        },
+        {
+            "id": "comment-13991861",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593026 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1593026 ]\n\nLUCENE-5644: add test case ",
+            "date": "2014-05-07T14:36:27+0000"
+        },
+        {
+            "id": "comment-13991863",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593027 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1593027 ]\n\nLUCENE-5644: i moved this test over to new class ",
+            "date": "2014-05-07T14:38:02+0000"
+        },
+        {
+            "id": "comment-13991864",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593028 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1593028 ]\n\nLUCENE-5644: i moved this test over to new class ",
+            "date": "2014-05-07T14:38:20+0000"
+        },
+        {
+            "id": "comment-13991865",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593029 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1593029 ]\n\nLUCENE-5644: i moved this test over to new class ",
+            "date": "2014-05-07T14:38:41+0000"
+        },
+        {
+            "id": "comment-13991904",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593037 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1593037 ]\n\nLUCENE-5644: add test case ",
+            "date": "2014-05-07T15:27:49+0000"
+        },
+        {
+            "id": "comment-13991905",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593038 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1593038 ]\n\nLUCENE-5644: add test case ",
+            "date": "2014-05-07T15:28:23+0000"
+        },
+        {
+            "id": "comment-13991906",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593039 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1593039 ]\n\nLUCENE-5644: add test case ",
+            "date": "2014-05-07T15:28:47+0000"
+        },
+        {
+            "id": "comment-13991921",
+            "author": "Michael McCandless",
+            "content": "Another usecase where I thought about thread-affinity is if you want to e.g. create an index in a special manner, for instance a pre-sorted index. So say that you aggregate a bunch of documents, then pre-sort them and add them one at a time, with the intention to have a pre-sorted segment. With this patch it's impossible right?\n\nFor that to work right you need to use only 1 thread right?  I don't\nthink this patch will break it?\n\nBut I also think this should be pluggable\n\nHow about I make this default impl un-final? ",
+            "date": "2014-05-07T15:37:47+0000"
+        },
+        {
+            "id": "comment-13991941",
+            "author": "Michael McCandless",
+            "content": "New patch, folding in Shai's feedback, removing the nocommit, and adding a notifyAll() to wake up any indexing threads (but my test case failed to uncover deadlock here...).\n\nI'm running distributed beasting of all Lucene's core + modules tests .... ",
+            "date": "2014-05-07T15:46:03+0000"
+        },
+        {
+            "id": "comment-13992136",
+            "author": "Michael McCandless",
+            "content": "I beasted Lucene's core+module tests 48 times and didn't hit any fails except https://issues.apache.org/jira/browse/LUCENE-5652 (unrelated)... ",
+            "date": "2014-05-07T19:18:55+0000"
+        },
+        {
+            "id": "comment-13992235",
+            "author": "Simon Willnauer",
+            "content": "I like the patch much simpler though... a couple of comments\n\n\n\tcan we remove the sync keyword from newThreadState now? it seems unnecessary?\n\tcan we call notifyall across the board seems safer?\n\tin the look instead of break can we lock and return the state it seems like it's more clear that way since we only lock if we get it form the free list?\n\tI'd love in general to not sync on \"this\" but rather have a lock obj or a condition but that's just taste I guess...\n\tin release can we unlock outside the sync block?\n\n\n\nin general that looks good though. I wonder if we really should make it final but that's a different story... ",
+            "date": "2014-05-07T21:19:03+0000"
+        },
+        {
+            "id": "comment-13992325",
+            "author": "Michael McCandless",
+            "content": "Thanks Simon, I'm folding these in ...\n\nin the look instead of break can we lock and return the state it seems like it's more clear that way since we only lock if we get it form the free list?\n\nThe challenge is I want to .lock() outside of the sync block ... ",
+            "date": "2014-05-07T22:54:05+0000"
+        },
+        {
+            "id": "comment-13992564",
+            "author": "Shai Erera",
+            "content": "\nFor that to work right you need to use only 1 thread right? I don't\nthink this patch will break it?\n\nNot necessarily. You can have different threads batch up different documents and pre-sort them before .addDocument. Then you end up w/ pre-sorted segments (if you have Thread-affinity). I'm not saying it's such an important usecase to support out-of-the-box, more that there is such a usecase, and I think it'd be better if we offer some way in Lucene to enable it.\n\nHow about I make this default impl un-final?\n\nEither that or factor out a simple API, your call. I haven't looked at the API closely yet, but my feeling is that if we keep the previous abstract class and a final LIFOPool class, that would do it? When the base class is not abstract and final, I worry that at some point we'll worry about back-compat issues etc. A final class makes it easier for us to assume things. But, I leave it to you. ",
+            "date": "2014-05-08T07:12:53+0000"
+        },
+        {
+            "id": "comment-13992615",
+            "author": "Michael McCandless",
+            "content": "\nNot necessarily. You can have different threads batch up different documents and pre-sort them before .addDocument. Then you end up w/ pre-sorted segments (if you have Thread-affinity). I'm not saying it's such an important usecase to support out-of-the-box, more that there is such a usecase, and I think it'd be better if we offer some way in Lucene to enable it.\n\nOK, I see, you're right.  But this (which segment your thread sends\nits docs to) was never really a hard guarantee with IW; it's really an\nimpl detail.\n\n\nHow about I make this default impl un-final?\n\nEither that or factor out a simple API, your call.\n\nI'd like to defer this: I'll open a separate issue.  I agree it's\ndangerous to have the one impl not be final, so I put final back for\nnow, and in the follow on issue we can make it un-final and abstract\nagain, and maybe we can get a (correct) thread-affinity impl back.  I\njust think tweaking with the thread assignment is very very expert.\n\nI'd love in general to not sync on \"this\" but rather have a lock obj or a condition but that's just taste I guess...\n\nI'd rather not add another lock here (this class is already using its\nintrinsic lock)?  Or at least, let's defer it; maybe we can make a\nlock-free queue later... ",
+            "date": "2014-05-08T09:19:32+0000"
+        },
+        {
+            "id": "comment-13992625",
+            "author": "Michael McCandless",
+            "content": "New patch, folding in all feedback.  I think it's ready; I'll commit soon.\n\nBut ant precommit is currently failing for other reasons:\n\n\nBUILD FAILED\n/l/fifo/build.xml:92: The following files contain @author tags, tabs or nocommits:\n* solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java\n\n ",
+            "date": "2014-05-08T09:35:30+0000"
+        },
+        {
+            "id": "comment-13992647",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593226 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1593226 ]\n\nLUCENE-5644: switch to simpler LIFO thread to ThreadState allocator during indexing ",
+            "date": "2014-05-08T10:13:25+0000"
+        },
+        {
+            "id": "comment-13992654",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593228 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1593228 ]\n\nLUCENE-5644: switch to simpler LIFO thread to ThreadState allocator during indexing ",
+            "date": "2014-05-08T10:19:53+0000"
+        },
+        {
+            "id": "comment-13992656",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593230 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1593230 ]\n\nLUCENE-5644: switch to simpler LIFO thread to ThreadState allocator during indexing ",
+            "date": "2014-05-08T10:24:11+0000"
+        },
+        {
+            "id": "comment-13992684",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593240 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1593240 ]\n\nLUCENE-5644: remove this class ",
+            "date": "2014-05-08T11:10:31+0000"
+        },
+        {
+            "id": "comment-13994010",
+            "author": "Michael McCandless",
+            "content": "Reopening ...\n\nI realized the simple LIFO logic is too simple, right after a flush.  When that happens, we should try to pick a ThreadState that's already initialized, so that if no full-flushing (getReader) is happening, we don't tie up RAM indefinitely in the pending segments. ",
+            "date": "2014-05-09T22:47:47+0000"
+        },
+        {
+            "id": "comment-13994041",
+            "author": "Michael McCandless",
+            "content": "Patch w/ test; the core change is quite minor, in the case where the ThreadState isn't initialized, we loop through the other thread states to find one that is initialized. ",
+            "date": "2014-05-09T23:21:56+0000"
+        },
+        {
+            "id": "comment-13994052",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593649 from Michael McCandless in branch 'dev/branches/lucene_solr_4_8'\n[ https://svn.apache.org/r1593649 ]\n\nLUCENE-5644: favor an already initialized ThreadState ",
+            "date": "2014-05-09T23:32:35+0000"
+        },
+        {
+            "id": "comment-13994053",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593650 from Michael McCandless in branch 'dev/branches/branch_4x'\n[ https://svn.apache.org/r1593650 ]\n\nLUCENE-5644: favor an already initialized ThreadState ",
+            "date": "2014-05-09T23:33:52+0000"
+        },
+        {
+            "id": "comment-13994055",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1593651 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1593651 ]\n\nLUCENE-5644: favor an already initialized ThreadState ",
+            "date": "2014-05-09T23:35:07+0000"
+        },
+        {
+            "id": "comment-16047452",
+            "author": "ASF GitHub Bot",
+            "content": "GitHub user vvdb opened a pull request:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    LUCENE-5644: switch to simpler LIFO thread to ThreadState allocator d\u2026\n\n    \u2026uring indexing\u201d. Technically, this is something from releases/lucene-solr/4.8.1, but profiling indicates it makes a huge difference in multithreaded scenarios\n\nYou can merge this pull request into a Git repository by running:\n\n    $ git pull https://github.com/vvdb/lucenenet master\n\nAlternatively you can review and apply these changes as the patch at:\n\n    https://github.com/apache/lucenenet/pull/208.patch\n\nTo close this pull request, make a commit to your master/trunk branch\nwith (at least) the following in the commit message:\n\n    This closes #208\n\n\ncommit 18b8ef71fc08c1583c323ff00e2d1ef07e55c72c\nAuthor: Vincent Van Den Berghe <vvdb@bvdep.com>\nDate:   2017-06-13T05:50:31Z\n\n    LUCENE-5644: switch to simpler LIFO thread to ThreadState allocator during indexing\u201d. Technically, this is something from releases/lucene-solr/4.8.1, but profiling indicates it makes a huge difference in multithreaded scenarios\n\n ",
+            "date": "2017-06-13T05:51:17+0000"
+        },
+        {
+            "id": "comment-16047515",
+            "author": "ASF GitHub Bot",
+            "content": "Github user synhershko commented on a diff in the pull request:\n\n    https://github.com/apache/lucenenet/pull/208#discussion_r121596530\n\n    \u2014 Diff: src/Lucene.Net/Document/Document.cs \u2014\n    @@ -278,9 +279,17 @@ public string Get(string name)\n                 return null;\n             }\n\n\n\t/// <summary>\n\t/// Prints the fields of a document for human consumption. </summary>\n\tpublic override string ToString()\n    +\t\t/// <summary>\n    +\t\t/// Remove all fields from a document\n    +\t\t/// </summary>\n    +\t\tpublic void Clear()\n    +\t\t\n{\n    +\t\t\tfields.Clear();\n    +\t\t}\n\t\n\t\t\n\t\t\n\t\t\tEnd diff \u2013\n\t\t\n\t\t\n\t\n\t\n\n\n\n    this seems unrelated? ",
+            "date": "2017-06-13T07:06:15+0000"
+        },
+        {
+            "id": "comment-16047517",
+            "author": "ASF GitHub Bot",
+            "content": "Github user synhershko commented on the issue:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    Thanks, that's an interesting one.\n\n    First, there's a lot of whitespace noise - can you remove it please? (align with the project's whitespace specs)\n\n    Second, assuming we have no threading issues at the moment, how can we be sure this doesn't introduce any? cc @NightOwl888  ",
+            "date": "2017-06-13T07:08:38+0000"
+        },
+        {
+            "id": "comment-16047539",
+            "author": "ASF GitHub Bot",
+            "content": "Github user vvdb commented on the issue:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    >> align with the project's whitespace specs\n    I\u2019ve been trying to find the project\u2019s code formatting document, but was unsuccessful.\n\n    >> Second, assuming we have no threading issues at the moment, how can we be sure this doesn't introduce any?\n    We can be sure of nothing, since certainty is only as strong as the assumptions it is based on.\n    However:\n\n\n\tthe tests have been appropriately changed and use the new code, and they all pass.\n\n\n\n\n\tOn a more personal level (even though it means nothing since you have to take my unverifiable word for it), this code has been in production use these past 3 months on a 28-core machine, all of them writing to a single IndexWriter for about a hundred million documents, repeatedly. No problems were ever seen.\n    These things don\u2019t show the absence of problems, but make me reasonably confident that the code is sound.\n\n\n\n    Vincent\n\n    From: Itamar Syn-Hershko notifications@github.com\n    Sent: Tuesday, June 13, 2017 9:09 AM\n    To: apache/lucenenet <lucenenet@noreply.github.com>\n    Cc: Van Den Berghe, Vincent <Vincent.VanDenBerghe@bvdinfo.com>; Author <author@noreply.github.com>\n    Subject: Re: [apache/lucenenet] LUCENE-5644: switch to simpler LIFO thread to ThreadState allocator d\u2026 (#208)\n\n\n    Thanks, that's an interesting one.\n\n    First, there's a lot of whitespace noise - can you remove it please? (align with the project's whitespace specs)\n\n    Second, assuming we have no threading issues at the moment, how can we be sure this doesn't introduce any? cc @NightOwl888<https://github.com/nightowl888>\n\n    \u2014\n    You are receiving this because you authored the thread.\n    Reply to this email directly, view it on GitHub<https://github.com/apache/lucenenet/pull/208#issuecomment-308027273>, or mute the thread<https://github.com/notifications/unsubscribe-auth/ARBXpku1AqOToF4KGaoBuQG8Pu83axMhks5sDjV4gaJpZM4N4A9a>.\n ",
+            "date": "2017-06-13T07:43:55+0000"
+        },
+        {
+            "id": "comment-16047842",
+            "author": "ASF GitHub Bot",
+            "content": "Github user NightOwl888 commented on the issue:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    > Second, assuming we have no threading issues at the moment, how can we be sure this doesn't introduce any? cc @NightOwl888\n\n    @synhershko \n\n    First of all, we still have some threading issues. The [Lucene.Net.Store.TestLockFactory.TestStressLocksNativeFSLockFactory test](https://teamcity.jetbrains.com/viewLog.html?buildId=1084071&tab=buildResultsDiv&buildTypeId=LuceneNet_PortableBuilds_TestOnNet451) and [Lucene.Net.Store.TestLockFactory.TestStressLocks test](https://teamcity.jetbrains.com/viewLog.html?buildId=1071425&tab=buildResultsDiv&buildTypeId=LuceneNet_PortableBuilds_TestOnNet451) still fail randomly, and there may be others (last I checked there were 2 tests that failed only when the MMapDirectory was randomly selected).\n\n    Secondly, this change is part of the Lucene 4.8.1 patch. Much of this port (including most or all of Analysis.Common) is from 4.8.1 already, so we should probably try to include the rest of the fixes to get us all the way to 4.8.1, especially if they have performance benefits.\n\n    @vvdb \n\n    If we are going to work toward 4.8.1 on a gradual basis, we should probably include a comment at the top of each changed file indicating the version compatibility level so we don't have to check the entire file to see if it is up to speed.\n\n    ```\n    // Version compatibility level: 4.8.1\n    ``` \n\n    As for getting all the way there, I have outlined a procedure [here](https://github.com/apache/lucenenet/pull/174#issuecomment-251614795) for upgrading Lucene.Net to 4.8.1, which should be a lot quicker and easier than porting it from scratch again. Of course, it requires you to have a text comparison tool that allows you to filter out \"unimportant changes\" such as Beyond Compare. This will ensure we get all of the changes between the old file and new file and port them into the .NET file.\n\n    It would be better to have a tool that allows you to ignore simple code formatting changes (such as changing the curly bracket from the same line to the following line of a function or if statement), but to my knowledge a tool like that doesn't exist. ",
+            "date": "2017-06-13T12:54:26+0000"
+        },
+        {
+            "id": "comment-16064455",
+            "author": "ASF GitHub Bot",
+            "content": "Github user vvdb closed the pull request at:\n\n    https://github.com/apache/lucenenet/pull/208 ",
+            "date": "2017-06-27T08:23:24+0000"
+        },
+        {
+            "id": "comment-16064460",
+            "author": "ASF GitHub Bot",
+            "content": "Github user NightOwl888 commented on the issue:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    @vvdb \n\n    I would like to add this fix to the next release. Are you planning to submit another pull request? ",
+            "date": "2017-06-27T08:26:36+0000"
+        },
+        {
+            "id": "comment-16064465",
+            "author": "ASF GitHub Bot",
+            "content": "Github user vvdb commented on the issue:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    I\u2019m not planning to submit another pull request at this time.\n    Feel free to take whatever you need from my repository: you\u2019re better at this than I am.\n\n    Vincent\n\n    From: Shad Storhaug notifications@github.com\n    Sent: Tuesday, June 27, 2017 10:27 AM\n    To: apache/lucenenet <lucenenet@noreply.github.com>\n    Cc: Van Den Berghe, Vincent <Vincent.VanDenBerghe@bvdinfo.com>; Mention <mention@noreply.github.com>\n    Subject: Re: [apache/lucenenet] LUCENE-5644: switch to simpler LIFO thread to ThreadState allocator d\u2026 (#208)\n\n\n    @vvdb<https://github.com/vvdb>\n\n    I would like to add this fix to the next release. Are you planning to submit another pull request?\n\n    \u2014\n    You are receiving this because you were mentioned.\n    Reply to this email directly, view it on GitHub<https://github.com/apache/lucenenet/pull/208#issuecomment-311289271>, or mute the thread<https://github.com/notifications/unsubscribe-auth/ARBXprqH0s0Tjj1dhQ4f_ryNc6H2vCZEks5sILy9gaJpZM4N4A9a>.\n ",
+            "date": "2017-06-27T08:29:26+0000"
+        },
+        {
+            "id": "comment-16066444",
+            "author": "ASF GitHub Bot",
+            "content": "Github user dsmiley commented on the issue:\n\n    https://github.com/apache/lucenenet/pull/208\n\n    Guys, the PR title here references LUCENE-5644 and this trigger's ASF JIRA-GitHub integration to link the conversation here to comments on that old issue.  Can you please edit the PR title? ",
+            "date": "2017-06-28T12:58:42+0000"
+        }
+    ]
+}

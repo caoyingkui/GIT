@@ -1,0 +1,138 @@
+{
+    "id": "LUCENE-7254",
+    "title": "DocIDSetBuilder is no good for points",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "6.1",
+            "7.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "For the postings lists, I think this approach works well in dense cases (e.g. whole DISI's are added, things are coming in order, etc).\n\nHowever in the points case, it holds back range performance significantly. There are a couple of problems here:\n\n\texpensive cardinality computation (this is a 2% hit) when its totally unnecessary. we can use index statistics to help here.\n\tlots of conditional stuff in add(). This includes growing checks / bitset switching checks and so on (which happens even if you are smart and call grow, but this stuff all adds up).\n\n\n\nI dont think we should try to create a magical shared API that is both efficient for postings lists of unstructured stuff and at the same time point collection for structured fields, instead we should just do things differently for points and iterate from there.",
+    "attachments": {
+        "LUCENE-7254.patch": "https://issues.apache.org/jira/secure/attachment/12800705/LUCENE-7254.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15257620",
+            "author": "Robert Muir",
+            "date": "2016-04-26T06:15:14+0000",
+            "content": "Here is a patch with MatchingPoints. it tries to use all the stats we have for points to leave less performance on the table.\n\nWe can try to make it fancier later, but for now it:\n1) decides up-front on sparsity, based on whether the field is sparse\n2) computes cost/cardinality as 'counter' if the field is single-valued (which is exact), otherwise multiplies counter by 'docs per point' from field stats in the multi-valued case.\n\nI see the following results in the geo benchmark:\n\nboxquery (this is a 2-D PointRangeQuery): 63.4 QPS -> 85.2 QPS\ndistance query: 37.2 QPS -> 46.2 QPS\npolygon query (n=5): 49.0 QPS -> 61.3 QPS\n\n "
+        },
+        {
+            "id": "comment-15257627",
+            "author": "Robert Muir",
+            "date": "2016-04-26T06:25:39+0000",
+            "content": "simplified and fixed the stats, we dont need any conditional for single/multi-valued. the formula works either way. "
+        },
+        {
+            "id": "comment-15257637",
+            "author": "Robert Muir",
+            "date": "2016-04-26T06:37:27+0000",
+            "content": "by the way: DocIDSetBuilder could use some of this same logic for postings to remove its cardinality computation too: just substitute sumDocFreq for numPoints. But its the lesser of the problems here.\n\nFor later improvements, to try to do more fancy things so a DocIDSetBuilder-type approach works better, we can consider e.g. improving BKDReader.addAll to e.g. target its entire range more efficiently, call grow() less often but with bigger numbers (e.g. just once per addAll). But we should keep an eye on benchmarks because the current code makes visit(int doc) very hot for ranges. "
+        },
+        {
+            "id": "comment-15257754",
+            "author": "Adrien Grand",
+            "date": "2016-04-26T08:43:31+0000",
+            "content": "by the way: DocIDSetBuilder could use some of this same logic for postings to remove its cardinality computation too: just substitute sumDocFreq for numPoints. But its the lesser of the problems here.\n\nThere used to be an optimization for avoiding the cardinality computation but I removed it in LUCENE-7051 (it could not use stats to estimate the number of docs per point at that time though).\n\nFor later improvements, to try to do more fancy things so a DocIDSetBuilder-type approach works better, we can consider e.g. improving BKDReader.addAll to e.g. target its entire range more efficiently, call grow() less often but with bigger numbers\n\n+1 I don't like that this patch might create iterators over sparse FixedBitSet instances. I am fine with doing that temporarily for queries that are likely to match many docs (I see that you modified the ranges but not the point-in-set queries for instance) but in the longer term I think we should improve points so that we can know earlier how many docs are going to be added.\n "
+        },
+        {
+            "id": "comment-15257785",
+            "author": "Robert Muir",
+            "date": "2016-04-26T09:04:03+0000",
+            "content": "\n+1 I don't like that this patch might create iterators over sparse FixedBitSet instances. I am fine with doing that temporarily for queries that are likely to match many docs (I see that you modified the ranges but not the point-in-set queries for instance) but in the longer term I think we should improve points so that we can know earlier how many docs are going to be added.\n\nNo, it is the opposite way around. The sparse case is not the case to optimize because it is already fast.\n\nnot doing point-in-set had nothing to do with that. I just don't have a good benchmark for it. I think we should use the fastest bitset always here for these queries.\n\nOptimizations for esoteric/abuse/etc cases (many values in a structured field, sparse fields) shouldnt drag down the hotspot of these searches for the common case. "
+        },
+        {
+            "id": "comment-15257801",
+            "author": "Robert Muir",
+            "date": "2016-04-26T09:18:19+0000",
+            "content": "And yes we can be honest with ourselves and know, that PointInSetQuery exists to handle all the abuse cases like TermsQuery (these will never, ever, be efficient). That is why it does not have a benchmark  \n\nIt can be a good thing because having those abuses in one place contains them: but it also means we shouldn't have to let abuse cases slow down everything else. Otherwise its not serving its purpose and we should remove it. "
+        },
+        {
+            "id": "comment-15257839",
+            "author": "Adrien Grand",
+            "date": "2016-04-26T09:56:05+0000",
+            "content": "The sparse case is not the case to optimize because it is already fast.\n\nI agree in general, but for instance right now points are an appealing way to index unique ids (potentially with the version as a second dimension). With this patch we would make lookups by id use O(maxDoc) memory and run in O(maxDoc). Even though the constant factors of FixedBitSet are very low, this is quite disappointing for an inverted structure. "
+        },
+        {
+            "id": "comment-15257909",
+            "author": "Yonik Seeley",
+            "date": "2016-04-26T11:11:24+0000",
+            "content": "If Points are really supposed to be the replacement for Numeric fields, then this isn't a good approach.\nIntPoint.newExactQuery() uses PointRangeQuery and would cause a simple lookup to allocate a full FixedBitSet(maxDoc). "
+        },
+        {
+            "id": "comment-15257989",
+            "author": "Robert Muir",
+            "date": "2016-04-26T12:34:15+0000",
+            "content": "These are structures geared at range queries for spatial data. They are not for unique IDs or tuned for that.\n\nIf you want to make them tuned for unique IDs you must do much more, its way more than fucking around with a bitset, much much more than specializing exactQuery. For example remove per-segment clone() in intersect. That is enough to make ID performance too slow by itself.\n\nBut i'm sure you guys know all this already. "
+        },
+        {
+            "id": "comment-15258053",
+            "author": "Robert Muir",
+            "date": "2016-04-26T13:10:39+0000",
+            "content": "I will remove the changes from core/: those queries can just continue be bogged down by abuse cases. NOTE: just because someone calls newExactQuery() means nothing: the value could match a ton of documents. This is not the postings list and the way it interacts is different.\n\nFor now, point ranges in core will remain slow. But sandbox/ spatial does not need to be held back by this: it does not have these problems: we can fix the queries I am interested in. "
+        },
+        {
+            "id": "comment-15258062",
+            "author": "ASF subversion and git services",
+            "date": "2016-04-26T13:17:30+0000",
+            "content": "Commit 6fa5166e41652fc58a5f18db4796e230b1354dbd in lucene-solr's branch refs/heads/master from Robert Muir\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6fa5166 ]\n\nLUCENE-7254: (sandbox/ only) Don't let abuse cases slow down spatial queries "
+        },
+        {
+            "id": "comment-15258065",
+            "author": "ASF subversion and git services",
+            "date": "2016-04-26T13:18:36+0000",
+            "content": "Commit 111107b3bd00473b0ddb452b5a059c95dfde272d in lucene-solr's branch refs/heads/branch_6x from Robert Muir\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=111107b ]\n\nLUCENE-7254: (sandbox/ only) Don't let abuse cases slow down spatial queries "
+        },
+        {
+            "id": "comment-15258074",
+            "author": "Robert Muir",
+            "date": "2016-04-26T13:22:14+0000",
+            "content": "This no longer bottlenecks the 2D spatial queries in sandbox, so I am happy.\n\nI don't personally wish to cater to the abuse cases, but I will keep the issue open in case someone wants to fix the performance for core/ range queries. "
+        },
+        {
+            "id": "comment-15258151",
+            "author": "Yonik Seeley",
+            "date": "2016-04-26T14:19:19+0000",
+            "content": "It's strange that you consider a high cardinality numeric field \"an abuse case\" for Points.\nThat case worked fine for IntField (now renamed to LegacyIntField and deprecated).  What should people use instead? "
+        },
+        {
+            "id": "comment-15258169",
+            "author": "Robert Muir",
+            "date": "2016-04-26T14:29:08+0000",
+            "content": "high cardinality is unrelated. These spatial fields are also high cardinality.\n\nthe abusive case is optimizations for things like index sparsity that slow down the normal case. \n\nAs far as \"using points as an ID field\", i don't think its ready for that for a number of reasons, so we shouldn't let that slow down range queries either. The datastructure is not even optimized for that and who knows if it will even work reasonly. If you have an ID field, you can index it with StringField and the postings have already been tweaked to hell for that. So use the best datastructure for the job.\n\nAnother common abuse case is \"shit tons of IDs\" to do super-inefficient graph/join type operations: but we have newSetQuery to contain that case too, so we don't need to keep range queries slow.\n\nSo really the range query, should be fast for ranges. that is its job and it should be fast at that, and bulk-collect is always the bottleneck for that operation. "
+        },
+        {
+            "id": "comment-15298215",
+            "author": "Adrien Grand",
+            "date": "2016-05-24T14:05:07+0000",
+            "content": "Robert Muir I ran the geo benchmark again on my machine and I now get the following QPS thanks to the recent improvements to DocIdSetBuilder:\n\n\n\n\n Benchmark \n MatchingPoints \n DocIdSetBuilder \n\n\n box \n 71.1 \n 72.0 \n\n\n distance \n 37.0 \n 36.9 \n\n\n poly 5 \n 51.9 \n 51.4 \n\n\n\n\n\nThe results now look very close (the difference might just be noise), so should we switch back to DocIdSetBuilder for geo queries? "
+        },
+        {
+            "id": "comment-15298228",
+            "author": "Robert Muir",
+            "date": "2016-05-24T14:15:41+0000",
+            "content": "+1, just remove the MatchingPoints in sandbox. "
+        },
+        {
+            "id": "comment-15298242",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-24T14:27:06+0000",
+            "content": "Commit abba6d95f7b9f07e5874f4cf4c44ff38943dd2d6 in lucene-solr's branch refs/heads/branch_6x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=abba6d9 ]\n\nLUCENE-7254: Switch geo queries back to DocIdSetBuilder. "
+        },
+        {
+            "id": "comment-15298243",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-24T14:27:07+0000",
+            "content": "Commit dfa3d6c9d909ff6baac6dd8dc4a2792dcf265b5f in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=dfa3d6c ]\n\nLUCENE-7254: Switch geo queries back to DocIdSetBuilder. "
+        }
+    ]
+}

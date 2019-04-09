@@ -1,0 +1,144 @@
+{
+    "id": "LUCENE-6813",
+    "title": "OfflineSorter.sort shouldn't remove the output Path up front",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [
+            "5.4",
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Closed",
+        "type": "Bug"
+    },
+    "description": "The new BKD tree classes, and NumericRangeTree (just a 1D BKD tree),\nmake heavy use of OfflineSorter to build their data structures at\nindexing time when the number of indexed documents is biggish.\n\nBut when I was first building them (LUCENE-6477), I hit a thread\nsafety issue in OfflineSorter, and at that time I just worked around\nit by creating my own private temp directory each time I need to write\na BKD tree.\n\nThis workaround is sort of messy, and it causes problems with \"pending\ndelete\" files on Windows when we try to remove that temp directory,\ncausing test failures like http://jenkins.thetaphi.de/job/Lucene-Solr-5.x-Windows/5149/\n\nI think instead we should fix the root cause ... i.e. make\nOfflineSorter thread safe.  It looks like it's simple...\n\nSeparately I'd like to somehow fix these BKD tests to catch any leaked\nfile handles ... I'm not sure they are today.",
+    "attachments": {
+        "LUCENE-6813.patch": "https://issues.apache.org/jira/secure/attachment/12761864/LUCENE-6813.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14904323",
+            "author": "Michael McCandless",
+            "date": "2015-09-23T10:31:56+0000",
+            "content": "Patch, but I still need to add a thread test to see if it provokes the original issue I hit.\n\nI think the only reason why OfflineSorter.sort wasn't thread safe was because it removed the output file up front, instead of replacing it later with the atomic move ... I just removed that Files.deleteIfExists and then added StandardCopyOption.REPLACE_EXISTING later when we do the Files.move. "
+        },
+        {
+            "id": "comment-14904338",
+            "author": "Dawid Weiss",
+            "date": "2015-09-23T10:59:11+0000",
+            "content": "I don't fully understand the problem but to me OfflineSorter is thread safe \u2013 it takes input and output paths, then potentially creates some intermediate files which should never cause any threading problems because they're created atomically by the file system. OfflineSorter also makes best effort to delete these files. If your output already exists, it should be overwritten... where is the thread safety problem?\n\nAs for Windows and the pending delete queue, can we pinpoint when this is happening (is it a leaked file handle, lock)? Perhaps there is a better fix to just cater for the delay of file/ folder deletion in Windows (assuming this is a documented feature)? If Files.delete returns and the file is not deleted, this seems like a bug in the JDK to me?\n\nhttp://docs.oracle.com/javase/7/docs/api/java/nio/file/Files.html#delete(java.nio.file.Path)\n "
+        },
+        {
+            "id": "comment-14904341",
+            "author": "Dawid Weiss",
+            "date": "2015-09-23T11:02:43+0000",
+            "content": "Also, this looks suspicious to me in OfflineSorter:\n\n        // If simple rename doesn't work this means the output is\n        // on a different volume or something. Copy the input then.\n        try {\n          Files.move(single, output, StandardCopyOption.ATOMIC_MOVE);\n        } catch (IOException | UnsupportedOperationException e) {\n          Files.copy(single, output);\n        }\n\n\nbecause Files.move should move files across volumes (so if it throws an exception then calling copy duplicates effort):\nhttp://docs.oracle.com/javase/7/docs/api/java/nio/file/Files.html#move(java.nio.file.Path,%20java.nio.file.Path,%20java.nio.file.CopyOption...)\n\nThis may be a left-over piece of code from when File.renameTo was used (which indeed doesn't work across volumes). "
+        },
+        {
+            "id": "comment-14904712",
+            "author": "Michael McCandless",
+            "date": "2015-09-23T15:57:50+0000",
+            "content": "I don't fully understand the problem but to me OfflineSorter is thread safe \n\nSorry I'm still trying to isolate exactly what the issue is ... I'll fixup the issue title once I have more of a clue.\n\nI think the problem is (maybe) that OfflineSorter.sort currently removes its output path well before writing to it, and so if the caller is relying on Files.createTempFile to \"pick\" a unique filename across threads, which BKD is doing, then this can illegally re-use the same output Path across threads.\n\nBut I'm not certain this is the problem, I need to get the thread test online to see if I can repro/understand outside of BKD's usage.\n\nAlso, this looks suspicious to me in OfflineSorter:\n\nIf I remove that try/catch then Files.move is angry because it cannot be ATOMIC_MOVE across volumes ... can I just remove the ATOMIC_MOVE option (and the try/catch)?  Why must this be atomic? "
+        },
+        {
+            "id": "comment-14905093",
+            "author": "Dawid Weiss",
+            "date": "2015-09-23T19:29:23+0000",
+            "content": "I think the problem is (maybe) that OfflineSorter.sort currently removes its output path well before writing to it, and so if the caller is relying on Files.createTempFile to \"pick\" a unique filename across threads, which BKD is doing, then this can illegally re-use the same output Path across threads.\n\nOk, I think I understand you now. In that case indeed OfflineSorter.sort shouldn't be removing the output path and calling Files.move with REPLACE_EXISTING. I don't think an atomic move is required (since we don't care about other processes observing partially moved/copied file). "
+        },
+        {
+            "id": "comment-14906031",
+            "author": "Michael McCandless",
+            "date": "2015-09-24T08:45:20+0000",
+            "content": "Patch, I think it's ready.\n\nI added a thread safety test, but it passes even before my fix.  I'll\nupdate the issue title ... sorry for the false blame!  Now I don't\nknow why BKD was angry before ... but it seems happy now.\n\nI also fixed test infra to set the default temp dir used by\nOfflineSorter, so we get MockFS checking, and (YAY!) it caught the\noffending place in RangeTreeWriter where it was leaking a file handle!\nThis should fix the windows failures (finally!). "
+        },
+        {
+            "id": "comment-14906062",
+            "author": "Dawid Weiss",
+            "date": "2015-09-24T08:59:30+0000",
+            "content": "Hmm... I don't like the move of defaultTempDir() to a static initializer \u2013 it means if anything fails (property read, whatever) then you'd get an early exception upon class linking which can often be very confusing. I'd rather have a lazy return as it was before.\n\n\n+    // So all code using OfflineSorter (suggesters, BKD tree, NumericRangeTree) see MockFS goodness, e.g. catching leaked file handles:\n+    OfflineSorter.setDefaultTempDir(javaTempDir);\n\n\n\nWouldn't it be possible to set the java.io.tmpdir property to a path that resolves to mockfs instead? Then any paths resolved from java.io.tmpdir would be \"wrapped\" by MockFS, no matter where they originate from and without the (dodgy) static test-only variable substitution methods... Don't know how hard it'd be though.\n "
+        },
+        {
+            "id": "comment-14906093",
+            "author": "Michael McCandless",
+            "date": "2015-09-24T09:23:38+0000",
+            "content": "Hmm... I don't like the move of defaultTempDir() to a static initializer \n\nOK ... if there is a cleaner way I would love to do that instead.\n\nWouldn't it be possible to set the java.io.tmpdir property to a path that resolves to mockfs instead? \n\nI don't know enough about mockfs to know if this is possible   I thought we must use the Path we had set up (backed by the mock FileSystem we created) ... but maybe there is a way to \"install\" the mock filesystem differently?\n\nI do think it's really useful to have OfflineSorter use our mock filesystems: it caught the bug in RangeTreeWriter... "
+        },
+        {
+            "id": "comment-14906151",
+            "author": "Dawid Weiss",
+            "date": "2015-09-24T10:07:26+0000",
+            "content": "I'd have to look into it. Filesystem providers have paths conversion utilities so a \"mockfs\" path in the property should be doable... I've been burnt by static initializers wish side effects (exceptions) so many time that it always displays a red flag for me. "
+        },
+        {
+            "id": "comment-14906257",
+            "author": "Dawid Weiss",
+            "date": "2015-09-24T12:00:39+0000",
+            "content": "It'd have to be a global override of java.nio.file.spi.DefaultFileSystemProvider which would wrap all of file:/// URIs. We could then install arbitrary filesystem operation interceptors or tracking. The problem is, as far as I recall, that this SPI is not frequently used and Robert Muir mentioned to me once that it's not actually implementable... \n\nIt'd be an interesting experiment to try to do leak checking via the default system provider.  "
+        },
+        {
+            "id": "comment-14906263",
+            "author": "Robert Muir",
+            "date": "2015-09-24T12:02:35+0000",
+            "content": "Can we please not do this? it was intentional that we dont change the default provider. At the very least we have test classes that do not want the wrapping: and we have annotations to allow them to disable it.\n\nAll we need is a setter here. "
+        },
+        {
+            "id": "comment-14906265",
+            "author": "Robert Muir",
+            "date": "2015-09-24T12:03:58+0000",
+            "content": "Mike, your setter can also be package private. Maybe that will make it more digestible. "
+        },
+        {
+            "id": "comment-14906267",
+            "author": "Dawid Weiss",
+            "date": "2015-09-24T12:07:33+0000",
+            "content": "Yeah... I noticed that while looking at the code. These are not really filesystem providers, they're default filesystem decorators... "
+        },
+        {
+            "id": "comment-14906300",
+            "author": "Robert Muir",
+            "date": "2015-09-24T12:49:04+0000",
+            "content": "We also don't use them all the time: we don't want the possibility of hiding bugs with any mocking layers. \n\nAnd this stuff is complex... what we have \"works for us\"  but I would not say it is ready to be set as default for the jvm, that is my opinion. "
+        },
+        {
+            "id": "comment-14906495",
+            "author": "Michael McCandless",
+            "date": "2015-09-24T15:27:09+0000",
+            "content": "Mike, your setter can also be package private\n\nOh good point, I'll do that. "
+        },
+        {
+            "id": "comment-14906528",
+            "author": "Michael McCandless",
+            "date": "2015-09-24T15:45:28+0000",
+            "content": "OK how about this new patch?\n\nI made the new setter package private, and I removed the static class init,\nand instead made it lazy init the first time someone asks for it.\n\nAnd I renamed defaultTempDir() --> getDefaultTempDir(). "
+        },
+        {
+            "id": "comment-14906552",
+            "author": "Dawid Weiss",
+            "date": "2015-09-24T16:03:37+0000",
+            "content": "We also don't use them all the time: we don't want the possibility of hiding bugs with any mocking layers.\n\nI know, but since these are effectively decorators I think it could be done in a way in which you'd turn them on and off dynamically. The only difference would be that they'd be effectively global. I don't want to impose it on Lucene, I'm just saying it'd be a fun exercise in general to write such a layer.\n\nThe patch looks good to me. "
+        },
+        {
+            "id": "comment-14907059",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-24T21:23:50+0000",
+            "content": "Commit 1705155 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1705155 ]\n\nLUCENE-6813: OfflineSorter no longer removes its output file up front; fix file handle leak in RangeTreeWriter "
+        },
+        {
+            "id": "comment-14907068",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-24T21:32:25+0000",
+            "content": "Commit 1705162 from Michael McCandless in branch 'dev/trunk'\n[ https://svn.apache.org/r1705162 ]\n\nLUCENE-6813: remove newly deceased code "
+        },
+        {
+            "id": "comment-14907093",
+            "author": "ASF subversion and git services",
+            "date": "2015-09-24T21:48:44+0000",
+            "content": "Commit 1705168 from Michael McCandless in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1705168 ]\n\nLUCENE-6813: OfflineSorter no longer removes its output file up front; fix file handle leak in RangeTreeWriter "
+        }
+    ]
+}

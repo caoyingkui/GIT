@@ -1,0 +1,191 @@
+{
+    "id": "LUCENE-8017",
+    "title": "FunctionRangeQuery and FunctionMatchQuery can pollute the QueryCache",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Bug",
+        "components": [],
+        "fix_versions": [
+            "7.2"
+        ]
+    },
+    "description": "The QueryCache assumes that queries will return the same set of documents when run over the same segment, independent of all other segments held by the parent IndexSearcher.  However, both FunctionRangeQuery and FunctionMatchQuery can select hits based on score, which depend on term statistics over the whole index, and could therefore theoretically return different result sets on a given segment.",
+    "attachments": {
+        "LUCENE-8017.patch": "https://issues.apache.org/jira/secure/attachment/12895193/LUCENE-8017.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16220259",
+            "date": "2017-10-26T10:03:36+0000",
+            "content": "The easiest solution is to just exclude the Function queries from the cache, but this seems a shame as you could easily have quite complex functions that are index-independent, and therefore ideal for cacheing.  It also ends up being kind of hacky as they're not in core, so we end up using introspection to determine class names.\n\nAnother option is to add an isCacheable() method to Query, or alternatively a cacheCost() method - the latter I quite like, as it means that different cache implementations can choose whether or not to cache in a more fine-grained manner.  Queries can then determine for themselves if they can be cached, so for example FunctionMatchQuery can delegate through to its DoubleValuesSource to determine whether or not it's index independent.  However, it does mean increasing the API surface.   ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16220453",
+            "date": "2017-10-26T13:56:11+0000",
+            "content": "We need something that better describes the needed context to ensure repeatable results.  isCacheable is only applicable to a single type of cache implementation.\n\n\tsome queries depend only on the segment\n\tsome queries depend on the entire searcher (example: docfreq across segments)\n\tsome queries depend on even more (example: global docfreq across different servers)\n\tsome queries actually may not be repeatable/cacheable\n\n\n\nOne could either use marker interfaces to distinguish between these:  SegmentRepeatability, SearcherRepeatability, ExternalRepeatability, NotRepeatable\n(I don't really like those names, but you get the idea).  We could just normally assume the first and mark the exceptions.\n\nOr perhaps \"SearcherInvariant\" (i.e. one needs to go up to the searcher level for results to be invariant / not change)\n\n ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16220527",
+            "date": "2017-10-26T14:28:27+0000",
+            "content": "There is a TODO about this issue in LRUQueryCache:\n\n\n      // TODO: should it be pluggable, eg. for queries that run on doc values?\n      final IndexReader.CacheHelper cacheHelper = context.reader().getCoreCacheHelper();\n\n\n\nMy idea was that we could add a CacheHelper Weight.getCacheHelper(LeafReaderContext) API, that would tell how a query is allowed to be cached:\n\n\tnull if matches should never be cached\n\tcontext.reader().getCoreCacheHelper() for queries that only depend on core data-structures like phrase queries, point queries, etc.\n\tcontext.reader().getReaderCacheHelper() for queries that run on doc values (or live docs, but I can't think of a use-case for looking at live docs in a query)\n\n\n\nOne could either use marker interfaces\n\nI thought about this at some point but it doesn't work well with compound queries, ie. what interface should ConstantScoreQuery and BooleanQuery implement?\n\nThe easiest solution is to just exclude the Function queries from the cache\n\nIt has a similar issue I think, how can we know that a Boolean Query may not be cached, do we need to unwrap all sub queries? What about 3rd-party compound queries that we cannot introspect?\n\na cacheCost() method - the latter I quite like, as it means that different cache implementations can choose whether or not to cache in a more fine-grained manner\n\nWhat would this cacheCost compute? Isn't it a metric that we already have with the scorer cost? This is a bit orthogonal to this issue, but I agree it would be good to avoid caching sub clauses whose cost is more than X times the cost of the entire query in order to preserve good tail latencies. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16220574",
+            "date": "2017-10-26T15:00:47+0000",
+            "content": "Nice, CacheHelper looks to be exactly what we need here.  I guess we're going to need some way of comparing them, though?  For example, if a BooleanQuery has one clause that uses a core helper, and one that uses a reader helper, then it will need to use the reader helper. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16220596",
+            "date": "2017-10-26T15:11:24+0000",
+            "content": "Good question. Maybe we can keep it simple for now and only handle the case that all sub clauses return the same instance, and return null otherwise? It would already be significant progress over today's situation? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16234100",
+            "date": "2017-11-01T14:01:33+0000",
+            "content": "Here's a patch adding getCacheHelper() as a method on Weight.  I've made this abstract and implemented it on all Weights - it could theoretically default to returning null or the Reader-level cache helper, but I think it's better to be explicit about it.\n\nSome things to explore in follow-up issues:\n\n\tre-instate getCoreAndDeletesCacheHelper (or CoreAndDocValues, or whatever we want to call it) so that doc-values based queries can be re-used between searchers if the DV gen is the same\n\tadd getCacheHelper to Double/LongValuesSource so that, eg constant DVS queries can be cached properly\n\n ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16234144",
+            "date": "2017-11-01T14:32:44+0000",
+            "content": "\nre-instate getCoreAndDeletesCacheHelper (or CoreAndDocValues, or whatever we want to call it) so that doc-values based queries can be re-used between searchers if the DV gen is the same\n\nThis seems really suboptimal given the fact you've added this method to Weight itself. Instead couldn't we alternatively just check context.reader.fieldInfos(field).dvGen from the new method in such queries, and if its -1, return the core cache helper, otherwise return null (or crappy per-reader stuff if we really must, but i don't think its helpful). Basically saying, I think its more important to cache normally in the case that you don't use the dv updates feature, versus worrying about cases where you do. presumably you are using the updates feature because values are changing too quickly to use updateDocument, so i don't think its worth optimizing. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16234159",
+            "date": "2017-11-01T14:42:07+0000",
+            "content": "Instead couldn't we alternatively just check context.reader.fieldInfos(field).dvGen from the new method in such queries\n\nThat's a much nicer way of doing it - will fold it into this patch. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16235664",
+            "date": "2017-11-02T12:41:51+0000",
+            "content": "I've made this abstract and implemented it on all Weights - it could theoretically default to returning null or the Reader-level cache helper, but I think it's better to be explicit about it.\n\n+1\n\n// TODO should this return null? (on MatchAllDocsQuery)\n\nI think it should return the core cache helper. Otherwise if a MatchAllDocsQuery is part of a more complex BooleanQuery, the BooleanQuery may never be cached even though it might be costly? Ensuring MatchAllDocsQuery is never cached is is better done in UsageTrackingQueryCachingPolicy?\n\n// TODO: can we work out which supplier will be used for this context cheaply? (on IndexOrDocValuesQuery)\n\nEven though doc values are updateable, this query relies on the fact that both queries have the same matches, so I think we should just delegate to the indexQuery.\n\nre-instate getCoreAndDeletesCacheHelper (or CoreAndDocValues, or whatever we want to call it) so that doc-values based queries can be re-used between searchers if the DV gen is the same\n\nI realize that I might have introduced some confusion by calling it \"reader\" cache helper. It does cache based on core and dv updates / deletes, I wanted to change the name so that it wouldn't look as if it only applied to deletes, since it also applies to dv updates.\n\nInstead couldn't we alternatively just check context.reader.fieldInfos(field).dvGen from the new method in such queries, and if its -1, return the core cache helper, otherwise return null (or crappy per-reader stuff if we really must, but i don't think its helpful)\n\n+1 to read the dvGen. Thinking about it again, I agree we should not cache queries on the reader helper, as there is no evidence that we will be able to keep entries in the cache for a long time if there is a constant stream of updates. So maybe Alan's original idea to just make it a boolean isCacheable() was better? Or maybe it is fine this way since otherwise the call-site of this method will convert the boolean into either `null` or the core cache helper anyway?\n ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16235766",
+            "date": "2017-11-02T13:56:12+0000",
+            "content": "Updated patch, checking dvGen for DV queries and returning null if it's >= 0.\n\nI agree we should not cache queries on the reader helper\n\nI can see cases where this would be useful - for example, a FunctionMatchQuery that uses the underlying score (reader-specific, because it uses global stats) could be cached in a long-running static index, but shouldn't be if anything is updated.  So I think returning a specific Cache key rather that relying on just a boolean is the way to go here. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16235841",
+            "date": "2017-11-02T14:48:40+0000",
+            "content": "So I think returning a specific Cache key rather that relying on just a boolean is the way to go here.\n\n+1, that's definitely an important use case to cache! ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16236168",
+            "date": "2017-11-02T17:25:02+0000",
+            "content": "reader-specific, because it uses global stats\n\nIn case there is confusion, getReaderHelper does not mean caching on the top-level reader, it means taking deletes and dv updates into account (I got a bit confused since you mentioned top-level statistics).\n\nI agree there are use-cases for caching on the core+dv-updates+deletes key, but we have no way to know whether it is safe to do. While caching on a core is ok due to the fact that segments get merged less and less often as they get bigger, caching on deletes and dv updates is problematic: if there is a constant stream of updates, there would very little reuse. This wouldn't be a big deal with a regular cache, but the query cache has the unusual property that caching a clause of a query can take 10x longer than running the query (think eg. of a selective query and a filter that matches most of the index). This makes caching dangerous if reuse of cache entries is not likely. And FunctionMatchQuery is a worst-case scenario since it requires to perform a linear scan of the documents of the segment.\n\nIf we want to start caching on the core+dv-updates+deletes key, we should find a way to make sure that the index is mostly static so that cache entries would be reused. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16236244",
+            "date": "2017-11-02T17:48:16+0000",
+            "content": "getReaderHelper does not mean caching on the top-level reader\n\nSo there's no way of caching on the top-level reader at the moment?  Fair enough, I'll remove the calls to getReaderHelper and replace them with null for now.  We can improve the cacheing of ValuesSource-related queries in a follow up. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16236257",
+            "date": "2017-11-02T17:53:05+0000",
+            "content": "Indeed, only caching at the segment level is supported.\n\n// no point cacheing this! (in MatchNoDocsQuery)\n\nFor similar reasons as MatchAllDocsQuery I think we should return the core cache helper? For instance say the query is A OR B OR C and C rewrites to a MatchNoDocsQuery, it would still make sense to cache the BooleanQuery? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16237364",
+            "date": "2017-11-03T09:42:00+0000",
+            "content": "We now return only getCoreCacheHelper() or null, with MatchNoDocsQuery returning the former. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16237404",
+            "date": "2017-11-03T10:27:28+0000",
+            "content": "+1\n\nOne minor thing I would change would be to make the helper on Weight take a Collection or a Stream so that callers do not have to materialize an array to call it, but otherwise it looks good to me. ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16237413",
+            "date": "2017-11-03T10:34:44+0000",
+            "content": "I thought about doing that, but the callers are split more or less half and half between materializing arrays and just passing an existing array, so it's pretty much a wash  ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16237417",
+            "date": "2017-11-03T10:39:08+0000",
+            "content": "Sure, but creating a collection when you have an array is just a matter of wrapping it with Arrays.asList (O(1) memory), while if you have a collection and need an array, you need to materialize the array (O( n) memory)? ",
+            "author": "Adrien Grand"
+        },
+        {
+            "id": "comment-16237438",
+            "date": "2017-11-03T10:52:19+0000",
+            "content": "OIC, ok will change. ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16237484",
+            "date": "2017-11-03T11:39:26+0000",
+            "content": "Commit 6f522dd66fe7783c5f700d23d23b3867ae9fb147 in lucene-solr's branch refs/heads/branch_7x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6f522dd ]\n\nLUCENE-8017: Add Weight.getCacheHelper() ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16237486",
+            "date": "2017-11-03T11:39:28+0000",
+            "content": "Commit d09cbffebe25847c5c462a4ef8c4ac4a81fb2d14 in lucene-solr's branch refs/heads/branch_7x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d09cbff ]\n\nLUCENE-8017: Use List rather than array ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16237487",
+            "date": "2017-11-03T11:39:30+0000",
+            "content": "Commit a886a001a4c08e37cc975fd4965bbbaa4ddf938a in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a886a00 ]\n\nLUCENE-8017: Add Weight.getCacheHelper() ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16237488",
+            "date": "2017-11-03T11:39:32+0000",
+            "content": "Commit 08f3a64dee8737020d0e65fea6f09799a018f92a in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=08f3a64 ]\n\nLUCENE-8017: Use List rather than array ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16237489",
+            "date": "2017-11-03T11:39:49+0000",
+            "content": "Thanks all ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16245486",
+            "date": "2017-11-09T10:48:56+0000",
+            "content": "Commit e740f15df2c241f376c3444b7779e72a378ade7d in lucene-solr's branch refs/heads/branch_7x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e740f15 ]\n\nLUCENE-8017: Don't use ParallelReader in tests ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16245487",
+            "date": "2017-11-09T10:48:59+0000",
+            "content": "Commit ff4874f3d3ff6c307121a6a1f6d87a33d45a48a4 in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ff4874f ]\n\nLUCENE-8017: Don't use ParallelReader in tests ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16245693",
+            "date": "2017-11-09T14:03:19+0000",
+            "content": "Commit f0fec1fc5f037ed18c901e43f1d17c4e6594f152 in lucene-solr's branch refs/heads/branch_7x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f0fec1f ]\n\nRevert \"LUCENE-8017: Don't use ParallelReader in tests\"\n\nThis reverts commit ff4874f3d3ff6c307121a6a1f6d87a33d45a48a4.\n\nLUCENE-8045 makes this unnecessary ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16245696",
+            "date": "2017-11-09T14:03:26+0000",
+            "content": "Commit e827f17be59d6f505cd920756e3ce780d30e2eb2 in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e827f17 ]\n\nRevert \"LUCENE-8017: Don't use ParallelReader in tests\"\n\nThis reverts commit ff4874f3d3ff6c307121a6a1f6d87a33d45a48a4.\n\nLUCENE-8045 makes this unnecessary ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

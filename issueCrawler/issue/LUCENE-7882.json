@@ -1,0 +1,125 @@
+{
+    "id": "LUCENE-7882",
+    "title": "Maybe expression compiler should cache recently compiled expressions?",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "status": "Open",
+        "type": "Improvement",
+        "components": [
+            "modules/expressions"
+        ],
+        "fix_versions": []
+    },
+    "description": "I've been running search performance tests using a simple expression (_score + ln(1000+unit_sales)) for sorting and hit this odd bottleneck:\n\n\n\"pool-1-thread-30\" #70 prio=5 os_prio=0 tid=0x00007eea7000a000 nid=0x1ea8a waiting for monitor entry [0x00007eea867dd000]\n   java.lang.Thread.State: BLOCKED (on object monitor)\n\tat org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression.evaluate(_score + ln(1000+unit_sales))\n\tat org.apache.lucene.expressions.ExpressionFunctionValues.doubleValue(ExpressionFunctionValues.java:49)\n\tat com.amazon.lucene.OrderedVELeafCollector.collectInternal(OrderedVELeafCollector.java:123)\n\tat com.amazon.lucene.OrderedVELeafCollector.collect(OrderedVELeafCollector.java:108)\n\tat org.apache.lucene.search.MultiCollectorManager$Collectors$LeafCollectors.collect(MultiCollectorManager.java:102)\n\tat org.apache.lucene.search.Weight$DefaultBulkScorer.scoreAll(Weight.java:241)\n\tat org.apache.lucene.search.Weight$DefaultBulkScorer.score(Weight.java:184)\n\tat org.apache.lucene.search.BulkScorer.score(BulkScorer.java:39)\n\tat org.apache.lucene.search.IndexSearcher.search(IndexSearcher.java:658)\n\tat org.apache.lucene.search.IndexSearcher$5.call(IndexSearcher.java:600)\n\tat org.apache.lucene.search.IndexSearcher$5.call(IndexSearcher.java:597)\n\tat java.util.concurrent.FutureTask.run(FutureTask.java:266)\n\tat java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)\n\tat java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)\n\tat java.lang.Thread.run(Thread.java:745)\n\n\n\nI couldn't see any synchronized in the sources here, so I'm not sure which object monitor it's blocked on.\n\nI was accidentally compiling a new expression for every query, and that bottleneck would cause overall QPS to slow down drastically (~4X slower after ~1 hour of redline tests), as if the JVM is getting slower and slower to evaluate each expression the more expressions I had compiled.\n\nI tested JDK 9-ea and it also kept slowing down over time as the performance test ran.\n\nMaybe we should put a small cache in front of the expressions compiler to make it less trappy?  Or maybe we can get to the root cause of why the JVM slows down more and more, the more expressions you compile?\n\nI won't have time to work on this in the near future so if anyone else feels the itch, please scratch it!",
+    "attachments": {
+        "demo.patch": "https://issues.apache.org/jira/secure/attachment/12937938/demo.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16053984",
+            "date": "2017-06-19T13:27:32+0000",
+            "content": "It probably does slow down over time because they're loaded into their own class loaders? Are they GCed properly? ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16056533",
+            "date": "2017-06-20T21:53:35+0000",
+            "content": "That's a great question Dawid Weiss; I don't know the answer.  Maybe Jack Conradson or Robert Muir knows? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16056605",
+            "date": "2017-06-20T22:51:38+0000",
+            "content": "I know i have benchmarked that its definitely slower not to reuse. But compiling a new one per-query was not that much overhead with lower concurrency and tests did not run as long as yours.\n\nEach one gets its own loader for the reason it can be GC'ed properly (you can test that this works). But i am not sure that java land is the issue. Maybe you just have codecache scanning/sweeping during a safepoint and thats how it looks?  Or maybe its related to class dictionaries and stuff in the JDK, i dont know.\n\nMaybe run with some improved debugging such as a better profiler, enable compilation log, look at codecache stats (they are at least in JMX), etc. Maybe try disabling inlining (at least for expression evaluation) to hope for a better stacktrace. \n\nI know this stuff is a PITA but it would be good to understand before adding a cache (as it would then hang onto cached classes and maybe have other downsides/user annoyances related to that). ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16057319",
+            "date": "2017-06-21T10:47:24+0000",
+            "content": "These one-off class loaders should be gc-ed if there are no root refs pointing at anything they declared. This should be relatively easy to verify if you dump the heap incrementally over time (yourkit is your friend here).\n\nThe blocked thread is possibly a related issue (if they do have some synchronization going on internally), but I don't see where that could occur. Try the things Robert mentioned. Interesting stuff. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16074108",
+            "date": "2017-07-04T22:54:05+0000",
+            "content": "I ran my searcher instance with -XX:+PrintSafepointStatistics -XX:+PrintCodeCacheOnCompilation -XX:+PrintCompilation and I see the CodeCache getting close to full over time, e.g.:\n\n\nCodeCache: size=245760Kb used=229999Kb max_used=230003Kb free=15760Kb\n[GC (Allocation Failure)  2872668K->1304388K(16581312K), 0.1226819 secs]\n10708156 764218       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)\n10708156 764217       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)\n10708162 764219       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)\nCodeCache: size=245760Kb used=230003Kb max_used=230007Kb free=15756Kb\nCodeCache: size=245760Kb used=230007Kb max_used=230011Kb free=15752Kb\nCodeCache: size=245760Kb used=230011Kb max_used=230015Kb free=15748Kb\n10708178 764220       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)\nCodeCache: size=245760Kb used=230015Kb max_used=230020Kb free=15744Kb\n10708192 764221       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)\n\n\n\nAnd then periodically I see tons and tons of lines like this at once:\n\n\n11108619 689344       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)   made not entrant\n11108619 689541       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)   made not entrant\n11108619 689540       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)   made not entrant\n11108619 689543       4       org.apache.lucene.expressions.js.JavascriptCompiler$CompiledExpression::evaluate (21 bytes)   made not entrant\n\n\n\nAnd also made zombie:\n\n\n11236528 748217       4      (method)   made zombie\n11236528 748210       4      (method)   made zombie\n11236528 748211       4      (method)   made zombie\n11236528 748207       4      (method)   made zombie\n11236528 748206       4      (method)   made zombie\n11236528 748203       4      (method)   made zombie\n11236528 748200       4      (method)   made zombie\n11236528 748198       4      (method)   made zombie\n11236528 748196       4      (method)   made zombie\n\n\n\nI think net/net Java is just working hard to clean up all the one-off compiled methods I was creating by not re-using my expression... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16074396",
+            "date": "2017-07-05T08:09:04+0000",
+            "content": "Code cache is an area I don't have much experience with. It's interesting the cache grows without being pruned though \u2013 zombie methods are effectively dead code, should be freed over time. Can you repeat and add -XX:+UseCodeCacheFlushing switch, see if this helps?\n\nSeparately from that, the hang you experienced is another thing to worry about. Could be an interaction with code cache (resource deadlock somewhere). Sigh. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16074399",
+            "date": "2017-07-05T08:14:32+0000",
+            "content": "Here is a bit more in-depth info.\nhttps://docs.oracle.com/javase/8/embedded/develop-apps-platforms/codecache.htm ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16074536",
+            "date": "2017-07-05T10:18:06+0000",
+            "content": "Sorry, I did not experience a full hang/deadlock: I only experienced that the QPS capacity of the searcher went down drastically for periods of time.  The pattern is odd ... at first the QPS is high, then it gradually slows down, then it enters periods where it's extremely slow, like 10X slower than \"normal\" for maybe ~20-30 seconds, then it gets somewhat faster again, then another super slow period.  But it never outright hangs.\n\nIt is odd to me that the code cache was allowed to grow to nearly it's maximum size; seems like these methods should very quickly become dead since after that one query executes, it should no longer be referenced.\n\nCan you repeat and add -XX:+UseCodeCacheFlushing switch, see if this helps?\n\nOK I'll try that, may be a while before I can though.  Though from its description it seems like it shouldn't be necessary here, i.e. the JVM should be able to tell, quickly, that these methods are not referenced anymore.  But I know very little about this part of the JVM! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16074552",
+            "date": "2017-07-05T10:28:33+0000",
+            "content": "As far as I understand it should sweep code cache from time to time... \n\nhttp://markmail.org/thread/acpxk7ogdunvfhry\n\nDon't know whether there is a compaction strategy (whether the already compiled code can be relocated around); if not, then the free size tells you nothing about fragmentation and lookup for a free block may be slowing things down. \n\nAn interesting problem. ",
+            "author": "Dawid Weiss"
+        },
+        {
+            "id": "comment-16597756",
+            "date": "2018-08-30T18:25:17+0000",
+            "content": "A simple idea here can be caching the compiled Expression instances.\n\nOne way of doing it is to have a class that wraps the JavascriptCompiler and it makes sure one unique expression text only get compiled once and cached. Note that errors can be cached, too, because same invalid expression should fail at exactly the same point (e.g the ParseException)! Future compilation of the same expression should return the cached compilation result.\n\nThis new class can be a static so we cache compilation in JVM scope or it can be instantiable so the caller decides the scope.\n\n\u00a0 ",
+            "author": "Tony Xu"
+        },
+        {
+            "id": "comment-16597774",
+            "date": "2018-08-30T18:39:47+0000",
+            "content": "I really still think we shouldn't add any java-level caches to lucene (which could easily end out turning into leaks) to workaround any bug in openjdk. They fix bugs often, probably best to spend the time running the test with a newer JVM instead. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16599031",
+            "date": "2018-08-31T17:13:47+0000",
+            "content": "But even once the JVM fixes its bugs and we can safely re-compile all expressions per query, it should still be faster to avoid that recompilation when you can?\n\nI think also the lack of Accountable on a compiled expression makes caching dangerous \u2013 we would have no good way to measure how much RAM is consumed by it. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16599040",
+            "date": "2018-08-31T17:20:42+0000",
+            "content": "IMHO, caching the compiled expressions is not Lucene's responsibility. You can do this easy with any caching library. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16599043",
+            "date": "2018-08-31T17:22:47+0000",
+            "content": "Well I think it needs to be tested on a modern JVM (e.g. latest release) to see if that bug even still happens at all. And I don't agree that a cache certainly makes it faster, we need to see real numbers to see if it matters. Historically it has been far too difficult to remove such caches, e.g. scoring used to cache sqrt() but then sqrt() got faster and the cache became unnecessary.\n\nI don't want to see Accountable here as that won't help the issue. There is more than just heap memory involved with compiled classes. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16599071",
+            "date": "2018-08-31T17:36:21+0000",
+            "content": "To explain why Mike saw a\u00a0many threads getting blocked on a monitor. I wrote an unit test to demonstrate the issue.\u00a0\n\nBasically each compiled expression is defined in a new ClassLoader and when the expression's evaluation needs to invoke an external method (in this case\u00a0ln\u00a0that maps to java.lang.Math#log), the new classLoader needs to load\u00a0that class. The classloading work is delegated to the parent classloader which uses itself as a monitor for synchronization.\u00a0\n\n\u00a0\n\nThe problem was\u00a0many compiled expression's defining classloaders share the same parent and were trying to load a class via the parent in the evaluate method.\u00a0 This led to more contention on the parent classloader's monitor.\u00a0\n\n\u00a0\n\n\u00a0\n\n\u00a0demo.patch ",
+            "author": "Tony Xu"
+        },
+        {
+            "id": "comment-16599076",
+            "date": "2018-08-31T17:40:56+0000",
+            "content": "Oh I forgot to paste the test output.\n\n\u00a0\n\n2\nLoading class <org.apache.lucene.expressions.Expression> , using Loaderorg.apache.lucene.expressions.js.JavascriptCompiler$Loader@3973f90b\nLoading class <java.lang.String> , using Loaderorg.apache.lucene.expressions.js.JavascriptCompiler$Loader@3973f90b\nLoading class <java.lang.Math> , using Loaderorg.apache.lucene.expressions.js.JavascriptCompiler$Loader@3973f90b\n3.0\nLoading class <org.apache.lucene.expressions.Expression> , using Loaderorg.apache.lucene.expressions.js.JavascriptCompiler$Loader@2a44f939\nLoading class <java.lang.String> , using Loaderorg.apache.lucene.expressions.js.JavascriptCompiler$Loader@2a44f939\nLoading class <java.lang.Math> , using Loaderorg.apache.lucene.expressions.js.JavascriptCompiler$Loader@2a44f939\n3.0 ",
+            "author": "Tony Xu"
+        },
+        {
+            "id": "comment-16609536",
+            "date": "2018-09-10T17:24:34+0000",
+            "content": "Thanks for the explanation Tony Xu; that makes sense. ",
+            "author": "Michael McCandless"
+        }
+    ]
+}

@@ -1,0 +1,301 @@
+{
+    "id": "LUCENE-7241",
+    "title": "Improve performance of geo3d for polygons with very large numbers of points",
+    "details": {
+        "resolution": "Fixed",
+        "affect_versions": "6.0",
+        "components": [
+            "modules/spatial3d"
+        ],
+        "labels": "",
+        "fix_versions": [
+            "6.0"
+        ],
+        "priority": "Major",
+        "status": "Resolved",
+        "type": "Improvement"
+    },
+    "description": "This ticket corresponds to LUCENE-7239, except it's for geo3d polygons.\n\nThe trick here is to organize edges by some criteria, e.g. z value range, and use that to avoid needing to go through all edges and/or tile large irregular polygons.  Then we use the ability to quickly determine intersections to figure out whether a point is within the polygon, or not.\n\nThe current way geo3d polygons are constructed involves finding a single point, or \"pole\", which all polygon points circle.  This point is known to be either \"in\" or \"out\" based on the direction of the points.  So we have one place of \"truth\" on the globe that is known at polygon setup time.\n\nIf edges are organized by z value, where the z values for an edge are computed by the standard way of computing bounds for a plane, then we can readily organize edges into a tree structure such that it is easy to find all edges we need to check for a given z value.  Then, we merely need to compute how many intersections to consider as we navigate from the \"truth\" point to the point being tested.  In practice, this means both having a tree that is organized by z, and a tree organized by (x,y), since we need to navigate in both directions.  But then we can cheaply count the number of intersections, and once we do that, we know whether our point is \"in\" or \"out\".\n\nThe other performance improvement we need is whether a given plane intersects the polygon within provided bounds.  This can be done using the same two trees (z and (x,y)), by virtue of picking which tree to use based on the plane's minimum bounds in z or (x,y).  And, in practice, we might well use three trees: one in x, one in y, and one in z, which would mean we didn't have to compute longitudes ever.\n\nAn implementation like this trades off the cost of finding point membership in near O(log(n)) time vs. the extra expense per step of finding that membership.  Setup of the query is O(n) in this scheme, rather than O(n^2) in the current implementation, but once again each individual step is more expensive.  Therefore I would expect we'd want to use the current implementation for simpler polygons and this sort of implementation for tougher polygons.  Choosing which to use is a topic for another ticket.",
+    "attachments": {
+        "LUCENE-7241.patch": "https://issues.apache.org/jira/secure/attachment/12800595/LUCENE-7241.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-15255654",
+            "author": "Karl Wright",
+            "date": "2016-04-24T17:12:33+0000",
+            "content": "I started implementing this.  It is straightforward until the following cases arise:\n\n\n\tintersection on an edge endpoint\n\tedge numerically identical to the plane being intersected with\n\n\n\nEndpoint intersections imply there is (at least one) adjacent edge that also intersects.  We have to decide whether or not to count each such intersection as a transition from inside to outside (or visa versa), or not.  This, in turn, depends completely on the geometry of the intersection, which may require us to look at multiple edges to resolve.  In particular, we need to know whether the adjoining edge that shares the same endpoint continues on the same side of the plane being tested for intersection, or on the opposite side of the plane.  We cannot just look at the edge's other endpoint, either, because the two planes are unlikely to be parallel, and therefore it can be the case that the plane meets a single edge at two points.\n\nNumerically identical planes mean that we can't necessarily figure this out by just looking at adjacent edges.  We have to find an edge that is not numerically identical before we even start.  This is roughly equivalent to dealing with coplanarity in the standard geo3d polygon case. "
+        },
+        {
+            "id": "comment-15256410",
+            "author": "Karl Wright",
+            "date": "2016-04-25T14:37:23+0000",
+            "content": "I've made good progress with this over the weekend.  The intersects() code is complete, although the performance improvements we can expect from it will depend critically on the bounds of the plane we choose to intersect with.  Luckily, in the XYZSolid case, those edges all have at least one tiny dimension, so we should get good results by choosing the right tree to traverse.\n\nThe crossing logic, while complicated for the case of crossings that are edge endpoints, is also done.  Some work needed to happen to create new basic functionality in Plane to support this logic, but it is all reasonably straightforward.  There's still some potential for issues arising from numerical problems in this logic, although I've tried to use computations that are robust in this way.  We'll see.\n\nThe last bit of logic we need is finding a path from the test point to the incoming point (for isWithin()).  This path should ideally proceed solely in x-z, y-z, or x-y.  It's therefore likely that a two-step path will be needed.  There is also logic that will be necessary to deal with the case where the intersection of the two legs of the path happens to sit on an edge.  This is rare but luckily we know that being on an edge is always considered \"in-set\", so we can use that to save ourselves in that case. "
+        },
+        {
+            "id": "comment-15256424",
+            "author": "Robert Muir",
+            "date": "2016-04-25T14:50:35+0000",
+            "content": "i don't know if it helps but I use a 2D version of the same structure on LUCENE-7251 (for boxes versus lines). For those boxes, i first tried the same 1D approach that we use for edges, but 2D was faster.  "
+        },
+        {
+            "id": "comment-15256586",
+            "author": "Karl Wright",
+            "date": "2016-04-25T16:58:35+0000",
+            "content": "Thanks, Robert Muir, I will look at that code later to see what can be borrowed.  I've got structures for everything already but I may borrow other things like the rebalance code at some point. "
+        },
+        {
+            "id": "comment-15256587",
+            "author": "Karl Wright",
+            "date": "2016-04-25T16:59:16+0000",
+            "content": "I've realized that the two-leg journey from test point to check point will have a problem if the end point of the first leg lands on an edge.  In that case we really can't figure out whether we've crossed or not, using the current code anyway.  For the leg ending in the check point, it doesn't matter because being on the edge means we're inside, but it's currently fatal to have the first leg land this way.  So I will have to consider how to deal with this case before I will be \"done\". "
+        },
+        {
+            "id": "comment-15256770",
+            "author": "Karl Wright",
+            "date": "2016-04-25T18:43:22+0000",
+            "content": "Attaching the current changes for safekeeping... "
+        },
+        {
+            "id": "comment-15257948",
+            "author": "Karl Wright",
+            "date": "2016-04-26T11:55:51+0000",
+            "content": "Another patch for safekeeping.\nFinally now we have everything in place for dealing effectively with the intersection point between the path legs, but I still need to write the actual logic. "
+        },
+        {
+            "id": "comment-15258061",
+            "author": "Karl Wright",
+            "date": "2016-04-26T13:16:53+0000",
+            "content": "Once more, attaching code for safekeeping.  This implements the tie-in to GeoPolygonFactory.  The new method, makeLargeGeoPolygon, has characteristics which make it quite distinct from the current makeGeoPolygon methods, which is why there's a separate factory method and not just a heuristic at this level to choose the best.  These are listed in the javadoc for it, but summarized quickly here:\n\n(1) No error checking; polygons are assumed to be properly constructed;\n(2) Very short edges are supported which are essentially coplanar with adjoining edges;\n(3) Algorithm is optimized for very large polygons ( > 100 sides);\n\nWhat this has in common with the standard polygon implementation is:\n\n(1) Computing the bounds of the shape remains expensive (O(N));\n(2) Computing the outside distance to the shape remains expensive (O(N)).\n "
+        },
+        {
+            "id": "comment-15259998",
+            "author": "Karl Wright",
+            "date": "2016-04-27T11:33:36+0000",
+            "content": "Latest patch.  Logic is complete; not yet tested, and we have a small problem of implementing hashCode(), equals(), toString() for these polygons, which could have 1,000,000+ edges... "
+        },
+        {
+            "id": "comment-15263245",
+            "author": "Karl Wright",
+            "date": "2016-04-28T23:22:45+0000",
+            "content": "Debugged and partly tested patch.  Had to rework the tree structure due to massive oversight on my part, and also had some confusion about picking the right path.  Seems to work for basic polygons now though. "
+        },
+        {
+            "id": "comment-15263294",
+            "author": "ASF subversion and git services",
+            "date": "2016-04-29T00:02:36+0000",
+            "content": "Commit 7bc50ec1ee0333d2a294ad163ed0f4f3a9c453b6 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7bc50ec ]\n\nMerge branch 'LUCENE-7241' "
+        },
+        {
+            "id": "comment-15264395",
+            "author": "ASF subversion and git services",
+            "date": "2016-04-29T17:33:20+0000",
+            "content": "Commit 595a55bbb54bdcf671e9563246302a93ee1d1f80 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=595a55b ]\n\nLUCENE-7241: Add public functionality for handling large polygons in geo3d. "
+        },
+        {
+            "id": "comment-15264398",
+            "author": "ASF subversion and git services",
+            "date": "2016-04-29T17:35:13+0000",
+            "content": "Commit 228aebe82d8f0b4820ec6d61124b661bd77607cf in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=228aebe ]\n\nLUCENE-7241: Add public functionality for handling large polygons in geo3d. "
+        },
+        {
+            "id": "comment-15264402",
+            "author": "Karl Wright",
+            "date": "2016-04-29T17:39:18+0000",
+            "content": "Michael McCandless: There is a new Geo3DPoint.makeLargePolygon() method now in place that builds large polygons.  If you hook it up in luceneutil, it will probably easily load the OSM london boroughs polygons without trouble (I would guess), but it may blow up still trying to do the perf test.  I'd like to kick it around more before declaring it ready for prime time.  Also, the BKD implementation as it stands now will need to obtain the bounds for the polygon, which may be expensive for a borough, so that may impact performance and may be worth getting rid of if this is the solution we want. "
+        },
+        {
+            "id": "comment-15265695",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-01T10:10:19+0000",
+            "content": "Commit 516fb5d19315e8677f7952ceddb4240620a9e26f in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=516fb5d ]\n\nLUCENE-7241: Add basic unit tests for intersections and bounds. "
+        },
+        {
+            "id": "comment-15265696",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-01T10:11:31+0000",
+            "content": "Commit 990b6241aa2dfa9812ff46302292365bf4f4cd62 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=990b624 ]\n\nLUCENE-7241: Add basic unit tests for intersections and bounds. "
+        },
+        {
+            "id": "comment-15265769",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-01T13:35:15+0000",
+            "content": "Commit ccc9057ea0bd68ecadce25dec920deef248c2e10 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ccc9057 ]\n\nLUCENE-7241: Various changes towards making GeoComplexPolygon fully testable. "
+        },
+        {
+            "id": "comment-15265771",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-01T13:37:10+0000",
+            "content": "Commit f1e972c0156d63986b51e5688dfed5050ad1a1ac in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f1e972c ]\n\nLUCENE-7241: Various changes towards making GeoComplexPolygon fully testable. "
+        },
+        {
+            "id": "comment-15265795",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-01T15:20:22+0000",
+            "content": "Commit 645889f6b296fd445b1b104ad112b3b9beea8f9d in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=645889f ]\n\nLUCENE-7241: Improve ability to find pole. "
+        },
+        {
+            "id": "comment-15265796",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-01T15:21:05+0000",
+            "content": "Commit f603e1529a1aea6b27a57d47f9b445d74ca90b81 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f603e15 ]\n\nLUCENE-7241: Improve ability to find pole. "
+        },
+        {
+            "id": "comment-15267503",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-02T21:05:31+0000",
+            "content": "Commit d7752408dbf94fa3fd1391bf1c37efa3da27eabb in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d775240 ]\n\nLUCENE-7241: Fix intersection bounding so we don't get spurious non-matching crossings. "
+        },
+        {
+            "id": "comment-15267510",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-02T21:07:55+0000",
+            "content": "Commit 45feaf3f88b99ccd561b47d3b8d82dda6655bcc3 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=45feaf3 ]\n\nLUCENE-7241: Fix intersection bounding so we don't get spurious non-matching crossings. "
+        },
+        {
+            "id": "comment-15268164",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-03T06:08:35+0000",
+            "content": "Commit 39e8e76c44f871e3fe988bf6d7fdf301130cbbe3 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=39e8e76 ]\n\nLUCENE-7241: Another round of tree debugging, and hook large polygons up to the random tester. "
+        },
+        {
+            "id": "comment-15268167",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-03T06:10:24+0000",
+            "content": "Commit 0a0037517b0526f9ce77cc6017b5882fc2b541d9 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=0a00375 ]\n\nLUCENE-7241: Another round of tree debugging, and hook large polygons up to the random tester. "
+        },
+        {
+            "id": "comment-15268507",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-03T10:46:21+0000",
+            "content": "Commit 9e09c5cbb0c3ce04faf4156933c1139bc07f2167 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=9e09c5c ]\n\nLUCENE-7241: Fix large polygon test point logic to deal properly with holes. "
+        },
+        {
+            "id": "comment-15268509",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-03T10:48:13+0000",
+            "content": "Commit 96cde1d41ca803d46b641794e4a59456633ada9d in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=96cde1d ]\n\nLUCENE-7241: Fix large polygon test point logic to deal properly with holes. "
+        },
+        {
+            "id": "comment-15268530",
+            "author": "Karl Wright",
+            "date": "2016-05-03T11:07:06+0000",
+            "content": "Some London borough perf numbers:\n\n\nmaxDoc=60844404\nTotal vertex count: 186318\nITER 0: 0.17 M hits/sec, 2.02 QPS (16.30 sec for 33 queries), totHits=2693539\n  ***\nITER 1: 0.18 M hits/sec, 2.25 QPS (14.69 sec for 33 queries), totHits=2693539\n  ***\nITER 2: 0.18 M hits/sec, 2.23 QPS (14.79 sec for 33 queries), totHits=2693539\nITER 3: 0.18 M hits/sec, 2.23 QPS (14.78 sec for 33 queries), totHits=2693539\nITER 4: 0.18 M hits/sec, 2.24 QPS (14.73 sec for 33 queries), totHits=2693539\nITER 5: 0.18 M hits/sec, 2.23 QPS (14.78 sec for 33 queries), totHits=2693539\nITER 6: 0.18 M hits/sec, 2.24 QPS (14.73 sec for 33 queries), totHits=2693539\nITER 7: 0.18 M hits/sec, 2.24 QPS (14.73 sec for 33 queries), totHits=2693539\n\n\n\n\nThis is without tree balancing etc, which might increase the query rate somewhat, and also there's still a BKD reliance on getBounds(), which is O(N) (but should be called only once).  So there are some tweaks that can be made, although it's doubtful we'd hit performance rates more than (say) double this.  Still, an analysis would likely be helpful. "
+        },
+        {
+            "id": "comment-15268778",
+            "author": "David Smiley",
+            "date": "2016-05-03T14:19:14+0000",
+            "content": "Karl Wright what was the QPS before? "
+        },
+        {
+            "id": "comment-15268783",
+            "author": "Karl Wright",
+            "date": "2016-05-03T14:22:39+0000",
+            "content": "Before I couldn't even evaluate it; the time spent looking at 186K edges overwhelmed everything, and there were way too many degenerate situations (where sidedness of edges could not be determined etc.) for it to be meaningful. "
+        },
+        {
+            "id": "comment-15271992",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T07:05:41+0000",
+            "content": "Commit 037ecceba839e7724abbe3a79ba8cc386aad77d0 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=037ecce ]\n\nLUCENE-7241: For rare cases, don't precompute stuff. "
+        },
+        {
+            "id": "comment-15271993",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T07:08:00+0000",
+            "content": "Commit e208e172cebadebb1473f9d78e4574227848b08d in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=e208e17 ]\n\nLUCENE-7241: For rare cases, don't precompute stuff. "
+        },
+        {
+            "id": "comment-15272022",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T07:37:04+0000",
+            "content": "Commit 551d267ff5bbf2f5a7ba46aa9725f2fa5a3ba046 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=551d267 ]\n\nLUCENE-7241: Another minor optimization. "
+        },
+        {
+            "id": "comment-15272023",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T07:37:49+0000",
+            "content": "Commit 4f6d06305977017dde224a823e2def6a40f2b3d7 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4f6d063 ]\n\nLUCENE-7241: Another minor optimization. "
+        },
+        {
+            "id": "comment-15272229",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T11:54:24+0000",
+            "content": "Commit 382ffdb63677ea694c35c26ff29ac8d5032dba17 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=382ffdb ]\n\nLUCENE-7241: More performance improvements. "
+        },
+        {
+            "id": "comment-15272231",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T11:55:30+0000",
+            "content": "Commit 22a93c19dbc9d94f8c43f544c5a57efc919f29f6 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=22a93c1 ]\n\nLUCENE-7241: More performance improvements. "
+        },
+        {
+            "id": "comment-15272824",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T18:47:58+0000",
+            "content": "Commit d4c5586032c9e24fad419958da3e848684703e61 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=d4c5586 ]\n\nLUCENE-7241: Don't allocate GeoPoints we aren't going to return. "
+        },
+        {
+            "id": "comment-15272827",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T18:49:16+0000",
+            "content": "Commit 2a3549a25766be556577d4ccc443e4de0358f7a8 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=2a3549a ]\n\nLUCENE-7241: Don't allocate GeoPoints we aren't going to return. "
+        },
+        {
+            "id": "comment-15272994",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T20:17:47+0000",
+            "content": "Commit 7d4f387384686fd292e2d0da7bbb78791f4731bd in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7d4f387 ]\n\nLUCENE-7241: More performance improvements "
+        },
+        {
+            "id": "comment-15272997",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T20:18:37+0000",
+            "content": "Commit 88f70ac2146f0c113dae3d375fc19da75f136ec3 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=88f70ac ]\n\nLUCENE-7241: More performance improvements "
+        },
+        {
+            "id": "comment-15273021",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T20:35:54+0000",
+            "content": "Commit 6c6667e60e87ca2bec85df859975912009672476 in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=6c6667e ]\n\nLUCENE-7241: Get rid of allocation for vector that we don't need. "
+        },
+        {
+            "id": "comment-15273023",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-05T20:36:37+0000",
+            "content": "Commit 3a6587708fbfb73529d7b72c491302f1616f4880 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3a65877 ]\n\nLUCENE-7241: Get rid of allocation for vector that we don't need. "
+        },
+        {
+            "id": "comment-15273956",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-06T12:10:46+0000",
+            "content": "Commit da6426f03cc49d3e945e90d03d8d3ab945e801de in lucene-solr's branch refs/heads/master from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=da6426f ]\n\nLUCENE-7241: Get rid of one more allocation during isWithin processing. "
+        },
+        {
+            "id": "comment-15273958",
+            "author": "ASF subversion and git services",
+            "date": "2016-05-06T12:11:44+0000",
+            "content": "Commit 1fdc2b988008235cd030b6350b31550ddef5b0e6 in lucene-solr's branch refs/heads/branch_6x from Karl Wright\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=1fdc2b9 ]\n\nLUCENE-7241: Get rid of one more allocation during isWithin processing. "
+        },
+        {
+            "id": "comment-15273995",
+            "author": "Michael McCandless",
+            "date": "2016-05-06T12:56:05+0000",
+            "content": "I've added geo3d poly searches to the nightly geo charts: http://home.apache.org/~mikemccand/geobench.html "
+        },
+        {
+            "id": "comment-15274002",
+            "author": "Karl Wright",
+            "date": "2016-05-06T13:02:37+0000",
+            "content": "I'm going to need to start creating new tickets for various perf optimizations, should I come up with any more. \n\nI think we're getting to the point where we are hitting intrinsic performance limits with geo3d anyhow, though.  The limits are due to three dimensions rather than two, and the concurrent extra expenses involved.  But we'll see... "
+        },
+        {
+            "id": "comment-15274114",
+            "author": "David Smiley",
+            "date": "2016-05-06T14:32:06+0000",
+            "content": "Awesome; thanks for sharing   Spatial is really moving these days. "
+        }
+    ]
+}

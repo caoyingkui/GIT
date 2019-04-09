@@ -1,0 +1,115 @@
+{
+    "id": "LUCENE-8121",
+    "title": "UnifiedHighlighter can highlight terms within SpanNear clauses at unmatched positions",
+    "details": {
+        "labels": "",
+        "priority": "Minor",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Bug",
+        "components": [
+            "modules/highlighter"
+        ],
+        "fix_versions": [
+            "7.3"
+        ]
+    },
+    "description": "The UnifiedHighlighter (and original Highlighter) highlight phrases by converting to a SpanQuery and using the Spans start and end positions to assume that every occurrence of the underlying terms between those positions are to be highlighted.  But this is inaccurate; see LUCENE-5455 for a good example, and also LUCENE-2287.  The solution is to use the SpanCollector API which was introduced after the phrase matching aspects of those highlighters were developed.",
+    "attachments": {
+        "LUCENE-2287_UH_SpanCollector.patch": "https://issues.apache.org/jira/secure/attachment/12904945/LUCENE-2287_UH_SpanCollector.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16314713",
+            "date": "2018-01-06T15:58:52+0000",
+            "content": "This was exciting to work on since it led to a lot of simplifications.  I wish I could have built it to work this way to begin with were it not for a requirement to support a version of Solr that didn't have the SpanCollector.\n\nAll changes are purely internal to this highlighter with no API changes except a little to PhraseHelper and OffsetsEnum which are only public for advanced uses.\n\n\tReplaced half of PhraseHelper with new code that uses the SpanCollector API, which is the aspect of this patch that fundamentally addresses the parent issue/bug.  It's much less LOC and it's simpler too (albeit it there remains complexity in the constructor with it's awkward relationship with WSTE).\n\tInstead of FieldOffsetStrategy.createOffsetsEnumsFromReader\nusing PhraseHelper to help filter PostingsEnums that it already seek'ed, it now lets PhraseHelper handle the position-sensitive parts completely, collecting the underlying offsets into OffsetsEnums it creates.  This is simpler and probably faster as there's no double-traversal of PostingsEnums.\n\t\n\t\tI stole Luwak's SpanExtractor utility, putting its two methods onto PhraseHelper.  It's ASL licensed although copyrighted to Lemur.  Alan Woodward can I incorporate this into Lucene without the copyright statement?\n\t\n\t\n\tRefactored OffsetsEnum to be an abstract class with several impls.  This addresses TODOs that make TokenStreamOffsetStrategy less hacky and make it easier in this patch to add a new type of OffsetsEnum.  I also removed hasMorePositions() and instead had nextPosition return a boolean \u2013 simpler.\n\tPorted the test from LUCENE-5455\n\n\n\nI looked at some related code in Luwak.  I think I made two improvements in this patch versus Luwak.  Firstly ForceNoBulkScoringQuery isn't needed here since PhraseHelper directly accesses the weight & scorer.  Secondly SpanOffsetReportingQuery isn't needed since we can more easily wrap the underlying PostingsEnum (one place to wrap versus every SpanTermQuery).\n\nI have a nocommit in PhraseHelper.OffsetSpanCollector.  It's using bulky List<Integer> for the offsets.  I could convert it to an int[].  Or I might create some new Hit class (as Luwak does) to thereby make it easier for advanced users to add new information to the hit (perhaps payloads)... but it's so internal that it it'll be awkward to actually support such a use-case completely.  Also, I believe I need to ensure the collected information is de-duplicated and sorted (as Luwak does).  It would be good to have a test exercising this possibility.\n\nThere will be follow-on work for LUCENE-7903 which can leverage the progress here and perhaps using Luwak's SpanRewriter. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16315946",
+            "date": "2018-01-08T09:35:43+0000",
+            "content": "can I incorporate this into Lucene without the copyright statement?\n\nSure, go ahead.  It's good to see this being used elsewhere! ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16319261",
+            "date": "2018-01-09T22:00:28+0000",
+            "content": "\n\tAdded Passage.toString, useful for debugging and in tests\n\tRewrote a large chunk of my last patch in PhraseHelper.  I want to prevent the same term in different SpanQueries from yielding two OffsetsEnum for the same term with different freqs.  I could get into the nitty gritty but anyone who is curious just read the (commented) patch.  I removed the two methods I had taken from Luwak since this refactoring didn't mesh with the API contract.\n\tI resolved the nocommits related to offset storage principally by simply having the value-side of the map be the SpanCollectedOffsetsEnum which was modified a bit to not be immutable such that the collector adds to it and then isn't modified.  I use postingsEnum.freq() to size the int arrays; no resizing needed. I'm really happy with that versus some other things I tried.  In the future it shouldn't be hard to add payload support.\n\tThe patch has a bunch of changes to TestUnifiedHighligher & TestUnifiedHighlighterMTQ which are improvements to test randomization and not strictly for this patch.\n\n\n\nNote that this change will cause passage scores that involve position-sensitive queries to be a little different.  The old methodology wrapped the PostingsEnum for each position-sensitive term in a Spans and used the freq of the underlying term (even if we'd match this term fewer than freq times due to position sensitivity).  Now the freq for position-sensitive terms is accurate \u2013 usually smaller, which will amount to higher scores for passages.\n\nI think it's ready and I'll commit in a day or two. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16321637",
+            "date": "2018-01-11T03:28:46+0000",
+            "content": "I benchmarked it using benchmark/conf/highlighters-postings.alg with file.query.maker.file=conf/query-phrases.txt and highlighter=UH_PV  (offsets in postings with term vectors) and there is only a slight difference that may be in the noise.  Seemed same or slightly faster, and slightly less memory.  That's a wikipedia data set.  \n\nCHANGES.txt:\nImprovement:\n\n* LUCENE-8121: UnifiedHighlighter passage relevancy is improved for terms that are\n  position sensitive (e.g. part of a phrase) by having an accurate freq. (David Smiley)\n\n\nBug Fixes:\n\n* LUCENE-8121: The UnifiedHighlighter would highlight some terms within some nested\n  SpanNearQueries at positions where it should not have.  It's fixed in this highlighter\n  by switching to the SpanCollector API.  The original Highlighter still has this\n  problem (LUCENE-2287, LUCENE-5455, LUCENE-6796).  Some public but internal parts of\n  the UH were refactored. (David Smiley, Steve Davids)\n\n ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16321658",
+            "date": "2018-01-11T03:49:51+0000",
+            "content": "Commit 352ec01a6ef68bc81fdb84a7f72e81a6698f594c in lucene-solr's branch refs/heads/master from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=352ec01 ]\n\nLUCENE-8121: UH switch to SpanCollector API. Better accuracy.\n\n\tUse the filtered freq in position sensitive terms (better scores)\n\tRefactored UH's OffsetsEnum\n\tImproved test randomization in TestUnifiedHighlighter & MTQ\n\n ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16321680",
+            "date": "2018-01-11T04:22:08+0000",
+            "content": "Commit 57e571559495e1aba4f8f345b06bcdbbcf5bd1db in lucene-solr's branch refs/heads/branch_7x from David Smiley\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=57e5715 ]\n\nLUCENE-8121: UH switch to SpanCollector API. Better accuracy.\n\n\tUse the filtered freq in position sensitive terms (better scores)\n\tRefactored UH's OffsetsEnum\n\tImproved test randomization in TestUnifiedHighlighter & MTQ\n\n\n\n(cherry picked from commit 352ec01a6ef68bc81fdb84a7f72e81a6698f594c)\n\n\n\tConflicts:\n\tlucene/highlighter/src/java/org/apache/lucene/search/uhighlight/PhraseHelper.java\n\tlucene/highlighter/src/test/org/apache/lucene/search/uhighlight/TestUnifiedHighlighterStrictPhrases.java\n\n ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16321930",
+            "date": "2018-01-11T09:31:44+0000",
+            "content": "Seeing lots of test failures due to this, specifically in TestUnifiedHighlighterStrictPhrases ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16322017",
+            "date": "2018-01-11T10:32:39+0000",
+            "content": "Changing the expected score in testSubPhrases and testWithSameTermQuery fixes things locally, and I don't think there's randomization issues in here?  Will commit and see if that quietens things down.\n\n\ndiff --git a/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/TestUnifiedHighlighterStrictPhrases.java b/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/TestUnifiedHighlighterStrictPhrases.java\nindex 08820aa543..9892b838f8 100644\n--- a/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/TestUnifiedHighlighterStrictPhrases.java\n+++ b/lucene/highlighter/src/test/org/apache/lucene/search/uhighlight/TestUnifiedHighlighterStrictPhrases.java\n@@ -163,7 +163,7 @@ public class TestUnifiedHighlighterStrictPhrases extends LuceneTestCase {\n         return Arrays.toString(passages);\n       }\n     });\n-    assertArrayEquals(new String[]{\"[Passage[0-22]{yin[0-3],yang[4-8],yin[10-13]}score=2.4964213]\"},\n+    assertArrayEquals(new String[]{\"[Passage[0-22]{yin[0-3],yang[4-8],yin[10-13]}score=2.0685003]\"},\n         highlighter.highlight(\"body\", query, topDocs));\n   }\n\n@@ -207,7 +207,7 @@ public class TestUnifiedHighlighterStrictPhrases extends LuceneTestCase {\n         return Arrays.toString(passages);\n       }\n     });\n-    assertArrayEquals(new String[]{\"[Passage[0-41]{alpha[0-5],bravo[6-11],charlie[12-19]}score=3.931102]\"},\n+    assertArrayEquals(new String[]{\"[Passage[0-41]{alpha[0-5],bravo[6-11],charlie[12-19]}score=2.723861]\"},\n         highlighter.highlight(\"body\", query, topDocs));\n   }\n\n ",
+            "author": "Alan Woodward"
+        },
+        {
+            "id": "comment-16322019",
+            "date": "2018-01-11T10:33:51+0000",
+            "content": "Commit ce468f3e021acd60e482e3e7e390133fec49cb24 in lucene-solr's branch refs/heads/branch_7x from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ce468f3 ]\n\nLUCENE-8121: Fix tests ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16322020",
+            "date": "2018-01-11T10:33:52+0000",
+            "content": "Commit 4d9a41807be188892f389e77948ce3af868894ba in lucene-solr's branch refs/heads/master from Alan Woodward\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=4d9a418 ]\n\nLUCENE-8121: Fix tests ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16322092",
+            "date": "2018-01-11T11:46:16+0000",
+            "content": "Commit fd7aea5bedba349261bae08b423504e76433bb17 in lucene-solr's branch refs/heads/master from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=fd7aea5 ]\n\nLUCENE-8121: Fix span terms frequency to return the freq of the entire spans (not the frequency of the term within the span). ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16322094",
+            "date": "2018-01-11T11:47:30+0000",
+            "content": "Commit af54154a664489741fbf03f7492e66986bb84f51 in lucene-solr's branch refs/heads/branch_7x from Jim Ferenczi\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=af54154 ]\n\nLUCENE-8121: Fix span terms frequency to return the freq of the entire spans (not the frequency of the term within the span). ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16322099",
+            "date": "2018-01-11T11:55:35+0000",
+            "content": "The expected score were correct, it's the frequency used to score the terms that was buggy. I pushed a fix that returns the expected frequency for a term that appears in a span query and the scores are the same as in the original commit now. I think it's just a missing change after optimizing some array resizing, David Smiley ? ",
+            "author": "Jim Ferenczi"
+        },
+        {
+            "id": "comment-16322249",
+            "date": "2018-01-11T14:06:52+0000",
+            "content": "Gah!  You are correct Jim (though not on the rationale).  I temporarily changed the freq to observe that the test would fail (and that the former score was lower), but then I forgot to change it back!  I ran precommit but forgot another round of executing the tests to be sure.  Thanks for fixing this up. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16372656",
+            "date": "2018-02-22T10:55:20+0000",
+            "content": "Think this can be resolved now. ",
+            "author": "Alan Woodward"
+        }
+    ]
+}

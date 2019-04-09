@@ -67,6 +67,7 @@ public class ClassParser {
             if(object instanceof MethodDeclaration){
                 MethodDeclaration declaration = (MethodDeclaration) object;
                 String methodName = declaration.getName().toString();
+                String name = declaration.getName().toString();
                 String parStr = "";
                 List parameters = declaration.parameters();
                 if(parameters.size() > 0){
@@ -83,9 +84,11 @@ public class ClassParser {
                 int endPosition = startPosition + declaration.getLength() - 1;
 
                 result.add(
-                        new Method(qualifiedName + "." + className + "." + methodName,
+                        new Method(qualifiedName + "." + className + ":" + methodName,
+                                name,
                                 getLine(startPosition),
-                                getLine(endPosition)
+                                getLine(endPosition),
+                                sourceCode.substring(startPosition, endPosition + 1)//declaration.toString()
                         )
                 );
             }
@@ -133,66 +136,63 @@ public class ClassParser {
         }
     }
 
-    public Set<String> getChangedMethod(Patch patch, boolean isNew){
-        Set<String> result = new HashSet<>();
-        for(FileHeader file: patch.getFiles()){
+    public Map<String, Method> getChangedMethod(EditList editList, boolean isNew) {
+        Map<String, Method> result = new HashMap<>();
 
+        int start = -1, end = -1;
+        if(isNew){
+            for(Edit edit: editList){
+                Edit.Type type = edit.getType();
+                if(type == Edit.Type.INSERT ||
+                        type == Edit.Type.REPLACE){
+                    start = edit.getBeginB() ;
+                    end = edit.getEndB() - 1;
+                }else
+                    continue;
+
+                for(Method method: methods){
+                    if(start >= method.startLine && start <= method.endLine ||
+                            end >= method.startLine && end <= method.endLine ||
+                            start <= method.startLine && end >= method.endLine) {
+                        result.put(method.fullName, method);
+                        //break; 不能加break;
+                    }
+                }
+
+            }
+        }else{
+            for(Edit edit: editList){
+                Edit.Type type = edit.getType();
+                if(type == Edit.Type.DELETE ||
+                        type == Edit.Type.REPLACE){
+                    start = edit.getBeginA() ;
+                    end = edit.getEndA() - 1;
+                }else
+                    continue;
+
+                for(Method method: methods){
+                    if(start >= method.startLine && start <= method.endLine ||
+                            end >= method.startLine && end <= method.endLine ) {
+                        result.put(method.fullName, method);
+                        //break; 不能break
+                    }
+                }
+
+            }
+        }
+        return result;
+    }
+
+    public Map<String, Method> getChangedMethod(Patch patch, boolean isNew){
+        Map<String, Method> result = new HashMap<>();
+        for(FileHeader file: patch.getFiles()){
             EditList list = null;
             try{
                 list = file.toEditList();
             }catch (NullPointerException e){
                 continue;
             }
-
-            int start = -1, end = -1;
-            if(isNew){
-                for(Edit edit: list){
-                    Edit.Type type = edit.getType();
-                    if(type == Edit.Type.INSERT ||
-                            type == Edit.Type.REPLACE){
-                        start = edit.getBeginB() ;
-                        end = edit.getEndB() - 1;
-                    }else
-                        continue;
-
-                    for(Method method: methods){
-                        if(start >= method.startLine && start <= method.endLine ||
-                                end >= method.startLine && end <= method.endLine ||
-                                start <= method.startLine && end >= method.endLine) {
-                            result.add(method.fullName);
-                            //break; 不能加break;
-                        }
-                    }
-
-                }
-            }else{
-                for(Edit edit: list){
-                    Edit.Type type = edit.getType();
-                    if(type == Edit.Type.DELETE ||
-                        type == Edit.Type.REPLACE){
-                        start = edit.getBeginA() ;
-                        end = edit.getEndA() - 1;
-                    }else
-                        continue;
-
-                    for(Method method: methods){
-                        if(start >= method.startLine && start <= method.endLine ||
-                                end >= method.startLine && end <= method.endLine ) {
-                            result.add(method.fullName);
-                            //break; 不能break
-                        }
-                    }
-
-                }
-            }
-        }
-        return result;
-    }
-
-    public String getSubString(int startLine, int endLine) {
-        String result = "";
-        for (int line = startLine; line <= endLine; line ++) {
-            result += codeLines[line] + "\n";
+            result.putAll(getChangedMethod(list, isNew));
         }
         return result;
     }
@@ -201,7 +201,7 @@ public class ClassParser {
      * 初始化该对象，包括：
      *      每一行对应的起始-终止位置
      *      函数信息
-     * @param sourceCode
+     * @param sourceCode 源代碼
      */
     private void initialize(String sourceCode){
         this.sourceCode = sourceCode;
@@ -238,6 +238,14 @@ public class ClassParser {
         return this;
     }
 
+    public boolean contains(String methodName) {
+        for (Method method: methods) {
+            if (method.fullName.equals(methodName))
+                return true;
+        }
+        return false;
+    }
+
     public static void main(String[] args){
         try {
             BufferedReader reader = new BufferedReader(new FileReader(new File("code.txt")));
@@ -248,7 +256,7 @@ public class ClassParser {
             }
             reader.close();
 
-            ClassParser parser = new ClassParser(code);
+            ClassParser parser = new ClassParser().setSourceCode(code);
         }catch (Exception e){
             e.printStackTrace();
         }

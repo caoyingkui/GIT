@@ -1,0 +1,769 @@
+{
+    "id": "LUCENE-7976",
+    "title": "Make TieredMergePolicy respect maxSegmentSizeMB and allow singleton merges of very large segments",
+    "details": {
+        "labels": "",
+        "priority": "Major",
+        "resolution": "Fixed",
+        "affect_versions": "None",
+        "status": "Closed",
+        "type": "Improvement",
+        "components": [],
+        "fix_versions": [
+            "7.5",
+            "master (8.0)"
+        ]
+    },
+    "description": "We're seeing situations \"in the wild\" where there are very large indexes (on disk) handled quite easily in a single Lucene index. This is particularly true as features like docValues move data into MMapDirectory space. The current TMP algorithm allows on the order of 50% deleted documents as per a dev list conversation with Mike McCandless (and his blog here:  https://www.elastic.co/blog/lucenes-handling-of-deleted-documents).\n\nEspecially in the current era of very large indexes in aggregate, (think many TB) solutions like \"you need to distribute your collection over more shards\" become very costly. Additionally, the tempting \"optimize\" button exacerbates the issue since once you form, say, a 100G segment (by optimizing/forceMerging) it is not eligible for merging until 97.5G of the docs in it are deleted (current default 5G max segment size).\n\nThe proposal here would be to add a new parameter to TMP, something like <maxAllowedPctDeletedInBigSegments> (no, that's not serious name, suggestions welcome) which would default to 100 (or the same behavior we have now).\n\nSo if I set this parameter to, say, 20%, and the max segment size stays at 5G, the following would happen when segments were selected for merging:\n\n> any segment with > 20% deleted documents would be merged or rewritten NO MATTER HOW LARGE. There are two cases,\n>> the segment has < 5G \"live\" docs. In that case it would be merged with smaller segments to bring the resulting segment up to 5G. If no smaller segments exist, it would just be rewritten\n>> The segment has > 5G \"live\" docs (the result of a forceMerge or optimize). It would be rewritten into a single segment removing all deleted docs no matter how big it is to start. The 100G example above would be rewritten to an 80G segment for instance.\n\nOf course this would lead to potentially much more I/O which is why the default would be the same behavior we see now. As it stands now, though, there's no way to recover from an optimize/forceMerge except to re-index from scratch. We routinely see 200G-300G Lucene indexes at this point \"in the wild\" with 10s of  shards replicated 3 or more times. And that doesn't even include having these over HDFS.\n\nAlternatives welcome! Something like the above seems minimally invasive. A new merge policy is certainly an alternative.",
+    "attachments": {
+        "SOLR-7976.patch": "https://issues.apache.org/jira/secure/attachment/12927125/SOLR-7976.patch",
+        "LUCENE-7976.patch": "https://issues.apache.org/jira/secure/attachment/12893596/LUCENE-7976.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-16188704",
+            "date": "2017-10-02T19:44:16+0000",
+            "content": "I had this issue on a previous project. Our indices were smaller than what you are talking about but we did have one or two of the max size segments that refused to merge away their deleted documents until they got to 50%. We had a fairly high update rate and a very high query rate. The deleted documents bloated the working set size somewhat causing more IO which was our bottleneck at the time. I would have been happy to pay for the increased merge IO to have lower query time IO.\n\nWe ultimately solved the problem by throwing money at it. More ram and better SSDs makes life much easier. I would have liked to have solved the problem in software but as an very infrequent contributor I didn't feel like I'd ever get a change to TieredMergePolicy merged. ",
+            "author": "Nik Everett"
+        },
+        {
+            "id": "comment-16189781",
+            "date": "2017-10-03T14:40:14+0000",
+            "content": "I would have liked to have solved the problem in software but as an very infrequent contributor I didn't feel like I'd ever get a change to TieredMergePolicy merged.\n\nPlease don't think like that   Good ideas are good ideas regardless of who they come from!\n\nIt's too bad people call forceMerge and get themselves into this situation to begin with   Maybe we should remove that method!  Or maybe the index should be put into a read-only state after you call it?\n\nAnyway, +1 to add another option to TMP.  Maybe it should apply to the whole index?  I.e. the parameters states that the index at all times should have less than X% deletions overall?  This way TMP is free to merge whichever segments will get it to that, but that would typically mean merging the big segments since they have most of the deletes.\n\nThe danger here is that if you set that parameter to 0 the results are catastrophic merging.  Maybe we place a lowerbound (20%) on how low you can set that parameter? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16189953",
+            "date": "2017-10-03T16:48:08+0000",
+            "content": "-1 to making the index read-only. It's just too easy to get in that trap and be stuck forever. Maybe a really-strongly worded warning in the docs and the Solr admin UI?\n\n-1 for taking the option away. I see far too many situations where users index rarely, say once a day and want to optimize to squeeze every last bit of performance they can. And maybe take the option out Solr's admin UI, but that's a separate issue.\n\nI think one of the critical bits is to rewrite segments that are > X% deleted, no matter how big. At least that gives people a way to recover, albeit painfully. Whatever solution needs to do that I think.\n\nAs for whether X% is per segment or index-wide I don't have any strong preferences. Enforcing that on a per-segment basis would automatically make it true for the entire index, but doing it index-wide would allow for less rewrites, let's say you have one segment, particularly a small one with 50% deleted docs that make up 1% of the whole index. There's not much need to rewrite it..... ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16189987",
+            "date": "2017-10-03T17:11:43+0000",
+            "content": "I think the main issue here is that only Solr still call the option \"optimize\" in the update request handler which is misleading. Maybe change that to be not so \"oh that's a good thing it makes everything better\" option.\n\nI know the issue, so the first thing I tell solr customers is: \"never ever call optimize unless your index is static.\" ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16191312",
+            "date": "2017-10-04T14:22:43+0000",
+            "content": "\"I think the main issue\" ... I disagree; this issue is about freeing up many deleted docs.  Uwe, feel free of course to create a Solr issue to rename \"optimize\" to \"forceMerge\" and to suggest where the Solr Ref Guide's wording is either bad or needs improvement.  I think these are clearly separate from this issue.   ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16191319",
+            "date": "2017-10-04T14:25:02+0000",
+            "content": "Agreed, it's not strictly a result of optimizations.  It can happen for large collections or with many updates to existing documents. ",
+            "author": "Timothy M. Rodriguez"
+        },
+        {
+            "id": "comment-16191339",
+            "date": "2017-10-04T14:35:50+0000",
+            "content": "It can happen for large collections or with many updates to existing documents.\n\nHmm can you explain how?  TMP should produce max sized segments of ~5 GB, and allow at most 50% deleted documents in them, at which point they are eligible for merging.\n\nDoing a forceMerge yet then continuing to add documents to your index can result in a large (> 5 GB) segment with more than 50% deletions not being merged away.\n\nBut I don't see how this can happen if you didn't do a forceMerge in the past? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16191428",
+            "date": "2017-10-04T15:24:30+0000",
+            "content": "\nIt's too bad people call forceMerge and get themselves into this situation to begin with  Maybe we should remove that method! Or maybe the index should be put into a read-only state after you call it?\n\n\nI know the issue, so the first thing I tell solr customers is: \"never ever call optimize unless your index is static.\"\n\nThe read-only idea is really cool, maybe consider deprecating forceMerge() and adding freeze()? I think this removes the trap completely and still allows for use-cases where people just want less segments for the read-only case. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16191454",
+            "date": "2017-10-04T15:44:23+0000",
+            "content": "How about having forceMerge() obey max segment size. If you really want to merge down to one segment, you have to change the policy to increase the max size. ",
+            "author": "Mike Sokolov"
+        },
+        {
+            "id": "comment-16191470",
+            "date": "2017-10-04T15:51:49+0000",
+            "content": "If a collection has many 5GB segments, it's possible for many of them to be at less than 50% but still accumulate a fair amount of deletes.  Increasing the max segment helps, but increases the amount of churn on disk through large merges. ",
+            "author": "Timothy M. Rodriguez"
+        },
+        {
+            "id": "comment-16191488",
+            "date": "2017-10-04T16:01:34+0000",
+            "content": "How about having forceMerge() obey max segment size. If you really want to merge down to one segment, you have to change the policy to increase the max size.\n\n+1, that makes a lot of sense.  Basically TMP is buggy today because it allows forceMerge to create too-big segments. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16191494",
+            "date": "2017-10-04T16:03:00+0000",
+            "content": "If a collection has many 5GB segments, it's possible for many of them to be at less than 50% but still accumulate a fair amount of deletes. Increasing the max segment helps, but increases the amount of churn on disk through large merges.\n\nRight, but that's a normal/acceptable index state, where up to 50% of your docs are deleted.\n\nWhat this bug is about is cases where it's way over 50% of your docs that are deleted, and as far as I know, the only way to get yourself into that state is by doing a forceMerge and then continuing to update/delete documents. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16191510",
+            "date": "2017-10-04T16:19:11+0000",
+            "content": "Michael McCandless thought this issue was about the case where you have segments that are effectively unmergeable and that stick around at < 50% deletes? We have seen this in our production systems where these segments which are at the segment size limit sick around and waste not only disk resources but throw off term frequencies because the policy does not merge at the lower delete level. Would love a way to specify that segments which would normally be unmergeable should still be considered for operations in the event the number of deletes passes a (lower) threshold.  ",
+            "author": "Michael Braun"
+        },
+        {
+            "id": "comment-16191541",
+            "date": "2017-10-04T16:40:15+0000",
+            "content": "Is it reasonable to modify the delete percentage in the policy while leaving the max in place?\n\n\n\u2013 \nSent from my Android device with K-9 Mail. Please excuse my brevity. ",
+            "author": "Mike Sokolov"
+        },
+        {
+            "id": "comment-16191703",
+            "date": "2017-10-04T17:51:05+0000",
+            "content": "I linked in SOLR-7733 for dealing with the admin UI optimize button (I favor removing it entirely, make people put in some effort to back themselves into a corner).\n\nre: read-only rather than optimize.....\n\nIt may be the cases I've seen where users think optimize gives a speed improvement are really the result of squeezing out the deleted documents. Question for the Lucene folks, what would you guess the performance differences would be between.\n\na single 200G segment?\n40 5G segments?\n\nWith no deleted documents? I see indexes on disk at that size in the wild.\n\nIf the perf in the two cases above is \"close enough\" then freezing rather than optimize is an easier sell. The rest of this JIRA is about keeping the % deleted documents small, which, if we do, would handle the perf issues people get currently from forceMerge, assuming the above.\n\nMike Sokolov The delete percentage isn't really the issue currently, if TMP respects max segment size it can't merge two segments > 50% live docs. If TMP were tweaked to merge unlike size segments when some % deleted docs is exceeded in the large one (i.e. merge a segment with 4.75G live docs with a segment with 0.25G live docs) we could get there.\n\nMichael McCandless: \n\nbq: Right, but that's a normal/acceptable index state, where up to 50% of your docs are deleted\n\nGotta disagree with acceptable, normal I'll grant. We're way over indexes being terabytes and on our way to petabytes. I have cases where they're running out of physical room to add more disks. Saying that half your disk space being occupied by deleted documents is a hard sell. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16191712",
+            "date": "2017-10-04T17:56:42+0000",
+            "content": "\"I think the main issue\" ... I disagree; this issue is about freeing up many deleted docs. Uwe, feel free of course to create a Solr issue to rename \"optimize\" to \"forceMerge\" and to suggest where the Solr Ref Guide's wording is either bad or needs improvement. I think these are clearly separate from this issue.\n\nSorry, it is always caused by calling \"optimize\" or \"forceMerge\" at some point in the past. Doing this always brings the index into a state where the deletes sum up, because its no longer in an ideal state for deleting an adding new documents. If you never call forceMerge/optifucke (sorry \"optimize\" haha), the deletes won't automatically sum up, as TieredMergePolicy will merge them away. The deleted documents ratio is in most cases between 30 and 40% on the whole index in that case. But if you force merge it gets bad and you sometimes sum up 80% deletes. The reason was described before.\n\nAnd for that reason it is way important to remove \"optimize\" from Solr, THIS issue won't happen without \"optifucke\"! PERIOD. ",
+            "author": "Uwe Schindler"
+        },
+        {
+            "id": "comment-16192266",
+            "date": "2017-10-05T00:30:45+0000",
+            "content": "There are two issues here that are a bit conflated; the consequences of forceMerge and having up to 50% of your index space used up by deleted docs:\n\n1> If they do optimize/forcemerge/expungeDeletes, they're stuck. Totally agree that having a big red button makes that way too tempting. Even if removed, users can still use the optimize call from the SolrJ client and/or via the update handler. So one issue is if there are ways to prevent the unfortunate consequences (the freeze idea, only optimize into segments max segment size etc) or recover somehow (some of the proposals above).  Keeping the number of deleted docs lower would make pressing that button less tempting, but the button still should be removed. There are ways to forceMerge even if removed though.\n\n2> Even if they don't forcemerge/expungeDeletes, having 50% of the index consumed by deleted docs can be quite costly. Telling users that they have only two choices, 1> start and keep optimizing or 2> buy enough hardware that they can meet their SLAs with half their index space wasted is a hard sell. We have people who need 100s of machines in their clusters to hit their SLAs. Accepting up to 50% deleted docs as the norm means potentially millions of dollars in unnecessary hardware.\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16192424",
+            "date": "2017-10-05T03:31:39+0000",
+            "content": "There are plenty of use-cases for a forceMerge or optimize to be done in either special cases, or on a fixed schedule.  It's a deficiency that the default merge policy can't deal more intelligently with that.  Merge policies are pluggable though, so we may be able to deal with this at either the Lucene or Solr level.  No need for 100% of all devs to agree \n\nany segment with > X% deleted documents would be merged or rewritten NO MATTER HOW LARGE.\n\n+1 for the idea... I haven't thought about all the ways it might interact with other things, but I like it in general.\nSegments with X% deleted docs will be candidates for merging.  Max segment sizes will still be targeted of course, so if it's estimated size after merging with smaller segments is less than the max seg size, we're good.  If not, merge it by itself (i.e. expungeDeletes). ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16211797",
+            "date": "2017-10-19T21:47:11+0000",
+            "content": "There are two scenarios that are being discussed here:\n\n\tUsers having large indexes and segments having <50% deleted docs. They aren't getting cleaned away because segments have become 5G. The absolute number of deleted docs is very high in this index because they were large to begin with.\n\tA user called optimize and now that one big segment will never get merged away.\n\n\n\nBoth are similar but the latter has got to do with users running the optimize command. Re-naming the command from the Solr side and other changes is important here.\n\nBut the first scenario is what I've now seen at two clusters recently so I'd like to tackle this. \n\nWe have a default on what the max segment size should be which is really nice. However I'm not convinced that adding a new setting which merges two segments when it reaches a delete threshold is a good idea. It works for this scenario but now we'll have a segment that's 8GB in size and then two 8GB segments will merge into a 14GB segment etc. The merge times will increase and potentially over the period of time could be harmful?\n\nInstead what if the delete threshold worked like this: if we can't find any eligible merges , pick a segment which is 5G in size and more than the threshold deletes and rewrite just that segment. So now the 5G segment will become 4G effectively purging he documents. Also keep a lower bound check so users can't set a delete threshold below 20%. ",
+            "author": "Varun Thacker"
+        },
+        {
+            "id": "comment-16211829",
+            "date": "2017-10-19T22:04:05+0000",
+            "content": "However I'm not convinced that adding a new setting which merges two segments when it reaches a delete threshold is a good idea. It works for this scenario but now we'll have a segment that's 8GB in size and then two 8GB segments will merge into a 14GB segment etc. \n\nThat would be a bad idea, but I'm not sure anyone proposed that.  Looks to me like what both Erick & I said was that the max segment size would still be respected.\n\nInstead what if the delete threshold worked like this: if we can't find any eligible merges , pick a segment which is 5G in size and more than the threshold deletes and rewrite just that segment. So now the 5G segment will become 4G effectively purging he documents. Also keep a lower bound check so users can't set a delete threshold below 20%.\n\nIt seems simpler to do what I proposed above: make the segment a candidate for merging.  If no other segments can be merged with it and keep under 5G, then it will be merged by itself.  But it could also be merged with other segments if the resulting size is estimated to be under the cap.  Looking back at Erick's rules first proposed, it looks like the same thing actually (same result, but just a different way of looking at it).\n ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16211857",
+            "date": "2017-10-19T22:27:37+0000",
+            "content": "+1 . I'll try to work on it in the next few days ",
+            "author": "Varun Thacker"
+        },
+        {
+            "id": "comment-16211959",
+            "date": "2017-10-20T00:11:47+0000",
+            "content": "What Yonik said.\n\n+1 to working up a patch. I actually think this is pretty important.\n\nbq: Also keep a lower bound check so users can't set a delete threshold below 20%.\n\nDon't know. This is another arbitrary decision that may or may not apply. Perhaps a strongly worded suggestion that this be the lower bound and a WARN message on startup if they specify < 20%? 20% of a 10TB (aggregate across shards) index is still a lot. I don't have strong feelings here though.\n\nHmmm. If you have a setter like setMaxDeletePctBeforeSingletonMerge(double pct) then through reflection you can just specify\n<double name=\"maxDeletePctBeforeSingletonMerge>5</double>\nin the merge policy and it'll automagically get picked up. Then we don't advertise it, making it truly expert.... \n\nbq:  ...pick a segment which is 5G in size and more than the threshold deletes...\n\nMinor refinement. Pick a segment > 2.5G \"live\" documents and > X% deleted docs and merge it. That way we merge a 4G segment with 20% deleted into a 3.2G segment. Rinse and repeat until it had < 2.5G live docs at which point it's eligible for regular merging.\n\nThe sweet thing about this is that it would allow users to recover from an optimize. Currently if they do hit that big red button and optimize they can't recover deleted documents until that single huge segment has < 2.5G live docs. Something like this will keep rewriting that segment into smaller and smaller (though still large) segments and it'll eventually disappear. Mind you it'll be painful, but at least it'll eventually get there.\n\nI'm not sure whether to make this behavior the default for  TieredMergePolicy or not. Other than rewriting very large segments, the current policy is essentially this with X being 50%. Despite my comments about keeping reflection above, WDYT about just making this explicit? That is, default a parameter like \"largeSegmentMaxDeletePct\" to 50?\n\nAnd for a final thought, WDYT about Mike's idea of making optimize/forcemerge/expungeDeletes respect maxSegemntSize? I think we still need to rewrite segments as this JIRA proposes since the current policy can hover around 50%. I'm lukewarm to making optimize respect max segment size since it would change that behavior, but I don't have strong feelings on it. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16211983",
+            "date": "2017-10-20T00:37:39+0000",
+            "content": "And for a final thought, WDYT about Mike's idea of making optimize/forcemerge/expungeDeletes respect maxSegemntSize?\n\nI think that would be great to be able to specify it per-operation.  That way one could do minor or major forceMerges/optimizes on different schedules or for different reasons.  The current maxSegSize could just be a default. ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16212949",
+            "date": "2017-10-20T17:50:08+0000",
+            "content": "I don't think we can allow different max segment sizes for forced merges and natural merges; that's effectively the state we are in today and it causes the bug (case 1) we have here, because natural merging can't touch the too-big segments.  I think we need to fix forceMerge, and findForcedDeletesMerges, to respect the maximum segment size, and if you really want a single segment and your index is bigger than 5 GB (default max segment size), you need to increase that maximum.  This would solve case 1 (the \"I ran forceMerge and yet continued updating my index\" situation).\n\nFor case 2, if we also must solve the \"even 50% deletions is too much for me\" case (and I'm not yet sure we should... Lucene is quite good at skipping deleted docs during search), maybe we could simply relax TMP so that even max sized segments that have < 50% deletions are eligible for merging.  Then, they would be considered for natural merging right off, and users could always (carefully!) tune up the reclaimDeletesWeight to more aggressively target segments with deletions. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16213021",
+            "date": "2017-10-20T18:35:29+0000",
+            "content": "Mike:\n\nbq: Lucene is quite good at skipping deleted docs during search....\n\nThat's not the nub of the issue for me. I'm seeing very large indexes, 200-300G is quite common lately on a single core. We have customers approaching 100T indexes in aggregate in single Solr collections. And that problem is only going to get worse as hardware improves and super-especially if Java's GC algorithm evolves to work smoothly with larger heaps. BTW, this is not theoretical, I have a client using Azul's Zing with Java heaps approaching 80G. It's an edge case to be sure, but similar will become more common.\n\nSo 50% deleted documents consumes a lot of resources, both disk and RAM when considered in aggregate at that scale. I realize that any of the options here will increase I/O, but that's preferable to having to provision a new data center because you're physically out of space and can't add more machines or even attach more storage to current machines.\n\nbq: maybe we could simply relax TMP so that even max sized segments that have < 50% deletions are eligible for merging\n\nJust to be sure I understand this... Are you saying that we make it possible to merge, say, one segment with 3.5G and 5 other segments each 0.3G? That seems like it'd work.\n\nThat leaves finding a way out of what happens when someone actually does have a huge segment as a result of force merging. I know, I know, \"don't do that\" and \"get rid of the big red optimize button in the Solr admin screen and stop talking about it!\". I suppose your suggestion can tackle that too if we define an edge case in your \"relax TMP so that....\" idea to include a \"singleton merge\" if the result of the merge would be > max segment size.\n\nThanks for your input! Let's just say I have a lot more faith in your knowledge of this code than mine...... ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16213024",
+            "date": "2017-10-20T18:37:03+0000",
+            "content": "An additional place where deletions come up is in replica differences due to the way merging happened on a shard.  This can cause jitter in results where the ordering will depend on which shard answered a query because the frequencies are off significantly enough.  I know this problem will never go away completely as we can't flush away deletes immediately, but allowing some reclamation of deletes in large segments will help minimize the issue.\n\nOn max segment size, I also think the merge policy ought to dutifully respect maxSegmentSize.  If we don't, other smaller bugs can come up for users, such as ulimits on file size, that they thought they were safely under. ",
+            "author": "Timothy M. Rodriguez"
+        },
+        {
+            "id": "comment-16213050",
+            "date": "2017-10-20T18:50:58+0000",
+            "content": "bq: If we don't, other smaller bugs can come up for users, such as ulimits on file size, that they thought they were safely under.\n\nMax segment sizes are a target, not a hard guarantee... Lucene doesn't know exactly how big the segment will be before it actually completes the merge, and it can end up going over the limit. ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16213052",
+            "date": "2017-10-20T18:52:13+0000",
+            "content": "I didn't know that! Thanks for pointing out. ",
+            "author": "Timothy M. Rodriguez"
+        },
+        {
+            "id": "comment-16213085",
+            "date": "2017-10-20T19:16:38+0000",
+            "content": "The max segment size is great for a number of reasons:\n\n\tBy default, prevents an unpredictable huge cascading merge when the user doesn't want it\n\tBy default, prevents a huge segment if the user never wants huge segments\n\n\n\nThe downside to a max segment size is that one can start getting many more segments than anticipated or desired (and can impact performance in unpredictable ways, depending on the exact usage).\nIf a user specifically asks to forceMerge (i.e. they realized they have 200 segments and they want to bring that down to 20), then that should be respected. ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16213175",
+            "date": "2017-10-20T20:23:19+0000",
+            "content": "Very interesting discussion and problem.\n\nIf we ignore for a moment what TMP actually does, and back up to the design intent when the policy was made ... what would the designer have wanted to happen in the case of a segment that's considerably larger than the configured max size?  Took me a while to find the right issue, which is LUCENE-854, work by Michael McCandless.\n\nI suspect that the current behavior, where a segment that's 20 times larger than the configured max segment size is ineligible for automatic merging until 97.5 percent deleted docs, was not actually what was desired.  Indexes with a segment like might not have even been considered when TMP was new.  I don't see anything in LUCENE-854 that mentions it.  I haven't checked all the later issues where changes to TMP were made.\n\nSo, how do we deal with this problem?  I see three options.  We can design an entirely new policy, and if its behavior becomes preferred, consider changing the default at a later date.  We can change TMP so it behaves better with very large segments with no change in user code or config.  We can add Erick's suggested option.  For any of these options, improved documentation is a must.\n\nThe second option (and the latter half of the first option) carries one risk factor I can think of \u2013 users complaining about new behavior in a similar manner to what I've heard about when the default directory was changed to MMAP. ",
+            "author": "Shawn Heisey"
+        },
+        {
+            "id": "comment-16213189",
+            "date": "2017-10-20T20:34:12+0000",
+            "content": "There are more options Shawn. Its a bug that we created this 20x too big segment to begin with. The configured merge policy is not configured to create a segment that big. Mike Sokolov suggestion about fixing that seems like the correct fix. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16213213",
+            "date": "2017-10-20T20:54:15+0000",
+            "content": "It's not a bug, it's a feature.  It's an explicit request that may or may not be a mistake on the part of the user, and it can certainly be a judgement call.  Given that it's explicit and we don't know if is advisable or not, we should do what is requested.\n\nThe root cause of the problem here seems to be that we have only one variable (maxSegmentSize) and multiple use-cases we're forcing on it:\n1) the max segment size that can be create automatically just by adding documents (this is maxSegmentSize currently)\n2) the max segment size that can ever be created, even through explicit forceMerge (this is more for Tim's usecase... certain filesystems or transports may break if you go over certain limits)\n\nThere is no variable/setting for #2 currently, but we should not re-use the current maxSegmentSize for this as it conflates the two use-cases.\nPerhaps something like hardMaxSegmentSize or something? ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16213228",
+            "date": "2017-10-20T20:58:58+0000",
+            "content": "I don't agree its a feature. The documentation for IndexWriter.forceMerge states:\n\nForces merge policy to merge segments until there are <= maxNumSegments. The actual merges to be executed are determined by the MergePolicy.\n\nI bolded sentence two just for emphasis. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16213242",
+            "date": "2017-10-20T21:06:11+0000",
+            "content": "The actual merges to be executed are determined by the MergePolicy.\n\nAnd so then we go and look a the merge policy in question (TieredMergePolicy) which says:\n\n *  <p><b>NOTE</b>: This policy always merges by byte size\n *  of the segments, always pro-rates by percent deletes,\n *  and does not apply any maximum segment size during\n *  forceMerge (unlike {@link LogByteSizeMergePolicy}).\n\n ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16213253",
+            "date": "2017-10-20T21:14:59+0000",
+            "content": "\nThe root cause of the problem here seems to be that we have only one variable (maxSegmentSize) and multiple use-cases we're forcing on it:\n1) the max segment size that can be create automatically just by adding documents (this is maxSegmentSize currently)\n2) the max segment size that can ever be created, even through explicit forceMerge (this is more for Tim's usecase... certain filesystems or transports may break if you go over certain limits)\n\nActually, looking at the other merge policy, LogByteSizeMergePolicy, it already has different settings for these different concepts/use-cases:\n\n\tsetMaxMergeMB()\n\tsetMaxMergeMBForForcedMerge()\n\n ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16213266",
+            "date": "2017-10-20T21:23:34+0000",
+            "content": "This can cause jitter in results where the ordering will depend on which shard answered a query because the frequencies are off significantly enough. \n\nSegment-based replication (http://blog.mikemccandless.com/2017/09/lucenes-near-real-time-segment-index.html) would improve this situation, in that the jitter no longer varies by shard since all replicas search identical point-in-time views of the index.  It's also quite a bit more efficient if you need many replicas.\n\nI suspect that the current behavior, where a segment that's 20 times larger than the configured max segment size is ineligible for automatic merging until 97.5 percent deleted docs, was not actually what was desired.\n\nRight!  The designer didn't think about this case because he didn't call forceMerge so frequently \n\nMax segment sizes are a target, not a hard guarantee... Lucene doesn't know exactly how big the segment will be before it actually completes the merge, and it can end up going over the limit.\n\nRight, it's only an estimate, but in my experience it's conservative, i.e. the resulting merged segment is usually smaller than the max segment size, but you cannot count on that.\n\nThe downside to a max segment size is that one can start getting many more segments than anticipated or desired (and can impact performance in unpredictable ways, depending on the exact usage).\n\nRight, but the proposed solution (TMP always respects the max segment size) would work well such users: they just need to increase their max segment size if they need to get a 10 TB index down to 20 segments.\n\nSo 50% deleted documents consumes a lot of resources, both disk and RAM when considered in aggregate at that scale.\n\nWell, disks are cheap and getting cheaper.  And 50% is the worst case \u2013 TMP merges those segments away once they hit 50%, so that the net across the index is less than 50% deletions.  Users already must have a lot of free disk space to accommodate running merges, pending refreshes, pending commits, etc.\n\nErick, are these timestamp'd documents?  It's better to index those into indices that rollover with time (see how Elasticsearch recommends it: https://www.elastic.co/blog/managing-time-based-indices-efficiently), where it's far more efficient to drop whole indices than delete documents in one index.\n\nStill, I think it's OK to relax TMP so it will allow max sized segments with less than 50% deletions to be eligible for merging, and users can tune the deletions weight to force TMP to aggressively merge such segments.  This would be a tiny change in the loop that computes tooBigCount.\n\nThe root cause of the problem here seems to be that we have only one variable (maxSegmentSize) and multiple use-cases we're forcing on it:\n\nBut how can that work?\n\nIf you have two different max sizes, then how can natural merging work with the too-large segments in the index due to a past forceMerge?  It cannot merge them and produce a small enough segment until enough (too many) deletes accumulate on them.\n\nOr, if we had two settings, we could insist that the maxForcedMergeSegmentSize is <= the maxSegmentSize but then what's the point \n\nThe problem here is forceMerge today sets up an index structure that natural merging is unable to cope with; having forceMerge respect the max segment size would fix that nicely.  Users can simply increase that size if they want massive segments. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16213427",
+            "date": "2017-10-20T22:37:51+0000",
+            "content": "But how can that work?\n\nIt will work as defined.  For some, this will be worse and they should not have called forceMerge.  For others, they knew what they were doing and it's exactly what they wanted.\nIf you don't want 1 big segment, don't call forceMerge(1).\n\nOr, if we had two settings, we could insist that the maxForcedMergeSegmentSize is <= the maxSegmentSize but then what's the point \n\nSee LogByteSizeMergePolicy which already works correctly and defaults to maxSegmentSize=2GB, maxForcedMergeSegmentSize=Long.MAX_VALUE\n ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16214159",
+            "date": "2017-10-22T02:59:07+0000",
+            "content": "Mike:\n\nbq: The designer didn't think about this case\nThat's funny! If you only knew how many times \"the designer\" of some of my code \"didn't think about....\" well, a lot of things....\n\nbq: Erick, are these timestamp'd documents?\nSome are, some aren't. Time-series data is certainly amenable to rolling over, but I have clients with significantly different data sets that are not timestamped and don't really work trying to add shards for new time periods.\n\nbq: And 50% is the worst case...\ntrue, but in situations where\n> the index is in the 200G range, implying 40 segments or so default\n> random ones are replaced\n\nit gets close enough to 50% for me to consider it a norm.\n\nbq: disks are cheap and getting cheaper.\nBut space isn't. I also have clients who simply cannot expand their capacity due to space constraints. I know it sounds kind of weird in this age of AWS but it's true. Some organizations require on-prem servers, either through corporate policy or dealing with sensitive information.\n\nbq: Users already must have a lot of free disk space to accommodate running merges\nRight, but that makes it worse. To store 1TB of \"live\" docs, I need an extra TB just to hold the index if it has 50% deleted docs, plus enough free space for ongoing merges. And aggregate indexes are rapidly approaching petabytes (not per shard of course, but.....)\n\nThis just looks to me like the natural evolution as Lucene gets applied to ever-bigger data sets. When TMP was designed (hey, I was alive then) sharding to deal with data sets we routinely deal with now was A Big Deal. Solr/Lucene (OK, I'll admit ES too) have gotten much better at dealing with much larger data sets, so it's time to revisit some of the assumptions, and here we are.....\n\nI'll also add that for lots of clients, \"just add more disk space\" is a fine solution, one I recommend often. The engineering time wasted trying to work around a problem that would be solved with $1,000 of new disks makes me tear my hair out. And I'll add that I don't usually deal with clients that have tiny little 1T aggregate indexes much, so my view is a bit skewed. That said, today's edge case is tomorrow's norm.\n\nAnd saying \"tiny little 1T aggregate indexes\" is, indeed, intended to be ironic..... ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16214299",
+            "date": "2017-10-22T12:14:39+0000",
+            "content": "\nso it's time to revisit some of the assumptions, and here we are.....\n\nExcept i don't see solr actually doing that. We've identified an actual root cause here (optimize), and there is pushback against fixing it: this is solr stuck in its old ways with top-level fieldcaches and all the other stuff.\n\nIn the other case of many deletes, I just imagine the trappy solr features that can create such a situation, delete-by-query and \"atomic updates\" come to mind. \n\nSo when will the root causes get fixed? Solr needs to fix this stuff. Lets not hack around it after-the-fact by making TieredMP more complex. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16214347",
+            "date": "2017-10-22T15:26:19+0000",
+            "content": "I completely agree that removing the Solr optimize button should be done, take that as read. I've linked that JIRA here. I think these two issues are interrelated. We need to give users some tools to control the percentage deleted docs their index accumulates and make it much less tempting to back themselves into a corner.\n\nI do not and will not agree that all uses of forceMerge are invalid. Currently, one thing that contributes to their being overused is the percentage of deleted documents in the index. If a user notices that near 50% of the docs are deleted, what else can they do? expungeDeletes doesn't help here, it still creates a massive segment.\n\nThe other valid use case is an index that changes, say, once a day. forceMerge makes perfect sense here since it can be run every time the index is built and does result in some improvements in throughput. People squeezing 1,000s of QPS out of their system are pretty sensitive to any throughput increase they can get.\n\nMaking optimize less attractive or harder to use does not address the problem that TMP can (and does! see Mikes blog) accumulate up to 50% of the index as deleted documents during the normal course of an indexes' lifetime.\n\nAs for removing \"trappy behavior\" like delete-by-query or atomic updates, there are completely valid use cases where the entire index gets replaced gradually over time that would get us back into this situation even if those features were removed. And I can't imagine getting consensus that they should be removed. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16214947",
+            "date": "2017-10-23T10:41:41+0000",
+            "content": "\n> But how can that work?\n\nIt will work as defined. For some, this will be worse and they should not have called forceMerge. For others, they knew what they were doing and it's exactly what they wanted.\nIf you don't want 1 big segment, don't call forceMerge(1).\n\nBut then the bug is not fixed?  I.e. if we don't require forced merges and natural merges to respect the same segment size, then users who force merge and then insist on continuing to change the index can easily get themselves to segments with 97% deletions.\n\nWith a single enforced max segment size, even then users can still get into trouble if they really want to, e.g. by making it MAX_LONG, running forceMerge, and then reducing it back to 5 GB default again.\n\nOr maybe we really should deprecate forceMerge and add a new forceMergeAndFreeze method...\n\nSee LogByteSizeMergePolicy which already works correctly and defaults to maxSegmentSize=2GB, maxForcedMergeSegmentSize=Long.MAX_VALUE\n\nJust because an older merge policy did it this way does not mean we should continue to repeat the mistake.  Two wrongs don't make a right!\n\nI completely agree that removing the Solr optimize button should be done, take that as read. \n\n+1; it's insane how tempting that button makes this dangerous operation.  Who wouldn't want to \"optimize\" their index?  Hell if my toaster had a button that looked like Solr's optimize button, I would press it every time I made toast!\n\nI do not and will not agree that all uses of forceMerge are invalid. Currently, one thing that contributes to their being overused is the percentage of deleted documents in the index. If a user notices that near 50% of the docs are deleted, what else can they do? expungeDeletes doesn't help here, it still creates a massive segment.\n\nBut if we make the small change to allow max sized segments to be merged regardless of their % deletes then that should fix that reason for force merge?\n\nThere are two separate bugs here:\n\n\tIf you force merge then keep updating you can get to segments with 97% deletes; fixing all force merges to respect max segment size fixes this.\n\t50% is too many deleted docs for some use cases; fixing TMP to let the large segments be eligible for merging, always, plus maybe tuning up the existing reclaimDeletesWeight, fixes that.\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16215300",
+            "date": "2017-10-23T15:26:58+0000",
+            "content": "I worked up a patch for SOLR-7733, just had the revelation that while I'm at it i can change references to \"optimize\" in the ref guide to \"forceMerge\" to see if that makes it less tempting to use.\n\nbq: they really want to, e.g. by making it MAX_LONG, running forceMerge, and then reducing it back to 5 GB default again.\n\nRight, but I'm completely unsympathetic in that case . \n\nOne question: Do we have any perf statistics on an index with, say, 40 segments .vs. 1 segment (assuming zero deleted docs)? I can run some up I guess...\n\nforceMergeAndFreeze feels wrong to me. At that point the only option if they make a mistake is to re-index everything into another core/collection, right? Unless we have a way to un-freeze the index. Hmmmmm, maybe I'm coming around to that notion now if there's a way to provide recover from a mistake without re-indexing everything. It sure would discourage forceMerging wouldn't it?\n\nforceMergeAndFreeze feels like a separate JIRA though, so I created one and linked it in here.\n\nProposal: Let's try Mike's suggestions and measure, i.e.\n> change TMP to allow large segments to be merged (respects max segment size, right?)\n> require force merge to respect max segment size (assuming this does \"singleton rewrites\" of segments if there's nothing good to merge them with)\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16215409",
+            "date": "2017-10-23T16:33:16+0000",
+            "content": "Its a bug that we created this 20x too big segment to begin with. \n\nI doubt that normal merging would create a segment a 100GB segment with an unmodified TMP config.  If that did happen, I would agree that it's a bug.  I haven't heard of anyone with that problem.\n\nUsers that end up with very large segments are doing so in one of two ways:  Either by using IndexUpgrader, or by explicitly using forceMerge.  No matter how often I recommend building a new index when upgrading, users still want to use their existing indexes.  If they upgrade more than one major version, we send them looking for IndexUpgrader.\n\nIn Solr, forceMerge is still named \"optimize\" ... something we are hoping to change, for the same reasons Lucene did.  And even if Solr loses the optimize button in the web UI, many users are still going to do it, with an explicit call to the API.  I do it on my own indexes, but relatively infrequently \u2013 one large shard is optimized each night by my indexing software, so it takes several days for it to happen across the entire index.  A single-segment index does perform better than one with dozens of segments.  I have no sense as to how great the performance boost is.  I know that recent project wisdom says that the boost is not significant, but even a minimal difference can pay off big in how much query load an index can handle. ",
+            "author": "Shawn Heisey"
+        },
+        {
+            "id": "comment-16215442",
+            "date": "2017-10-23T16:51:34+0000",
+            "content": "bq: I doubt that normal merging would create a segment a 100GB segment with an unmodified TMP config\n\nThat doesn't happen. forceMerge does do this however. TMP does have the problem that when the segments are max sized (5G by default), they aren't merged until over 50% of the docs in them have been deleted.\n\nbq: Either by using IndexUpgrader....\nYeah, this is probably another JIRA, we shouldn't do a forceMerge with IndexUpgrader, rather just rewrite the individual segments. One coming up....\n\nI also saw that expungeDeletes creates large segments as well. FWIW. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16215513",
+            "date": "2017-10-23T17:40:50+0000",
+            "content": "Hi Mike,\n\n50% is too many deleted docs for some use cases; fixing TMP to let the large segments be eligible for merging, always, plus maybe tuning up the existing reclaimDeletesWeight, fixes that.\n\nI'm interested in tackling this use-case. This is what you had stated in a previous reply as a potential solution:\n\nStill, I think it's OK to relax TMP so it will allow max sized segments with less than 50% deletions to be eligible for merging, and users can tune the deletions weight to force TMP to aggressively merge such segments. This would be a tiny change in the loop that computes tooBigCount.\n\nSo you are proposing changing this statement if (segBytes < maxMergedSegmentBytes/2.0)  and make 2.0 ( 50%) configurable ? \nWouldn't this mean that the segment sizes keep growing over time well beyond the max limit? Would have have downsides in the long run on the index in terms of performance?\n\n\n\n\n ",
+            "author": "Varun Thacker"
+        },
+        {
+            "id": "comment-16215764",
+            "date": "2017-10-23T20:16:42+0000",
+            "content": "Wouldn't this mean that the segment sizes keep growing over time well beyond the max limit\n\nLooking at the code this is not possible. I'll cook up a patch to make this check's weight configurable if (segBytes < maxMergedSegmentBytes/2.0) ",
+            "author": "Varun Thacker"
+        },
+        {
+            "id": "comment-16215799",
+            "date": "2017-10-23T20:42:07+0000",
+            "content": "I think we don't need to add another tunable to TMP; I think the existing reclaimDeletesWeight should suffice, as long as we:\n\nModify the logic around tooBigCount, so that even too big segments are added to the eligible set, but they are still not counted against the allowedSegCount.\n\nThis way TMP is able to choose to merge e.g. a too big segment with 20% deletions, with lots of smaller segments.  The thing is, this merge will be unappealing, since the sizes of the input segments are so different, but then the reclaimDeletesWeight can counteract that.\n\nI'll attached a rough patch with what I mean ... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16215801",
+            "date": "2017-10-23T20:44:01+0000",
+            "content": "Very rough, untested patch, showing how we could allow the \"too big\" segments into the eligible set of segments ... but we should test how this behaves around deletions once an index has too-big segments ... it could be the deletion reclaim weight is now too high! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16215829",
+            "date": "2017-10-23T20:59:34+0000",
+            "content": "forceMergeAndFreeze feels wrong to me. At that point the only option if they make a mistake is to re-index everything into another core/collection, right? \n\nOr IndexWriter's addIndexes(Directory[]) which is quite efficient.\n\nBut yeah I agree this is a separate issue... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16305721",
+            "date": "2017-12-28T20:29:35+0000",
+            "content": "OK, let's see if I can summarize where we are on this:\n\n1> make TMP respect maxMergeSegmentSize, even during forcemerge unless maxSegments is specified (see <3>).\n\n2> Add some documentation about how reclaimDeletesWeight can be used to tune the % deleted documents that will be in the index along with some guidance. Exactly how this should be set is rather opaque. It defaults to 2.0. The comment in the code is: \"but be careful not to go so high that way too much merging takes place; a value of 3.0 is probably nearly too high\". We need to keep people from setting it to 1000. Should we establish an upper bound with perhaps a warning if it's exceeded? \n\n3> If people want the old behavior they have two choices:\n3a> set maxMergedSegmentMB very high. This has the consequence of kicking in when normal merging happens. I think this is sub-optimal for the pattern where once a day I index docs and then want to optimize at the end though.\n3b> specify maxSegments = 1 during forceMerge. This will override any maxMergedSegmentMB settings.\n\n<3b> is my attempt to reconcile the issue of wanting one huge segment but only when doing forceMerge. Yes, they can back themselves into a the same corner they get into now by doing this, but this is acceptable IMO. We're not trying to make it impossible to get into a bad state, just trying to make it so users don't do it by accident.\n\nIs this at least good enough for going on with until we see how it behaves?\n\nMeanwhile, I'll check in SOLR-7733 ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16305755",
+            "date": "2017-12-28T21:41:13+0000",
+            "content": "+1 to the summary; thanks Erick Erickson, except I think this is dangerous:\n\nspecify maxSegments = 1 during forceMerge. This will override any maxMergedSegmentMB settings.\n\nbecause it means you can get a too large segment in your index just by invoking forceMerge.  I don't think we need that behavior?  I.e., one way to shoot yourself (3a) is enough?  So I think maxMergedSegmentMB should win over maxSegments passed to forceMerge. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16305820",
+            "date": "2017-12-28T23:07:13+0000",
+            "content": "bq: So I think maxMergedSegmentMB should win over maxSegments passed to forceMerge\n\nWorks for me. \n\nbq: one way to shoot yourself (3a) is enough\n\n\nWDYT about going one step further and deprecating maxSegments? Does having that extra knob (maxSegments) really add any value? A value of -1 for maxMergedSegmentMB would mean the same thing as the old optimize. That would avoid having to reconcile the two\n\nSo here's what we tell users (needs to be prettied up):\n\n1> In general invoking forceMerge is unnecessary. Especially in a frequently updated index the default settings should suffice and forceMerge can hurt (there's a blog about that).\n\n2> If you find  you have too many deleted documents in your index, consider changing reclaimDeletesWeight in your configuration (and provide some guidance on reasonable values).\n\n3> forceMerge now respects maxMergedSegmentMB. This means that forceMerge will no longer create an index with one segment by default although it will purge all deleted documents.\n\n4> If you require forceMerge to produce a single segment, you must provide a parameter maxMergedSegmentMB=-1 to the forceMerge command. It is not recommended to set maxMergedSegmentMB=-1 as a permanent setting in your config as it will lead to excessive I/O during normal indexing. Invoking forceMerge with maxMergedSegmentMB=-1 is only recommended when you're willing and able to perform this operation whenever the index is changed or it will lead to excessive space occupied by deleted documents.\n\n5> (assuming we deprecate maxSegments). forceMerge no longer supports maxSegments. You can approximate this behavior by selecting an appropriate value for maxMergedSegmentMB based on the total size of your index.\n\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16306201",
+            "date": "2017-12-29T11:05:07+0000",
+            "content": "\n<3b> is my attempt to reconcile the issue of wanting one huge segment but only when doing forceMerge. Yes, they can back themselves into a the same corner they get into now by doing this, but this is acceptable IMO. We're not trying to make it impossible to get into a bad state, just trying to make it so users don't do it by accident.\n\nI'm against the maxMergedSegmentMB = -1 thing. Sorry, we don't need it. \n\n\nIt is not recommended to set maxMergedSegmentMB=-1 as a permanent setting in your config as it will lead to excessive I/O during normal indexing.\n\nthis is making matters worse. We don't need an \"optimize-all-the-time\" option. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16306338",
+            "date": "2017-12-29T15:28:16+0000",
+            "content": "I'm not particularly wedded to using -1. Functionally though I don't see any difference between using -1 to mean \"unlimited\" and allowing values like 1,000,000,000. Disks aren't that big (yet at least).\n\nRequiring an explicit number rather than using -1 is more in-your-face when it comes to understanding the consequences though.\n\nThat does bring up a point; how big is \"too big\"? Should we log a warning if someone configures this to be > (some number)? Even in the current code, one could configure maxMergedSegmentSizeMB to be ridiculous. Not sure how far down the road I want to go in protecting the users from themselves though.\n\nbq: this is making matters worse.\n\nNever advocated configuring maxMergedSegmentsSizeMB to -1, said it's not recommended. And they can do this now, just use a large number. If we're going to direct people's attention to using this parameter for forceMerge, we need to discourage changing it in solrconfig.xml. Or at least provide guidance. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16306834",
+            "date": "2017-12-30T14:59:39+0000",
+            "content": "WDYT about going one step further and deprecating maxSegments? \n\nI think we should keep maxSegments argument to forceMerge: it has (separate) value because you may want to merge down to e.g. 10 segments that are not the maximum sized segments. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16306850",
+            "date": "2017-12-30T15:44:16+0000",
+            "content": "\nShould we log a warning if someone configures this to be > (some number)?\n\nYou've mentioned logging several times on this issue, I just want to remind you that lucene is an API: method calls need to be either valid, or not. It doesn't logging or any sheistiness like this. ",
+            "author": "Robert Muir"
+        },
+        {
+            "id": "comment-16306869",
+            "date": "2017-12-30T16:37:37+0000",
+            "content": "Robert:\n\nI'm quite aware that logging at the Lucene level doesn't happen. Since this is a setting in solrconfig.xml it's reasonable to log it at that level which is at least where I was thinking about it. Ditto a URL coming in.\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16424814",
+            "date": "2018-04-04T00:41:47+0000",
+            "content": "OK, I'm working on this today, Michael McCandless, thanks for the hints.\n\nNext up is making forceMerge respect maxMergedSegmentSizeMB. I further propose that this be an optional argument to the command that would override the setting in solrconfig.xml (if any). WDYT?\n\nNote this is a significant change in behavior from the perspective that someone does a forcemerge and then will ask \"What? I didn't get one segment when I was done!\". Of course putting it in CHANGES.txt and the ref guide is indicated.\n\n> if a person does  forcemerge, then there are two parameters\n> maxMergedSegmentsSizeMB\n> maxSegments\n\n> maxMergedSegmentsSizeMB overrides maxSegments if both are specified\n> if only one is specified, it's respected.\n> if neither are specified then whatever TMP was configured with is used. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16424851",
+            "date": "2018-04-04T01:53:13+0000",
+            "content": "I further propose that this be an optional argument to the command that would override the setting in solrconfig.xml (if any). WDYT?\n\n+1\nSeems like a good way to enable minor compactions during peak hours and major compactions off-peak.  ",
+            "author": "Yonik Seeley"
+        },
+        {
+            "id": "comment-16427642",
+            "date": "2018-04-05T21:40:46+0000",
+            "content": "This is coming together, here's a preliminary patch. It has nocommits and several rough spots/hard-coded numbers, code commented out etc.\n\nI'm putting it up in case anyone interested in this wants to take a look at the approach and poke holes in it. Please raise any concerns but also please don't spend a lot of time on the details before I wrap up things I know will need addressing.\n\nCurrent state:\n\n0> refactors a bit of findMerges to gather the stats into a separate class as that method was getting quite hard follow. I haven't made use of that new class in forceMerge or expungeDeletes yet.\n\n1> forceMerge and expungeDeletes respect maxMergedSegmentSizeMB\n\n2> regular merging will do \"singleton merges\" on overly-large segments when they're more than 20% deleted docs. 20% is completely arbitrary, don't quite know the correct numbers yet. That handles the case of a single-segment optimize not getting merged away for a long time.\n\n3> forceMerge will purge all deleted docs. It tries to assemble max-sized segments. Any segments where the live docs are larger than maxMergedSegmentSizeMB get a singleton merge.\n\n4> fixes the annoying bit where segments reported on the admin UI are improperly proportioned\n\n5> expungeDeletes now tries to assemble max sized segments from all segments with > 10% deleted docs. If a segment has > 10% deleted docs and it's liveDocs > maxMergedSegmentSizeMB it gets a singleton merge.\n\nWhat's left to do:\n\n1> more rigorous testing. So far I've just been looking at the admin UI segments screen and saying \"that looks about right\".\n\n2> Normal merging rewrites the largest segment too often until it gets to max segment size. I think it also merges dissimilar-sized segments too often.\n\n3> compare the total number of bytes written for one of my test runs between the old and new versions. I'm sure this does more writing, just not sure how much.\n\n4> allow forceMerge to merge down to one segment without having to change solrconfig.xml.\n\n5> perhaps refactor, findMerges, forceMerge and findForcedDeletesMerges to make use of common code.\n\n6> ???? ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16427789",
+            "date": "2018-04-06T00:19:13+0000",
+            "content": "Michael McCandless do you know the condition in TieredMergePolicy that segmentsToMerge is used? I'm looking at refactoring out the common code and conceptually, forcemerge and expunge deletes are the same thing now, they just operate on slightly different initial lists. But findForcedDeletesMerges doesn't have that parameter and findForcedMerges does.\n\nI guess I'm fuzzy on why a segment would be in segmentsToMerge but not in \n\nwriter.getMergingSegments()\n\nthis latter seems to be sufficient for detecting segments that are being merged in other cases... ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16427892",
+            "date": "2018-04-06T03:36:29+0000",
+            "content": "One more thing. The current patch doesn't deal at all with the maxSegmentCount parameter to findForcedMerges. I'm thinking of deprecating it and having another method that takes the maxMergeSegmentSize(MB). I'll change the method name or something so when the method is removed anyone using it won't be trapped by the underlying method compiling but having a different meaning.\n\nI'm not sure what use-case is served by specifying this anyway. We ignore it currently when we have max-sized segments.\n\nI started looking at this and we already have maxSegments as a parameter to optimize and there's a really hacky way to use that (if it's not present on the command, set it to Integer.MAX_VALUE) and that's just....ugly. So changing that to maxMergeSegmentSizeMB seems cleaner.\n\nAny objections? ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16427982",
+            "date": "2018-04-06T05:22:02+0000",
+            "content": "Erick Erickson Thanks for tackling this.\n\nRegarding singleton merges: if I read your code correctly and am right about how Lucene works, I think\u00a0that, on a large enough collection, your patch could generate ~50% more reads/writes when re-indexing the whole collection:\n\n\tI think new\u00a0documents are typically flushed once and merged 2-3 times before ending up in a large segment.\n\tWith a 20% delete threshold, old documents would, on average, be singleton\u00a0merged\u00a04 times before being expunged vs only one merge at a 50% delete threshold. In Latex notation:\n\n\n\n\n20% deleted docs threshold:\n\\sum_{n=1}^\\infnty (1 - 0.2)^n = (1 / (1 - (1 - 0.2))) - 1 = 4\n\n50% deleted docs threshold:\n\\sum_{n=1}^\\infnty (1 - 0.5)^n = (1 / (1 - (1 - 0.5))) - 1 = 1\n\nOn the odd chance that my math bears any resemblance to reality, I would suggest that you disable singleton merges when the short term\u00a0deletion rate of a\u00a0segment is above a certain threshold (say 0.5% per hour). This should prevent performance degradations during heavy re-indexation while maintaining the desired behaviour on seldom updated indexes. ",
+            "author": "Marc Morissette"
+        },
+        {
+            "id": "comment-16428605",
+            "date": "2018-04-06T17:04:10+0000",
+            "content": "Marc:\n\nThanks for looking, especially at how jumbled the code is right now!\n\nI collected some preliminary stats on total bytes written, admittedly unscientific and hacky. I set a low maxMergedSegmentSizeMB and reindexed the same docs randomly. To my great surprise the new code wrote fewer bytes than the current code. My expectation was just what you're pointing out, I expected to see the new stuff write a lot more bytes. This was with an index that respected max segment sizes.\n\nOn my plate today is to reconcile my expectations and measurements. What I think happened is that Mike's clever cost measurements are getting in here. \n\nThe singleton merge is not intended (I'll have to ensure I didn't screw this up, thanks for drawing attention to it) to be run against segments that respect the max segment size. It's supposed to be there to allow recovery from the case where someone optimized to 1 huge segment. If it leads to a lot of extra writes in that case I think it's acceptable. If it leads to a lot more bytes written in the case where the segments respect max segment size, I worry a lot....\n\nIn the normal case, it's not that a segment are merged when it has > 20% deleted docs, it's that it becomes eligible for merging even if it has > 50% maxSegmentSize \"live\" docs.. What I have to figure out (all help appreciated!) is how Mike's scoring algorithm influences this. The code starting with\n // Consider all merge starts:\nis key here. Let's say I have 100 possible eligible segments and 30 \"maxMergeAtOnce\". The code starts at 0 and collects up to 30 segments and scores that merge. Then it starts at 1, collects up to 30 segments and scores that. Repeat until you start at 70, keeping the \"best\" merge as determined by the scoring method and use the best-scoring one. What I think is happening is that the large segments do grow past 20% before they're merged due to the scoring. \n\nAnd there's a whole discussion here about what's a \"good\" number and whether it should be user-configurable, I chose 20% semi-randomly (and hard-coded it!) just to get something going.\n\nAll that said, performance is the next big chunk of this I need to tackle, insuring that this doesn't become horribly I/O intensive. Or, as you suggest, we figure out a way to throttle it.\n\nOr throw out the idea of singleton merges in the first place and, now that expungeDeletes respects max segment size too, tell users who've optimized down to single segments that they should occasionally run expungeDeletes as they replace documents. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16428991",
+            "date": "2018-04-06T21:06:09+0000",
+            "content": "Michael McCandless re: do you know the condition in TieredMergePolicy that segmentsToMerge is used\n\nFigured it out. Basically the forceMerge doesn't want to merge more than maxMergeAtOnceExplicit segments at once so there may be multiple passes (gosh, almost looks like Map/Reduce).\n\nbq: I started looking at this and we already have maxSegments as a parameter to optimize and there's a really hacky way to use that (if it's not present on the command, set it to Integer.MAX_VALUE) and that's just....ugly. So changing that to maxMergeSegmentSizeMB seems cleaner.\n\nChanging my mind about this. I found a better way to deal with an external (Solr-level) optimize command. For the update command, default maxSegments to MAX_INT, assume there's no limit and always respect maxMergedSegmentMB. If the user does specify the max number of segments allowed, do what they say even if it means creating one giant segment.\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16429038",
+            "date": "2018-04-06T21:33:36+0000",
+            "content": "Phew suddenly a lot of action here!\u00a0 I'll review the patch soon, but wanted to answer:\nMichael McCandless\u00a0do you know the condition in TieredMergePolicy that segmentsToMerge is used?\u00a0\nRight, the idea here is that if you call forceMerge, we will only merge those segments present in the index at the moment forceMerge started.\u00a0 Any newly written segments due to concurrent indexing will not participate in that forceMerge (unless you go and call forceMerge again).\u00a0 I think it's a bug that forceMergeDeletes doesn't do the same thing?\u00a0 Otherwise the operation can run endlessly? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16429054",
+            "date": "2018-04-06T21:46:49+0000",
+            "content": "I'm confused what this means:\nI further propose that this be an\u00a0optional\u00a0argument to the command that would override the setting in solrconfig.xml (if any). WDYT?\nWe are in Lucene not Solr\u00a0here \u2013 I think what you mean is you want to change the forceMerge and forceMergeDeletes APIs in IndexWriter and the merge policy\u00a0to optionally (default would be unbounded) accept a parameter to set the maxMergedSegmentSizeMB? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16429059",
+            "date": "2018-04-06T21:50:35+0000",
+            "content": "I think this change might be cleaner if we can reformulate the desired outcomes using the existing \"generate candidates and score them\" approach?\n\nE.g. for singleton merges ... I wonder if we could just relax TMP to allow it to consider merges with fewer than maxMergeAtOnce, and then \"improve\" the scoring function to give a good score to cases that would reclaim > X% deletions? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16429433",
+            "date": "2018-04-07T15:57:43+0000",
+            "content": "Thanks for taking the time Mike! Going in reverse order:\n\nbq: I wonder if we could just relax TMP to allow it to consider merges with fewer than maxMergeAtOnce, and then \"improve\" the scoring function to give a good score to cases that would reclaim > X% deletions?\n\nInteresting. At this point in the change cycle I've got my head around most of what's going on and can think about how to do it better. We'd want to tweak things I should think so scoring could return \"don't do this merge at all\"? I'm thinking of the case where we have, say, 1 max-sized (or bigger) segment as a candidate with a few deletions, we wouldn't want to merge that at all, right? I'm thinking some threshold score above which we score it as \"don't bother\"....\n\nThe number of changes I'm introducing here does make me nervous, I wonder if taking a fresh look at it with an eye toward just doing the above would lead to less surgery.... I mean this has been working fine for years, I do worry that I'm introducing bugs... I don't mind throwing away a bunch of work if smaller changes can cure my problem.\n\nbq: I think what you mean is you want to change the forceMerge and forceMergeDeletes APIs in IndexWriter\n\nRight, that would have been the consequence. But I changed my mind on this yesterday, I don't think any Lucene API change is needed after all. What I did instead (not in the current patch) is default the Solr \"update\" command to pass Integer.MAX_VALUE for the max number of segments to forceMerge. That just flows into the TMP code without changing the API and lets maxMergedSegmentBytes control how many segments are created. Anyone who wants the old behavior needs to pass 1 like the default is now.\n\nbq:  I think it's a bug that findForceMergeDeletes doesn't do the same thing....\n\nOK, let me look this over again. Yesterday I started to see the differences between forceMerge and forceMergeDeletes and thought they should stay separate, but you seem to be saying the idea of combining them is worth exploring. I'll revisit this again this weekend. Wouldn't making that work require changing the findForceMergeDeletes interface? I'm perfectly willing but didn't want to do that without discussion. And it seems that then findForcedDeletesMerges and findForcedMerges would be very thin wrappers around the same code for both.... Or were you thinking of handling this differently?\n\nThanks again... ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16429447",
+            "date": "2018-04-07T16:19:04+0000",
+            "content": "Oh, and Mike (and others):\n\nPlease don't go over this with too fine a comb on my behalf. I'm grateful for any time you do want to spend of course, but I don't consider this patch in good enough shape for really serious review. Your comments already may mean that I revise the approach in a major way, that's the level I'm aiming for now.\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16439785",
+            "date": "2018-04-16T17:51:49+0000",
+            "content": "Well, it didn't get simpler ;(...\n\nMichael McCandless The problem with tweaks to scoring is that the assumptions made in findForcedDeletesMerges and findForcedMerges now have to respect max segment  size. Which really means that all three methods (including findMerges) are the same operation just with some different initial assumptions. findForcedMerges is particularly ugly in that it can have a segment count specified and that makes for some uglier code.\n\nI think I want to defer your comments about findForcedMergeDeletes possibly having a bug and should do the same kind of round-tripping as findForcedMerges to another JIRA if necessary, this is already big enough.\n\nCurrent state:\n> Despite all the nocommits and extraneous comments, I think it's pretty close to being functionally correct.\n\n> I need to clean this up considerably as I've been concentrating on getting it structured, I'll leave it for a day or two and then look again.\n\n> I'm not entirely sure I like the structure of the InfosStats class with the computeStats being sensitive to what kind of merge is being called for. On the one hand it does centralize all the different considerations. On the other it concentrates the ugliness in one place. Moving tricky code from one place to the other isn't necessarily an improvement. Oh the other other hand, when the trickiness was in findMerges, findForcedMerges and findForcedDeletesMerges I had to pass a bunch of parameters to getSpec which was ugly too.\n\n> I've hard-coded 20% as a threshold in indexDeletedPctAllowed and it does double-duty, both as a threshold for total index pct deleted before singleton merges are allowed and the threshold for a singleton merge. I don't think this is something I particularly want to make into a tuning parameter right now, possibly leave that for another JIRA if at all. See the bit on perf  below. With expungeDeletes and forceMerge now respecting max segment bytes, if someone really, really, really cares about this they can use those operations.\n\n> singleton merges work, so if I have a massive segment it will gradually reduce in size over time. Max sized segments are also singleton-merged when the minimum deleted percentage threshold is reached and they're over 20% deleted docs.\n\n> There's some reporting in this code that will disappear completely to measure bytes written. I compared this version to the original and I'm pleasantly surprised to see only about a 10% increase in bytes written with the new patch. For this testing, I indexed 10M docs with maxMergedSegmentMB=50. Each doc's ID was randomly generated between 0 and 10M and I ran through all 10M 25 times. I indexed in packets of 1,000 and sent the same packet to the old and new versions. Of course I added the reporting to the old version as well. Mind you that was last night so I haven't analyzed in detail yet.\n\n> This approach, especially the singleton merges, will certainly increase the I/O if the index has been optimized to 1 segment. I don't think that's something that should be addressed in this JIRA (or at all). Prior to this there was no way to recover from that situation except to wait until most of it was deleted docs.\n\n> I think the critical  bit here is that all these merges, including the singleton merges, run through the (unchanged) scoring mechanism, which I haven't changed at all. I'll re-run my test today with the new code changing reclaimDeletesWeight to 1.5 'cause I'm curious. And maybe 1.0 (no effect) and maybe 0.75 (reducing deletes weight).\n\nLet me know what you think. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16441001",
+            "date": "2018-04-17T15:20:36+0000",
+            "content": "Hold the presses. I really, really, really hate it when the thought occurs at 6:30 AM \"Maybe if I approached the problem slightly differently it would be vastly simpler\". I suppose sometimes I have to work through all the gory details before understanding the process enough to think of a simpler way...\n\nAnyway, I said it above Michael McCandless, If findForcedDeletesMerges and findForcedMerges all need to go through the work of findMerges to respect segment size, would it be possible to refactor out the meat of findMerges and feed it the eligible lists from findForcedDeletesMerges and findForcedMerges? Then a couple of parameters would need to be passed into the extracted method, things like max segment size and segs per tier etc. But the current code then stays largely intact.\n\nTaking a hack at this now, if it pans out at all you should completely ignore the previous patch. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16443506",
+            "date": "2018-04-19T03:00:40+0000",
+            "content": "I'm much more optimisitc about this approach. What this approach does is extract the scoring loop from findMerges and call it from findMerges, findForcedDeletesMerges and findForcedMerges. \n\nEach of those methods creates a list of its peculiar version of eligible segments to merge and passes that (and some other info) to the extracted doFindMerges method.\n\nSo far it seems to work well.\n\nGenerally when it comes to large segments, here defined as anything over maxMergedSegmentBytes/2 live documents, they're ignoed unless the new parameter indexPctDeletedTarget is exceeded, which defaults to 20%. This means that if (and only if) the total number of deleted documents in the entire index is > 20%, then segments with > maxMergedSegmentBytes/2 live docs are eligible for merging. Whether they're merged or not depends on whether they are scored highest.\n\nOn a relatively quick test, setting indexPctDeletedTarget to 20% causes about 10% more bytes to be written. Setting it to 10% causes 50% more bytes to be written. Setting it to 50% (which is kind of the default now) causes the number of bytes written to drop by about 10%, but I consider that mostly noise.\n\nforceMerge to 1 segment is possible, and continuing to index will gradually shrink that back as indexPctDeletedTarget gets exceeded as these large segments become eligible for merging.\n\nSo despite the size of the patch, the actual code differences are not nearly as great as it might seem. It's mostly moving some code around.\n\nComments welcome, I'm going to put this down for a few days. There are still a few nocommits and the like, but not many.\n\nI do have one question: When should writer.numDeletesToMerge(info) be preferred over info.getDelCount()? The former seems more expensive.\n\nOh, and I haven't run precommit or test on it yet, just gathered stats on indexing to the new and old code. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16443559",
+            "date": "2018-04-19T04:16:25+0000",
+            "content": "On a relatively quick test, setting indexPctDeletedTarget to 20% causes about 10% more bytes to be written. Setting it to 10% causes 50% more bytes to be written. Setting it to 50% (which is kind of the default now) causes the number of bytes written to drop by about 10%, but I consider that mostly noise.\nJust curious, how did you go about measuring that? \u00a0\n\nFWIW I recently wrote a custom MergePolicy and along with it I wrote a fairly generic \"MergePolicy simulator\" that takes the MergePolicy and over many iterations feeds it dummy segments and as output records what merging it was told to do, then collect stats on all this like, critically, the \"write amplification factor\" (sum of all\u00a0segments written / sum of new segments flushed). \u00a0It's able to do this extremely fast since no actual indexing/merging\u00a0is done at all. \u00a0Maybe I should share it. \u00a0There's plenty more it could do to be improved; notably it doesn't have any deleted doc simulation. ",
+            "author": "David Smiley"
+        },
+        {
+            "id": "comment-16444213",
+            "date": "2018-04-19T15:13:53+0000",
+            "content": "bq: Just curious, how did you go about measuring that?  \n\nFirst a disclaimer: the intent here was to get some idea whether things had blown up all out of proportion so rigor wasn't the main thrust.\n\nAnyway, I have a client program that assembles docs then sends the same set of docs to two instances of Solr, one running old and one running new code. Then I hacked in a bit to each that prints the number of bytes being merged into each new segment (i.e. each of the OneMerge's each time a MergeSpecification is returned from TieredMergePolicy.findMerges and accumulates the total) into a file.\n\nEach doc has a randomly-generated ID in a bounded range so I get deletions.\n\nSo I get output like: \nBytes Written This Pass: 15,456,941: Accumulated Bytes Written: 16,071,461,273 This pct del: 26, accum pct del max: 26\n\nfinally, I lowered the max segment size artificially to force lots and lots of merges. So there are several places it might not reflect reality.\n\nYour simulation sounds cool, but for this case how deletes affect decisions on which segments to merge is a critical difference between the old and new way of doing things so needs to be exercised.... ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16446985",
+            "date": "2018-04-21T20:47:13+0000",
+            "content": "It'd be great to have this simulator available somewhere (maybe under dev-tools?); we can improve it (e.g. add deletions support), we can fix it to invoke the merge policy class(es) directly and record their choices over time, etc.\u00a0 David Smiley maybe open a separate issue for this?\u00a0 It would really help merge policy experimentation... ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16447006",
+            "date": "2018-04-21T21:23:38+0000",
+            "content": "This looks like it's coming together \u2013 thanks Erick Erickson!\n\nCan we do this change in two parts? First part is the nice refactoring to have all the methods share a common scoring loop, which should show no behavior change I think?\n\nSecond part is adding the indexPctDeletedTarget?\n\nSome minor comments:\n\n\n\t* @lucene.experimental\n+ * <p><b>note</b>NOTD: As of Solr 7.4, forceMerge/optimize\n+ * and expungeDeletes (findForcedMerges and\n+ * findForcedDeletesMerges) respect the max segment\n+ * size by default. forceMerge now defaults to\n\n\nHmm what is the note/NOTD? Can you change to As of Lucene 7.4\n(these are Lucene sources)? Did you mean to remove the\n@lucene.experimental?\nINDEXING, FORCEMERGE, EXPUNGEDELETES\nCan you name it NATURAL, FORCE_MERGE\u00a0and FORCE_MERGE_DELETES?\nbq:\nI just wanted to point out that the right way to do this is bq.\u00a0(period, not colon) \u2013 then Jira will render that as a \"quoted\" text.\u00a0 It's hard to remember how all different places do it differently, but I keep seeing you doing \"bq:\" so thought I would point it out  ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16447046",
+            "date": "2018-04-22T00:04:22+0000",
+            "content": "Michael McCandless Thanks for looking!\n\nAbout removing  @lucene.experimental, yes that was deliberate, TMP has been around for a very long time and it seemed to me that it's now mainstream. I have no problem with putting it back. Let me know if that's your preference. Is putting it back for back-compat? Well, actually so we don't have to maintain back-compat?\n\nCan we do this change in two parts? First part is the nice refactoring to have all the methods share a common scoring loop, which should show no behavior change I think?\n\nMaybe I got the block quote thing right this time, thanks!\n\nWhat's the purpose here? Mechanically it's simple and I'll be glad to do it, I'd just like to know what the goal is. My guess is so we can have a clear distinction between changes in behavior in NATURAL indexing and refactoring.\n\nWhen you say \"no change in behavior\" you were referring to NATURAL merging, correct? Not FORCE_MERGE or FORCE_MERGE_DELETES. Those will behave quite differently.\n\ncan you name it NATURAL, FORCE_MERGE and FORCE_MERGE_DELETES?\n\ndone.\n\n\nHmm what is the note/NOTD? Can you change to As of Lucene 7.4\nWhat can I say? I spend 99% of my life in Solr, everything is Solr, right? As for rest, typos late at night.\n\nDone.\n\nFinally, can you comment on this nocommit?\n\nShould you be using writer.numDeletesToMerge rather than the info.getDelDocs other places\n\nI see both of these in the code, and writer.numDeletesToMerge seems considerably more expensive. Is there a reason to prefer one over the other?\n\nThanks again! ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16447323",
+            "date": "2018-04-22T18:42:55+0000",
+            "content": "About removing\u00a0@lucene.experimental, yes that was deliberate, TMP has been around for a very long time and it seemed to me that it's now mainstream. I have no problem with putting it back. Let me know if that's your preference. Is putting it back for back-compat? Well, actually so we don't\u00a0have\u00a0to maintain back-compat?\nWell, it expresses that the API might change w/o back-compat, and as long as TMP has been around, I'm not sure it's safe to remove that label yet.\u00a0 E.g. here on this issue we are working out big changes to its behavior (though, no API breaks I think?).\nWhat's the purpose here? Mechanically it's simple and I'll be glad to do it, I'd just like to know what the goal is. My guess is so we can have a clear distinction between changes in behavior in NATURAL indexing and refactoring.\nHmm I was hoping to separate out changes that are just refactoring (with no change to behavior), which I think is\u00a0the bulk\u00a0of the change here, from changes that do alter behavior (the indexPctDeletedTarget).\u00a0 This makes large changes like this easier to review, I think.\nWhen you say \"no change in behavior\" you were referring to NATURAL merging, correct? Not FORCE_MERGE or FORCE_MERGE_DELETES. Those will behave quite differently.\nHmm then I'm confused\u00a0\u2013 I thought the refactoring was to get\u00a0all of these methods to use the scoring approach (enumerate all possible merges, score them, pick the best scoring ones), and that that change alone should not change behavior, and then, separately, changing the limits on\u00a0% deletions of a max sized segment before it can be merged.\nShould you be using writer.numDeletesToMerge rather than the info.getDelDocs other places\nHmm I think it's more correct to use writer.numDeletesToMerge \u2013 that API will reflect any pending deletions as well, which can be significant.\u00a0 If you use info.getDelCount you are using stale information. That first method should not be too costly, unless soft deletes are used? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16447344",
+            "date": "2018-04-22T19:51:24+0000",
+            "content": "not sure it's safe to remove that label yet\n\nI'll put @lucene.experimental back.\n\nit's more correct to use writer.numDeletesToMerge \n\ndone\n\nHmm then I'm confused \u2013 I thought the refactoring was to get all of these methods to use the scoring approach (enumerate all possible merges, score them, pick the best scoring ones),\n\nRight, but that has quite a few consequences when comparing old .vs. new behavior for FORCE_MERGE and FORCE_MERGE_DELETES for several reasons, mostly stemming from having these two operations respect maxSegmentBytes:\n\n> Those two operations now respect maxSegmentSize, so very different segments will get merged than used to. The whole impetus to refactor is basically the realization that to respect maxSegmentSize, all three methods had to do essentially the same thing rather than each doing their own thing.\n\n> Before, the top N segments up to maxMergeAtOnceExplicit would get merged, regardless of how big the resulting segment was. There was no cost analysis.\n\n> The fact that the potential merges are scored also changes what segments will get merged on each pass even when doing a FORCE_MERGE down to one segment The end result if maxSegments=1 is still a single segment, but the intermediate merges will be different.\n\nFor NATURAL merging, this should be close to a no-op. It's a different story for the other two.\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16447548",
+            "date": "2018-04-23T04:12:41+0000",
+            "content": "New patch with Mike's suggestions and most tests running. I have to beast some overnight, at least one failed once (seed didn't reproduce) for no obvious reason but didn't fail afterwards.\n\nI @Ignored one test (nocommitted too). I'll have to revisit that. Looking at it again my comment about why it's different is bogus, it should pass. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16449265",
+            "date": "2018-04-24T04:29:37+0000",
+            "content": "Fix for the failing test ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16450104",
+            "date": "2018-04-24T15:43:52+0000",
+            "content": "Right, but that has quite a few consequences when comparing old .vs. new behavior for FORCE_MERGE and FORCE_MERGE_DELETES for several reasons, mostly stemming from having these two operations respect maxSegmentBytes:\nOK I see ... I think it still makes sense to try to break these changes into a couple issues.\u00a0 This one (just refactoring to share the scoring approach, with the corresponding change in behavior) is going to be big enough!\n\nHmm I see some more failing tests e.g.:\n[junit4] Suite: org.apache.lucene.search.TestTopFieldCollectorEarlyTermination\n [junit4] 2> NOTE: reproduce with: ant test -Dtestcase=TestTopFieldCollectorEarlyTermination -Dtests.method=testEarlyTermination -Dtests.seed=355D07976851D85A -Dtests.badapples=true -Dtests.locale=nn-N\\\n O -Dtests.timezone=America/Cambridge_Bay -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n [junit4] ERROR 869s J3 | TestTopFieldCollectorEarlyTermination.testEarlyTermination <<<\n [junit4] > Throwable #1: java.lang.OutOfMemoryError: GC overhead limit exceeded\n [junit4] > at __randomizedtesting.SeedInfo.seed([355D07976851D85A:FACA46C8503D4859]:0)\n [junit4] > at java.util.Arrays.copyOf(Arrays.java:3332)\n [junit4] > at java.lang.AbstractStringBuilder.ensureCapacityInternal(AbstractStringBuilder.java:124)\n [junit4] > at java.lang.AbstractStringBuilder.append(AbstractStringBuilder.java:448)\n [junit4] > at java.lang.StringBuilder.append(StringBuilder.java:136)\n [junit4] > at org.apache.lucene.store.MockIndexInputWrapper.toString(MockIndexInputWrapper.java:224)\n [junit4] > at java.lang.String.valueOf(String.java:2994)\n [junit4] > at java.lang.StringBuilder.append(StringBuilder.java:131)\n [junit4] > at org.apache.lucene.store.BufferedChecksumIndexInput.<init>(BufferedChecksumIndexInput.java:34)\n [junit4] > at org.apache.lucene.store.Directory.openChecksumInput(Directory.java:119)\n [junit4] > at org.apache.lucene.store.MockDirectoryWrapper.openChecksumInput(MockDirectoryWrapper.java:1072)\n [junit4] > at org.apache.lucene.codecs.lucene50.Lucene50CompoundReader.readEntries(Lucene50CompoundReader.java:105)\n [junit4] > at org.apache.lucene.codecs.lucene50.Lucene50CompoundReader.<init>(Lucene50CompoundReader.java:69)\n [junit4] > at org.apache.lucene.codecs.lucene50.Lucene50CompoundFormat.getCompoundReader(Lucene50CompoundFormat.java:70)\n [junit4] > at org.apache.lucene.index.SegmentCoreReaders.<init>(SegmentCoreReaders.java:100)\n [junit4] > at org.apache.lucene.index.SegmentReader.<init>(SegmentReader.java:78)\n [junit4] > at org.apache.lucene.index.ReadersAndUpdates.getReader(ReadersAndUpdates.java:202)\n [junit4] > at org.apache.lucene.index.ReadersAndUpdates.getReaderForMerge(ReadersAndUpdates.java:782)\n [junit4] > at org.apache.lucene.index.IndexWriter.mergeMiddle(IndexWriter.java:4221)\n [junit4] > at org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3910)\n [junit4] > at org.apache.lucene.index.SerialMergeScheduler.merge(SerialMergeScheduler.java:40)\n [junit4] > at org.apache.lucene.index.IndexWriter.maybeMerge(IndexWriter.java:2077)\n [junit4] > at org.apache.lucene.index.IndexWriter.forceMerge(IndexWriter.java:1910)\n [junit4] > at org.apache.lucene.index.IndexWriter.forceMerge(IndexWriter.java:1861)\n [junit4] > at org.apache.lucene.index.RandomIndexWriter.forceMerge(RandomIndexWriter.java:454)\n [junit4] > at org.apache.lucene.search.TestTopFieldCollectorEarlyTermination.createRandomIndex(TestTopFieldCollectorEarlyTermination.java:96)\n [junit4] > at org.apache.lucene.search.TestTopFieldCollectorEarlyTermination.doTestEarlyTermination(TestTopFieldCollectorEarlyTermination.java:123)\n [junit4] > at org.apache.lucene.search.TestTopFieldCollectorEarlyTermination.testEarlyTermination(TestTopFieldCollectorEarlyTermination.java:113)\n\n\nand\n[junit4] 2> NOTE: reproduce with: ant test -Dtestcase=TestIndexWriterDelete -Dtests.method=testOnlyDeletesTriggersMergeOnClose -Dtests.seed=355D07976851D85A -Dtests.badapples=true -Dtests.locale=en-IE\\\n -Dtests.timezone=Australia/Perth -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n [junit4] ERROR 0.05s J0 | TestIndexWriterDelete.testOnlyDeletesTriggersMergeOnClose <<<\n [junit4] > Throwable #1: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Captured an uncaught exception in thread: Thread[id=660, name=Lucene Merge Thread #6, state=RUNNABLE, group=TGRP-Tes\\\n tIndexWriterDelete]\n [junit4] > Caused by: org.apache.lucene.index.MergePolicy$MergeException: java.lang.RuntimeException: segments must include at least one segment\n [junit4] > at __randomizedtesting.SeedInfo.seed([355D07976851D85A]:0)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler.handleMergeException(ConcurrentMergeScheduler.java:704)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:684)\n [junit4] > Caused by: java.lang.RuntimeException: segments must include at least one segment\n [junit4] > at org.apache.lucene.index.MergePolicy$OneMerge.<init>(MergePolicy.java:228)\n [junit4] > at org.apache.lucene.index.TieredMergePolicy.findForcedMerges(TieredMergePolicy.java:701)\n [junit4] > at org.apache.lucene.index.IndexWriter.updatePendingMerges(IndexWriter.java:2103)\n [junit4] > at org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3929)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:625)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:662)Throwable #2: com.carrotsearch.randomizedtesting.UncaughtExceptionError: Capture\\\n d an uncaught exception in thread: Threadid=661, name=Lucene Merge Thread #7, state=RUNNABLE, group=TGRP-TestIndexWriterDelete\n [junit4] > Caused by: org.apache.lucene.index.MergePolicy$MergeException: java.lang.IllegalStateException: this writer hit an unrecoverable error; cannot merge\n [junit4] > at __randomizedtesting.SeedInfo.seed([355D07976851D85A]:0)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler.handleMergeException(ConcurrentMergeScheduler.java:704)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:684)\n [junit4] > Caused by: java.lang.IllegalStateException: this writer hit an unrecoverable error; cannot merge\n [junit4] > at org.apache.lucene.index.IndexWriter._mergeInit(IndexWriter.java:4072)\n [junit4] > at org.apache.lucene.index.IndexWriter.mergeInit(IndexWriter.java:4052)\n [junit4] > at org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3904)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:625)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:662)\n [junit4] > Caused by: java.lang.RuntimeException: segments must include at least one segment\n [junit4] > at org.apache.lucene.index.MergePolicy$OneMerge.<init>(MergePolicy.java:228)\n [junit4] > at org.apache.lucene.index.TieredMergePolicy.findForcedMerges(TieredMergePolicy.java:701)\n [junit4] > at org.apache.lucene.index.IndexWriter.updatePendingMerges(IndexWriter.java:2103)\n [junit4] > at org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3929)\n [junit4] > ... 2 more\nand\n\n [junit4] 2> NOTE: reproduce with: ant test -Dtestcase=TestIndexWriterDelete -Dtests.method=testDeleteAllSlowly -Dtests.seed=355D07976851D85A -Dtests.badapples=true -Dtests.locale=en-IE -Dtests.timezon\\\n e=Australia/Perth -Dtests.asserts=true -Dtests.file.encoding=UTF-8\n [junit4] ERROR 0.21s J0 | TestIndexWriterDelete.testDeleteAllSlowly <<<\n [junit4] > Throwable #1: java.lang.IllegalStateException: this writer hit an unrecoverable error; cannot complete forceMerge\n [junit4] > at __randomizedtesting.SeedInfo.seed([355D07976851D85A:C651573F1DF18CA2]:0)\n [junit4] > at org.apache.lucene.index.IndexWriter.forceMerge(IndexWriter.java:1917)\n [junit4] > at org.apache.lucene.index.IndexWriter.forceMerge(IndexWriter.java:1861)\n [junit4] > at org.apache.lucene.index.RandomIndexWriter.doRandomForceMerge(RandomIndexWriter.java:371)\n [junit4] > at org.apache.lucene.index.RandomIndexWriter.getReader(RandomIndexWriter.java:386)\n [junit4] > at org.apache.lucene.index.RandomIndexWriter.getReader(RandomIndexWriter.java:332)\n [junit4] > at org.apache.lucene.index.TestIndexWriterDelete.testDeleteAllSlowly(TestIndexWriterDelete.java:984)\n [junit4] > at java.lang.Thread.run(Thread.java:745)\n [junit4] > Caused by: java.lang.RuntimeException: segments must include at least one segment\n [junit4] > at org.apache.lucene.index.MergePolicy$OneMerge.<init>(MergePolicy.java:228)\n [junit4] > at org.apache.lucene.index.TieredMergePolicy.findForcedMerges(TieredMergePolicy.java:701)\n [junit4] > at org.apache.lucene.index.IndexWriter.updatePendingMerges(IndexWriter.java:2103)\n [junit4] > at org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3929)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:625)\n [junit4] > at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:662)\n [junit4] 2> Apr 24, 2018 9:27:54 PM com.carrotsearch.randomizedtesting.RandomizedRunner$QueueUncaughtExceptionsHandler uncaughtException\n [junit4] 2> WARNING: Uncaught exception in thread: ThreadLucene Merge Thread #6,5,TGRP-TestIndexWriterDelete\n [junit4] 2> org.apache.lucene.index.MergePolicy$MergeException: java.lang.RuntimeException: segments must include at least one segment\n [junit4] 2> at __randomizedtesting.SeedInfo.seed([355D07976851D85A]:0)\n [junit4] 2> at org.apache.lucene.index.ConcurrentMergeScheduler.handleMergeException(ConcurrentMergeScheduler.java:704)\n [junit4] 2> at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:684)\n [junit4] 2> Caused by: java.lang.RuntimeException: segments must include at least one segment\n [junit4] 2> at org.apache.lucene.index.MergePolicy$OneMerge.<init>(MergePolicy.java:228)\n [junit4] 2> at org.apache.lucene.index.TieredMergePolicy.findForcedMerges(TieredMergePolicy.java:701)\n [junit4] 2> at org.apache.lucene.index.IndexWriter.updatePendingMerges(IndexWriter.java:2103)\n [junit4] 2> at org.apache.lucene.index.IndexWriter.merge(IndexWriter.java:3929)\n [junit4] 2> at org.apache.lucene.index.ConcurrentMergeScheduler.doMerge(ConcurrentMergeScheduler.java:625)\n [junit4] 2> at org.apache.lucene.index.ConcurrentMergeScheduler$MergeThread.run(ConcurrentMergeScheduler.java:662)\n [junit4] 2>\n\n\nCan we make these ints, and cast to double when we need to divide them?:\n+ double totalDelDocs = 0;\n + double totalMaxDocs = 0;\n\nHmm that 50/100 integer division will just be zero:\ncutoffSize = (long) ((double) maxMergeSegmentBytesThisMerge * (1.0 - (50/100)));\nHmm this left me hanging (in findForcedMerges):\n// First condition is that\nWe define this:\nint totalEligibleSegs = eligible.size();\nBut do not decrement it when we remove segments from eligible in the loop after?\n\nIn findForcedMerges since we pre-compute the per-segment sizes using getSegmentSizes, can you use that map instead of calling\u00a0size(info, writer) again? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16450110",
+            "date": "2018-04-24T15:47:22+0000",
+            "content": "\u00a0 \u00a0 // We did our best to find the right merges, but through the vagaries of the scoring algorithm etc. we didn't \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0 \u00a0\u00a0\u00a0\u00a0// merge down to the required max segment count. So merge the N smallest segments to make it so.\u00a0\nHmm can you describe why this would happen?\u00a0 Seems like if you ask the scoring algorithm to find merges down to N segments, it shouldn't ever fail?\n\nWe also seem to invoke getSegmentSizes more than once in findForcedMerges? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16457885",
+            "date": "2018-04-29T02:17:50+0000",
+            "content": "I think it still makes sense to try to break these changes into a couple issues\n\nWorks for me, I'll just leave the new parameter stuff commented out and we can discuss it in a separate JIRA.\n\nis going to be big enough!\n\nAnd scary enough. Anyway, I left the new bits about indexPctDeletedTarget commented out.\n\nThanks for the test failures, \"it worked for me\", but I'll beast this and see and try the seeds.\n\nCan we make these ints, and cast to double when we need to divide them?:\n\ndone. Longs unnecessary as this is within a single core, right?\n\ncutoffSize = (long) ((double) maxMergeSegmentBytesThisMerge * (1.0 - (50/100))); divide-by-zero\n\nOddly it doesn't,  think the compiler casts them to doubles due to the 1.0 leading, but since it's confusing I'll use 50.0/100.0.\n\n\n// First condition is that\n\nNice english wasn't it...... Removed, it was the remnant of some intermediate versions.\n\nBut do not decrement it when we remove segments from eligible in the loop after?\n\nIn that case it's a silly variable to have since eligible.size() is the same thing, removed it.\n\nHmm can you describe why this would happen?\n\nThe problem I ran into was that say we're merging down to 5 segments. At some point we might have 9 eligible segments, and it's even possible that none of them have deletes.  The doFindMerges code may return a spec == null 'cause there's not enough segments to make a decent merge according to that code, and/or it would create an out-sized segment etc. So we need to collect segments 4-9 and merge them to get to 5 total segments. We try to choose the smallest ones.\n\nThis is actually similar in spirit to the old code, at the end of findForcedMerges there's a clause that catches this condition.\n\nAll that said, this seems ad-hoc, I'll take another look at it. \n\nI've also imagined at least one edge case that results in very dissimilar size segments at the end of forceMerge, but with the singleton merge they'll correct themselves so I don't think it's really worth trying to protect against.\n\nWe also seem to invoke getSegmentSizes more than once in findForcedMerges?\n\nI was going to take another look at all the usages of size(info, writer) as well as the getting the deleted doc count, I'll see. I think what I want to do, rather than manipulate the List<SegmentCommitInfo> eligible, is get the sizes up front (and maybe deleted docs?) and manipulate that (also pass that to doFindMerges).\n\nProbably another patch to look soon. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16459460",
+            "date": "2018-05-01T05:24:02+0000",
+            "content": "OK, I think this is getting quite close. The place I'm most uncomfortable is in findForcedMerges. See the TODO around line 778 plus the fact that there's a bunch of special handling depending on whether we're forceMerging to 1 segment, a max count or respecting max segments size. I want to make one more pass though it, there ought to be a more organized way of doing this.\n\nAlso, when giving a maximum number of segments, we calculate the ideal segment size and then I increase it by 25% on the theory that segments won't fit perfectly, so allow some extra space in hopes that all the segments will be fit into the max segment count the first time through.\n\nHowever, there are still edge cases I think where that won't necessarily work on the first pass, especially if there are very many segments. In that case, at the very end there's a loop essentially saying \"go through as many iterations as necessary increasing the max segment size by 25% each time until you can fit them all in the required number of segments\". This really means that in this case you could rewrite the entire index twice. Is that OK? I don't want to spend a lot of time on this case though, it seems to me that if you specify this you'll have to live with this edge case.\n\nMichael McCandless There's another departure from the old process here. If there are multiple passes for forceMerge, I keep returning null in until there aren't any current merges running involving the original segments. Is there any real point in trying to create another merge specification if there are merges from previous passes going on? This is around line 684.\n\nI beasted all of Mikes failures 120 times along with TestTieredMergePolicy and no failures. All tests pass and precommit worked.\n\nThen, of course I made one tiny change so I'll have to go 'round that testing again. I also have to make another couple of runs at counting the total bytes written to see if something crept in.\n\nThat said, I think this is the last major rearrangement I want to do. If my additional testing succeeds and there are no objections, I'll probably commit sometime this weekend.\n\nThanks to all who've looked at this! ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16462618",
+            "date": "2018-05-03T15:36:03+0000",
+            "content": "Thanks Erick Erickson; I will try to review this soon.\u00a0 Maybe Simon Willnauer\u00a0can also have a look. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16463273",
+            "date": "2018-05-04T01:42:18+0000",
+            "content": "Michael McCandless Do note that I'm seeing these errors on my latest full test run, I'll chase down what's up with them. That said, I think I'm at a point where I don't want to do another significant change to the approach if I can help it or unless there are issues.... I'll see if I can reproduce these errors reliably and whether I can get them to occur with the unmodified TMP code.\n\nPrecommit passes though and compiles, can I ship it \n\n   [junit4]   - org.apache.solr.core.TestCodecSupport.testMixedCompressionMode\n   [junit4]   - org.apache.solr.search.join.TestScoreJoinQPNoScore.testRandomJoin\n   [junit4]   - org.apache.solr.TestRandomFaceting.testRandomFaceting\n   [junit4]   - org.apache.solr.TestRandomDVFaceting.testRandomFaceting\n   [junit4]   - org.apache.solr.core.TestMergePolicyConfig.testTieredMergePolicyConfig\n   [junit4]   - org.apache.solr.TestJoin.testRandomJoin\n   [junit4]   - org.apache.solr.TestJoin.testJoin\n   [junit4]   - org.apache.solr.core.TestSolrDeletionPolicy1.testKeepOptimizedOnlyCommits ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16463704",
+            "date": "2018-05-04T10:54:10+0000",
+            "content": "Eric thanks for tackling this big issue here!\n\nhere are a couple comments:\n\n\n\tplease remove the commented part that refers to // TODO: See LUCENE-8263\n\tCan we find a better name for InfoInfo maybe SegmentSizeAndDocs\n\tcan you make  SegmentSizeAndDocs static and maybe a simple struct ie. no getters and don't pass IW to it\n\tcan we assert that int totalMaxDocs is always positive. I know we don't allow that many documents in an index but I think it would be good to have an extra check.\n\tcan we name maxMergeAtOnceThisMerge  currentMaxMergeAtOnce or maybe just maxMergeAtOnce\n\n\n\nI got down this quite a bit and I am starting to question if we should really try to change the algorithm that we have today or if this class needs cleanup and refactorings first. I am sorry to come in late here but this is a very very complex piece of code and adding more complexity to it will rather do harm. \nThat said, I wonder if we can generalize the algorithm here into a single method because in the end they all do the same thing. We can for instance make the selection alg pluggable with a func we pass in and that way differentiate between findMerges and findForceMerge etc. At the end of the day we want them all to work in the same way. I am not saying we should go down all that way but maybe we can extract a common code path that we can share between the places were we filter out the segments that are not eligible. \n\nThis is just a suggestion, I am happy to help here btw. One thing that concerns me and is in-fact a showstopper IMO is that the patch doesn't have a single test that ensures it's correct. I mean we significantly change the behavior I think it warrants tests no? ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16464131",
+            "date": "2018-05-04T16:49:21+0000",
+            "content": "Simon:\n\nThanks for taking the time, and yeah, the complexity bothers me too.\n\nI'm reluctant to take the comments out for 8263 as their lifetime is expected to be a few days after this is checked in and I don't want to have to remember how I got it to work, but we can if you strongly object.\n\nAbout tests. There are actually a number of tests for TMP functionality already, in particular merging down to N segments and forcemerging, what particular parts of the code do you think should be exercised more?\n\nAs for naming/style changes, sure. I always feel like an interloper in the Lucene code;  I'm perfectly willing to try to keep it consistent with the folks' expectations who, you know live in the Lucene codebase \n\nAs for your other suggestions, I don't know. I've rewritten/refactored/whatever this about three times already and every time I do it gets complicated again.\n\nI wonder if we can generalize the algorithm here into a single method because in the end they all do the same thing.\n\ndoFindMerges is called from all three operations so I'm a bit puzzled about what this would look like. Each of the three operations has different initial conditions, eligible segments, max segment size allowed and the like. Once those are established, they all go through the same scoring/selection code. Figuring out the initial conditions is \"interesting\"\n\nThere are several areas here that are particularly gnarly and any way to un-gnarl them would be great.\n\n> the variable number of segments in findForcedMerges. I'd love for there to be exactly two choices; merge down to one or respect max segment size. Controlling the number of segments would then be more along the lines of setting maxMergedSegmentsMB in TMP.\n\n> the multi-pass nature of findForcedMerges because it respects the maxMergeAtOnceExplicit.\n\n> Somewhat different decisions need to be made in doFindMerges depending on what type of merge it is. I'm not a huge fan of passing that enum in. One of the iterations tried to pass information into an uber-function but that lead to having to pass around segmentsToMerge from findForcedMerges, which wasn't present in the other two, so passing null in from them was also ugly.\n\n> I also ran into a couple of issues with findMerges needing to not merge segments if there weren't enough in the tier, which is exactly the opposite of findForcedMerges, which itself has conditions around whether it should merge a segment with no deletions or not if exceeds maxMergedSegmentMB which itself is a variable condition based on whether maxSegments has been specified.....\n\nLet me know if you're going to take a whack at it, even a skeleton of a different approach would help me get on the same page.\n\nMeanwhile I can incorporate your other comments, they'll be useful no matter what. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16464399",
+            "date": "2018-05-04T21:08:52+0000",
+            "content": "I have not been following the code, but I have been following the discussion.  How much of the complexity is related to not surprising existing users?\n\nI think a lot of concerns would disappear if the focus is implementing a new merge policy instead of attempting to fix/augment TMP.\n\nMichael McCandless, was TMP a ground-up implementation, or an evolution from LBMP?  When I find some time, I can look at the code.\n\nI've been on a little bit of a \"let's rewrite it from scratch!\" kick lately with regards to my own code, so keep that  in mind when evaluating any bias I might show! ",
+            "author": "Shawn Heisey"
+        },
+        {
+            "id": "comment-16464414",
+            "date": "2018-05-04T21:27:49+0000",
+            "content": "General thoughts: I think the overall goals stated in the class-level javadoc for TieredMergePolicy are good.  Based on the discussion, minimizing deleted docs (whether there has been a forceMerge in the past or not) needs to be a more significant focus than it is now. ",
+            "author": "Shawn Heisey"
+        },
+        {
+            "id": "comment-16464560",
+            "date": "2018-05-05T01:42:58+0000",
+            "content": "Shawn:\n\nMuch of the point of this work is exactly to change the behavior. The old code did this massive merge into a single segment for forceMerge which made it easy to shoot oneself in the foot. forceMerge, expungeDeletes, and IndexUpgraderTool have the same problem: they produce very large segments that then aren't merged away unless they have < maxSegmentSizeMB/2 \"live\" docs. There's a blog about that... https://lucidworks.com/2017/10/13/segment-merging-deleted-documents-optimize-may-bad/\n\nI thought a bit about a new policy, but the motivation here is to alter the behavior of producing very large segments so I decided to approach it by altering TMP, rather than creating a new policy and deprecating TMP.\n\nFWIW. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16465430",
+            "date": "2018-05-07T04:58:45+0000",
+            "content": "Simon WillnauerMichael McCandless So I'm finally thinking about the tests. Simon's totally right, I really hadn't been thinking about tests yet, but now that he prompted me it's, well, obvious that there are some that can be written to test things like respecting max segment size by default etc...\n\nAnyway, since I don't know what documents are in what segments, I can't really predict some things, like which specific segments should be merged under various conditions.\n\nI see two approaches:\n1> delete documents from specific segments. I'm guessing this is just getting terms(field) from a leaf reader and enumerating?\n\n2> Just delete some random documents, examine the segments before and after a forceMerge or expungeDeletes with various parameters to see if my expectations are met.\n\nGot any preferences?\n\nOh, and the test failures were because I'd missed a check and I've incorporated the rest of Simon's comments, no new patch until tests. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16465780",
+            "date": "2018-05-07T10:54:38+0000",
+            "content": "Erick Erickson if you index with a single thread, and `commit()` at the right times you can build a precise set of segments and then directly test TMP's behavior.\u00a0 I like approach one since it then gives you full deterministic control to enumerate the different tricky cases that surface in real indices? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16465852",
+            "date": "2018-05-07T12:35:19+0000",
+            "content": ">\u00a0Erick Erickson\u00a0if you index with a single thread, and `commit()` at the right times you can build a precise set of segments and then directly test TMP's behavior.\u00a0 I like approach one since it then gives you full deterministic control to enumerate the different tricky cases that surface in real indices?\n\n\u00a0\n\nI really think we should start working towards testing this as real unittest. Creating stuff with IW and depending on it is a big issue. We can change the code to be less dependent on IW. I think we should and we should do it before making significant changes to MPs IMO ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16469931",
+            "date": "2018-05-10T05:07:50+0000",
+            "content": "Latest patch incorporating comments so far and adding tests, plus some Solr documentation changes.\n\nI'd really like to wrap this up soon, I think we should move more refactoring/restructuring on to other JIRAs.\n\nPrecommit and tests run, or at least ran before I worked on the tests. \n\nTODO:\n\n\tmake sure precommit and test still runs.\n\tdo some more measurements against old code to insure that the write rates are OK.\n\tgive the code a last once-over, make sure I took out anything I had in there for debugging and the like.\n\n\n\nOtherwise, AFAICT, it's ready to rock-n-roll. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16470548",
+            "date": "2018-05-10T15:20:32+0000",
+            "content": "I really think we should start working towards testing this as real unittest.\u00a0\n+1, this would be great; I think we'd need to disentangle IndexWriter and MergePolicy a bit to enable this?\u00a0 We pass IndexWriter to MergePolicy's methods, but then the merge policy only uses a few methods like numDeletesToMerge, segString (for verbosity), getMergingSegments ; we could abstract these out somehow? Or use a mocking tool I suppose. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16470787",
+            "date": "2018-05-10T17:26:36+0000",
+            "content": "Erick Erickson I'll review your latest patch soon! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16471009",
+            "date": "2018-05-10T19:49:50+0000",
+            "content": "Net/net I like this change; it would allow the forced merges to pick \"better\" merges to achieve their constraints.  But I think we do need to keep iterating... this is really a complex change.\n\nCan you remove the @Test annotations?  They are redundant.\n\ntwoManyHaveBeenMerged --> tooManyHaveBeenMerged?\n\nCan you name it maxDoc not maxDocs?  E.g. segMaxDocs -> segMaxDoc, just to be consistent w/ maxDoc elsewhere in our sources.\n\n\n    int originalSortedSize = sortedEligible.size();\n    if (verbose(writer)) {\n      message(\"findMerges: \" + originalSortedSize + \" segments\", writer);\n    }\n    if (sortedEligible.size() == 0) {\n      return null;\n    }\n\n\n\nYou can use originalSortedSize in the if above?\n\nShould the haveOneLargeMerge also look at the merging segments to decide whether a large merge is already running before invoking TMP? Otherwise the very next time IW invokes TMP it could send out another large merge.\n\nThis new change worries me:\n\n\n    // If we're already merging, let it all merge before doing more.\n    if (merging.size() > 0) return null;\n\n\n\nAnd I think that's the line you were asking me about with this?\n\nMichael McCandless There's another departure from the old process here. If there are multiple passes for forceMerge, I keep returning null in until there aren't any current merges running involving the original segments. Is there any real point in trying to create another merge specification if there are merges from previous passes going on? This is around line 684.\n\nBut I think that's dangerous \u2013 won't this mean that we will fail to return a merge that could concurrently run with already merging segments, in the cascading case?\n\nThese parts still seem smelly to me:\n\n\n     // Fudge this up a bit so we have a better chance of not having to rewrite segments. If we use the exact size,\n     // it's almost guaranteed that the segments won't fit perfectly and we'll be left with more segments than\n     // we want and have to re-merge in the code at the bottom of this method.\n     maxMergeBytes = Math.max((long) (((double) totalMergeBytes / (double) maxSegmentCount)), maxMergedSegmentBytes);\n     maxMergeBytes = (long)((double) maxMergeBytes * 1.25);\n\n\n\n\n    // we're merging down to some specified number of segments> 1, but the scoring with the first guess at max\n    // size of segments didn't get us to the required number. So we need to relax the size restrictions until they all\n    // fit and trust the scoring to give us the cheapest merges..\n    // TODO: Is this really worth it? It potentially rewrites the entire index _again_. Or should we consider\n    // maxSegments a \"best effort\" kind of thing? Or do we just assume that any bad consequences of people doing this\n    // is SEP (Someone Else's Problem)?\n    \n    if (maxSegmentCount != Integer.MAX_VALUE) {\n      while (spec == null || spec.merges.size() > maxSegmentCount) {\n        maxMergeBytes = (long)((double)maxMergeBytes * 1.25);\n        sortedSizeAndDocs.clear();\n        sortedSizeAndDocs.addAll(holdInCase);\n        spec = doFindMerges(sortedSizeAndDocs, maxMergeBytes, maxMergeAtOnceExplicit,\n            maxSegmentCount, MERGE_TYPE.FORCE_MERGE, writer);\n      }\n    }\n\n\n\nThe 25% up front fudge factor, the retrying in the end with larger and larger fudge factors ... seems risky; rewriting the index 2X times during forceMerge is no good.  I wonder if there's a better way; it's sort of a bin packing problem, where you need to distribute existing segments into N bins where the bins are close to the same size?\n\nOr, maybe we can change the problem: when you forceMerge to N segments, should we really allow violating the maxMergedSegmentMB constraint in that case?\n\nI think that retry loop can run forever, if you have an index that has so many segments that in order to force merge down to the requested count, the merges must cascade?  Maybe make a test?  E.g. if you want to force merge to 5 segments, and the index has more than 6 * 30 (default maxMergeAtOnceExplicit) then it may spin forever?\n\nCan you change doFindMerges to not modify the incoming list (i.e. make its own copy), then you don't need to holdInCase local variable?\n\nCan you use an ordinary if here instead of ternary operator?  And invert the if to if (mergeType == MERGE_TYPE.NATURAL)?  And then move the // if forcing comment inside the else clause?\n\n\n        int lim = (mergeType != MERGE_TYPE.NATURAL) ? sortedEligible.size() - 1 : sortedEligible.size() - maxMergeAtonce;\n\n ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16473280",
+            "date": "2018-05-12T21:50:28+0000",
+            "content": "Mike:\n\nThanks, I'm off on vacation until the 22nd, then probably catching up the last part of that week, I'll take a look then. No doubt after leaving it alone for a couple of weeks I'll wonder why the heck I did that....\n\nErick ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16490054",
+            "date": "2018-05-25T00:39:12+0000",
+            "content": "Michael McCandless OK, I'm back at it.\n\n------------easy parts.\nI'll incorporate all your style suggestions, NP there. Except for twoMayHaveBeenMerged. That's not a typo, it's meant to cover the case where there could be one tiny segment and findForcedMerges legitimately combines that small segment with a larger one even if there are no deletions while still respecting maxMergedSegmentSizeMB. I've added a bit more explanation in the comments though, if it confused you it would confuse others. Maybe I'll be able to think of a better name.\n\nCan you change doFindMerges to not modify the incoming list...\nI've done that. Pending the resolution to maxSegments, holdInCase may not be necessary though in which case copying to a local variable is unnecessary. I'm not sure I care given how expensive merging is in general, one extra list copy is probably immeasurable (and cleaner).\n\n------hard part 1\nThese parts still seem smelly to me:\nYeah, me too.\n\nOr, maybe we can change the problem: when you forceMerge to N segments, should we really allow violating the maxMergedSegmentMB constraint in that case?\n\nFrankly I'd like to have exactly one valid value for maxSegments: 1 . That is, the only choices would be to merge down to 1 segment or respect maxMergedSegmentMB. WDYT?\n\nAnother option is to relax what specifying maxSegments means to a \"best effort\". If we just calculate the max segment size based on the number of segments specified and not worry about meeting it exactly. Then the loop goes away. In that case, the 25% (or whatever) fudge factor isn't dangerous since there'd be no loop, but fudging it up isn't totally necessary either.\n\nI do wonder who, if anybody, uses maxSegments except to avoid the issue that started this, that is optimize creating a large segment that can accumulate lots of deleted docs. Has it outlived its usefulness?\n\n\n---- hard part 2\nAnd I think that's the line you were asking me about with this?\nBut I think that's dangerous \u2013 won't this mean that we will fail to return a merge that could concurrently run with already merging segments, in the cascading case?\n\nSo the scenario here is that we have a long-running merge running on one thread and, even though we could be running a dozen other small merges we wouldn't run any of them until the big one was done, right?\n\nOK, I'll put this back.\n\n--------------- TBD then:\nSo I think the only thing remaining from your review is what to do about maxSegments and that really horrible loop. Options in the order I like \n\n1> Remove the loop entirely. Calculate the theoretical segment size and add 25% (or whatever) and call doFindMerges once. The purpose of the loop is to handle the case where that calculations results in N+M segments when N was specified but M additional segments were created because they didn't pack well (your bin packing characterization). Update the docs to say it's on a \"best effort\" basis.\n\nThis option preserves most of the intent of maxSegments without introducing the complexity/danger. And I think you're right, with enough segments we'd never get out of that loop.\n\n2> Allow maxSegments to have only one option: 1. Otherwise we just respect maxMergedSegmentSizeMB. Users can approximate doing forceMerge with maxSegments with values other than 1 by configuring their maxMergedSegmentsSizeMB to suit their wishes and do a forceMerge without specifying maxSegments.\n\n--------\nSo all told this is closer than I feared when I saw how long your response was . If we decide to go with option <1> for maxSegments, all that would remain after that is putting back the bits with find merges even if there are merges currently running.\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16495578",
+            "date": "2018-05-30T19:20:27+0000",
+            "content": "Iteration N+1. This one removes the horrible loop that concerned Michael McCandless, and good riddance to it. Also puts in all the rest of the changes so far.\n\n2 out of 2,004 iterations of TestTieredMergePolicy.testPartialMerge failed because a forceMerge was specified with maxSegments != 1 that didn't produce the exact number of segments specified. I changed the test a bit to accommodate the fact that if we respect maxSegmentSize + 25% as an upper limit, then there are certainly some situations where the expected segment count will not be exactly what's specified. Is this acceptable? It's the packing problem.\n\nAnd of course I thought that when the segment count is 1 there should be no ambiguity so that's why two patches are uploaded so close to each other.\n\nMeanwhile I'll run another couple of thousand iterations and the whole precommit/test cycle again.\n\nPending more comments I think we're close. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16496712",
+            "date": "2018-05-31T15:27:08+0000",
+            "content": "Thanks Erick Erickson; I'll look at the new iteration soon!\u00a0 Sounds promising  ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16496805",
+            "date": "2018-05-31T16:21:37+0000",
+            "content": "Hit another failure (one in 2004), chasing now. Looks like I've messed up the hitTooLarge in some weird case. Don't think it'll be anything major, FYI. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16497581",
+            "date": "2018-06-01T05:26:38+0000",
+            "content": "The failure was a bad test assumption, only a test change. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16497857",
+            "date": "2018-06-01T11:14:49+0000",
+            "content": "\n\n\n+          // A singleton merge with no deletes makes no sense. We can get here when forceMerge is looping around...\n+          if (candidate.size() == 1) {\n+            SegmentSizeAndDocs segSizeDocs = segInfosSizes.get(candidate.get(0));\n+            if (segSizeDocs.segDelDocs == 0) {\n+              continue;\n+            }\n\n\nshould we check here if the segDelDocs is less that the threshold rather than checking if there is at least one delete.\n\n\n+          if (haveOneLargeMerge == false || bestTooLarge == false || mergeType == MERGE_TYPE.FORCE_MERGE_DELETES) {\n\n\n\n\nI have a question about it, I might just not understand this well enough:\n\n\tif we have seen one or more large merges we don't add the merge\n\tif the best one is too large neither\n\tbut always when we do force merge deletes\n\n\n\nno if we have not seen a too large merge but the best one is too large we still add it? is this correct, don't we want to prevent \nthese massive merges? I might just miss something sorry for being slow.\n\n\n+      this.segDelDocs = maxDoc;\n\n\n\nI do wonder about the naming here why is this named maxDoc should it be named delCount or so?\n\n\n+    private final SegmentCommitInfo segInfo;\n+    private final long segBytes;\n+    private final int segDelDocs;\n+    private final int segMaxDoc;\n+    private final String segName;\n\n\n\ncan I suggest to remove the seg prefix. It's obivous form the name. I also think it should be delCount instead.\n\n\n if (haveWork == false) return null;\n\n\n\ncan you plese use parentesis around this?\n\n\n  SegmentInfos infos =\n        SegmentInfos.readLatestCommit(searcher.getIndexReader().directory());\n\n\n\nin SegmentsInfoRequestHandler solr reads the SegmentInfos from disk which will not result in accurate counts. I know this \nis a preexisting issue I just want to point it out. IW will use the object identity of the SegmentCommitInfo of the reader to look\nup it's live-stats for NRT deletes etc.\n\nI do like the tests, I would loved to see them work without index writer. They should be real unittests not relying on stats in IW. Do you think you can still fix that easily. Not a blocker just a bummer :/\n\n\n ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16502206",
+            "date": "2018-06-05T17:57:35+0000",
+            "content": "Simon: \n\nThanks, I'll be able to work on this sometime this week I hope.\n\nI'm trying to keep \"scope creep\" from happening too much here so may add another JIRA or two for things that are pre-existing. I'll detail when I incorporate your comments.\n\nI won't consider committing this before the 7.4 version is cut, if for no other reason than I want this to get as much mileage as possible before it's included in a release.\n\n6,000 iterations of TestTieredMergePolicy later and no failures so I'm starting to feel optimistic. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16506594",
+            "date": "2018-06-08T21:36:10+0000",
+            "content": "Simon Willnauer\n\nshould we check here if the segDelDocs is less that the threshold rather than checking if there is at least one delete.\n\nNot unless we redefine what forceMerge does. It's perfectly possible to have a segment at this point that's 4.999G with one document deleted. It'll be horribly wasteful, but it's no worse than what has always happened with forceMerge.\n\nOutside of forceMerge, segments won't be eligible unless they have 10% deleted docs.\n\nIn the case of findMerge, I'm counting on the scoring mechanism to keep this from being a problem.\n\nno if we have not seen a too large merge but the best one is too large we still add it? is this correct, don't we want to prevent.\n\nThis is awkward at present in that it preserves the old behavior. findForcedDeletesMerges has always allowed multiple large merges, leaving that for a later JIRA.\n\nIn the other cases, this will prevent multiple large merges because the first time we get a large merge, haveOneLargeMerge == false and bestTooLarge == true so we create a large merge.\n\nThereafter, if bestTooLarge == true we'll avoid adding it.\n\nI do wonder about the naming here why is this named maxDoc should it be named delCount or so?\n\nBrain fart, changed. I started out doing one thing then changed it without noticing that.\n\ncan I suggest to remove the seg prefix. It's obivous form the name. I also think it should be delCount instead\nDone\n\ncan you plese use parentesis around this?\nDone\n\nin SegmentsInfoRequestHandler solr reads the SegmentInfos from disk which will not result in accurate counts.\n\nGood to know, is there a better way to go? I don't think total accuracy is necessary here.\n\n..I would loved to see them work without index writer....Do you think you can still fix that easily\n\nI have no idea  I saw the discussion at 8330 but didn't see any test conversions I could copy. I'll put up another version of this patch momentarily, if you could show me the pattern to use I'll see what I can do. That said, if it's involved at all I'd like to put it in a follow-on JIRA.\n\nMichael McCandless This set of changes is purely style, no code changes. So unless there are objections, I'll commit it sometime next week. \n\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16507735",
+            "date": "2018-06-11T06:53:31+0000",
+            "content": "I have no idea  I saw the discussion at 8330 but didn't see any test conversions I could copy. I'll put up another version of this patch momentarily, if you could show me the pattern to use I'll see what I can do. That said, if it's involved at all I'd like to put it in a follow-on JIRA.\n\nlets do a followup\n\nMichael McCandless This set of changes is purely style, no code changes. So unless there are objections, I'll commit it sometime next week.\n\n+1 to the patch\n\nGood to know, is there a better way to go? I don't think total accuracy is necessary here.\n\nI do agree that it's not absolutely necessary but confusing as hell if you call it and then it tells you it should merge but it doesn't. I think it defeats the purpose of this API entirely. I just thought I should mention it.  ",
+            "author": "Simon Willnauer"
+        },
+        {
+            "id": "comment-16510118",
+            "date": "2018-06-12T20:05:20+0000",
+            "content": "Thanks Erick Erickson; patch looks a lot better!\u00a0 I'm glad that scary loop is gone.\n\nA few small things:\n\n\u00a0Can we remove this code:\n\n\n          // A singleton merge with no deletes makes no sense. We can get here when forceMerge is looping around...                                                                    \n          if (candidate.size() == 1) {\n            SegmentSizeAndDocs segSizeDocs = segInfosSizes.get(candidate.get(0));\n            if (segSizeDocs.delCount == 0) {\n              continue;\n            }\n          }\n\n\n\nIf we fix the above loop to not add the singleton merge unless it has deletes?\n\nCan you rename maxMergeAtonce --> maxMergeAtOnce?\n\nHmm shouldn't this code only run if the merge candidate is max sized (bestTooLarge)?  I.e. change true to bestTooLarge?\n\n\n            if (bestTooLarge) {\n              haveOneLargeMerge = true;\n            }\n\n\n\nI think this logic might be buggy?\n\n\n      boolean maxMergeIsRunning = false;\n      if (mergeType == MERGE_TYPE.NATURAL) {\n        maxMergeIsRunning = mergingBytes >= maxMergedSegmentBytes;\n      }\n\n\n\nE.g. if we have picked two merges to run, neither of which is the max segment size, but when added together they are over the max, then we incorrectly conclude maxMergeIsRunning? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16510541",
+            "date": "2018-06-13T02:35:02+0000",
+            "content": "If we fix the above loop to not add the singleton merge unless it has deletes?\n\nI don't think so. Since this is common code, then it's quite possible that during forceMerge we assemble some segments that have no deletes due to maxMergeAtOnceExplicit that are still a fraction of maxMergedSegmentMB. These segments are eligible next pass to be merged even though they have no deleted documents. So we can't just omit them from the candidate up-front.\n\n...rename maxMergeAtonce to maxMergeAtOnce\n\nDone. Autocomplete strikes again, one misspelling and it propagates.\n\nI.e. change true to bestTooLarge?\n\nI've no objection, but what's the functional difference? Just making sure there's not a typo there.\n\nI think this logic is buggy?\n\nThe more I look the more I think it's always been buggy. Or at least should be restructured.\n\nCheck me out on this. As far as I can tell, mergingBytes would be the exact same in the old code every time it was calculated. Every time through the loop for gathering the best merge, the code looks in the same infosSorted (which doesn't change) and starts from the same point every time (tooBigCount which doesn't change) and adds to mergingBytes if (and only if) the segment is in mergeContext.getMergingSegments() (which doesn't change).\n\nmergingBytes really just asks if the sum of all the segments that could be merged are currently being merged total more than maxMergedSegmentBytes. So I'll make the new code do the same thing. I can calculate that value outside the loop and just set it once.\n\nOr I'm missing something that'll be obvious when someone else points it out. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16511434",
+            "date": "2018-06-13T17:04:19+0000",
+            "content": "All tests pass, beasting 2,004 times succeeds, Mike's latest comments incorporated. So if my latest response to Mike is acceptable I'll commit over the weekend.\n\nI'll beast it a bit more while I'm at it, since that's mostly waiting. ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16511517",
+            "date": "2018-06-13T18:29:03+0000",
+            "content": "I don't think so. Since this is common code, then it's quite possible that during forceMerge we assemble some segments that have no deletes due to maxMergeAtOnceExplicit that are still a fraction of maxMergedSegmentMB. These segments are eligible next pass to be merged even though they have no deleted documents. So we can't just omit them from the candidate up-front.\n\nAhhh, you are right!  So let's leave it in.\n\n\nI.e. change true to bestTooLarge?\n\nI've no objection, but what's the functional difference? Just making sure there's not a typo there.\n\nOh duh not sure what I was thinking \u2013 there would be no functional difference   OK maybe change to this?:\n\n\nhaveOneLargeMerge |= bestTooLarge;\n\n\n\n\nI think this logic is buggy?\n\nThe more I look the more I think it's always been buggy. Or at least should be restructured.\n\nHmm I said might be buggy, but somehow when you quoted me it became is!\n\nAnyway, the maxMergeIsRunning logic prevents picking a \"max sized\" merge if the total bytes being merged across all running merges is >= the max merged size, which I think is good.  But I don't see where TMP is doing this same thing?  We do compute mergingBytes, and pass it to score but otherwise seem not to use it? ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16511577",
+            "date": "2018-06-13T19:35:39+0000",
+            "content": "maybe change to this?:\nSure. Next patch.\n\nAnyway, the maxMergeIsRunning logic prevents picking a \"max sized\" merge if the total bytes being merged across all running merges is >= the max merged size, which I think is good. \n\nRight, good to know we're talking about the same thing \n\nBut I don't see where TMP is doing this same thing? We do compute mergingBytes, and pass it to score but otherwise seem not to use it?\n\nThis is where I get lost. I looked at mergingBytes clear back to the first revision of this file and mergingBytes never been used in score(...), just passed as a parameter. I think Simon took it out as part of LUCENE-8330.\n\nAll it's used for is to set maxMergeIsRunning to prevent a computed candidate from being used if a max merge is already running, just as you say. So the latest patch passes that boolean along to doFindMerges and does the same thing with it. Since the old code only seemed to care about this when doing a \"natural\" merge, the new code passes false from the other two cases.\n\nHow about this. If that makes no sense and we only think we're talking about the same thing, maybe hop on a Google hangout or something at your convenience and see if we can reconcile it all?\n ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16512580",
+            "date": "2018-06-14T15:00:48+0000",
+            "content": "maybe hop on a Google hangout or something at your convenience and see if we can reconcile it all?\n+1, just reach out when you have a chance?\u00a0 I'm just confused where TMP is currently implementing this. ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16513252",
+            "date": "2018-06-15T02:38:54+0000",
+            "content": "\n\n\n  -1 overall \n\n\n\n\n\n\n\n\n\n Vote \n Subsystem \n Runtime \n Comment \n\n\n\u00a0\n\u00a0\n\u00a0\n  Prechecks  \n\n\n +1 \n  test4tests  \n   0m  0s \n  The patch appears to include 1 new or modified test files.  \n\n\n\u00a0\n\u00a0\n\u00a0\n  master Compile Tests  \n\n\n +1 \n  compile  \n   7m 27s \n  master passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Patch Compile Tests  \n\n\n +1 \n  compile  \n   6m 58s \n  the patch passed  \n\n\n -1 \n  javac  \n   1m 49s \n  lucene_core generated 3 new + 1 unchanged - 0 fixed = 4 total (was 1)  \n\n\n +1 \n  Release audit (RAT)  \n   2m 27s \n  the patch passed  \n\n\n +1 \n  Check forbidden APIs  \n   1m 49s \n  the patch passed  \n\n\n +1 \n  Validate source patterns  \n   1m 49s \n  the patch passed  \n\n\n +1 \n  Validate ref guide  \n   1m 49s \n  the patch passed  \n\n\n\u00a0\n\u00a0\n\u00a0\n  Other Tests  \n\n\n +1 \n  unit  \n  43m 49s \n  core in the patch passed.  \n\n\n -1 \n  unit  \n  65m 50s \n  core in the patch failed.  \n\n\n -1 \n  unit  \n  13m 31s \n  solrj in the patch failed.  \n\n\n  \n   \n 148m 29s \n   \n\n\n\n\n\n\n\n\n\n Reason \n Tests \n\n\n Failed junit tests \n solr.rest.TestManagedResourceStorage \n\n\n\u00a0\n solr.cloud.autoscaling.SearchRateTriggerIntegrationTest \n\n\n\u00a0\n solr.cloud.autoscaling.ScheduledMaintenanceTriggerTest \n\n\n\u00a0\n solr.client.solrj.impl.CloudSolrClientTest \n\n\n\u00a0\n solr.common.util.TestJsonRecordReader \n\n\n\n\n\n\n\n\n\n Subsystem \n Report/Notes \n\n\n JIRA Issue \n LUCENE-7976 \n\n\n JIRA Patch URL \n https://issues.apache.org/jira/secure/attachment/12927680/LUCENE-7976.patch \n\n\n Optional Tests \n  compile  javac  unit  ratsources  checkforbiddenapis  validatesourcepatterns  validaterefguide  \n\n\n uname \n Linux lucene2-us-west.apache.org 4.4.0-112-generic #135-Ubuntu SMP Fri Jan 19 11:48:36 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux \n\n\n Build tool \n ant \n\n\n Personality \n /home/jenkins/jenkins-slave/workspace/PreCommit-LUCENE-Build/sourcedir/dev-tools/test-patch/lucene-solr-yetus-personality.sh \n\n\n git revision \n master / 2db2fb3 \n\n\n ant \n version: Apache Ant(TM) version 1.9.6 compiled on July 8 2015 \n\n\n Default Java \n 1.8.0_172 \n\n\n javac \n https://builds.apache.org/job/PreCommit-LUCENE-Build/33/artifact/out/diff-compile-javac-lucene_core.txt \n\n\n unit \n https://builds.apache.org/job/PreCommit-LUCENE-Build/33/artifact/out/patch-unit-solr_core.txt \n\n\n unit \n https://builds.apache.org/job/PreCommit-LUCENE-Build/33/artifact/out/patch-unit-solr_solrj.txt \n\n\n  Test Results \n https://builds.apache.org/job/PreCommit-LUCENE-Build/33/testReport/ \n\n\n modules \n C: lucene/core solr/core solr/solrj solr/solr-ref-guide solr/webapp U: . \n\n\n Console output \n https://builds.apache.org/job/PreCommit-LUCENE-Build/33/console \n\n\n Powered by \n Apache Yetus 0.7.0   http://yetus.apache.org \n\n\n\n\n\n\nThis message was automatically generated.\n ",
+            "author": "Lucene/Solr QA"
+        },
+        {
+            "id": "comment-16514064",
+            "date": "2018-06-15T16:39:55+0000",
+            "content": "OK I just chatted w/ Erick Erickson and indeed I was simply confused \u2013 the current TMP already has logic to not run multiple \"max sized\" merges, and so this patch isn't changing that.\n\n\u00a0\n\n+1 to push! ",
+            "author": "Michael McCandless"
+        },
+        {
+            "id": "comment-16514278",
+            "date": "2018-06-15T19:48:35+0000",
+            "content": "I'm not quite sure what's happening, but my two recent pushes don't seem to auto-add the git link to the JIRA.\n\nRevision for master: 2519025fdafe55494448854c87e094b14f434b41\n\nRevision for 7x: 9c4e315c1cb3495f400c179159836f568cd2989d ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16514950",
+            "date": "2018-06-17T01:08:38+0000",
+            "content": "Thanks for all who helped! ",
+            "author": "Erick Erickson"
+        },
+        {
+            "id": "comment-16521359",
+            "date": "2018-06-24T03:20:17+0000",
+            "content": "git bisect points the finger at commit 2519025 on this issue for the reproducing failure noted at SOLR-12513. ",
+            "author": "Steve Rowe"
+        },
+        {
+            "id": "comment-16522933",
+            "date": "2018-06-25T23:19:49+0000",
+            "content": "git bisect blames commits 2519025 & 9c4e315 on this issue for the reproducing failures noted at LUCENE-8370. ",
+            "author": "Steve Rowe"
+        },
+        {
+            "id": "comment-16532645",
+            "date": "2018-07-04T11:38:03+0000",
+            "content": "Commit a8a1cf8a88915eb42786e5e7d8a321130f67b689 in lucene-solr's branch refs/heads/branch_7x from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=a8a1cf8 ]\n\nLUCENE-7976: Fix indentation. ",
+            "author": "ASF subversion and git services"
+        },
+        {
+            "id": "comment-16532646",
+            "date": "2018-07-04T11:38:04+0000",
+            "content": "Commit 799d2acd88e2886f90ff276ccb8d443ca0268963 in lucene-solr's branch refs/heads/master from Adrien Grand\n[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=799d2ac ]\n\nLUCENE-7976: Fix indentation. ",
+            "author": "ASF subversion and git services"
+        }
+    ]
+}

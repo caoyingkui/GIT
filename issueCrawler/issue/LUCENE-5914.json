@@ -1,0 +1,258 @@
+{
+    "id": "LUCENE-5914",
+    "title": "More options for stored fields compression",
+    "details": {
+        "type": "Improvement",
+        "priority": "Major",
+        "labels": "",
+        "resolution": "Fixed",
+        "components": [],
+        "affect_versions": "None",
+        "status": "Closed",
+        "fix_versions": [
+            "5.0",
+            "6.0"
+        ]
+    },
+    "description": "Since we added codec-level compression in Lucene 4.1 I think I got about the same amount of users complaining that compression was too aggressive and that compression was too light.\n\nI think it is due to the fact that we have users that are doing very different things with Lucene. For example if you have a small index that fits in the filesystem cache (or is close to), then you might never pay for actual disk seeks and in such a case the fact that the current stored fields format needs to over-decompress data can sensibly slow search down on cheap queries.\n\nOn the other hand, it is more and more common to use Lucene for things like log analytics, and in that case you have huge amounts of data for which you don't care much about stored fields performance. However it is very frustrating to notice that the data that you store takes several times less space when you gzip it compared to your index although Lucene claims to compress stored fields.\n\nFor that reason, I think it would be nice to have some kind of options that would allow to trade speed for compression in the default codec.",
+    "attachments": {
+        "LUCENE-5914.patch": "https://issues.apache.org/jira/secure/attachment/12665372/LUCENE-5914.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14115503",
+            "author": "Adrien Grand",
+            "content": "What I have been thinking about would be to provide 2 options for compression (we could have more than 2 but that would make it more complicated backward-compatibility wise):\n\n\tone option that focuses on search speed,\n\tone option that focuses on compression.\n\n\n\nHere is how the current patch tries to address these requirements:\n\n1. For high compression, documents are grouped into blocks of 16KB (pretty much like today) but instead of being compressed with LZ4, they are compressed with deflate and a low compression level (3 which is the highest level that doens't use lazy match evaluation, I think it is a good trade-off for our stored fields).\n\nIf you want to decompress a document, you need to decompress the whole block.\n\n2. For better search speed, documents are compressed individually with lz4. In order to keep the compression ratio good enough, documents are still grouped into blocks, and what happens is that the data that results from the compression of the previous documents in the block are used as a dictionary in order to compress the current document.\n\nWhen you want to decompress, you can decompress a single document at a time, all that you need to is to have a buffer that stores the compressed representation of the previous documents in the block so that the decompression routine can make references to it.\n\nIn both cases, I tried to implement it in such a way that it is not required to override the default bulk merge API in order to get good merging performance: the readers keep some state that allow them to read documents sequentially. This should also help for operations like exports of the indices since they would get much better performance when iterating over documents in order.\n\nThe patch is not ready yet, it is too light on tests so that I can sleep quietly, and quite inefficient on large documents. For now I'm just sharing it in order to get some feedback. \n\nFor the shared dictionary logic, I looked at other approaches that didn't work out well:\n\n\ttrying to compute a shared dictionary happens to be very costly since you would need to compute the longest common subsequences that are shared across documents in a block. That is why I ended up using the compressed documents as a dictionary since it requires neither additional CPU nor space while works quite efficiently due to the way that lz4 works.\n\tI tried to see what can be done with shared dictionaries and DEFLATE, but the dictionaries are only used for the LZ77 part of the algorithm, not for the huffman coding so it was not really helpful in our case.\n\tI tried to see if we could compute a huffman dictionary per block and use it to compress all documents individually (some thing that the deflate API doesn't allow for) but it was very slow (probably for two reasons: 1. I wanted to keep it simple and 2. Java is not as efficient as C for that kind of stuff)\n\tI also played with the ng2 and ng3 algorithms described in http://openproceedings.org/EDBT/2014/paper_25.pdf but it was significantly slower than lz4 (because lz4 can process large sequences of bytes at a time, while these formats only work on 2 or 3 bytes at a time).\n\n ",
+            "date": "2014-08-29T17:14:01+0000"
+        },
+        {
+            "id": "comment-14116025",
+            "author": "Erick Erickson",
+            "content": "Haven't looked at the patch I confess, but is there a way to turn compression off completely? I've seen a few situations in the wild where compressing/decompressing is taking up large amounts of CPU.....\n\nFWIW,\nErick ",
+            "date": "2014-08-29T23:14:20+0000"
+        },
+        {
+            "id": "comment-14116075",
+            "author": "Shawn Heisey",
+            "content": "Haven't looked at the patch I confess, but is there a way to turn compression off completely?\n\n+1.\n\nFrom what I understand, this would be relatively straightforward in Lucene, where you can swap low-level components in and out pretty easily, but I'm really looking for that option to be user-configurable in Solr.  I know that will require a separate issue.  For my index, compression is a good thing, but like Erick, I've seen situations with Solr on the list and IRC where it really hurts some people. ",
+            "date": "2014-08-29T23:59:50+0000"
+        },
+        {
+            "id": "comment-14116233",
+            "author": "Robert Muir",
+            "content": "The patch adds conditional logic to the default codec, instead of different formats. Why this approach?  ",
+            "date": "2014-08-30T04:46:17+0000"
+        },
+        {
+            "id": "comment-14116904",
+            "author": "Adrien Grand",
+            "content": "Erick Erickson Shawn Heisey Do you have pointers to emails/irc logs describing such issues? Maybe that is something that can be solved without disabling compression? By the way, the current patch already improves CPU usage in two cases: when doing random access since you can decompress a single document at a time, and also sequential access (typically used if you export your current dataset using stored fields, or internally by Lucene when merging mixed codecs) so maybe that would already help.\n\nRobert Muir I will change this. ",
+            "date": "2014-08-31T21:48:13+0000"
+        },
+        {
+            "id": "comment-14116926",
+            "author": "Robert Muir",
+            "content": "Adrien Grand well I just was curious about the motivation behind it. \n\nThere are advantages and disadvantages to each way, but as separate formats each use case would really be able to proceed in its own direction in the future. \n\nWith the current patch, BEST_COMPRESSION = Deflate, but what if we wanted to replace this with bzip later and still support the old indexes etc (which I think is a goal of this issue). \n\nSo I think its better to have separate formats (if they want to share some code behind the scenes at the moment, thats ok). If we want to provide back compat on both options, then thats something we can decide to do here (IMO, there should be a \"price\" for the added complexity, such as moving all ancient codecs out of lucene/core, dropping 3.x index support, something to keep it all manageable). ",
+            "date": "2014-08-31T22:40:46+0000"
+        },
+        {
+            "id": "comment-14117242",
+            "author": "Andrzej Bialecki",
+            "content": "Do you have pointers to emails/irc logs describing such issues?\nI've seen this issue on AWS small instances, where CPU \"steal time\" and not I/O can easily become the limiting factor. ",
+            "date": "2014-09-01T09:26:29+0000"
+        },
+        {
+            "id": "comment-14117637",
+            "author": "Erick Erickson",
+            "content": "These were some user's list discussions, can't lay my hands on them right now.\n\nWhether there were work-arounds or not, I've always been uncomfortable with not having the option to turn off compression. There are just too many places where people do \"non standard\" things like store not-very-many huge documents to take that option away from them unless we can guarantee that in all configurations trading I/O for CPU is A Good Thing. And I don't believe we can make that guarantee.\n\nThat said, I'm not the one doing the coding so I don't know the ins and outs here. If it's easy to turn compression off then I think it's worth doing. If it's major surgery OTOH, I don't have any hot complaints to point to so insisting that you do the work because of a vaguely-remembered user list discussion (that I can't prove there was no work-around for) is just not in the cards . The response has been \"write your own codec\", so maybe the right option is to provide a non-compressing codec? Here's where you tell me there already is one \n\nAndrzej points out an interesting case though.\n ",
+            "date": "2014-09-01T18:51:14+0000"
+        },
+        {
+            "id": "comment-14117726",
+            "author": "Stefan Pohl",
+            "content": "This is an interesting discussion based on awesome work, thanks Adrian!\n\nFrom my experience, LZ4 can actually speed up reading (such as implemented here) and working on byte arrays if they have reasonable size, say 10k. There can however be some small overhead for short stored fields (e.g. if only an int is stored). It remains to be seen how this impl compares to no-compression.\n\nOn AWS instances as the ones Andrzej Bialecki  refers to, wouldn't switching off index compression be even more helpful, especially after having per-doc decompression as implemented here? Lucene and most other IR engines always have been trading in CPU for IO/size because index compression is on per default.\nThis doesn't mean though not to provide the option to users if a case for it can be made  ",
+            "date": "2014-09-01T21:11:30+0000"
+        },
+        {
+            "id": "comment-14117759",
+            "author": "Robert Muir",
+            "content": "\nThis doesn't mean though not to provide the option to users if a case for it can be made\n\nIts ok to provide such options without hesitation in the codecs/ module, however:\n\nWe have to be careful, this issue proposes supporting such options in the default codec.\n\nThis is a completely different thing. This means we support such formats for years and years and years. Currently as we speak we are trying to release 4.10, and it must still be able to read the 3.0 index format from 5 years ago (and we had to respin another release candidate because there were bugs in such support).\n\nSo that's why i point out, if we want to add an option (and i expect we can add at most 1 option here feasibly), then tradeoffs have to be made in our backwards compatibility support such that we can maintain this stuff and it does not spin out of control. ",
+            "date": "2014-09-01T22:34:23+0000"
+        },
+        {
+            "id": "comment-14117986",
+            "author": "Eks Dev",
+            "content": "Do you have pointers to emails/irc logs describing such issues?\n\nI do not know what the gold standard lucene usage is, but at least one use case I can describe, maybe it helps. I am not proposing anything here, just sharing experience. \n\nThink about the (typical lucene?) usage with structured data (e.g. indexing relational db, like product catalog or such) with many smallish fields and then retrieving 2k such documents to post-process them, classify, cluster them or whatnot (e.g. mahout and co.) \n\n\n\tDefault compression with CHUNK_SIZE makes it decompress 2k * CHUNK_SIZE/2  bytes on average in order to retrieve 2k Documents\n\tReducing chunk_size helps a lot, but there is a sweet-spot, and if you reduce it too much, you will not see enough compression and then your index is not fitting into cache , so you get hurt on IO.\n\n\n\nIdeally we should enable to use biggish chunk_size during compression to improve compression and decompress only single document (not depending on chunk_size), just like you proposed here (if I figured it out correctly?)\n\nUsually, such data is highly compressible (imagine all these low cardinality fields like color of something...) and even some basic compression does the magic.\n\nWhat we did?\n\n\tReduced chunk_size\n\tAs a bonus to improve compression, added plain static dictionary compression for a few fields in update chain (we store analysed fields)\n\tWhen applicable, we pre-sort collection periodically before indexing (on low cardinality fields first).... this old db-admin secret weapon helps a lot\n\n\n\nConclusion: compression is great, and anything that helps tweak this balance (CPU effort / IO effort)  in different phases indexing/retrieving smoothly makes lucene use case coverage broader.  (e.g. \"I want to afford more CPU during indexing, and less CPU during retrieval\", static coder being extreme case for this...)\n\nI am not sure I figured out exactly if and how this patch is going to help in a such cases (how to achieve reasonable compression if we do per document compression for small documents? Reusing dictionaries from previous chunks? static dictionaries... ). \n\nIn any case, thanks for doing the heavy lifting here! I think you already did really great job with compression in lucene. \n\nPS: Ages ago, before lucene, when memory was really expensive, we had our own serialization (not in lucene) that simply had one static Huffman coder per field (with byte or word symbols), with code-table populated offline,  that was great, simple option as it enabled reasonable compression for \"slow changing collections\" and really fast random access.  \n ",
+            "date": "2014-09-02T07:30:09+0000"
+        },
+        {
+            "id": "comment-14119918",
+            "author": "Adrien Grand",
+            "content": "Ideally we should enable to use biggish chunk_size during compression to improve compression and decompress only single document (not depending on chunk_size), just like you proposed here (if I figured it out correctly?)\n\nExactly, this is one of the two proposed options. The only overhead would be that you would need to read the shared dictionary and have it in memory (but that is a single call to readBytes and its size can be controlled so that should be no issue).\n\nUsually, such data is highly compressible (imagine all these low cardinality fields like color of something...) and even some basic compression does the magic.\n\nAgreed, this is the reason why I'd prefer the \"low-overhead\" option to be something cheap rather than no compression at all: data usually has lots of patterns and even something as simple as LZ4 manages to reach interesting compression ratios.\n\n\nConclusion: compression is great, and anything that helps tweak this balance (CPU effort / IO effort) in different phases indexing/retrieving smoothly makes lucene use case coverage broader. (e.g. \"I want to afford more CPU during indexing, and less CPU during retrieval\", static coder being extreme case for this...)\n\nI am not sure I figured out exactly if and how this patch is going to help in a such cases (how to achieve reasonable compression if we do per document compression for small documents? Reusing dictionaries from previous chunks? static dictionaries... ). \n\nThe trade-off that this patch makes is:\n\n\tkeep indexing fast enough in all cases\n\tallow to trade random access speed to documents for index compression\n\n\n\nThe current patch provides two options:\n\n\teither we compress documents in blocks like today but with Deflate instead of LZ4, this provides good compression ratios but makes random access quite slow since you need to decompress a whole block of documents every time you want to access a single document\n\teither we still group documents into blocks but compress them individually, using the compressed representation of the previous documents as a dictionary.\n\n\n\nI'll try to explain the 2nd option better: it works well because lz4 mostly deduplicates sequences of bytes in a stream. So imagine that you have the following 3 documents in a block:\n 1. abcdefghabcdwxyz\n 2. abcdefghijkl\n 3. abcdijklmnop\n\nWe will first compress document 1. Given that it is the first document in the block, there is no shared dictionary, so the compressed representation look like this (`literals` means that bytes are copied as-is, and `ref` means it is a reference to a previous sequence of bytes. This is how lz4 works, it just replaces existing sequences of bytes with references to previous occurrences of the same bytes. The more references you have and the longer they are, the better the compression ratio.).\n\n<literals:abcdefgh><ref:abcd><literals:wxyz>\n\nNow we are going to compress document 2. It doesn't contain any repetition of bytes, so if we wanted to compress it individually, we would just have <literals:abcdefghijkl> which doesn't compress at all (and is even slightly larger due to the overhead of the format). However, we are using the compressed representation of document1 as a dictionary, and \"abcdefgh\" exists in the literals, so we can make a reference to it!\n\n<ref:abcdefgh><literals:ijkl>\n\nAnd again for document3 using literals of document1 for \"abcd\", and literals of document2 for \"ijkl\":\n\n<ref:abcd><ref:ijkl><literals:mnop> ",
+            "date": "2014-09-03T14:57:22+0000"
+        },
+        {
+            "id": "comment-14119977",
+            "author": "Eks Dev",
+            "content": "lovely, thanks for explaining, I expected something like this but was not 100% sure without looking into code. \nSimply, I see absolutely nothing ono might wish from general, OOTB compression support... \n\nIn theory...\nThe only meaningful enhancements to the standard are possible to come only by modelling semantics of the data (the user must know quite a bit about the distribution of the data) to improve compression/speed => but this cannot be provided by the core, (Lucene is rightly content agnostic), at most the core APIs might make it more or less comfortable, but imo nothing more. \n\nFor example (contrived as LZ4 would deal with it quite ok, just to illustrate), if I know that my field contains up to 5 distinct string values, I might  add simple dictionary coding to use max one byte without even going to codec level. The only place where I see theoretical possibility to need to go down-dirty is if I would want to reach sub-byte representations (3 bits per value in example), but this is rarely needed/hard to beat default LZ4/deflate and also even harder not to make slow. At the end of a day, someone who needs this type of specialisation should be able to write his own per-field codec.\n\nGreat work, and thanks again!\n\n ",
+            "date": "2014-09-03T15:38:49+0000"
+        },
+        {
+            "id": "comment-14121459",
+            "author": "Erick Erickson",
+            "content": "Here's an example of what I was remembering. I haven't verified, could be totally unrelated to compression. The use-case seems to be very large documents (up to 50M) indexing time going from 3 hours to 3 days. There may very well be stuff going on here that is unrelated, but...\n\nSkipping the discussion about what the point of 50M docs is \n\nhttp://mail-archives.apache.org/mod_mbox/lucene-solr-user/201409.mbox/%3C27589A9FF2E7CC42B56140FD01CEC3A2EF794C56%40clrc-nt-mbx01p.corp.org.local%3E ",
+            "date": "2014-09-04T15:28:54+0000"
+        },
+        {
+            "id": "comment-14121721",
+            "author": "Ryan Ernst",
+            "content": "Erick Erickson That example doesn't appear to even have stored fields enabled?\n\n\n<field name=\"majorTextSignalStem\" type=\"text_stem\" indexed=\"true\" stored=\"false\" multiValued=\"true\"\nomitNorms=\"false\"/> ",
+            "date": "2014-09-04T18:25:48+0000"
+        },
+        {
+            "id": "comment-14121916",
+            "author": "Erick Erickson",
+            "content": "Ryan Ernst] Right, that particular field doesn't, I was assuming that other fields did.\n\nHmmm, let me ping him back and we'll see if we can get him to experiment for us.\n ",
+            "date": "2014-09-04T20:15:26+0000"
+        },
+        {
+            "id": "comment-14228437",
+            "author": "Adrien Grand",
+            "content": "Here is a new patch. Quick reminder of what it brings:\n\n\tability to use shared dictionaries when compressing documents: this means that you benefit from compressing several documents in a single block while keeping the ability to decompress a single document at a time (and not the entire block). This can make the decompression of a single document significantly faster if your documents are small.\n\tyou can now trade speed for compression. In that case it will fall back to compressing all documents from a single block at once with deflate, which will make retrieval slow but the compression ratio good.\n\tthe stored fields reader keeps state so that iterating in order is fast and does not need to decompress the same thing twice (useful for merging and exporting the content of the index)\n\n\n\nCompared to the previous version of the patch, we now have two standalone stored fields formats for both options, which makes testing easier, as well as a main Lucene50StoredFieldsFormat which delegates to these formats based on the result of Lucene50Codec.getStoredFieldsCompression. ",
+            "date": "2014-11-28T17:54:34+0000"
+        },
+        {
+            "id": "comment-14229025",
+            "author": "Robert Muir",
+            "content": "Some updates:\n\n\tport to trunk apis (i guess this was outdated?)\n\tfix some javadoc bugs\n\tnuke lots of now-unused stuff in .compressing, only still used for term vectors\n\timprove float/double compression: it was not so effective and wasteful. these now write 1..5 and 1..9 bytes.\n\n\n\nWe should try to do more cleanup:\n\n\tI don't like the delegator. maybe its the best solution, but at least it should not write its own file. I think we should revive SI.attributes (properly: so it rejects any attribute puts on dv updates) and use that.\n\tThe delegator shouldnt actually need to delegate the writer? If i add this code, all tests pass:\n\n    final StoredFieldsWriter in = format.fieldsWriter(directory, si, context);\n    if (true) return in; // wrapper below is useless\n    return new StoredFieldsWriter() {\n\n\nThis seems to be all about delegating some manual file deletion on abort() ? Do we really need to do this? If we have some bugs around indexfiledeleter where it doesn't do the right thing, enough to warrant such apis, then we should have tests for it. Such tests would also show the current code deletes the wrong filename:\n\nIOUtils.deleteFilesIgnoringExceptions(directory, formatName); // formatName is NOT the file the delegator writes\n\n\nBut this is obselete if we add back SI.attributes.\n\tThe header check logic should be improved. I don't know why we need the Reader.checkHeader method, why cant we just check it with the other files?\n\tWe should try to use checkFooter(Input, Throwable) for better corruption messages, with this type of logic. It does more an appends suppressed exceptions when things go wrong:\n\ntry (ChecksumIndexInput input =(...) {\n  Throwable priorE = null;\n  try {\n    // ... read a bunch of stuff ... \n  } catch (Throwable exception) {\n    priorE = exception;\n  } finally {\n    CodecUtil.checkFooter(input, priorE);\n  }\n}\n\n\n\tAny getChildResources() should return immutable list: doesn't seem to always be the case. Maybe assertingcodec can be improved to actually test this automatically.\n\n\n\nI will look more tomorrow. ",
+            "date": "2014-11-30T06:12:57+0000"
+        },
+        {
+            "id": "comment-14229166",
+            "author": "Robert Muir",
+            "content": "nuked abort() in LUCENE-6082 and removed the delegating writer here. ",
+            "date": "2014-11-30T17:17:12+0000"
+        },
+        {
+            "id": "comment-14229170",
+            "author": "Robert Muir",
+            "content": "I will think more on the header check logic. On one hand it would be nice if we could figure out an idiom for CodecUtil.checkFooter(Throwable, Input...) that would be safe, but every option I think of is crazier than the current stuff.\n\nIts also a bit wierd to be slurping in 3 read-once metadata files here. This adds complexity at read... the current format is simpler here with just a single file. Can we avoid this? ",
+            "date": "2014-11-30T17:22:30+0000"
+        },
+        {
+            "id": "comment-14229698",
+            "author": "Adrien Grand",
+            "content": "Its also a bit wierd to be slurping in 3 read-once metadata files here. This adds complexity at read... the current format is simpler here with just a single file. Can we avoid this?\n\nI tried to look into it, but it's not easy. Lucene41 has its own custom stored fields index, which is mostly the same thing as MonotonicBlockPackReader, so for this new codec, I wanted to move the index to MonotonicBlockPackReader.\n\nThe index for stored fields basically stores two pieces of information: the first doc ID for each block, and the first start pointer for each block. In Lucene41, blocks were interleaved, but this is not something that the MonotonicBlockPackWriter allows for, this is why there are 2 files: one for doc IDs and one for start pointers. Second limitation, at read time, you need to know up-front how many values the MonotonicBlockPackReader stores in order to be able to decode it. This is why we have a 3rd file for metadata that stores the number of documents in the segment upon call to StoredFieldsWriter.finish.\n\nI agree having 3 read-only files might look strange, but it's probably better than having to re-implement specialized monotonic encoding? ",
+            "date": "2014-12-01T11:52:41+0000"
+        },
+        {
+            "id": "comment-14229708",
+            "author": "Robert Muir",
+            "content": "\nSecond limitation, at read time, you need to know up-front how many values the MonotonicBlockPackReader stores in order to be able to decode it. This is why we have a 3rd file for metadata that stores the number of documents in the segment upon call to StoredFieldsWriter.finish.\n\nBut this is redundant with SegmentInfo? ",
+            "date": "2014-12-01T12:05:42+0000"
+        },
+        {
+            "id": "comment-14229716",
+            "author": "Adrien Grand",
+            "content": "Sorry, I meant number of blocks instead of number of documents. ",
+            "date": "2014-12-01T12:16:45+0000"
+        },
+        {
+            "id": "comment-14230731",
+            "author": "Adrien Grand",
+            "content": "Here is a new patch that iterates on Robert's:\n\n\timproved compression for numerics:\n\tfloats and doubles representing small integers take 1 byte\n\tother positive floats and doubles take 4 / 8 bytes\n\tother floats and doubles (negative) take 5 / 9 bytes\n\tdoubles that are actually casted floats take 5 bytes\n\tlongs are compressed if they represent a timestamp (2 bits are used to encode for the fact that the number is a multiple of a second, hour, day, or is uncompressed)\n\tclean up of the checkFooter calls in the reader\n\tslightly better encoding of the offsets with the BEST_SPEED option by using monotonic encoding: this allows to just slurp a sequence of bytes and then decode a single value instead of having to decode lengths and sum them up in order to have offsets (the BEST_COMPRESSION option still does this however)\n\tfixed some javadocs errors\n\n ",
+            "date": "2014-12-02T00:03:28+0000"
+        },
+        {
+            "id": "comment-14231040",
+            "author": "Robert Muir",
+            "content": "I opened LUCENE-6085 for the SI.attributes, which should help with cleanup.\n\nI ran some benchmarks on various datasets to get an idea where this is at, they are disappointing. For geonames, the new format increases size of the stored fields 50%, for apache http server logs, it doubles the size. Indexing time is significantly slower for any datasets i test as well: there must be bugs in the lz4+shared dictionary?\n\n\n\n\nimpl\nsize\nindex time\nforce merge time\n\n\ntrunk\n372,845,278\n101,745\n15,976\n\n\npatch(BEST_SPEED)\n780,861,727\n141,699\n60,114\n\n\npatch(BEST_COMPRESSION)\n265,063,340\n132,238\n53,561\n\n\n\n\n\nTo confirm its a bug and not just the cost of additional i/o (due to less compression with shared dictionaries), i set deflate level to 0, and indexed with the BEST_COMPRESSION layout to really jack up the size. Sure, it created a 1.8GB stored field file, but in 126,093ms with 44,377ms merging. This is faster than both the options in the patch...\n\nAnyway, this leads to more questions:\n\n\tDo we really need a completely separate lz4 impl for the shared dictionaries support? Its tough to understand e.g. why it reimplements the hashtable differently and so on.\n\tDo we really need to share code between different stored fields impls that have different use-cases and goals? I think the patch currently overshares here, and the additional abstractions make it hard to work with.\n\tAlong with the sharing approach above: we can still reuse code between formats though. for example the document<->byte stuff could be shared static methods. I would just avoid subclassing and interfaces because I get lost in the patch too easily. And we just need to be careful that any shared code is simple and clear because we have to assume the formats will evolve overtime.\n\tWe shouldnt wrap the deflate case with zlib header/footer. This saves a little bit.\n\n\n\nAbout the oversharing issue: I really think the separate formats should just be separate formats, it will make life easier. Its more than just a difference in compression algorithm and we shouldn't try to structure things so that can just be swapped in, i think its not the right tradeoff.\n\nFor example, with high compression its more important to lay it out in a way where bulk-merge doesn't cause re-compressions, even if it causes 'temporary' waste along segment boundaries. This is important because compression here gets very costly, and for e.g. \"archiving\" case, bulk merge should be potent as there shouldnt be so many deletions: we shouldnt bear the cost of re-compressing over and over. This gets much much worse if you try to use something \"better\" than gzip, too. \n\nOn the other hand with low compression, we should ensure merging is still fast even in the presence of deletions: the shared dictionary approach is one way, another way is to just have at least the getMergeInstance() remember the current block and have \"seek within block\" optimization, which is probably simpler and better than what trunk does today. ",
+            "date": "2014-12-02T05:58:09+0000"
+        },
+        {
+            "id": "comment-14231066",
+            "author": "Robert Muir",
+            "content": "I also want to propose a new way to proceed here. In my opinion this issue tries to do a lot at once:\n\n\n\tmake changes to the default codec\n\tsupport high and low compression options in the default codec with backwards compatibility\n\tprovide some easy way to \"choose\" between supported options without having to use FilterCodec\n\tnew lz4 implementation\n\tnew deflate implementation\n\n\n\nI think its too scary to do all at once. I would prefer we start by exposing the current CompressionMode.HIGH_COMPRESSION as the \"high compression\" option. At least for that one test dataset i used above (2GB highly compressible apache server logs), this is reasonably competitive with the deflate option on this issue:\n\n\n\nimpl\nsize\nindex time\nforce merge time\n\n\ntrunk_HC\n275,262,504\n143,264\n49,030\n\n\n\n\n\nBut more importantly, HighCompressingCodec has been baking in our test suite for years, scary bugs knocked out of it, etc.\nI think we should first figure out the plumbing to expose that, its something we could realistically do for lucene 5.0 and have confidence in. There is still plenty to do there to make that option work: exposing the configuration option, addressing concerns about back compat testing (we should generate back compat indexes both ways), and so on. But at least there is a huge head start on testing, code correctness, etc: its baked.\n\nFor new proposed formats (LZ4 with shared dictionary, deflate, whatever), I think we should address each one individually, adding to the codecs/ package first / getting into tests / baking in a similar way... doesn't need to be years but we should split these concerns. ",
+            "date": "2014-12-02T06:35:49+0000"
+        },
+        {
+            "id": "comment-14231118",
+            "author": "Robert Muir",
+            "content": "Applying the tuning parameters proposed for the deflate case here to the trunk code is a trivial and safe patch, and more compelling:\n\n\n\n\nimpl\nsize\nindex time\nforce merge time\n\n\ntrunk_HC_level3_24576_512\n269,857,651\n118,150\n28,313\n\n\n\n\n\nedited: impl name to make it clear i also bumped maxDocsPerChunk in this case too. ",
+            "date": "2014-12-02T07:41:40+0000"
+        },
+        {
+            "id": "comment-14231144",
+            "author": "Adrien Grand",
+            "content": "For the benchmarks, there are two reasons I think:\n\n\tmerging is not optimized to the byte level at all (yet?)\n\tmaking each document compressible on its own makes the compressing more complicated (hence slow)\n\n\n\nLet's move forward with your idea to reuse the lz4 hc format as a first step. I will try to improve the shared dictionary approach in a different issue. ",
+            "date": "2014-12-02T08:13:50+0000"
+        },
+        {
+            "id": "comment-14231163",
+            "author": "Robert Muir",
+            "content": "the benchmark I did here are for HighCompressingCodec aka CompressionMode.HIGH_COMPRESSION which is actually deflate, not lz4 hc. I benchmarked lz4 hc as well, but i didn't seem like the right tradeoff, slow writes but for not much benefit. ",
+            "date": "2014-12-02T08:29:02+0000"
+        },
+        {
+            "id": "comment-14232039",
+            "author": "Robert Muir",
+            "content": "Here is a patch using the current stuff as proposed. I didn't address the need for testing besides bare minimum (besides adding another BaseStoredFieldsFormatTestCase with high compression set). We should think about how to rotate nicely in tests, how to address back compat testing, and fix format docs too. ",
+            "date": "2014-12-02T19:47:19+0000"
+        },
+        {
+            "id": "comment-14232189",
+            "author": "Adrien Grand",
+            "content": "This looks like a good start! Nice that we can use segment attributes now! ",
+            "date": "2014-12-02T21:49:55+0000"
+        },
+        {
+            "id": "comment-14233874",
+            "author": "Robert Muir",
+            "content": "Updated patch:\n\n\tI made this a proper ctor parameter rather than the crazy subclassing: thats too hard to use. This way its intuitive to the user, that this parameter is a proper one and supported with backwards compatibility. On the other hand if you subclass, its more clear you are doing something \"custom\" and must deal with this another way (and i added docs for those methods).\n\tupdates to fileformat docs.\n\tadded testing where this is changed up across segments of the index.\n\thooked into test rotation.\n\n ",
+            "date": "2014-12-04T03:22:30+0000"
+        },
+        {
+            "id": "comment-14234059",
+            "author": "Adrien Grand",
+            "content": "+1 thanks Robert. I am good with a constructor argument, the only reason why I initially added it as a protected method was to be consistent with postings and doc values formats.\n\nRegarding the patch, it just feels weird to me to have this Objects.requireNonNull(mode) validation in the Lucene50Codec(Mode) constructor, I would have expeced it to be solely the responsibility of the Lucene50StoredFieldsFormat constructor? ",
+            "date": "2014-12-04T09:32:26+0000"
+        },
+        {
+            "id": "comment-14234141",
+            "author": "Robert Muir",
+            "content": "I want the null check robust to code changes. Both classes are public. I am afraid someone will remove them thinking it makes something faster.\n\nWe should add tests for this too. ",
+            "date": "2014-12-04T11:35:13+0000"
+        },
+        {
+            "id": "comment-14234933",
+            "author": "Robert Muir",
+            "content": "I added explicit tests for both these null conditions. Logic is unchanged: we have explicit null check everywhere. \n\nLucene is bogus about null checks like this everywhere: it hurts nobody's performance to do it here and its silly to have something like an aborting exception in indexwriter lose somebody's documents when it could have been prevented.\n\nI'm not going to be placed into a defensive posture where I must defend doing the right thing. IMO we can just not have this stored fields option, too. But if we are going to accept options which we must support with backwards compatibility in tthe default codec, then we should check the parameters. ",
+            "date": "2014-12-05T02:15:48+0000"
+        },
+        {
+            "id": "comment-14235404",
+            "author": "Adrien Grand",
+            "content": "+1 to the patch\n\nLooks like my comment made you angry, but it was really just something I was wondering about. I'm fine with keeping things this way. ",
+            "date": "2014-12-05T11:43:08+0000"
+        },
+        {
+            "id": "comment-14236556",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1643490 from Robert Muir in branch 'dev/trunk'\n[ https://svn.apache.org/r1643490 ]\n\nLUCENE-5914: More options for stored fields compression ",
+            "date": "2014-12-06T03:30:12+0000"
+        },
+        {
+            "id": "comment-14236574",
+            "author": "ASF subversion and git services",
+            "content": "Commit 1643491 from Robert Muir in branch 'dev/branches/branch_5x'\n[ https://svn.apache.org/r1643491 ]\n\nLUCENE-5914: More options for stored fields compression ",
+            "date": "2014-12-06T04:02:53+0000"
+        },
+        {
+            "id": "comment-14332647",
+            "author": "Anshum Gupta",
+            "content": "Bulk close after 5.0 release. ",
+            "date": "2015-02-23T05:01:08+0000"
+        }
+    ]
+}

@@ -1,0 +1,112 @@
+{
+    "id": "LUCENE-6785",
+    "title": "Consider merging Query.rewrite() into Query.createWeight()",
+    "details": {
+        "resolution": "Unresolved",
+        "affect_versions": "None",
+        "components": [],
+        "labels": "",
+        "fix_versions": [],
+        "priority": "Major",
+        "status": "Open",
+        "type": "Improvement"
+    },
+    "description": "Prompted by the discussion on LUCENE-6590.\n\nQuery.rewrite() is a bit of an oddity.  You call it to create a query for a specific IndexSearcher, and to ensure that you get a query implementation that has a working createWeight() method.  However, Weight itself already encapsulates the notion of a per-searcher query.\n\nYou also need to repeatedly call rewrite() until the query has stopped rewriting itself, which is a bit trappy - there are a few places (in highlighting code for example) that just call rewrite() once, rather than looping round as IndexSearcher.rewrite() does.  Most queries don't need to be called multiple times, however, so this seems a bit redundant.  And the ones that do currently return un-rewritten queries can be changed simply enough to rewrite them.\n\nFinally, in pretty much every case I can find in the codebase, rewrite() is called purely as a prelude to createWeight().  This means, in the case of for example large BooleanQueries, we end up cloning the whole query structure, only to throw it away immediately.\n\nI'd like to try removing rewrite() entirely, and merging the logic into createWeight(), simplifying the API and removing the trap where code only calls rewrite once.  What do people think?",
+    "attachments": {
+        "LUCENE-6785.patch": "https://issues.apache.org/jira/secure/attachment/12754738/LUCENE-6785.patch",
+        "LUCENE-6785-alt.patch": "https://issues.apache.org/jira/secure/attachment/12762368/LUCENE-6785-alt.patch"
+    },
+    "issue_links": {},
+    "comments": [
+        {
+            "id": "comment-14735064",
+            "author": "Adrien Grand",
+            "date": "2015-09-08T16:12:16+0000",
+            "content": "+1 to fold rewrite into createWeight\n\nFor the record I tried to merge them in the past but got some issues. For instance if you have a constant-score query that wraps a fuzzy query today, Weight.getQuery on the CSQ would return a CSQ that wraps a BooleanQuery, since rewriting happened before we created the Weight. This is desirable because query caching is based on the result of Weight.getQuery and using the rewritten query is better since there are odds that several queries will rewrite to the same primitive query. If we simply put the rewriting logic at the top of createWeight, then this won't be the case anymore. So I guess BooleanQuery would have to be changed eg. to create the sub-weights first, then rewrite itself entirely using the queries returned by Weight.getQuery() on the sub weights and finally create the BooleanWeight? "
+        },
+        {
+            "id": "comment-14735088",
+            "author": "David Smiley",
+            "date": "2015-09-08T16:25:08+0000",
+            "content": "It'll be interesting to see how it all looks in the patch.  I could imagine it reducing the LOC \u2013 I'm thinking of wrapping Queries that simply delegate that no longer need to do so. "
+        },
+        {
+            "id": "comment-14735631",
+            "author": "Alan Woodward",
+            "date": "2015-09-08T21:17:12+0000",
+            "content": "Here's a first-pass patch, just changing things in lucene-core.  As David says, for quite a few queries this is a straight simplification, and in those cases where rewrites aren't just passed on, it's just a matter of moving the logic from rewrite() to createWeight().\n\nI added a couple of tests for Adrien's cacheing case, specifically for BQ and DismaxQ.  Existing tests didn't seem to be picking up on those changes. SpanOr might cause the same issue as well, I'll have a look at that.  But I think this is promising overall. "
+        },
+        {
+            "id": "comment-14735655",
+            "author": "Robert Muir",
+            "date": "2015-09-08T21:33:41+0000",
+            "content": "I didn't thoroughly examine the patch, but this part alone is worth the trouble. Its crazy today that if you subclass Query, you only need to implement toString() for it to compile!\n\n\n-  public Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {\n-    throw new UnsupportedOperationException(\"Query \" + this + \" does not implement createWeight\");\n-  }\n+  public abstract Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException;\n\n "
+        },
+        {
+            "id": "comment-14736431",
+            "author": "Adrien Grand",
+            "date": "2015-09-09T08:21:38+0000",
+            "content": "I think the API is more usable this way. The only concern I might have is that we don't have as much flexibility for rewriting as we used to since we can't make decisions for rewriting based on the impl of the rewritten queries, since we only know about the rewritten queries once we have the weights and dropping weights could be problematic since they can be expensive to create due to statistics collection. I am not sure how much of an issue this would be but eg. I think Terry's patch on LUCENE-6787 would be impacted. An alternative to the current patch might be to do something like this:\n\n\nIndex: lucene/core/src/java/org/apache/lucene/search/Query.java\n===================================================================\n--- lucene/core/src/java/org/apache/lucene/search/Query.java\t(revision 1701820)\n+++ lucene/core/src/java/org/apache/lucene/search/Query.java\t(working copy)\n@@ -57,18 +57,32 @@\n   /**\n    * Expert: Constructs an appropriate Weight implementation for this query.\n    * <p>\n-   * Only implemented by primitive queries, which re-write to themselves.\n+   * This method will first {@link #rewrite(IndexReader)} the query and then\n+   * construct a concrete {@link Weight} on the rewritten query using\n+   * {@link #doCreateWeight(IndexSearcher, boolean)}.\n    *\n    * @param needsScores   True if document scores ({@link Scorer#score}) or match\n    *                      frequencies ({@link Scorer#freq}) are needed.\n    */\n-  public Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {\n-    throw new UnsupportedOperationException(\"Query \" + this + \" does not implement createWeight\");\n+  public final Weight createWeight(IndexSearcher searcher, boolean needsScores) throws IOException {\n+    Query query = this;\n+    final IndexReader reader = searcher.getIndexReader();\n+    for (Query rewrittenQuery = query.rewrite(reader); rewrittenQuery != query;\n+         rewrittenQuery = query.rewrite(reader)) {\n+      query = rewrittenQuery;\n+    }\n+    return query.doCreateWeight(searcher, needsScores);\n   }\n \n-  /** Expert: called to re-write queries into primitive queries. For example,\n-   * a PrefixQuery will be rewritten into a BooleanQuery that consists\n-   * of TermQuerys.\n+  /** Construct a Weight for this {@link Query}. In case this {@link Query} object\n+   *  always {@link #rewrite(IndexReader) rewrites} to a different Query\n+   *  implementation, it is safe to implement this method by just throwing an\n+   *  exception as it will never get called. */\n+  protected abstract Weight doCreateWeight(IndexSearcher searcher, boolean needsScores);\n+\n+  /** Internal: called to re-write queries into primitive queries. This method\n+   *  only exists as an implementation detail of\n+   *  {@link #createWeight(IndexSearcher, boolean)}. Do not call directly.\n    */\n   public Query rewrite(IndexReader reader) throws IOException {\n     return this;\n\n\n\nWe would still have the same flexibility for rewriting and consumers of the Query API would not have the trap anymore that they need to rewrite queries first. However I agree it's not as clean...  "
+        },
+        {
+            "id": "comment-14736932",
+            "author": "Terry Smith",
+            "date": "2015-09-09T14:28:02+0000",
+            "content": "The original patch drops a few key settings from the BooleanQuery in BQ.createWeight, the following patch puts them back and makes the tests happier.\n\n\ndiff --git a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java\nindex fb5f7c8..8dec338 100644\n--- a/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java\n+++ b/lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java\n@@ -210,7 +210,9 @@ public class BooleanQuery extends Query implements Iterable<BooleanClause> {\n     }\n \n     List<Weight> subweights = new ArrayList<>();\n-    Builder builder = new Builder();\n+    Builder builder = new Builder()\n+      .setDisableCoord(disableCoord)\n+      .setMinimumNumberShouldMatch(minimumNumberShouldMatch);\n     for (BooleanClause clause : query) {\n       Weight w = searcher.createWeight(clause.getQuery(), needsScores);\n       subweights.add(w);\n\n "
+        },
+        {
+            "id": "comment-14738913",
+            "author": "Alan Woodward",
+            "date": "2015-09-10T15:25:12+0000",
+            "content": "I'm travelling at the moment, will put up a larger patch changing all the modules + solr when I get back (including Terry's fix, thank you!).  I still have some tests failing around highlighting multiterm queries.\n\nThe bits keeping the QueryCache happy are a bit hacky, but I think it's worth the pain of that to make the API nicer.  Maybe in another issue we could look at using the Weights themselves as cache keys, rather than their parent queries?\n\ndropping weights could be problematic since they can be expensive to create due to statistics collection\n\nOne thought I had was that term statistics could be collected and cached by an object that's passed to createWeight().  That way we only collect stats for each term once per top-level query.  This would also be a nicer solution than the searcher term cache I proposed in LUCENE-6561. "
+        },
+        {
+            "id": "comment-14739701",
+            "author": "Adrien Grand",
+            "date": "2015-09-10T22:07:36+0000",
+            "content": "The bits keeping the QueryCache happy are a bit hacky, but I think it's worth the pain of that to make the API nicer. Maybe in another issue we could look at using the Weights themselves as cache keys, rather than their parent queries?\n\nI mentioned the query cache, but highlighting relies on this behaviour too if I recall correctly, because it needs to know about the rewritten boolean query in order to be able to highlight eg. a FuzzyQuery.\n\nI don't think weights can make good cache keys: Could two weights that have been created against different index readers be equal? I think they could not, but on the other hand this is something we need from the cache keys if we want to be able to retain cache entries on a given segment across reopens? "
+        },
+        {
+            "id": "comment-14742536",
+            "author": "Alan Woodward",
+            "date": "2015-09-13T16:25:08+0000",
+            "content": "Patch with all tests passing.\n\nI don't think weights can make good cache keys\n\nI wasn't thinking of the Weights themselves, rather that we could add a getCacheKey() method to weight, with a default implementation that just returns getQuery().  BQ, DisMaxQ, etc, could then implement their own cache keys. "
+        },
+        {
+            "id": "comment-14742575",
+            "author": "Robert Muir",
+            "date": "2015-09-13T17:41:15+0000",
+            "content": "What is the reason to add such complexity? "
+        },
+        {
+            "id": "comment-14742579",
+            "author": "Alan Woodward",
+            "date": "2015-09-13T17:49:20+0000",
+            "content": "Do you mean the getCacheKey() method?  It decouples query cacheing and weight creation a bit more, and will make BooleanWeight.createWeight() tidier, so it's a tradeoff between nicer internal implementations and smaller APIs.  But either way, it's not necessary for this issue. "
+        },
+        {
+            "id": "comment-14745750",
+            "author": "Alan Woodward",
+            "date": "2015-09-15T17:07:57+0000",
+            "content": "Adrien Grand are you happy with the latest patch?  Or do you want to try your alternative API above? "
+        },
+        {
+            "id": "comment-14907871",
+            "author": "Adrien Grand",
+            "date": "2015-09-25T09:50:05+0000",
+            "content": "Sorry for the late reply, I was on vacation and just returned yesterday. Overall I'm torn with this patch because I like it a lot from a usability perspective (I really hate how you need to call rewrite in a loop today before calling createWeight) but Query.rewrite was our only opportunity to perform some kind of query optimization, and it's gone now. I can give a try to the alternative I mentionned above on lucene-core to see how things fit together. "
+        },
+        {
+            "id": "comment-14907945",
+            "author": "Adrien Grand",
+            "date": "2015-09-25T11:22:46+0000",
+            "content": "Here is a patch for the alternative idea (lucene-core only). "
+        },
+        {
+            "id": "comment-14939628",
+            "author": "Alan Woodward",
+            "date": "2015-10-01T10:15:40+0000",
+            "content": "The API isn't as tidy, but I think you're right that this gives us more flexibility when it comes to query optimization, etc.  I'll extend the patch to all modules.  Thanks! "
+        }
+    ]
+}
