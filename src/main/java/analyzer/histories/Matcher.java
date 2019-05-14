@@ -1,13 +1,15 @@
 package analyzer.histories;
 
+import fileDiff.method.MethodDiff;
 import analyzer.histories.variation.Mutant;
 import analyzer.histories.variation.MutantType;
 import analyzer.histories.variation.Variation;
-import com.google.errorprone.annotations.Var;
 import javafx.util.Pair;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 public class Matcher {
@@ -19,9 +21,6 @@ public class Matcher {
             double sim = 0, max = 0;
             int maxIndex = -1;
 
-            if (variation.methodName.contains("ensureCacheSize")) {
-                int a = 2;
-            }
             for (int i = 0; i < comments.size(); i ++) {
                 Comment comment = comments.get(i);
                 sim = getSimilarity(variation, comment);
@@ -37,6 +36,44 @@ public class Matcher {
         }
 
         return result;
+    }
+
+    public static List<Pair<MethodDiff, Comment>> matchMethodDiff(List<MethodDiff> methodDiffs, List<Comment> comments) {
+        List<Pair<MethodDiff, Comment>> result = new ArrayList<>();
+
+        if (methodDiffs == null || comments == null || methodDiffs.size() == 0 || comments.size() == 0)
+            return result;
+        methodDiffs.stream().forEach(methodDiff -> {
+
+            result.addAll(matchMethodDiff(methodDiff, comments) );
+        });
+        return result;
+    }
+
+    public static List<Pair<MethodDiff, Comment>> matchMethodDiff(MethodDiff methodDiff, List<Comment> comments) {
+
+        int keyWordMax = 0, tokenMax = 0, size = comments.size();
+        Set<Integer> resultList = new HashSet<>();
+        for (int i = 0; i < size; i ++) {
+            int keyWordCount = methodDiff.commonKeyWords(comments.get(i));
+            int tokenCount = methodDiff.commentWords(comments.get(i));
+
+            if (keyWordCount > keyWordMax ||
+                    (keyWordCount == keyWordMax && tokenCount > tokenMax)) {
+                keyWordMax = keyWordCount;
+                tokenMax = tokenCount;
+                resultList.clear();
+                resultList.add(i);
+            } else if (keyWordCount == keyWordMax && tokenCount == tokenMax) {
+                resultList.add(i);
+            }
+        }
+
+        List<Pair<MethodDiff, Comment>> ans = new ArrayList<>();
+        for (int result: resultList) {
+            ans.add(new Pair<MethodDiff, Comment>(methodDiff, comments.get(result)));
+        }
+        return ans;
     }
 
     public static List<Pair<Variation, Comment>> match(List<Variation> variations, Issue issue) {

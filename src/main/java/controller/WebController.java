@@ -13,6 +13,7 @@ import org.json.JSONObject;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.messaging.handler.annotation.MessageMapping;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.CrossOrigin;
@@ -41,6 +42,7 @@ public class WebController {
 
 
     @MessageMapping("/log")
+    @Async
     public void codeSearch() throws Exception{
 
         List<RevCommit> commits = analyzer.getCommits();
@@ -50,6 +52,7 @@ public class WebController {
     }
 
     @MessageMapping("/commit")
+    @Async
     public void getTargetCommit(String commit) throws Exception{
         List<String> files = analyzer.getAllFilesModifiedByCommit(commit);
         //String commitMessage = analyzer.getCommitMessage(commit);
@@ -69,6 +72,7 @@ public class WebController {
     }
 
     @MessageMapping("/file")
+    @Async
     public void fileSearch(String p) throws Exception{
         JSONObject parameter = new JSONObject(p);
         String targetCommit = parameter.getString("target_commit");
@@ -91,6 +95,7 @@ public class WebController {
     }
 
     @MessageMapping("/specific_file_commit")
+    @Async
     public void searchCommitsForASpecificFile(String filepath){
         List<Pair<ObjectId, Pair<String, String>>> temp = analyzer.getAllCommitModifyAFile(filepath);
         JSONArray array = new JSONArray();
@@ -101,6 +106,7 @@ public class WebController {
         this.template.convertAndSend("/message/commit", array);
     }
 
+    @Async
     @MessageMapping("/specific_issue_commit")
     public void searchCommitsForASpecificIssue(String issue) {
         List<RevCommit> commits = analyzer.getCommits();
@@ -114,6 +120,7 @@ public class WebController {
 
     @CrossOrigin
     @GetMapping(value = "/sections/{commitid:.+}/questions/{file:.+}")
+    @Async
     public void search(@PathVariable String commitid, @PathVariable String file){
         ObjectId curId= analyzer.getId(commitid);
         String curFile = analyzer.getFileFromCommit(curId, file);
@@ -135,6 +142,7 @@ public class WebController {
 
     @CrossOrigin
     @MessageMapping("/histories")
+    @Async
     public void searchHistory(String fileName) {
         HistoryAnalyzer historyAnalyzer = new HistoryAnalyzer();
         String histories = historyAnalyzer.getHistories(fileName);

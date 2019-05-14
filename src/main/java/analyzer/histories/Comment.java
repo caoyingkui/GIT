@@ -12,6 +12,14 @@ public class Comment {
     public Comment() {
     }
 
+    public Comment(String issueId, String issueTitle, EventDate date, String author, String content) {
+        this.issueId = issueId;
+        this.issueTitle = issueTitle;
+        this.date = date;
+        this.author = author;
+        this.content = content;
+    }
+
     public Comment(JSONObject json){
         this.issueId = get("issue_id", json);
         this.issueTitle = get("issue_title", json);

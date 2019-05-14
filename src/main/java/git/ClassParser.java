@@ -1,29 +1,55 @@
 package git;
 
 
+import com.github.javaparser.ast.comments.JavadocComment;
+import fileDiff.type.FileType;
+import javafx.util.Pair;
 import org.eclipse.jdt.core.dom.*;
+import org.eclipse.jdt.internal.core.util.CommentRecorderParser;
 import org.eclipse.jgit.diff.Edit;
 import org.eclipse.jgit.diff.EditList;
 import org.eclipse.jgit.patch.FileHeader;
 import org.eclipse.jgit.patch.HunkHeader;
 import org.eclipse.jgit.patch.Patch;
+import org.json.JSONObject;
 import util.ReaderTool;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
+import java.security.CodeSource;
+import java.security.ProtectionDomain;
 import java.util.*;
 
 public class ClassParser {
+    public FileType type;
+
+    public String name;
+
     CompilationUnit unit;
+
     String sourceCode;
+
     List<Integer> lines;
+
     String[] codeLines;
+
     int codeLength;
+
     List<Method> methods;
+
+    List<Field> fields;
+
+    List<Comment> comments;
+
+    public List<String> interfaces = new ArrayList<>();
+
+    public String parent = "";
+
 
     public List<Method> getMethods() {
         return methods;
+    }
+
+    public List<Field> getFields() {
+        return fields;
     }
 
     public ClassParser(){
@@ -36,15 +62,138 @@ public class ClassParser {
     }
 
     /**
+     * 在解析出所有的field, method之后，需要将抽取的comment分配到相应的field或则函数上。
+     */
+    private void commentDispatch() {
+
+        // region <创建comment到行数的映射>
+        //建立comment和行数的关联
+        //integer为一个comment出现的最后一行的行数
+        //采取这样的方式是因为，比如给一个field，可以先推断这个field出现的行数n，
+        //然后利用n-1，就可以知道是否存在comment
+        Map<Integer, String> commentMap = new HashMap<>();
+        for (int i = 0; i < comments.size(); i ++) {
+            Comment comment = comments.get(i);
+            if (comment.isBlockComment()) {
+                BlockComment blockComment = (BlockComment)comment;
+                int start = blockComment.getStartPosition(), end = start + blockComment.getLength();
+                String content = blockCommentExtractor(sourceCode.substring(start, end));
+                commentMap.put(getLine(end), content);
+            } else if (comment.isDocComment()) {
+                Javadoc javadocComment = (Javadoc) comment;
+                int start = javadocComment.getStartPosition(), end = start + javadocComment.getLength();
+                String content = javadocCommentExtractor(sourceCode.substring(start, end));
+
+                //这里需要注意一下，javadoc类型的评论是会算作紧跟着后面的函数或域值的一部分。
+                //例如
+                // /** example **/
+                // int example = 0;
+                // 注释的起始位置是和example的起始位置是一样的
+                // 因此呢，我们就把这个注释的最后一行，人为改变为起始位置的上一行，
+                // 这样呢，逻辑上这个注释就在后面的类型的上一行。
+                commentMap.put(getLine(start) - 1, content);
+            } else if (comment.isLineComment()) {
+                LineComment lineComment = (LineComment) comment;
+                int start = lineComment.getStartPosition(), end = start + lineComment.getLength();
+                String content = lineCommentExtractor(sourceCode.substring(start, end));
+                StringBuilder builder = new StringBuilder(content);
+
+                while (i + 1 < comments.size() && comments.get(i + 1).isLineComment()) {
+                    LineComment nextComment = (LineComment) comments.get(i + 1);
+                    int nextStart = getLine(nextComment.getStartPosition());
+                    if (nextStart == start + 1) {
+                        String nextContent = sourceCode.substring(nextStart, nextStart + nextComment.getLength());
+                        builder.append(" ").append(lineCommentExtractor(nextContent));
+                        i ++;
+                    } else {
+                        break;
+                    }
+                }
+                commentMap.put(getLine(start), builder.toString());
+            } else {
+                assert(1 == 0); // 报错
+            }
+        }
+        // endregion <创建comment到行数的映射>
+
+        for (Field field: fields) {
+            if (commentMap.containsKey(field.startLine - 1))
+                field.comment = commentMap.get(field.startLine - 1);
+        }
+
+        for (Method method: methods) {
+            if (commentMap.containsKey(method.startLine - 1))
+                method.comment = commentMap.get(method.startLine - 1);
+        }
+
+    }
+
+    /**
+     * 去除comment中的特殊符号
+     * @param comment
+     * @return
+     */
+    public static String blockCommentExtractor(String comment) {
+        // TODO 把该方法实现得完善一下
+        return comment.substring(
+                comment.indexOf("/*") + 2,
+                comment.lastIndexOf("*/")
+        ).trim();
+    }
+
+    public static String lineCommentExtractor(String comment) {
+        return comment.substring(comment.indexOf("//") + 2).trim();
+    }
+
+    public static String javadocCommentExtractor(String comment) {
+        return comment.substring(
+                comment.indexOf("/**" ) + 3,
+                comment.lastIndexOf("*/")
+        ).trim();
+    }
+
+    private void extractAllFields() {
+        fields = new ArrayList<>();
+        PackageDeclaration p = unit.getPackage();
+        String packageName = p == null ? "" : p.getName().toString();
+        for (Object object: unit.types()) {
+            fields.addAll(extractAllFields((TypeDeclaration)object, packageName));
+        }
+    }
+
+    private List<Field> extractAllFields(TypeDeclaration type, String qualifiedName) {
+        List<Field> result = new ArrayList<>();
+        String className = type.getName().toString();
+
+        for (FieldDeclaration de: type.getFields()) {
+            int startLine = getLine(de.getStartPosition());
+            String filedType = de.getType().toString();
+            for (Object f : de.fragments()) {
+                VariableDeclarationFragment fragment = (VariableDeclarationFragment) f;
+                String name = fragment.getName().toString();
+                Field field = new Field(filedType,
+                        qualifiedName + "." + className + "." + name,
+                        name,
+                        "",
+                        startLine);
+                result.add(field);
+            }
+        }
+
+        for (TypeDeclaration de: type.getTypes()) {
+            result.addAll(extractAllFields(de, qualifiedName + "." + className));
+        }
+
+        return result;
+    }
+
+    /**
      * 从代码中抽取所有的method信息
      */
     private void extractAllMethods(){
         methods = new ArrayList<>();
         PackageDeclaration p = unit.getPackage();
-        String packageName = "";
-        if(p != null){
-            packageName = p.getName().toString();
-        }
+        String packageName = p == null ? "" : p.getName().toString();
 
         for(Object type: unit.types()){
             if(type instanceof TypeDeclaration){
@@ -72,6 +221,8 @@ public class ClassParser {
                 List parameters = declaration.parameters();
                 if(parameters.size() > 0){
                     for(Object par: parameters){
+
+                        //在这里不能正常获取 “double... d1”,只能获取double，而不能获取“double...”
                         if(par instanceof SingleVariableDeclaration){
                             parStr += ("," + ((SingleVariableDeclaration) par).getType().toString());
                         }
@@ -88,7 +239,11 @@ public class ClassParser {
                                 name,
                                 getLine(startPosition),
                                 getLine(endPosition),
-                                sourceCode.substring(startPosition, endPosition + 1)//declaration.toString()
+                                startPosition,
+                                endPosition,
+                                sourceCode.substring(startPosition, endPosition + 1), //declaration.toString()
+                                "",
+                                declaration
                         )
                 );
             }
@@ -134,6 +289,19 @@ public class ClassParser {
             }
             return lines.size();
         }
+    }
+
+    /**
+     * 给定一个位置，返回包含该位置的函数的下标
+     * @param startPosition
+     * @return
+     */
+    public int getMethod(int startPosition) {
+        for (int i = 0; i < methods.size(); i++) {
+            if (methods.get(i).startPos <= startPosition && methods.get(i).endPos >= startPosition)
+                return i;
+        }
+        return -1;
     }
 
     public Map<String, Method> getChangedMethod(EditList editList, boolean isNew) {
@@ -209,9 +377,44 @@ public class ClassParser {
         this.codeLines = sourceCode.split("\n");
         ASTParser parser = ASTParser.newParser(AST.JLS8);
         parser.setSource(sourceCode.toCharArray());
+        parser.setKind(ASTParser.K_COMPILATION_UNIT);
         unit = (CompilationUnit) parser.createAST(null);
+
+        comments = unit.getCommentList();
+
+        //获取接口信息
+        TypeDeclaration type =  null;
+        try {
+            type = (TypeDeclaration)(unit.types().get(0));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        this.name = type.getName().toString();
+
+        for ( Object i: type.superInterfaceTypes()) {
+            if (i instanceof SimpleType) {
+                SimpleType t = (SimpleType) i;
+                interfaces.add(t.getName().toString());
+            }
+        }
+        //获取继承信息
+        Object superType = type.getSuperclassType();
+        if (superType instanceof SimpleType) {
+            SimpleType t = (SimpleType) superType;
+            parent = t.getName().toString();
+        }
+
+        if (type.isInterface()) this.type = FileType.Interface;
+        else this.type = FileType.Class;
+
         initializeLines();
+
         extractAllMethods();
+
+        extractAllFields();
+
+        commentDispatch();
     }
 
     /**
@@ -247,20 +450,18 @@ public class ClassParser {
     }
 
     public static void main(String[] args){
+        ProtectionDomain pd = CommentRecorderParser.class.getProtectionDomain();
+        CodeSource source = pd.getCodeSource();
+        System.out.println(source);
+
         try {
-            BufferedReader reader = new BufferedReader(new FileReader(new File("code.txt")));
-            String line;
-            String code = "";
-            while ((line = reader.readLine()) != null) {
-                code += line + "\n";
-            }
-            reader.close();
+            String code = ReaderTool.read("file1.java");
 
             ClassParser parser = new ClassParser().setSourceCode(code);
+            int a = 2;
         }catch (Exception e){
             e.printStackTrace();
         }
 
-    }
-
+      }
 }

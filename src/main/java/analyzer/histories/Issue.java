@@ -1,10 +1,15 @@
 package analyzer.histories;
 
+import com.google.common.primitives.Bytes;
+import org.apache.commons.io.IOUtils;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import sun.nio.ch.IOUtil;
 import util.ReaderTool;
 
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 public class Issue {
@@ -17,7 +22,10 @@ public class Issue {
     public List<Comment> comments;
 
     public Issue(String issueId) {
-        String issueContent = ReaderTool.read("issueCrawler/issue/" + issueId + ".json");
+        InputStream is = this.getClass().getClassLoader().getResourceAsStream("issue" + System.getProperty("file.separator") + issueId + ".json");
+        //String issueContent = ReaderTool.read("issueCrawler/issue/" + issueId + ".json");
+
+        String issueContent = ReaderTool.read(is);
         if (issueContent.equals("")) return ;
         JSONObject object = new JSONObject(issueContent);
         this.id = get("id", object);
@@ -41,13 +49,31 @@ public class Issue {
         }
 
         this.comments = new ArrayList<>();
-        JSONArray comments = (JSONArray) object.get("comments");
+        List<Comment> original = new ArrayList<>();
+        JSONArray originalList = (JSONArray) object.get("comments");
 
-        comments.forEach(comment -> {
+        originalList.forEach(comment -> {
             JSONObject com = (JSONObject) comment;
             com.put("issue_id", this.id);
             com.put("issue_title", this.title);
-            this.comments.add( new Comment((JSONObject) comment));
+            original.add(new Comment((JSONObject) comment));
+        });
+
+        original.forEach(comment -> {
+            String content = comment.content;
+            String[] lines = content.split("\\n", 0);
+            for (String line: lines) {
+                line = line.trim();
+                if (line.length() > 30) {
+                    Comment subComment = new Comment(comment.issueId,
+                            comment.issueTitle,
+                            comment.date,
+                            comment.author,
+                            line);
+                    this.comments.add(subComment);
+
+                }
+            }
         });
 
         Comment comment = new Comment();
@@ -67,11 +93,15 @@ public class Issue {
             while (commentIndex < comments.size()) {
                 Comment comment = comments.get(commentIndex);
                 //加上30秒钟的误差
-                if (comment.date.time < commitTime + 1000 *30) {
-                    commentList.add(comment);
-                    commentIndex ++;
-                } else {
-                    break;
+                try {
+                    if (comment.date.time < commitTime + 1000 * 30) {
+                        commentList.add(comment);
+                        commentIndex++;
+                    } else {
+                        break;
+                    }
+                } catch (Exception e) {
+                    //e.printStackTrace();
                 }
             }
             if (commentList.size() > 0) {

@@ -1,13 +1,10 @@
 package git;
 
-import analyzer.line.ClassFile;
-import analyzer.line.CodeLine;
 import com.sun.xml.internal.messaging.saaj.util.ByteInputStream;
 import javafx.util.Pair;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.diff.*;
 import org.eclipse.jgit.lib.*;
-import org.eclipse.jgit.patch.FileHeader;
 import org.eclipse.jgit.patch.Patch;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
@@ -15,11 +12,9 @@ import org.eclipse.jgit.treewalk.CanonicalTreeParser;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.jgit.treewalk.filter.PathFilter;
 import org.eclipse.jgit.util.io.DisabledOutputStream;
-import util.WriterTool;
 
 import java.io.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -41,9 +36,22 @@ public class GitAnalyzer {
         }
     }
 
+    public static void printfile(File file) {
+        if (file.isFile()) {
+            System.out.println(file.getAbsolutePath());
+        } else if (file.isDirectory()) {
+            for (File f: file.listFiles())
+                printfile(f);
+        }
+    }
+
     public GitAnalyzer(){
         try {
-            git = Git.open(new File("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr"));
+            ResourceBundle bundle = ResourceBundle.getBundle("properties");
+            String path = "";
+            if (System.getProperty("os.name").equals("Windows 10")) path = bundle.getString("windows_main_git_dir");
+            else path = bundle.getString("ubantu_main_git_dir");
+            git = Git.open(new File(path));
             //git = Git.open(new File("C:\\Users\\oliver\\Desktop\\firefox-browser-architecture"));
             repository = git.getRepository();
             getFirstCommit();
@@ -80,6 +88,12 @@ public class GitAnalyzer {
         return result;
     }
 
+    /**
+     * getAllCommitModifyAFile函数用于获取所有修改一个文件的commit
+     * @param filePath 文件路径
+     * @return 一个元组list，其中每一个pair的key是修改文件的commit id，
+     *          而value是一个元组，该元组的key为commit前的文件名，value为commit后的文件名。
+     */
     public List<Pair<ObjectId, Pair<String, String>>> getAllCommitModifyAFile(String filePath){
         List<Pair<ObjectId, Pair<String, String>>> result = new ArrayList<>();
         try {
@@ -198,6 +212,14 @@ public class GitAnalyzer {
         return result;
     }
 
+
+    /**
+     * 获取一个文件在特定commit版本时的内容
+     * @param commitId commit id
+     * @param filePath 文件路径
+     * @return 如果commit版本和文件路径合法，则返回文件内容
+     *          否则返回空字符串（""）
+     */
     public String getFileFromCommit(ObjectId commitId, String filePath){
         String result = "";
         try(TreeWalk treeWalk = new TreeWalk(repository)){
@@ -214,6 +236,19 @@ public class GitAnalyzer {
             System.out.println(e.getMessage());
         }
         return result;
+    }
+
+    /**
+     * 获取一个文件在当前版本，再之前的一个版本的内容
+     * 例如commitId 为2， 则返回版本1的文件内容
+     * @param commitId 当前commit id
+     * @param filePath 文件路径
+     * @return 返回内容，如果不存在则返回空字符串（""）
+     */
+    public String getFileFromFormerCommit(ObjectId commitId, String filePath) {
+        String oldPath = this.getFormerName(commitId, filePath);
+        ObjectId formerId = this.getCommit(commitId.getName()+"^");
+        return (oldPath == null || formerId == null )? "" : getFileFromCommit(formerId, oldPath);
     }
 
     private void getFirstCommit(){
@@ -240,6 +275,12 @@ public class GitAnalyzer {
         return null;
     }
 
+    /**
+     * 获取一个file在之前一个版本的路径
+     * @param cur
+     * @param file
+     * @return
+     */
     private String getFormerName(RevCommit cur, String file){
         String formerName = null;
         try{
@@ -305,7 +346,13 @@ public class GitAnalyzer {
         return patch;
     }
 
-    public EditList getEditList(String oldFile, String newFile) {
+    /**
+     * 返回两个版本代码的差异
+     * @param oldFile
+     * @param newFile
+     * @return 修改区域的list，但没有修改时，返回的内容大小为0，不会返回null。
+     */
+    public static EditList getEditList(String oldFile, String newFile) {
         RawText file1 = new RawText(oldFile.getBytes());
         RawText file2 = new RawText(newFile.getBytes());
 
@@ -314,7 +361,7 @@ public class GitAnalyzer {
         return diffList;
     }
 
-    public Patch getPatch(String oldFile, String newFile){
+    public static Patch getPatch(String oldFile, String newFile){
         Patch patch = new Patch();
         EditList diffList= getEditList(oldFile, newFile);
         RawText file1 = new RawText(oldFile.getBytes());
@@ -348,65 +395,10 @@ public class GitAnalyzer {
     }
 
     public static void main(String[] args) throws Exception{
+        GitAnalyzer a = new GitAnalyzer();
+        System.out.println(a.getCommits().size());
 
-        //GitAnalyzer poi_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\poi");
-        //poi_analyzer.start();
-        GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
-        RevCommit comdmit = lucene_analyzer.getCommit("HEAD");
-        List<RevCommit> commits = lucene_analyzer.getCommits();
-        BufferedWriter writer = new BufferedWriter(new FileWriter(new File("file.txt")));
-        int yes = 0, no = 0;
-        for (RevCommit commit: commits) {
-            writer.write(commit.getId().toString() + "\n");
-            //System.out.println(comdmit.getId());
-            String msg = commit.getShortMessage();
-            //Pattern pattern = Pattern.compile("SOLR-([0-9]+)|LUCENE-([0-9]+)");
-            Pattern pattern = Pattern.compile("jboss");
-            Matcher matcher = pattern.matcher(msg.toLowerCase());
-            if (matcher.find()) {
-                System.out.println(commit.toString());
-                yes ++;
-            } else {
-
-                no ++;
-            }
-        }
-        System.out.println(yes + " " + no);
-        /*GitAnalyzer lucene_analyzer = new GitAnalyzer("C:\\Users\\oliver\\Downloads\\lucene-solr-master\\lucene-solr");
-        ClassFile classFile = new ClassFile(lucene_analyzer);
-        List<String> files = lucene_analyzer.getAllFiles("HEAD", ".java");
-        for (String file: files) {
-            System.out.println(file);
-            file = "solr/core/src/test/org/apache/solr/update/AutoCommitTest.java";
-            classFile.retrieveHistory(file);
-            List<CodeLine> codeLines = classFile.getLines();
-            WriterTool.append("oneLine.txt", file + "\n");
-            for(CodeLine line: codeLines){
-                if(line.history.size() > 1) {
-                    String msg = "  " + line.lineNumber + "\n";
-                    msg += line.toString();
-                    WriterTool.append("oneLine.txt",msg);
-                }
-            }
-        }*/
-
-        //file.retrieveHistory("lucene/core/src/java/org/apache/lucene/store/ByteBuffersDirectory.java");
-
-
-
-
-        //lucene_analyzer.getAllFilesModifiedByCommit("c60cd2529b9c9d3e57e23e67e7c55a75269a23f9");
-        //lucene_analyzer.getPatch(" 123\n2\n", "32323\n123\2\n");
-
-
-        //lucene_analyzer.start();
-
-
-        //lucene_analyzer.print();
-        //poi_analyzer.print();
 
     }
 
 }
-
-//lucene/core/src/java/org/apache/lucene/util/BytesRefArray.java

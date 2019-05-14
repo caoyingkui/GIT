@@ -20,13 +20,13 @@ import java.util.List;
 
 public class GumTree {
 
-    public static List<Mutant> getDifference(String code1, String code2) {
+    public static List<Mutant> getDifference(String newContent, String oldContent) {
         List<Mutant> result = new ArrayList<>();
 
         JdtTreeGenerator generator = new JdtTreeGenerator();
         try {
-            ITree r1 = generator.generateFromString(code1, ASTParser.K_STATEMENTS).getRoot();
-            ITree r2 = generator.generateFromString(code2, ASTParser.K_STATEMENTS).getRoot();
+            ITree r1 = generator.generateFromString(oldContent, ASTParser.K_CLASS_BODY_DECLARATIONS).getRoot();
+            ITree r2 = generator.generateFromString(newContent, ASTParser.K_CLASS_BODY_DECLARATIONS).getRoot();
             Matcher m = Matchers.getInstance().getMatcher(r1, r2);
             m.match();
             MappingStore store = m.getMappings();
@@ -54,7 +54,7 @@ public class GumTree {
 
                     }
                 } else if (action instanceof Move) {
-                    System.out.println("new action type: " + action.getName());
+                    //System.out.println("new action type: " + action.getName());
                 } else {
                     System.out.println("new action type: " + action.getName());
                 }
@@ -82,7 +82,7 @@ public class GumTree {
         String content1 = ReaderTool.read("file1.java");
         String content2 = ReaderTool.read("file2.java");
 
-        getDifference(content1, content2);
+        getDifference(content2, content1);
     }
 
 }

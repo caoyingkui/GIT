@@ -35,12 +35,10 @@ public class History {
             if (commitId.equals(event.commitId)) {
                 event.issueId = issueId;
                 event.issueTile = issueTitle;
-                event.issueDescription = description;
+                event.issueDescription += (event.issueDescription.length() > 0 ? "<br>" : "")+  description;
                 result = true;
             }
         }
-
-
         return result;
     }
 
