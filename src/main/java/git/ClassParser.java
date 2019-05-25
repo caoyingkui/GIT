@@ -1,17 +1,14 @@
 package git;
 
 
-import com.github.javaparser.ast.comments.JavadocComment;
 import fileDiff.type.FileType;
-import javafx.util.Pair;
+import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.dom.*;
 import org.eclipse.jdt.internal.core.util.CommentRecorderParser;
 import org.eclipse.jgit.diff.Edit;
 import org.eclipse.jgit.diff.EditList;
 import org.eclipse.jgit.patch.FileHeader;
-import org.eclipse.jgit.patch.HunkHeader;
 import org.eclipse.jgit.patch.Patch;
-import org.json.JSONObject;
 import util.ReaderTool;
 
 import java.security.CodeSource;
@@ -21,23 +18,23 @@ import java.util.*;
 public class ClassParser {
     public FileType type;
 
-    public String name;
+    public String name = "";
 
-    CompilationUnit unit;
+    CompilationUnit unit = null;
 
-    String sourceCode;
+    String sourceCode = "";
 
-    List<Integer> lines;
+    List<Integer> lines = new ArrayList<>();
 
     String[] codeLines;
 
     int codeLength;
 
-    List<Method> methods;
+    List<Method> methods = new ArrayList<>();
 
-    List<Field> fields;
+    List<Field> fields = new ArrayList<>();
 
-    List<Comment> comments;
+    List<Comment> comments = new ArrayList<>();
 
     public List<String> interfaces = new ArrayList<>();
 
@@ -157,7 +154,9 @@ public class ClassParser {
         PackageDeclaration p = unit.getPackage();
         String packageName = p == null ? "" : p.getName().toString();
         for (Object object: unit.types()) {
-            fields.addAll(extractAllFields((TypeDeclaration)object, packageName));
+            if (object instanceof TypeDeclaration) {
+                fields.addAll(extractAllFields((TypeDeclaration) object, packageName));
+            }
         }
     }
 
@@ -211,12 +210,17 @@ public class ClassParser {
     private List<Method> extractAllMethods(TypeDeclaration type, String qualifiedName) {
         List<Method> result = new ArrayList<>();
         String className = type.getName().toString();
-        for(Object object: type.bodyDeclarations()){
+
+       for(Object object: type.bodyDeclarations()){
             // region MethodDeclaration
             if(object instanceof MethodDeclaration){
                 MethodDeclaration declaration = (MethodDeclaration) object;
                 String methodName = declaration.getName().toString();
                 String name = declaration.getName().toString();
+                if (name.equals("FieldInfo")) {
+                    int a = 2;
+                }
+
                 String parStr = "";
                 List parameters = declaration.parameters();
                 if(parameters.size() > 0){
@@ -224,7 +228,11 @@ public class ClassParser {
 
                         //在这里不能正常获取 “double... d1”,只能获取double，而不能获取“double...”
                         if(par instanceof SingleVariableDeclaration){
-                            parStr += ("," + ((SingleVariableDeclaration) par).getType().toString());
+                            SingleVariableDeclaration p = (SingleVariableDeclaration) par;
+                            String typeName = p.getType().toString();
+                            parStr += "," + typeName;
+                        } else {
+                            assert 1 == 2;
                         }
                     }
                     parStr = parStr.substring(1);
@@ -296,7 +304,7 @@ public class ClassParser {
      * @param startPosition
      * @return
      */
-    public int getMethod(int startPosition) {
+    public int getMethodAt(int startPosition) {
         for (int i = 0; i < methods.size(); i++) {
             if (methods.get(i).startPos <= startPosition && methods.get(i).endPos >= startPosition)
                 return i;
@@ -378,35 +386,50 @@ public class ClassParser {
         ASTParser parser = ASTParser.newParser(AST.JLS8);
         parser.setSource(sourceCode.toCharArray());
         parser.setKind(ASTParser.K_COMPILATION_UNIT);
+        // In order to parse 1.5 code, some compiler options need to be set to 1.5
+        Map options = JavaCore.getOptions();
+        JavaCore.setComplianceOptions(JavaCore.VERSION_1_5, options);
+        parser.setCompilerOptions(options);
         unit = (CompilationUnit) parser.createAST(null);
 
         comments = unit.getCommentList();
 
         //获取接口信息
         TypeDeclaration type =  null;
+
+        //特例：commit_ID: 2dfad693d6870e43a63aba3b43a62bf6c146b4c9
+        //file: solr/core/src/java/org/apache/solr/util/hll/package-info.java
+        if (unit.types().size() == 0) return;
         try {
-            type = (TypeDeclaration)(unit.types().get(0));
+            if (unit.types().get(0) instanceof TypeDeclaration ) {
+                type = (TypeDeclaration) (unit.types().get(0));
+                this.name = type.getName().toString();
+
+
+                for (Object i : type.superInterfaceTypes()) {
+                    if (i instanceof SimpleType) {
+                        SimpleType t = (SimpleType) i;
+                        interfaces.add(t.getName().toString());
+                    }
+                }
+                //获取继承信息
+                Object superType = type.getSuperclassType();
+                if (superType instanceof SimpleType) {
+                    SimpleType t = (SimpleType) superType;
+                    parent = t.getName().toString();
+                }
+
+                if (type.isInterface()) this.type = FileType.Interface;
+                else this.type = FileType.Class;
+            } else if (unit.types().get(0) instanceof EnumDeclaration) {
+
+            }
         } catch (Exception e) {
             e.printStackTrace();
+            return;
         }
 
-        this.name = type.getName().toString();
 
-        for ( Object i: type.superInterfaceTypes()) {
-            if (i instanceof SimpleType) {
-                SimpleType t = (SimpleType) i;
-                interfaces.add(t.getName().toString());
-            }
-        }
-        //获取继承信息
-        Object superType = type.getSuperclassType();
-        if (superType instanceof SimpleType) {
-            SimpleType t = (SimpleType) superType;
-            parent = t.getName().toString();
-        }
-
-        if (type.isInterface()) this.type = FileType.Interface;
-        else this.type = FileType.Class;
 
         initializeLines();
 
