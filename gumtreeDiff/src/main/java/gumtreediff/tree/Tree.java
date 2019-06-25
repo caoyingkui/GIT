@@ -31,6 +31,8 @@ public class Tree extends AbstractTree implements ITree {
 
     private String label;
 
+    public String content;
+
     // Begin position of the tree in terms of absolute character index and length
     private int pos;
     private int length;
@@ -42,9 +44,10 @@ public class Tree extends AbstractTree implements ITree {
      * Constructs a new node. If you need type labels corresponding to the integer
      * @see TreeContext#createTree(int, String, String)
      */
-    public Tree(int type, String label) {
+    public Tree(int type, String label, String content) {
         this.type = type;
         this.label = (label == null) ? NO_LABEL : label.intern();
+        this.content = content;
         this.id = NO_ID;
         this.depth = NO_VALUE;
         this.hash = NO_VALUE;
@@ -60,6 +63,7 @@ public class Tree extends AbstractTree implements ITree {
     protected Tree(Tree other) {
         this.type = other.type;
         this.label = other.getLabel();
+        this.content = other.content;
         this.id = other.getId();
         this.pos = other.getPos();
         this.length = other.getLength();

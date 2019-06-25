@@ -217,10 +217,6 @@ public class ClassParser {
                 MethodDeclaration declaration = (MethodDeclaration) object;
                 String methodName = declaration.getName().toString();
                 String name = declaration.getName().toString();
-                if (name.equals("FieldInfo")) {
-                    int a = 2;
-                }
-
                 String parStr = "";
                 List parameters = declaration.parameters();
                 if(parameters.size() > 0){
@@ -230,6 +226,7 @@ public class ClassParser {
                         if(par instanceof SingleVariableDeclaration){
                             SingleVariableDeclaration p = (SingleVariableDeclaration) par;
                             String typeName = p.getType().toString();
+                            if (par.toString().contains("...")) typeName += "...";
                             parStr += "," + typeName;
                         } else {
                             assert 1 == 2;
@@ -243,7 +240,8 @@ public class ClassParser {
                 int endPosition = startPosition + declaration.getLength() - 1;
 
                 result.add(
-                        new Method(qualifiedName + "." + className + ":" + methodName,
+                        //new Method(qualifiedName + "." + className + ":" + methodName,
+                        new Method(qualifiedName + "." + className + "." + methodName,
                                 name,
                                 getLine(startPosition),
                                 getLine(endPosition),
@@ -287,7 +285,7 @@ public class ClassParser {
      * @param position 位置
      * @return 行数
      */
-    int getLine(int position){
+    public int getLine(int position){
         if(position < 0|| position >= codeLength)
             return -1;
         else{
@@ -404,6 +402,9 @@ public class ClassParser {
             if (unit.types().get(0) instanceof TypeDeclaration ) {
                 type = (TypeDeclaration) (unit.types().get(0));
                 this.name = type.getName().toString();
+
+                if (type.getSuperclassType() != null)
+                    this.parent = type.getSuperclassType().toString();
 
 
                 for (Object i : type.superInterfaceTypes()) {

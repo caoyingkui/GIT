@@ -81,9 +81,9 @@ public class TreeContext {
         }
     }
 
-    public ITree createTree(int type, String label, String typeLabel) {
+    public ITree createTree(int type, String label, String content, String typeLabel) {
         registerTypeLabel(type, typeLabel);
-        return new Tree(type, label);
+        return new Tree(type, label, content);
     }
 
     public ITree createTree(ITree... trees) {

@@ -3,6 +3,7 @@ package fileDiff.file;
 import ch.uzh.ifi.seal.changedistiller.ChangeDistiller;
 import ch.uzh.ifi.seal.changedistiller.distilling.FileDistiller;
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.EntityType;
+import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
@@ -25,10 +26,10 @@ import git.Method;
 import javafx.util.Pair;
 import javassist.runtime.Desc;
 
+import javax.validation.constraints.NotNull;
 import java.util.*;
 
-import static ch.uzh.ifi.seal.changedistiller.model.classifiers.ChangeType.ADDITIONAL_FUNCTIONALITY;
-import static ch.uzh.ifi.seal.changedistiller.model.classifiers.ChangeType.REMOVED_FUNCTIONALITY;
+import static ch.uzh.ifi.seal.changedistiller.model.classifiers.ChangeType.*;
 
 /**
  * Created by kvirus on 2019/4/20 19:29
@@ -82,8 +83,50 @@ public class ChangedClass extends FileDiff implements Update{
     }
 
     @Override
+    public HashSet<String> getChangedFiledNames() {
+        if (changedFiledNames == null) {
+            changedFiledNames = new HashSet<>();
+            for (ChangedField field :changedFields) {
+                changedFiledNames.add(field.name.OLD);
+                changedFiledNames.add(field.name.NEW);
+            }
+
+            for (NewField field : newFields)
+                changedFiledNames.add(field.name);
+
+            for (DelField field : delFields)
+                changedFiledNames.add(field.name);
+        }
+        return changedFiledNames;
+    }
+
+    @Override
+    public HashSet<String> getChangedMethodNames() {
+        if (changedMethodNames == null) {
+            changedMethodNames = new HashSet<>();
+            for (ChangedMethod method: changedMethods) {
+                changedMethodNames.add(method.name.OLD);
+                changedMethodNames.add(method.name.NEW);
+            }
+
+            for (NewMethod method: newMethods)
+                changedMethodNames.add(method.name);
+
+            for (DelMethod method: delMethods)
+                changedMethodNames.add(method.name);
+        }
+
+        return changedMethodNames;
+    }
+
+    @Override
     public String getName() {
         return name.NEW;
+    }
+
+    @Override
+    public String getPath() {
+        return path.NEW;
     }
 
     @Override
@@ -171,6 +214,7 @@ public class ChangedClass extends FileDiff implements Update{
 
     @Override
     public void methodDiff() {
+
         distiller = ChangeDistiller.createFileDistiller(ChangeDistiller.Language.JAVA);
         distiller.extractClassifiedSourceCodeChanges(content.OLD, content.NEW, "");
         distiller.extractClassifiedSourceCodeChanges("", "");
@@ -180,9 +224,6 @@ public class ChangedClass extends FileDiff implements Update{
         for (Method method: parser.NEW.getMethods()) methodsInNew.put(method.fullName.replace(":", "."), method);
         List<Method> methodsInOld = parser.OLD.getMethods();
 
-        if(name.NEW.contains("FieldInfo")) {
-            int a = 2;
-        }
         class Relation {
             public Method newMethod = null;
             public Method oldMethod = null;
@@ -197,21 +238,41 @@ public class ChangedClass extends FileDiff implements Update{
             Method newMethod = null, oldMethod = null;
             if (change.getRootEntity().getType().isMethod()) {
                 String uniqueName = change.getRootEntity().getUniqueName().replaceAll(" ", "");
+                newMethod = methodsInNew.getOrDefault(uniqueName, null);
+                if (newMethod == null) newMethod = methodsInNew.getOrDefault(uniqueName, null);
                 if (change instanceof Insert) {
-                    newMethod = methodsInNew.get(uniqueName);
+                    if (change.getChangeType() == PARAMETER_INSERT) {
+                        try {
+                            oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getParentEntity().getStartPosition() + 2));
+                        } catch (Exception e) {
+                            int a = 2;
+                        }
+                    } else {
+                        for (Method method: methodsInOld) {
+                            if (method.fullName.equals(uniqueName)) {
+                                oldMethod = method;
+                                break;
+                            }
+
+                        }
+                    }
                 } else if (change instanceof ch.uzh.ifi.seal.changedistiller.model.entities.Update) {
-                    newMethod = methodsInNew.get(uniqueName);
-                    oldMethod = methodsInOld.get(parser.OLD.getMethod(change.getChangedEntity().getStartPosition()));
+                    //newMethod = methodsInNew.get(uniqueName);
+                    oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
                 } else if (change instanceof Move) {
-                    newMethod = methodsInNew.get(uniqueName);
-                    oldMethod = methodsInOld.get(parser.OLD.getMethod(change.getChangedEntity().getStartPosition()));
+                    //newMethod = methodsInNew.get(uniqueName);
+                    oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
                 } else if (change instanceof Delete) {
-                    oldMethod = methodsInOld.get(parser.OLD.getMethod(change.getChangedEntity().getStartPosition()));
+                    if (change.getChangeType() == PARAMETER_DELETE) {
+                        int a = 2;
+                    }
+                    //newMethod = methodsInNew.getOrDefault(uniqueName, null);
+                    oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
                 }
             } else if (change.getChangeType() == ADDITIONAL_FUNCTIONALITY) {
-                newMethod = methodsInNew.get(change.getChangedEntity().getUniqueName());
+                newMethod = methodsInNew.get(change.getChangedEntity().getUniqueName().replaceAll(" ", ""));
             } else if (change.getChangeType() == REMOVED_FUNCTIONALITY) {
-                oldMethod = methodsInOld.get(parser.OLD.getMethod(change.getChangedEntity().getStartPosition()));
+                oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
             } else {
                 continue;
             }
@@ -233,11 +294,16 @@ public class ChangedClass extends FileDiff implements Update{
                 r.changes = new ArrayList<>();
                 r.changes.add(change);
                 relations.add(r);
+                if (r.oldMethod == null && r.newMethod == null) {
+                    int a = 2;
+                }
             }
-        }
 
+        }
         for (Relation r: relations) {
+
             if (r.oldMethod == null) {
+
                 NewMethod method = new NewMethod(r.newMethod, this, commitId);
                 newMethods.add(method);
             } else if (r.newMethod == null) {

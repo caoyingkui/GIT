@@ -1,8 +1,12 @@
 package fileDiff.file;
 
 import fileDiff.Diff;
+import fileDiff.field.ChangedField;
+import fileDiff.field.DelField;
 import fileDiff.field.FieldDiff;
 import fileDiff.field.NewField;
+import fileDiff.method.ChangedMethod;
+import fileDiff.method.DelMethod;
 import fileDiff.method.MethodDiff;
 import fileDiff.method.NewMethod;
 import fileDiff.type.DiffType;
@@ -49,8 +53,34 @@ public class NewInterface extends FileDiff {
     }
 
     @Override
+    public HashSet<String> getChangedFiledNames() {
+        if (changedFiledNames == null) {
+            changedFiledNames = new HashSet<>();
+            for (NewField field : newFields)
+                changedFiledNames.add(field.name);
+        }
+        return changedFiledNames;
+    }
+
+    @Override
+    public HashSet<String> getChangedMethodNames() {
+        if (changedMethodNames == null) {
+            changedMethodNames = new HashSet<>();
+            for (NewMethod method: newMethods)
+                changedMethodNames.add(method.name);
+        }
+
+        return changedMethodNames;
+    }
+
+    @Override
     public String getName() {
         return name;
+    }
+
+    @Override
+    public String getPath() {
+        return path;
     }
 
     /**

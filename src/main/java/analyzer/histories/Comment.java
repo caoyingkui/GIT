@@ -1,6 +1,11 @@
 package analyzer.histories;
 
+import description.Description;
 import org.json.JSONObject;
+import util.StemTool;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class Comment {
     public String issueId;
@@ -8,6 +13,9 @@ public class Comment {
     public EventDate date;
     public String author;
     public String content;
+
+    //将content分成句子后，形成的子评论
+    public List<Description> subDescriptions = new ArrayList<>();
 
     public Comment() {
     }
@@ -18,6 +26,8 @@ public class Comment {
         this.date = date;
         this.author = author;
         this.content = content;
+
+        split();
     }
 
     public Comment(JSONObject json){
@@ -26,6 +36,8 @@ public class Comment {
         this.date = new EventDate(get("date", json));
         this.author = get("author", json);
         this.content = get("content", json);
+
+        split();
     }
 
     private String get(String fileName, JSONObject json) {
@@ -36,6 +48,15 @@ public class Comment {
             ;
         }finally {
             return result;
+        }
+    }
+
+    private void split() {
+        //for (String sentence: StemTool.string2sentence(content)) {
+        for (String sentence: content.split("\n")) {
+            if (sentence.length() < 30) continue;
+            Description description = new Description(sentence);
+            subDescriptions.add(description);
         }
     }
 }

@@ -15,8 +15,7 @@ import fileDiff.field.FieldDiff;
 import fileDiff.file.ChangedClass;
 import fileDiff.file.DelClass;
 import fileDiff.file.FileDiff;
-import fileDiff.modify.type.FieldReplace;
-import fileDiff.modify.type.MethodReplace;
+import fileDiff.modify.section.ChangedSection;
 import fileDiff.modify.type.Modify;
 import fileDiff.type.DiffType;
 import git.GitAnalyzer;
@@ -58,10 +57,10 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
 
     public List<Change<String>> changedFields = null;
 
-    public List<Change<String>> changedSection = new ArrayList<>();
+    public List<ChangedSection> changedSections = new ArrayList<>();
 
     @NotNull
-    private List<SourceCodeChange> sourceCodeChanges = new ArrayList<>();
+    public List<SourceCodeChange> sourceCodeChanges = new ArrayList<>();
 
     public ChangedMethod(Method newMethod, Method oldMethod, FileDiff file, String commitId) {
         this.commitId = commitId;
@@ -84,7 +83,7 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
 
     public void setSourceCodeChanges(List<SourceCodeChange> changes) {
         this.sourceCodeChanges = changes;
-        extractChangedSection();
+        this.changedSections = ChangedSection.extractSections(changes, this, (ChangedClass) file);
         extractChangedTokens();
     }
 
@@ -127,155 +126,31 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
         return count;
     }
 
-    /**
-     * 提取两段代码中差异的section
-     */
-    private void extractChangedSection() {
-        changedSection = new ArrayList<>();
-
-        if (!(file instanceof ChangedClass)) return;
-
-        ChangedClass clazz = (ChangedClass)file;
-        class T{
-            int chStart;    //chStart修改前区域的起始位置
-            int chEnd;      //chEnd修改前区域的终止位置，
-            int neStart;    //neStart修改后区域的起始位置
-            int neEnd;      //neEnd修改后区域的终止位置。
-
-            public boolean merge(T t) {
-                boolean res = false;
-                if (chStart >= 0 && t.chStart >= 0) {
-                    //相交
-                    int min = Math.min(chStart, t.chStart), max = Math.max(chEnd, t.chEnd);
-
-                    if(max - min <= chEnd - chStart + t.chEnd - t.chStart) {
-                        chStart = min;
-                        chEnd = max;
-                        res = true;
-                    }
-                }
-
-                if (neStart >= 0 && t.neStart >= 0) {
-                    int min = Math.min(neStart, t.neStart), max = Math.max(neEnd, t.neEnd);
-
-                    if(max - min <= neEnd - neStart + t.neEnd - t.neStart) {
-                        neStart = min;
-                        neEnd = max;
-                        res = true;
-                    }
-                }
-                return res;
-            }
-        };
-
-        List<T> list = new ArrayList<>();
-        for (SourceCodeChange change: sourceCodeChanges) {
-
-            T t = new T();
-            if (change instanceof Insert) {
-                t.neStart = change.getChangedEntity().getStartPosition();
-                t.neEnd = change.getChangedEntity().getEndPosition();
-                t.chStart = t.chEnd = -1;
-            } else if (change instanceof Move) {
-                Move m = (Move) change;
-                t.neStart = m.getNewEntity().getStartPosition();
-                t.neEnd = m.getNewEntity().getEndPosition() + 1;
-                t.chStart = m.getChangedEntity().getStartPosition();
-                t.chEnd = m.getChangedEntity().getEndPosition() + 1;
-            } else if (change instanceof Update) {
-                Update u = (Update) change;
-                t.neStart = u.getNewEntity().getStartPosition();
-                t.neEnd = u.getNewEntity().getEndPosition() + 1;
-                t.chStart = u.getChangedEntity().getStartPosition();
-                t.chEnd = u.getChangedEntity().getEndPosition() + 1;
-            } else if (change instanceof Delete) {
-                Delete d = (Delete) change;
-                t.neStart = t.neEnd = -1;
-                t.chStart = d.getChangedEntity().getStartPosition();
-                t.chEnd = d.getChangedEntity().getEndPosition() + 1;
-            }
-
-//            //因为在用changeDistiller时，只能解析类，不能直接解析函数
-//            //所以为了能解析函数，我在函数的外层构造了"public class temp {METHOD}"，
-//            //为了得到正确的内容，所以要对位置进行修正。
-//            int correction = "public class temp {".length();
-//            t.chStart -= correction;
-//            t.chEnd -= correction;
-//            t.neStart -= correction;
-//            t.neEnd -= correction;
-
-            boolean merge = false;
-            for (T temp: list) {
-                if (temp.merge(t)) {
-                    merge = true;
-                    break;
-                }
-            }
-            if (!merge) {
-                list.add(t);
-            }
-        }
-
-        for(T temp: list) {
-            //这说明该函数的函数前面发生了修改，暂时不处理
-            if(temp.neStart == 0 || temp.chStart == 0)
-                continue;
-            try {
-                String neSection = temp.neStart < 0 ? "" : clazz.content.NEW.substring(temp.neStart, temp.neEnd );
-                String chSection = temp.chStart < 0 ? "" : clazz.content.OLD.substring(temp.chStart, temp.chEnd);
-                if (neSection.equals(chSection)) continue;
-                Change<String> section = new Change<>(neSection, chSection);
-                changedSection.add(section);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        };
-
-        /*changedSection = new ArrayList<>();
-        EditList list = GitAnalyzer.getEditList(content.OLD, content.NEW);
-
-        if (list.size() == 0) return;
-        Change<HashSet<Integer>> lines = new Change<HashSet<Integer>>(new HashSet<>(), new HashSet<>());
-
-        String[] newLines = content.NEW.split("\\n");
-        String[] oldLines = content.OLD.split("\\n");
-        for (Edit edit: list) {
-            StringBuilder newSection = new StringBuilder(), oldSection = new StringBuilder();
-            for (int i = edit.getBeginA(); i < edit.getEndA(); i++) {
-                oldSection.append(oldLines[i]).append("\n");
-                lines.OLD.add(i);
-            }
-            for (int i = edit.getBeginB(); i < edit.getEndB(); i++) {
-                newSection.append(newLines[i]).append("\n");
-                lines.NEW.add(i);
-            }
-
-            //存储修改区域
-            Change<String> section = new Change<String>(newSection.toString().trim(), oldSection.toString().trim());;
-            if (section.NEW.length() > 0 || section.OLD.length() > 0) //有一些修改空行的情况
-                changedSection.add(section);
-        }*/
-    }
 
     /**
      * 提取两段代码中差异的token
      */
     protected void extractChangedTokens() {
-        Set<String> newTokens = new HashSet<>();
-        Set<String> oldTokens = new HashSet<>();
-        changedSection.stream().forEach(section -> {
-            Arrays.stream(section.NEW.split("[^a-zA-Z0-9_]"))
+        if (name.OLD.equals("assignClassNormalizedList")) {
+            int a = 2;
+        }
+        HashSet<String> newTokens = new HashSet<>();
+        HashSet<String> oldTokens = new HashSet<>();
+        changedSections.stream().forEach( section -> {
+            if (section.content == null) return;
+
+            Arrays.stream(section.content.NEW.split("[^a-zA-Z0-9_]"))
                     .filter(token -> token.length() > 0)
                     .forEach(token -> newTokens.add(token));
 
-            Arrays.stream(section.OLD.split("[^a-zA-Z0-9_]"))
+            Arrays.stream(section.content.OLD.split("[^a-zA-Z0-9_]"))
                     .filter(token -> token.length() > 0)
                     .forEach(token -> oldTokens.add(token));
         });
 
-        tokens = new Change<>(
-                SetTool.difference(newTokens, oldTokens),
-                SetTool.difference(oldTokens, newTokens)
+        tokens = new Change<HashSet<String>>(
+                newTokens, //SetTool.difference(newTokens, oldTokens),
+                oldTokens //SetTool.difference(oldTokens, newTokens)
         );
     }
 
@@ -284,13 +159,50 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
      * @param diff
      */
     private void extractWords(Diff diff) {
-        if (getName().equals("BKDReader")) {
+        if (name.OLD.equals("relateRangeBBoxToQuery")) {
             int a = 2;
         }
-        SetTool.union(diff.delFields.keySet(), diff.delMethods.keySet()).stream()
+
+        for (String token: diff.delFields.keySet())
+            if (tokens.OLD.contains(token) || tokens.NEW.contains(token)) changedWords.add(token);
+
+        for (String token: diff.delMethods.keySet())
+            if (tokens.OLD.contains(token) || tokens.NEW.contains(token)) changedWords.add(token);
+
+        for (String token: diff.newFields.keySet())
+            if (tokens.OLD.contains(token) || tokens.NEW.contains(token)) changedWords.add(token);
+
+        for (String token: diff.newMethods.keySet())
+            if (tokens.OLD.contains(token) || tokens.NEW.contains(token)) changedWords.add(token);
+
+        for (String token: diff.changedFields.keySet()){
+            for (ChangedField field: diff.changedFields.get(token)) {
+                if (tokens.NEW.contains(field.name.OLD) || tokens.OLD.contains(field.name.OLD)) {
+                    changedWords.add(field.name.OLD);
+                }
+                if (tokens.NEW.contains(field.name.NEW) || tokens.OLD.contains(field.name.NEW)) {
+                    changedWords.add(field.name.NEW);
+                }
+            }
+
+        }
+
+        for (String name: diff.changedMethods.keySet()){
+            for (ChangedMethod method: diff.changedMethods.get(name)) {
+                if (tokens.NEW.contains(method.name.OLD) || tokens.OLD.contains(method.name.OLD)) {
+                    changedWords.add(method.name.OLD);
+                }
+                if (tokens.NEW.contains(method.name.NEW) || tokens.OLD.contains(method.name.NEW)) {
+                    changedWords.add(method.name.NEW);
+                }
+            }
+
+        }
+
+        /*SetTool.union(diff.delFields.keySet(), diff.delMethods.keySet()).stream()
                 .filter(token -> !tokens.NEW.contains(token))
                 .filter(token -> tokens.OLD.contains(token))
-                .forEach(token -> delWords.add(token));
+                .forEach(token ->  delWords.add(token));
 
         SetTool.union(diff.newFields.keySet(), diff.newMethods.keySet()).stream()
                 .filter(token -> tokens.NEW.contains(token))
@@ -318,8 +230,8 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
                         }
                     });
         }
-        changedWords.add(getName());
-        changedWords.add(file.getName());
+        /*changedWords.add(getName());
+        changedWords.add(file.getName());*/
     }
 
     @Override
@@ -367,9 +279,6 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
 
     @Override
     public void update(Diff diff) {
-        if (name.NEW.equals("getIntersectState")) {
-            int a = 2;
-        }
         fieldUpdate(diff);
         getStaticModifies(diff);
     }
@@ -422,8 +331,8 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
         for (Change token : changedFields) {
             for (ChangedField field : clazz.changedFields) {
                 if (field.name.OLD.equals(token.OLD) && field.name.NEW.equals(token.NEW)) {
-                    FieldReplace fr = new FieldReplace(field.name.OLD, field.comment.OLD, field.name.NEW, field.comment.NEW);
-                    modifies.add(fr);
+                    //FieldReplace fr = new FieldReplace(field.name.OLD, field.comment.OLD, field.name.NEW, field.comment.NEW);
+                    //modifies.add(fr);
                     MethodDiff.connect(field, this);
                 }
             }
@@ -444,9 +353,9 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
                 set2.stream().filter(token -> diff.changedMethods.containsKey(token))
                         .forEach(token -> {
                             ChangedMethod method = diff.changedMethods.get(token).iterator().next();
-                            MethodReplace replace = new MethodReplace(method.name.OLD, method.comment.OLD,
-                                    method.name.NEW, method.comment.NEW);
-                            modifies.add(replace);
+                            //MethodReplace replace = new MethodReplace(method.name.OLD, method.comment.OLD,
+                                    //method.name.NEW, method.comment.NEW);
+                            //modifies.add(replace);
                         });
 
             }

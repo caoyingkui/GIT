@@ -121,7 +121,7 @@ public class NewMethod extends MethodDiff implements MethodUpdate, FieldUpdate{
 
     @Override
     public void update(Diff diff) {
-
+        fieldUpdate(diff);
     }
 
     @Override

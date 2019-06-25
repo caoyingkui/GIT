@@ -5,12 +5,19 @@ import java.nio.file.Paths;
 
 public class ReaderTool {
     public static String read(String filePath) {
+
         try {
+            StringBuilder builder = new StringBuilder();
             FileInputStream in = new FileInputStream(new File(filePath));
-            byte[] bytes = new byte[in.available()];
-            in.read(bytes, 0, in.available());
+            int available = 0;
+            while ((available = in.available()) > 0) {
+                if (available > 4096) available = 4096;
+                byte[] bytes = new byte[available];
+                in.read(bytes, 0, available);
+                builder.append(new String(bytes).replaceAll("\r", ""));
+            }
             in.close();
-            return new String(bytes).replaceAll("\r", "");
+            return builder.toString();
         }catch (FileNotFoundException e) {
             System.out.println("No such file:" + Paths.get(filePath).toAbsolutePath().toString());
             return "";

@@ -3,9 +3,11 @@ package fileDiff.file;
 import description.Description;
 import fileDiff.Change;
 import fileDiff.Diff;
+import fileDiff.field.ChangedField;
 import fileDiff.field.DelField;
 import fileDiff.field.FieldDiff;
 import fileDiff.field.NewField;
+import fileDiff.method.ChangedMethod;
 import fileDiff.method.DelMethod;
 import fileDiff.method.MethodDiff;
 import fileDiff.method.NewMethod;
@@ -61,8 +63,42 @@ public class ChangedInterface extends FileDiff {
     }
 
     @Override
+    public HashSet<String> getChangedFiledNames() {
+        if (changedFiledNames == null) {
+            changedFiledNames = new HashSet<>();
+
+            for (NewField field : newFields)
+                changedFiledNames.add(field.name);
+
+            for (DelField field : delFields)
+                changedFiledNames.add(field.name);
+        }
+        return changedFiledNames;
+    }
+
+    @Override
+    public HashSet<String> getChangedMethodNames() {
+        if (changedMethodNames == null) {
+            changedMethodNames = new HashSet<>();
+
+            for (NewMethod method: newMethods)
+                changedMethodNames.add(method.name);
+
+            for (DelMethod method: delMethods)
+                changedMethodNames.add(method.name);
+        }
+
+        return changedMethodNames;
+    }
+
+    @Override
     public String getName() {
         return name.NEW;
+    }
+
+    @Override
+    public String getPath() {
+        return path.NEW;
     }
 
     @Override
@@ -203,11 +239,4 @@ public class ChangedInterface extends FileDiff {
         return name.NEW + " : Interface";
     }
 
-    @Override
-    public void matchDescription(List<Description> descriptions) {
-        String className = name.NEW;
-        for (Description des: descriptions)
-            if (des.APIs.contains(className))
-                descriptions.add(des);
-    }
 }

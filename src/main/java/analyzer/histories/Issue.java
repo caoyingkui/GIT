@@ -1,12 +1,15 @@
 package analyzer.histories;
 
 import com.google.common.primitives.Bytes;
+import description.Description;
 import org.apache.commons.io.IOUtils;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import sun.nio.ch.IOUtil;
+import sun.security.krb5.internal.crypto.Des;
 import util.ReaderTool;
+import util.StemTool;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +23,8 @@ public class Issue {
     public List<String> attachements = new ArrayList<>();
     public Map<String, String> issueLinks = new HashMap<>();
     public List<Comment> comments;
+
+    public List<Description> descriptions = new ArrayList<>();
 
     public Issue(String issueId) {
         InputStream is = this.getClass().getClassLoader().getResourceAsStream("issue" + System.getProperty("file.separator") + issueId + ".json");
@@ -49,38 +54,50 @@ public class Issue {
         }
 
         this.comments = new ArrayList<>();
-        List<Comment> original = new ArrayList<>();
+
+        Comment issueDescription = new Comment(this.id, this.title, null, "", this.description);
+        this.comments.add(issueDescription);
+
         JSONArray originalList = (JSONArray) object.get("comments");
 
         originalList.forEach(comment -> {
             JSONObject com = (JSONObject) comment;
             com.put("issue_id", this.id);
             com.put("issue_title", this.title);
-            original.add(new Comment((JSONObject) comment));
+            this.comments.add(new Comment((JSONObject) comment));
         });
 
-        original.forEach(comment -> {
-            String content = comment.content;
-            String[] lines = content.split("\\n", 0);
-            for (String line: lines) {
-                line = line.trim();
-                if (line.length() > 30) {
-                    Comment subComment = new Comment(comment.issueId,
-                            comment.issueTitle,
-                            comment.date,
-                            comment.author,
-                            line);
-                    this.comments.add(subComment);
-
-                }
+        //设置description的id 信息
+        int index = 0;
+        for (Comment comment: this.comments) {
+            for (Description des: comment.subDescriptions) {
+                des.id = index ++;
             }
-        });
+        }
 
-        Comment comment = new Comment();
-        comment.issueId = this.id;
-        comment.issueTitle = this.title;
-        comment.content = this.description;
-        this.comments.add(comment);
+//
+//        original.forEach(comment -> {
+//            String content = comment.content;
+//            String[] lines = content.split("\\n", 0);
+//            //List<String> lines = StemTool.string2sentence(content);
+//            for (String line: lines) {
+//                line = line.trim();
+//                if (line.length() > 30) {
+//                    Comment subComment = new Comment(comment.issueId,
+//                            comment.issueTitle,
+//                            comment.date,
+//                            comment.author,
+//                            line);
+//                    this.comments.add(subComment);
+//                }
+//            }
+//        });
+
+
+    }
+
+    public void split() {
+
     }
 
     public Map<String, List<Comment>> split(List<RevCommit> commits) {
@@ -121,10 +138,13 @@ public class Issue {
         }
     }
 
-
-
-    public static void main(String[] args){
-        Issue issue = new Issue("SOLR-1");
+    public static void main(String[] args) {
+        Issue issue = new Issue("LUCENE-8496");
+        for (Comment comment: issue.comments) {
+            for (Description des: comment.subDescriptions) {
+                System.out.println(des.id + ": " + des.description);
+            }
+        }
     }
 
 

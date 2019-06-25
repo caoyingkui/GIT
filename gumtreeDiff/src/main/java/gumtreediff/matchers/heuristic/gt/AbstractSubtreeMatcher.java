@@ -125,6 +125,7 @@ public abstract class AbstractSubtreeMatcher extends Matcher {
 
         private int maxHeight;
 
+        //应该是目前从top to down 的层数
         private int currentIdx;
 
         @SuppressWarnings("unchecked")

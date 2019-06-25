@@ -16,13 +16,16 @@ import fileDiff.method.ChangedMethod;
 import fileDiff.method.DelMethod;
 import fileDiff.method.MethodDiff;
 import fileDiff.method.NewMethod;
+import fileDiff.modify.section.ChangedSection;
 import fileDiff.rationale.Explainable;
 import fileDiff.type.FileType;
 import git.ClassParser;
 import git.GitAnalyzer;
 import git.Method;
+import javassist.runtime.Desc;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.revwalk.RevCommit;
+import sun.security.krb5.internal.crypto.Des;
 
 import java.io.File;
 import java.util.*;
@@ -58,7 +61,7 @@ public class Diff implements Explainable {
 
     public Diff(GitAnalyzer git, ObjectId objectId) {
         parse(git, objectId);
-        //update(this);
+        update();
     }
 
     public List<FileDiff> getClasses() {
@@ -69,6 +72,8 @@ public class Diff implements Explainable {
         result.addAll(newInterfaces);
         result.addAll(changedInterfaces);
         result.addAll(delInterfaces);
+
+        result.sort((f1, f2)-> f1.getName().compareTo(f2.getName()));
         return result;
     }
 
@@ -117,11 +122,11 @@ public class Diff implements Explainable {
     }
 
     public FileDiff getFileObject(GitAnalyzer git, ObjectId commit, String fileName) {
-        System.out.println(fileName);
+        //System.out.println(fileName);
         String curContent = git.getFileFromCommit(commit, fileName);
         String formerContent = git.getFileFromFormerCommit(commit, fileName);
         String oldPath = git.getFormerName(commit, fileName);
-        if (oldPath != null && !oldPath.equals("/dev/null")) {
+        if (!formerContent.equals("") || oldPath != null && !oldPath.equals("/dev/null")) {
 
             Change<String> content = new Change<>(curContent, formerContent);
             Change<String> path = new Change<>(fileName, oldPath);
@@ -223,6 +228,7 @@ public class Diff implements Explainable {
         this.commitId = commit.getName();
         List<String> files = git.getAllFilesModifiedByCommit(this.commitId, ".java");
         for (String fileName: files) {
+
             FileDiff f = getFileObject(git, commit, fileName);
             if (f instanceof NewClass) newClasses.add((NewClass) f);
             else if (f instanceof ChangedClass) changedClasses.add((ChangedClass) f);
@@ -297,49 +303,65 @@ public class Diff implements Explainable {
                 });
     }
 
+    public List<ChangedSection> getChangedSections() {
+        List<ChangedSection> sections = new ArrayList<>();
+        getClasses().stream().filter(file -> file instanceof ChangedClass).forEach(file -> {
+            ChangedClass cClass = (ChangedClass) file;
+            for (ChangedMethod m: cClass.changedMethods) {
+                sections.addAll(m.changedSections);
+            }
+        });
+        sections.sort((s1, s2) -> s1.toString().compareTo(s2.toString()));
+        return sections;
+    }
+
     @Override
     public void matchDescription(List<Description> descriptions) {
-        for (FileDiff clazz: getClasses()) {
-            if (clazz.getName().toLowerCase().contains("test")) continue;
-            clazz.matchDescription(descriptions);
+        Set<String> classNames = new HashSet<>();
+        Set<String> methodNames = new HashSet<>();
+        Set<String> fieldNames = new HashSet<>();
+        for (FileDiff file: this.getClasses()) {
+            classNames.add(file.getName());
+            methodNames.addAll(file.getChangedMethodNames());
+            fieldNames.addAll(file.getChangedFiledNames());
         }
+
+        for (Description des: descriptions)
+            des.recognize(classNames, methodNames, fieldNames);
+
+        for (FileDiff file: this.getClasses()) {
+            List<Description> deses = new ArrayList<>();
+            String fileName = file.getName();
+            if (fileName.toLowerCase().contains("test")) continue;
+            if (fileName.equals("BKDReader")) {
+                int a = 2;
+            }
+            descriptions.forEach(des -> {
+                if (des.classes.size() == 0) {
+                    //deses.add(des);
+                } else {
+
+                    if (des.classes.contains(fileName)) {
+                        deses.add(des);
+                    }
+                }
+            });
+
+            file.matchDescription(deses);
+        }
+
     }
 
     public static void main(String[] args) {
         GitAnalyzer git = new GitAnalyzer();
-        Diff d = new Diff(git, git.getId("1118299c338253cea09640acdc48dc930dc27fda"));
-        Set<String> apis = new HashSet<>();
+        for (RevCommit commit: git.getCommits()) {
+            //
+            String msg = git.getCommitMessage(commit.getName());
 
-        for (FileDiff clazz: d.getClasses()) {
-            for (MethodDiff method: clazz.getMethods())
-                apis.add(method.getName());
-            for (FieldDiff field: clazz.getFields())
-                apis.add(field.getName());
-        }
-
-
-        Issue issue = new Issue("LUCENE-8496");
-        List<Description> descriptions = new ArrayList<>();
-        for (Comment comment: issue.comments) {
-            Description description = new Description(comment.content);
-            description.extractAPIs(apis);
-            descriptions.add(description);
-
-        }
-        d.matchDescription(descriptions);
-
-        for (FileDiff clazz: d.getClasses()) {
-            for (MethodDiff method: clazz.getMethods()) {
-                if (method.descriptions != null && method.descriptions.size() > 0) {
-                    System.out.println(clazz.getName() + "."+ method.getName());
-                    for (Description des: method.descriptions) {
-                        System.out.println("\t" + des.description);
-                    }
-                }
+            if (msg.contains("134091")) {
+                System.out.println(commit.getId().toString());
+                System.out.println("\t" + msg.substring(0, Math.min(msg.length(), 100)));
             }
-        }
-
-        int a = 2;
-
+         }
     }
 }

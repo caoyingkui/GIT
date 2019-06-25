@@ -16,4 +16,17 @@ public class Mutant {
         this.before = before;
         this.after = after;
     }
+
+    public boolean isUpdate() {
+        return type == MutantType.UPDATE;
+    }
+
+    public boolean isInsert() {
+        return type == MutantType.INSERT;
+    }
+
+    public boolean isDelete() {
+        return type == MutantType.DELETE;
+    }
+
 }

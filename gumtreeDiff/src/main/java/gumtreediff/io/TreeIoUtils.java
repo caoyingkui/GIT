@@ -645,7 +645,7 @@ public final class TreeIoUtils {
                         int type = Integer.parseInt(s.getAttributeByName(TYPE).getValue());
 
                         ITree t = context.createTree(type,
-                                labelForAttribute(s, LABEL), labelForAttribute(s, TYPE_LABEL));
+                                labelForAttribute(s, LABEL), "", labelForAttribute(s, TYPE_LABEL));
                         // FIXME this iterator has no type, due to the API. We have to cast it later
                         Iterator<?> it = s.getAttributes();
                         while (it.hasNext()) {

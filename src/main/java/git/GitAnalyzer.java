@@ -248,7 +248,8 @@ public class GitAnalyzer {
     public String getFileFromFormerCommit(ObjectId commitId, String filePath) {
         String oldPath = this.getFormerName(commitId, filePath);
         ObjectId formerId = this.getCommit(commitId.getName()+"^");
-        return (oldPath == null || formerId == null )? "" : getFileFromCommit(formerId, oldPath);
+        //return (oldPath == null || formerId == null )? "" : getFileFromCommit(formerId, oldPath);
+        return getFileFromCommit(formerId, filePath);
     }
 
     private void getFirstCommit(){
@@ -396,8 +397,11 @@ public class GitAnalyzer {
 
     public static void main(String[] args) throws Exception{
         GitAnalyzer a = new GitAnalyzer();
-        System.out.println(a.getCommits().size());
-
+        System.out.println(a.getCommit("f92974be5295e55dcc64d71b120e30866018b539^").toString());
+        String content = a.getFileFromCommit(a.getCommit("925197473b2cbfa3068041e6e12e537a5b66e2e6"), "bundles/org.eclipse.swt/Eclipse SWT Drag and Drop/motif/org/eclipse/swt/dnd/DragSource.java");
+        String c2 = a.getFileFromFormerCommit(a.getCommit("f92974be5295e55dcc64d71b120e30866018b539"), "bundles/org.eclipse.swt/Eclipse SWT Drag and Drop/motif/org/eclipse/swt/dnd/DragSource.java");
+        String c3 = a.getFileFromCommit(a.getCommit("f92974be5295e55dcc64d71b120e30866018b539^"), "bundles/org.eclipse.swt/Eclipse SWT Drag and Drop/motif/org/eclipse/swt/dnd/DragSource.java");
+        int aa = 2;
 
     }
 

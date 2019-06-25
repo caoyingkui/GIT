@@ -8,6 +8,7 @@ import fileDiff.rationale.Explainable;
 import fileDiff.type.FileType;
 import javassist.runtime.Desc;
 import sun.security.krb5.internal.crypto.Des;
+import util.SetTool;
 import util.StemTool;
 
 import java.util.*;
@@ -29,12 +30,22 @@ public abstract class FileDiff implements Explainable {
 
     public Diff diff;
 
+    protected HashSet<String> changedFiledNames = null;
+
+    protected HashSet<String> changedMethodNames = null;
+
     /**
      * descriptions记录了从issue等来源与当前类相关的描述信息。
      */
     public List<Description> descriptions = new ArrayList<>();
 
+    public abstract HashSet<String> getChangedFiledNames();
+
+    public abstract HashSet<String> getChangedMethodNames();
+
     public abstract String getName();
+
+    public abstract String getPath();
 
     public abstract List<FieldDiff> getFields();
 
@@ -72,8 +83,38 @@ public abstract class FileDiff implements Explainable {
 
     @Override
     public void matchDescription(List<Description> desList) {
-        for (MethodDiff method: getMethods())
-            method.matchDescription(desList);
+        Map<String, Set<Description>> method2Des = new HashMap<>();
+        Map<String, Set<Description>> field2Des = new HashMap<>();
+        for (Description des: desList) {
+            for (String methodName: des.methods)
+                SetTool.add(method2Des, methodName, des);
+
+            for (String field: des.fields)
+                SetTool.add(field2Des, field, des);
+        }
+
+        Map<String, Set<MethodDiff>> method2Met = new HashMap<>();
+        Map<String, Set<MethodDiff>> field2Met = new HashMap<>();
+        for (MethodDiff method: this.getMethods()) {
+            String methodName = method.getName();
+            SetTool.add(method2Met, methodName, method);
+            for (String token: SetTool.union(method.changedWords, method.addWords, method.delWords)) {
+                SetTool.add(field2Met, methodName, method);
+            }
+        }
+
+        for (String methodName: method2Des.keySet()) {
+            if (!method2Met.containsKey(methodName)) continue;
+            for (MethodDiff m: method2Met.get(methodName))
+                m.descriptions.addAll(method2Des.get(methodName));
+        }
+
+        for (String fieldName: field2Des.keySet()) {
+            if (!field2Met.containsKey(fieldName)) continue;
+            for (MethodDiff m: field2Met.get(fieldName))
+                m.descriptions.addAll(field2Des.get(fieldName));
+        }
+
         /*matchDescriptionBasedOnMethodName(desList);
         matchDescriptionBasedOnKeyWords(desList);*/
     }
@@ -92,7 +133,7 @@ public abstract class FileDiff implements Explainable {
             }
             boolean s = false;
             for (String methodName: methods.keySet()) {
-                if (des.APIs.contains(methodName)) {
+                if (des.methods.contains(methodName)) {
                     for (MethodDiff method: methods.get(methodName)) {
                         method.descriptions.add(des);
                     }

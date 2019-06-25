@@ -2,9 +2,8 @@ package util;
 
 import fileDiff.Change;
 
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
+import java.util.stream.Collector;
 
 /**
  * Created by kvirus on 2019/4/19 11:40
@@ -16,7 +15,7 @@ import java.util.Set;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class SetTool{
+public class SetTool <T extends Object, U extends Object>{
 
     public static Set<String> insert(Set<String> set1, Set<String> set2) {
         HashSet<String> result = new HashSet<>();
@@ -61,6 +60,16 @@ public class SetTool{
     }
 
     public static HashSet<String> toSet(String code) {
-        return toSet(code.split("[^a-zA-Z0-9_]"));
+        HashSet<String> result = new HashSet<>();
+        Arrays.stream(code.split("[^a-zA-Z0-9_]"))
+                .filter(token -> token.trim().length() > 0)
+                .forEach(token -> result.add(token));
+        return result;
+    }
+
+    public  static <T extends Object, U extends Object> void add(Map<T, Set<U>> map, T key, U value) {
+        Set<U> set = map.getOrDefault(key, new HashSet<>());
+        set.add(value);
+        if (set.size() == 1) map.put(key, set);
     }
 }

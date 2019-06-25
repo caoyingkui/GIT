@@ -21,7 +21,7 @@ import java.util.List;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class DelMethod extends MethodDiff implements MethodUpdate{
+public class DelMethod extends MethodDiff implements MethodUpdate, FieldUpdate{
     public DiffType type;
 
     public String name;
@@ -96,6 +96,21 @@ public class DelMethod extends MethodDiff implements MethodUpdate{
     @Override
     public void parseRefactorRelation(MethodDiff method) {
 
+    }
+
+    @Override
+    public void fieldUpdate(Diff diff) {
+        for (String token: diff.delFields.keySet())
+            if (tokens.contains(token))
+                delWords.add(token);
+
+        for (String token: diff.delMethods.keySet())
+            if (tokens.contains(token))
+                delWords.add(token);
+
+        for (String token: diff.changedMethods.keySet())
+            if (tokens.contains(token))
+                delWords.add(token);
     }
 
     @Override

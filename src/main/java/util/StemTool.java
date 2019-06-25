@@ -10,8 +10,7 @@ import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.tartarus.snowball.ext.EnglishStemmer;
 import org.apache.commons.text.similarity.CosineSimilarity;
 
-import java.io.Reader;
-import java.io.StringReader;
+import java.io.*;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -459,5 +458,58 @@ public class StemTool {
 
     public static boolean isStopWord(String word) {
         return stopWordsList.contains(word);
+    }
+
+    public static List<String> java2Tokens(String sourceCode) {
+        List<String> result = new ArrayList<>();
+
+        InputStream in = new ByteArrayInputStream(sourceCode.getBytes());
+        StreamTokenizer st = new StreamTokenizer(in);
+
+        st.parseNumbers();
+        st.wordChars('_', '_');
+        st.eolIsSignificant(true);
+        st.ordinaryChars(0, ' ');
+        st.slashSlashComments(true);
+        st.slashStarComments(true);
+
+        int token;
+        try {
+            while ((token = st.nextToken()) != StreamTokenizer.TT_EOF) {
+                switch (token) {
+                    case StreamTokenizer.TT_NUMBER:
+                        double num = st.nval;
+                        result.add(num + "");
+                        break;
+                    case StreamTokenizer.TT_WORD:
+                        String word = st.sval;
+                        result.add(word);
+                        break;
+                    case '"':
+                        String dquoteVal = st.sval;
+                        result.add(dquoteVal);
+                        break;
+                    case '\'':
+                        String squoteVal = st.sval;
+                        result.add(squoteVal);
+                        break;
+                    case StreamTokenizer.TT_EOL:
+                        break;
+                    case StreamTokenizer.TT_EOF:
+                        break;
+                    default:
+                        String s = Character.toString((char)st.ttype).trim();
+                        if (s.length() > 0) result.add(s);
+                        break;
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return result;
+    }
+
+    public static void main(String[] args) {
+        java2Tokens(" (Integer) gaugeValue);");
     }
 }
