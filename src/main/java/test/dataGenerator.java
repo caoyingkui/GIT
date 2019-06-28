@@ -37,7 +37,7 @@ import java.util.Map;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class dataGenerator {
+public class  dataGenerator {
 
     public static void generate(String issueID, String commitId) {
         File file = new File("test/method-des-data/" + issueID);

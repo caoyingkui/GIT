@@ -24,10 +24,11 @@ public class IAssignment extends InsertHash {
     private final int ACTION    = 0;
     private final int STATEMENT = 1;
     private final int PARENT    = 2;
-    private final int LEFTNAME  = 3;
-    private final int RIGHTTYPE = 4;
-    private final int OPTIONAL  = 5;
-    private final int KEY       = 6;
+    private final int LEFTTYPE  = 3;
+    private final int LEFTNAME  = 4;
+    private final int RIGHTTYPE = 5;
+    private final int OPTIONAL  = 6;
+    private final int KEY       = 7;
 
     public IAssignment(SourceCodeChange change) {
         assert (change instanceof Insert || change instanceof Delete) &&
@@ -35,12 +36,13 @@ public class IAssignment extends InsertHash {
 
         //Insert insert = (Insert) change;
 
-        hashes = new int[7];
+        hashes = new int[8];
         hashes[ACTION]      = typeHash(change);
         hashes[STATEMENT]   = statementHash();
         hashes[PARENT]      = blockStatementHash(change.getParentEntity().getType());
 
         AssignmentVisitor v = getVisitor(change);
+        hashes[LEFTTYPE]    = v.leftType;
         hashes[LEFTNAME]    = v.variableName.hashCode();
         hashes[RIGHTTYPE]   = v.init;
         hashes[OPTIONAL]    = v.optionalName.hashCode();
@@ -71,9 +73,9 @@ public class IAssignment extends InsertHash {
                 if (hashes[i] != hash.hashes[i]) return false;
             return true;
         } else {
-            return hashes[LEFTNAME] == hash.hashes[LEFTNAME] ||
+            return hashes[LEFTTYPE] == hash.hashes[LEFTTYPE] && (hashes[LEFTNAME] == hash.hashes[LEFTNAME] ||
                     hashes[PARENT] == hash.hashes[PARENT] && hashes[RIGHTTYPE] == hash.hashes[RIGHTTYPE] &&
-                            hashes[OPTIONAL] == hash.hashes[OPTIONAL];
+                            hashes[OPTIONAL] == hash.hashes[OPTIONAL]);
         }
     }
 }

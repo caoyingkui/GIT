@@ -246,7 +246,7 @@ public class GitAnalyzer {
      * @return 返回内容，如果不存在则返回空字符串（""）
      */
     public String getFileFromFormerCommit(ObjectId commitId, String filePath) {
-        String oldPath = this.getFormerName(commitId, filePath);
+        //String oldPath = this.getFormerName(commitId, filePath);
         ObjectId formerId = this.getCommit(commitId.getName()+"^");
         //return (oldPath == null || formerId == null )? "" : getFileFromCommit(formerId, oldPath);
         return getFileFromCommit(formerId, filePath);

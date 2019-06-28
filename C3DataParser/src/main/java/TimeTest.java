@@ -12,7 +12,11 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+import java.util.stream.Collectors;
 
 /**
  * Created by kvirus on 2019/6/23 9:51
@@ -56,11 +60,11 @@ public class TimeTest {
         return result;
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception{
 
         char[][] result = new char[4000][4000];
 
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\json1.json");
+        List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\json1.json");
         //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_junit_results_combined1.json");
 
         //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_eclipseswt_results_combined1.json");
@@ -70,7 +74,10 @@ public class TimeTest {
         //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_checkstyle_results_combined1.json");
 
         //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_checkstyle_results_combined1.json");
-        List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_eclipsejdt_results_combined1.json");
+        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_eclipsejdt_results_combined1.json");
+        Stream<Integer> arrs = Arrays.asList(new Integer(1), 2, 3, 4).stream();
+        Map<Integer, List<Integer>> a = arrs.collect(Collectors.groupingBy(n -> n));
+
         List<List<StatementHash>>   hashes  = getHashes(methods);
         long cur = System.currentTimeMillis();
         int len = hashes.size();
@@ -79,6 +86,17 @@ public class TimeTest {
                 System.out.println(i);
             for (int j = i + 1; j < len; j ++) {
                 boolean r = MethodDiff.isSimilar(hashes.get(i), hashes.get(j));
+                if (r) {
+                    System.out.println(methods.get(i).NEW);
+                    System.out.println("\n");
+                    System.out.println(methods.get(i).OLD);
+                    System.out.println("\n");
+                    System.out.println(methods.get(j).NEW);
+                    System.out.println("\n");
+                    System.out.println(methods.get(j).OLD);
+                    System.out.println("\n");
+                    int aa = 2;
+                }
             }
         }
         System.out.println(len);
