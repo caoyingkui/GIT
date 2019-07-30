@@ -3,6 +3,7 @@ package fileDiff.group.hash.insert;
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 import fileDiff.group.hash.visitor.CatchVisitor;
@@ -27,7 +28,8 @@ public class ICatch extends InsertHash{
     public final int EXCEPTION = 3;
 
     public ICatch(SourceCodeChange change) {
-        assert (change instanceof Insert || change instanceof Delete) &&
+        super(change);
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move) &&
                 change.getChangedEntity().getType() == JavaEntityType.CATCH_CLAUSE;
 
         //Insert insert = (Insert) change;

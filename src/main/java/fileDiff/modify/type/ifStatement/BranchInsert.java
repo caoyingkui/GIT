@@ -154,7 +154,6 @@ public class BranchInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     BranchInsert result = BranchInsert.match(method);
-                    int a = 2;
                 }
             }
         }

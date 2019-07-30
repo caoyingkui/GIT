@@ -124,7 +124,6 @@ public class ParameterRename extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ParameterRename result = ParameterRename.match(method);
-                    int a = 2;
                 }
             }
         }

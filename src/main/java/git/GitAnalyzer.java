@@ -48,7 +48,7 @@ public class GitAnalyzer {
     public GitAnalyzer(){
         try {
             ResourceBundle bundle = ResourceBundle.getBundle("properties");
-            String path = "";
+            String path = ""; //"E:\\Intellij workspace\\GIT\\test\\data\\cPatMiner\\rawData\\repositories\\jackrabbit-oak";
             if (System.getProperty("os.name").equals("Windows 10")) path = bundle.getString("windows_main_git_dir");
             else path = bundle.getString("ubantu_main_git_dir");
             git = Git.open(new File(path));
@@ -60,6 +60,10 @@ public class GitAnalyzer {
         }
     }
 
+    public void close(){
+        git.close();
+    }
+
     public RevCommit getCommit(String commitId) {
         try {
             Iterator<RevCommit> commits = git.log().addRange(getId(commitId + "^"), getId(commitId)).call().iterator();
@@ -67,7 +71,8 @@ public class GitAnalyzer {
                 return commits.next();
             }
         }catch (Exception e) {
-            e.printStackTrace();
+            //e.printStackTrace();
+            return null;
         }
         return null;
     }

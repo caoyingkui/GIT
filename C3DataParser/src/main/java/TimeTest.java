@@ -2,6 +2,7 @@ import com.google.gson.Gson;
 import fileDiff.Change;
 import fileDiff.group.hash.StatementHash;
 import fileDiff.method.MethodDiff;
+import git.GitAnalyzer;
 import org.codehaus.jackson.JsonFactory;
 import org.codehaus.jackson.JsonNode;
 import org.codehaus.jackson.JsonParser;
@@ -51,55 +52,56 @@ public class TimeTest {
         }
     }
 
+    public static void run(String path) {
+        List<Change<String>> methods = getMethods(path);
+        int len = methods.size();
+        System.out.println("Total Method Amount: " + methods.size());
+
+
+        List<List<StatementHash>> hashes  = getHashes(methods);
+        long cur = System.currentTimeMillis();
+        long totalHash = 0;
+        long strlen = 0;
+        double[] dis = new double[20];
+        for (int i = 0; i < len; i++) {
+            int hashesNum = hashes.get(i).size();
+            dis[hashesNum > 19 ? 19 : hashesNum] ++;
+            totalHash += hashesNum;
+            for (StatementHash hash: hashes.get(i))
+                strlen += hash.content.length();
+            if (i % 1000 == 0)
+                System.out.println(String.format("\tfinish " + (i / (len / 100))) + "%");
+            //if (true) continue;
+            for (int j = i + 1; j < len; j ++) {
+                boolean r = MethodDiff.isSimilar(hashes.get(i), hashes.get(j)) > 0;
+            }
+        }
+        for (int i = 0; i < 20; i ++)
+            System.out.print(String.format("%.2f\t", dis[i] / len % 100));
+        System.out.println();
+
+        System.out.println("average hash: " + (totalHash / (double) len));
+        System.out.println("average length: " + (strlen / (double) len));
+        System.out.println("Total Time: " + (System.currentTimeMillis() - cur));
+    }
+
+
     static List<List<StatementHash>> getHashes(List<Change<String>> methods) {
         List<List<StatementHash>> result = new ArrayList<>();
 
         for (Change<String> method: methods) {
-            result.add(MethodDiff.getHashes(MethodDiff.getChanges(method.NEW, method.OLD)));
+            result.add(MethodDiff.getHashes(method.NEW, method.OLD));
         }
         return result;
     }
 
     public static void main(String[] args) throws Exception{
+        for (ProjectInfo.Project project: ProjectInfo.projects) {
+            System.out.println("\n\nTime Test For \"" + project.name + "\"");
+            if (!new File(project.storePath).exists())
+                DataGenerator.generate(project.originalFile, new GitAnalyzer(project.gitPath), project.storePath);
 
-        char[][] result = new char[4000][4000];
-
-        List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\json1.json");
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_junit_results_combined1.json");
-
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_eclipseswt_results_combined1.json");
-
-
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_fitlibrary_results_combined1.json");
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_checkstyle_results_combined1.json");
-
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_checkstyle_results_combined1.json");
-        //List<Change<String>>        methods = getMethods("C:\\Users\\oliver\\Desktop\\ares_eclipsejdt_results_combined1.json");
-        Stream<Integer> arrs = Arrays.asList(new Integer(1), 2, 3, 4).stream();
-        Map<Integer, List<Integer>> a = arrs.collect(Collectors.groupingBy(n -> n));
-
-        List<List<StatementHash>>   hashes  = getHashes(methods);
-        long cur = System.currentTimeMillis();
-        int len = hashes.size();
-        for (int i = 0; i < len; i++) {
-            if (i % 1000 == 0)
-                System.out.println(i);
-            for (int j = i + 1; j < len; j ++) {
-                boolean r = MethodDiff.isSimilar(hashes.get(i), hashes.get(j));
-                if (r) {
-                    System.out.println(methods.get(i).NEW);
-                    System.out.println("\n");
-                    System.out.println(methods.get(i).OLD);
-                    System.out.println("\n");
-                    System.out.println(methods.get(j).NEW);
-                    System.out.println("\n");
-                    System.out.println(methods.get(j).OLD);
-                    System.out.println("\n");
-                    int aa = 2;
-                }
-            }
+            run(project.storePath);
         }
-        System.out.println(len);
-        System.out.println(System.currentTimeMillis() - cur);
     }
 }

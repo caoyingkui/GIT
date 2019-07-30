@@ -169,7 +169,6 @@ public class ParameterModify extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ParameterModify result = ParameterModify.match(method);
-                    int a = 2;
                 }
             }
         }

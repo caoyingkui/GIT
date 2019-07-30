@@ -89,7 +89,6 @@ public class SynchronizedInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     SynchronizedInsert result = SynchronizedInsert.match(method);
-                    int a = 2;
                 }
             }
         }

@@ -23,7 +23,9 @@ package gumtreediff.actions.model;
 import gumtreediff.tree.ITree;
 import gumtreediff.tree.TreeContext;
 
-public abstract class Action {
+import java.io.Serializable;
+
+public abstract class Action implements Serializable {
 
     protected ITree node;
 

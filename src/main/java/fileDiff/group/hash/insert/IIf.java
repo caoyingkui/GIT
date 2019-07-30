@@ -1,14 +1,16 @@
 package fileDiff.group.hash.insert;
 
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 import fileDiff.group.hash.visitor.RenameVisitor;
-import gumtree.GumTree;
 import org.eclipse.jdt.core.dom.ASTNode;
 import org.eclipse.jdt.core.dom.ASTParser;
 import org.eclipse.jdt.core.dom.Expression;
+import util.CompileTool;
 
 /**
  * Created by kvirus on 2019/6/16 13:28
@@ -27,7 +29,8 @@ public class IIf extends InsertHash{
     public final int CONDITION  = 3;
 
     public IIf(SourceCodeChange change) {
-        assert change instanceof Insert &&
+        super(change);
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move)&&
                 ( change.getChangedEntity().getType() == JavaEntityType.IF_STATEMENT ||
                     change.getChangedEntity().getType() == JavaEntityType.ELSE_STATEMENT) ;
 
@@ -43,13 +46,10 @@ public class IIf extends InsertHash{
         return getCode(ASTNode.IF_STATEMENT);
     }
 
-    private int getConditionHash(String conditionExression) {
-        parser.setKind(ASTParser.K_EXPRESSION);
-        parser.setSource(conditionExression.toCharArray());
-        Expression expression = (Expression) parser.createAST(null);
+    private int getConditionHash(String conditionExpression) {
+        Expression expression = CompileTool.getExpression(conditionExpression);
         RenameVisitor visitor = new RenameVisitor();
         expression.accept(visitor);
-
         return expression.toString().hashCode();
     }
 

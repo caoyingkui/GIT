@@ -28,6 +28,7 @@ import org.eclipse.jgit.revwalk.RevCommit;
 import sun.security.krb5.internal.crypto.Des;
 
 import java.io.File;
+import java.io.Serializable;
 import java.util.*;
 
 /**
@@ -40,7 +41,7 @@ import java.util.*;
  * |  **              *          **  **
  * |   *******        *          **     **
  */
-public class Diff implements Explainable {
+public class Diff implements Explainable, Serializable {
     String commitId = "";
 
     public Map<String, Set<NewField>> newFields = new HashMap<>();
@@ -333,9 +334,6 @@ public class Diff implements Explainable {
             List<Description> deses = new ArrayList<>();
             String fileName = file.getName();
             if (fileName.toLowerCase().contains("test")) continue;
-            if (fileName.equals("BKDReader")) {
-                int a = 2;
-            }
             descriptions.forEach(des -> {
                 if (des.classes.size() == 0) {
                     //deses.add(des);

@@ -89,11 +89,7 @@ fun getContents(rep: String, commit: String, fileName: String, newName: String, 
                     if (m.fullName.OLD.endsWith(oldName))
                         oldContent = m.content.OLD;
                 }
-
             } else {
-
-
-
                 for (m in file.changedMethods) {
                     if (m.fullName.NEW.endsWith(oldName)) {
                         newContent = m.content.NEW;
@@ -123,6 +119,8 @@ fun getContents(rep: String, commit: String, fileName: String, newName: String, 
             }
 
 
+            newContent = "class temp {\n $newContent \n}"
+            oldContent = "class temp {\n $oldContent \n}"
             return Change<String>(newContent, oldContent)
             break
         }
@@ -130,15 +128,9 @@ fun getContents(rep: String, commit: String, fileName: String, newName: String, 
     return null
 }
 
-fun parseJdtData(group: JSONObject) {
-}
-
 fun parsePatch(group: JSONObject) {
 
     val patchID = group.getString("name")
-    //if (!(patchID=="76182")) return
-    //if (!(patchID == "74139")) return
-    //if (!(patchID == "142947_2" || patchID == "139329_2" || patchID == "142947_2")) return
     println(patchID)
     val scripts = group.getJSONArray("scripts")
 

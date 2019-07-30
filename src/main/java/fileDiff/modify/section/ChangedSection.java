@@ -35,7 +35,7 @@ import java.util.*;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class ChangedSection {
+public class ChangedSection implements Serializable {
     public Change<String> content;
 
     public ChangedMethod method;
@@ -539,7 +539,6 @@ public class ChangedSection {
             }
         }
         matrix.print(0.1);
-        int a = 2;
     }
 
     public static void main(String[] args) throws IOException {

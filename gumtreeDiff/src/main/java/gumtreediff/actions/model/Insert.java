@@ -21,8 +21,11 @@
 package gumtreediff.actions.model;
 
 import gumtreediff.tree.ITree;
+import org.omg.PortableServer.SERVANT_RETENTION_POLICY_ID;
 
-public class Insert extends Addition {
+import java.io.Serializable;
+
+public class Insert extends Addition implements Serializable {
 
     public Insert(ITree node, ITree parent, int pos) {
         super(node, parent, pos);

@@ -174,7 +174,6 @@ public class MethodChange extends Modify {
                 if (method.getName().equals(methodName)) {
                     MethodChange result = MethodChange.match(method);
                     System.out.println(result != null);
-                    int a = 2;
                 }
             }
         }

@@ -1,1 +1,0 @@
-int a = fun(new Double(2));

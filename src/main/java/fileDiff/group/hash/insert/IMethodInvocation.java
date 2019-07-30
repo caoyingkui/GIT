@@ -1,7 +1,9 @@
 package fileDiff.group.hash.insert;
 
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 import fileDiff.group.hash.visitor.MethodVisitor;
@@ -9,6 +11,7 @@ import fileDiff.method.MethodDiff;
 import org.eclipse.jdt.core.dom.ASTNode;
 import org.eclipse.jdt.core.dom.ASTParser;
 import org.eclipse.jdt.core.dom.Block;
+import org.eclipse.jdt.core.dom.MethodInvocation;
 
 /**
  * Created by kvirus on 2019/6/16 10:34
@@ -30,8 +33,10 @@ public class IMethodInvocation extends InsertHash{
     private final int KEY           = 5;
 
     public IMethodInvocation(SourceCodeChange change) {
-        assert change instanceof Insert &&
-                change.getChangedEntity().getType() == JavaEntityType.METHOD_INVOCATION;
+        super(change);
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move) &&
+                (change.getChangedEntity().getType() == JavaEntityType.METHOD_INVOCATION ||
+                change.getChangedEntity().getType() == JavaEntityType.CONSTRUCTOR_INVOCATION);
 
         //Insert insert = (Insert) change;
 
@@ -71,5 +76,6 @@ public class IMethodInvocation extends InsertHash{
             return hashes[METHODNAME] == hash.hashes[METHODNAME];
         }
     }
+
 
 }

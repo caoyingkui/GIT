@@ -28,6 +28,7 @@ public class IThrow extends InsertHash {
     private final int KEY = 4;
 
     public IThrow(SourceCodeChange change) {
+        super(change);
         hashes = new int[5];
         hashes[ACTION] = typeHash(change);
         hashes[STATEMENT] = getCode(ASTNode.THROW_STATEMENT);

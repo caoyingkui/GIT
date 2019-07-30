@@ -102,7 +102,6 @@ public class SuperMethodChange extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     SuperMethodChange result = SuperMethodChange.match(method);
-                    int a = 2;
                 }
             }
         }

@@ -20,6 +20,19 @@ public class MethodVisitor extends ASTVisitor {
 
 
     @Override
+    public boolean visit(ConstructorInvocation node) {
+        methodName      = "this";
+        qualifiedName   = "";
+        return false;
+    }
+
+    public boolean visit(SuperConstructorInvocation node) {
+        methodName      = "super";
+        qualifiedName   = "";
+        return false;
+    }
+
+    @Override
     public boolean visit(MethodInvocation node) {
         methodName = node.getName().toString();
         Expression e = node.getExpression();
@@ -36,6 +49,5 @@ public class MethodVisitor extends ASTVisitor {
         MethodVisitor v = new MethodVisitor();
         block.accept(v);
 
-        int a = 2;
     }
 }

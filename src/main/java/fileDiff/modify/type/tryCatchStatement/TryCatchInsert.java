@@ -100,7 +100,6 @@ public class TryCatchInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     TryCatchInsert result = TryCatchInsert.match(method);
-                    int a = 2;
                 }
             }
         }

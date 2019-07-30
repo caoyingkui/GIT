@@ -72,4 +72,43 @@ public class SetTool <T extends Object, U extends Object>{
         set.add(value);
         if (set.size() == 1) map.put(key, set);
     }
+
+
+    /**
+     *
+     * @param l1
+     * @param l2
+     * @return 0 : 相等
+     *          1 ： l1 包含 l2
+     *          -1:  l2 包含 l1
+     *          2 :  l1 和 l2 overlap
+     *          -2 : l1 和 l2 无交集
+     */
+    public static int difference(List<Integer> l1, List<Integer>l2) {
+        List<Integer> result = new ArrayList<>();
+        Set<Integer> set1 = new HashSet<>();
+        Set<Integer> set2 = new HashSet<>();
+        Set<Integer> set3 = new HashSet<>();
+        for (int n: l1) {
+            if (l2.contains(n)) {
+                set1.add(n);
+            } else {
+                set2.add(n);
+            }
+        }
+
+        for (int n: l2) {
+            if (!l1.contains(n)) {
+                set3.add(n);
+                break;
+            }
+        }
+        if (set2.size() == 0 && set3.size() == 0 && set1.size() != 0) return 0;
+        if (set1.size() != 0 && set2.size() != 0 && set3.size() == 0 ) return 1;
+        if (set1.size() != 0 && set2.size() == 0 && set3.size() != 0) return -1;
+        if (set1.size() * set2.size() * set3.size() != 0) return 2;
+        if (set1.size() == 0 && set2.size() == 0 && set3.size() == 0) return -2;
+
+        return 3;
+    }
 }

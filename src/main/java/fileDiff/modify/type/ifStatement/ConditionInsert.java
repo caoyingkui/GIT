@@ -128,7 +128,6 @@ public class ConditionInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ConditionInsert result = ConditionInsert.match(method);
-                    int a = 2;
                 }
             }
         }

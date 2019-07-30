@@ -85,7 +85,6 @@ public class ReturnTypeInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ReturnTypeInsert result = ReturnTypeInsert.match(method);
-                    int a = 2;
                 }
             }
         }

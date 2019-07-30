@@ -11,6 +11,7 @@ import sun.security.krb5.internal.crypto.Des;
 import util.SetTool;
 import util.StemTool;
 
+import java.io.Serializable;
 import java.util.*;
 
 /**
@@ -23,7 +24,7 @@ import java.util.*;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public abstract class FileDiff implements Explainable {
+public abstract class FileDiff implements Explainable, Serializable {
     public FileType type;
 
     public String commitId = "";
@@ -128,9 +129,6 @@ public abstract class FileDiff implements Explainable {
         }
 
         desList.removeIf(des -> {
-            if (des.description.contains("writeIndex")) {
-                int a = 2;
-            }
             boolean s = false;
             for (String methodName: methods.keySet()) {
                 if (des.methods.contains(methodName)) {

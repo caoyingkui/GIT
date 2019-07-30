@@ -3,6 +3,7 @@ package fileDiff.group.hash.insert;
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 import fileDiff.group.hash.visitor.MethodVisitor;
@@ -22,15 +23,16 @@ import org.eclipse.jdt.core.dom.Block;
  * |   *******        **         **     **
  */
 public class IPostfixExpression extends InsertHash {
-    private final int ACTION = 0;
+    private final int ACTION    = 0;
     private final int STATEMENT = 1;
-    private final int PARENT = 2;
-    private final int OP = 3;
-    private final int VARIABLE = 4;
-    private final int KEY = 5;
+    private final int PARENT    = 2;
+    private final int VARIABLE  = 3;
+    private final int OP        = 4;
+    private final int KEY       = 5;
 
     public IPostfixExpression(SourceCodeChange change) {
-        assert (change instanceof Insert || change instanceof Delete) &&
+        super(change);
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move) &&
                 change.getChangedEntity().getType() == JavaEntityType.POSTFIX_EXPRESSION;
 
         hashes = new int[5];
@@ -52,7 +54,7 @@ public class IPostfixExpression extends InsertHash {
 
     @Override
     public boolean equals(StatementHash hash) {
-        if (!(hash instanceof IPostfixExpression)) return false;
+        if (!(hash instanceof IPostfixExpression || hash instanceof IPrefixExpression)) return false;
 
         if (strict) {
             int len = hashes.length;

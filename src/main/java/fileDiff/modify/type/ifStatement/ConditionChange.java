@@ -105,7 +105,6 @@ public class ConditionChange extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ConditionChange result = ConditionChange.match(method);
-                    int a = 2;
                 }
             }
         }

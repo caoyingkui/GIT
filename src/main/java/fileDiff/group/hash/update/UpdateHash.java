@@ -15,6 +15,9 @@ import fileDiff.group.hash.StatementHash;
  * |   *******        **         **     **
  */
 public class UpdateHash extends StatementHash {
+    public UpdateHash(SourceCodeChange change) {
+        content = change.getChangedEntity().getUniqueName();
+    }
     public static UpdateHash getHash(SourceCodeChange change) {
         return new UUpdate(change);
     }

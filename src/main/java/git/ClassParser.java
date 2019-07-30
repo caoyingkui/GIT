@@ -9,6 +9,7 @@ import org.eclipse.jgit.diff.Edit;
 import org.eclipse.jgit.diff.EditList;
 import org.eclipse.jgit.patch.FileHeader;
 import org.eclipse.jgit.patch.Patch;
+import util.CompileTool;
 import util.ReaderTool;
 
 import java.security.CodeSource;
@@ -149,120 +150,6 @@ public class ClassParser {
         ).trim();
     }
 
-    private void extractAllFields() {
-        fields = new ArrayList<>();
-        PackageDeclaration p = unit.getPackage();
-        String packageName = p == null ? "" : p.getName().toString();
-        for (Object object: unit.types()) {
-            if (object instanceof TypeDeclaration) {
-                fields.addAll(extractAllFields((TypeDeclaration) object, packageName));
-            }
-        }
-    }
-
-    private List<Field> extractAllFields(TypeDeclaration type, String qualifiedName) {
-        List<Field> result = new ArrayList<>();
-        String className = type.getName().toString();
-
-        for (FieldDeclaration de: type.getFields()) {
-            int startLine = getLine(de.getStartPosition());
-            String filedType = de.getType().toString();
-            for (Object f : de.fragments()) {
-                VariableDeclarationFragment fragment = (VariableDeclarationFragment) f;
-                String name = fragment.getName().toString();
-                Field field = new Field(filedType,
-                        qualifiedName + "." + className + "." + name,
-                        name,
-                        "",
-                        startLine);
-                result.add(field);
-            }
-        }
-
-        for (TypeDeclaration de: type.getTypes()) {
-            result.addAll(extractAllFields(de, qualifiedName + "." + className));
-        }
-
-        return result;
-    }
-
-    /**
-     * 从代码中抽取所有的method信息
-     */
-    private void extractAllMethods(){
-        methods = new ArrayList<>();
-        PackageDeclaration p = unit.getPackage();
-        String packageName = p == null ? "" : p.getName().toString();
-
-        for(Object type: unit.types()){
-            if(type instanceof TypeDeclaration){
-                methods.addAll(extractAllMethods((TypeDeclaration)type, packageName));
-            }
-        }
-    }
-
-    /**
-     * 从一个typeDeclaration中抽取所有的method信息
-     * @param type
-     * @param qualifiedName 递归抽取时,method的前缀名
-     * @return
-     */
-    private List<Method> extractAllMethods(TypeDeclaration type, String qualifiedName) {
-        List<Method> result = new ArrayList<>();
-        String className = type.getName().toString();
-
-       for(Object object: type.bodyDeclarations()){
-            // region MethodDeclaration
-            if(object instanceof MethodDeclaration){
-                MethodDeclaration declaration = (MethodDeclaration) object;
-                String methodName = declaration.getName().toString();
-                String name = declaration.getName().toString();
-                String parStr = "";
-                List parameters = declaration.parameters();
-                if(parameters.size() > 0){
-                    for(Object par: parameters){
-
-                        //在这里不能正常获取 “double... d1”,只能获取double，而不能获取“double...”
-                        if(par instanceof SingleVariableDeclaration){
-                            SingleVariableDeclaration p = (SingleVariableDeclaration) par;
-                            String typeName = p.getType().toString();
-                            if (par.toString().contains("...")) typeName += "...";
-                            parStr += "," + typeName;
-                        } else {
-                            assert 1 == 2;
-                        }
-                    }
-                    parStr = parStr.substring(1);
-                }
-                methodName += ("(" + parStr + ")");
-
-                int startPosition = declaration.getStartPosition();
-                int endPosition = startPosition + declaration.getLength() - 1;
-
-                result.add(
-                        //new Method(qualifiedName + "." + className + ":" + methodName,
-                        new Method(qualifiedName + "." + className + "." + methodName,
-                                name,
-                                getLine(startPosition),
-                                getLine(endPosition),
-                                startPosition,
-                                endPosition,
-                                sourceCode.substring(startPosition, endPosition + 1), //declaration.toString()
-                                "",
-                                declaration
-                        )
-                );
-            }
-            //endregion
-            else if(object instanceof TypeDeclaration){
-                TypeDeclaration subType = (TypeDeclaration) object;
-                result.addAll(extractAllMethods(subType, qualifiedName + "." + type.getName().toString()));
-            }
-
-        }
-        return result;
-    }
-
     /**
      * 获取类中定义的所有method名
      * @return
@@ -378,20 +265,20 @@ public class ClassParser {
      * @param sourceCode 源代碼
      */
     private void initialize(String sourceCode){
-        this.sourceCode = sourceCode;
-        this.codeLength = sourceCode.length();
-        this.codeLines = sourceCode.split("\n");
-        ASTParser parser = ASTParser.newParser(AST.JLS8);
-        parser.setSource(sourceCode.toCharArray());
-        parser.setKind(ASTParser.K_COMPILATION_UNIT);
-        // In order to parse 1.5 code, some compiler options need to be set to 1.5
-        Map options = JavaCore.getOptions();
-        JavaCore.setComplianceOptions(JavaCore.VERSION_1_5, options);
-        parser.setCompilerOptions(options);
-        unit = (CompilationUnit) parser.createAST(null);
+
+        unit = CompileTool.getCommilationUnit(sourceCode);
+        getMetaInfo(unit);
+
+        DeclarationVisitor visitor = new DeclarationVisitor(this);
+        unit.accept(visitor);
+        methods = visitor.methods;
+        fields  = visitor.fields;
 
         comments = unit.getCommentList();
+        commentDispatch();
+    }
 
+    private void getMetaInfo(CompilationUnit unit) {
         //获取接口信息
         TypeDeclaration type =  null;
 
@@ -429,16 +316,6 @@ public class ClassParser {
             e.printStackTrace();
             return;
         }
-
-
-
-        initializeLines();
-
-        extractAllMethods();
-
-        extractAllFields();
-
-        commentDispatch();
     }
 
     /**
@@ -446,7 +323,6 @@ public class ClassParser {
      */
     private void initializeLines(){
         lines = new ArrayList<>();
-        int length = sourceCode.length();
         int start = 0;
         for(int i = 0 ; i < codeLength ; i++){
             if(sourceCode.charAt(i) =='\n'){
@@ -461,6 +337,12 @@ public class ClassParser {
      * @param sourceCode
      */
     public ClassParser setSourceCode(String sourceCode) {
+
+        this.sourceCode = sourceCode;
+        this.codeLength = sourceCode.length();
+        this.codeLines = sourceCode.split("\n");
+
+        initializeLines();
         initialize(sourceCode);
         return this;
     }
@@ -474,18 +356,10 @@ public class ClassParser {
     }
 
     public static void main(String[] args){
-        ProtectionDomain pd = CommentRecorderParser.class.getProtectionDomain();
-        CodeSource source = pd.getCodeSource();
-        System.out.println(source);
 
-        try {
-            String code = ReaderTool.read("file1.java");
+        ClassParser parser = new ClassParser();
+        String str = ReaderTool.read("file1.java");
+        parser.setSourceCode(str);
 
-            ClassParser parser = new ClassParser().setSourceCode(code);
-            int a = 2;
-        }catch (Exception e){
-            e.printStackTrace();
-        }
-
-      }
+    }
 }

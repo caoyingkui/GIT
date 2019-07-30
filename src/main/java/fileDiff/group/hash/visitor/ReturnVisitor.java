@@ -1,9 +1,7 @@
 package fileDiff.group.hash.visitor;
 
 import fileDiff.group.hash.StatementHash;
-import org.eclipse.jdt.core.dom.ASTVisitor;
-import org.eclipse.jdt.core.dom.Block;
-import org.eclipse.jdt.core.dom.ReturnStatement;
+import org.eclipse.jdt.core.dom.*;
 
 /**
  * Created by kvirus on 2019/6/16 12:47
@@ -16,11 +14,17 @@ import org.eclipse.jdt.core.dom.ReturnStatement;
  * |   *******        **         **     **
  */
 public class ReturnVisitor extends ASTVisitor {
-    public int returnType = 0;
+    public String expression = "";
 
     @Override
     public boolean visit(ReturnStatement node) {
-        returnType = StatementHash.getCode(node.getExpression());
+        Expression exp = node.getExpression();
+        if (exp instanceof MethodInvocation) {
+            expression = ((MethodInvocation)exp).getName().toString();
+        } else {
+            node.accept(new RenameVisitor());
+            expression = node.getExpression().toString();
+        }
         return false;
     }
 

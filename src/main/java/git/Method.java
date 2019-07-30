@@ -9,26 +9,49 @@ import java.util.Arrays;
 import java.util.List;
 
 public class Method {
-    public String fullName ;
-    public String name;
-    public int startLine;
-    public int endLine;
-    public int startPos;
-    public int endPos;
-    public String methodContent;
-    public String comment;
+    public String           fullName ;
+    public String           name;
+    public int              startLine;
+    public int              endLine;
+    public int              startPos;
+    public int              endPos;
+    public String           methodContent;
+    public String           comment;
     public MethodDeclaration node;
 
-    public Method(String fullName, String name, int startLine, int endLine,
-                  int startPos, int endPos, String methodContent, String comment, MethodDeclaration node){
+    public void setFullName(String fullName) {
         this.fullName = fullName;
+    }
+
+    public void setName(String name) {
         this.name = name;
+    }
+
+    public void setStartLine(int startLine) {
         this.startLine = startLine;
+    }
+
+    public void setEndLine(int endLine) {
         this.endLine = endLine;
+    }
+
+    public void setStartPos(int startPos) {
         this.startPos = startPos;
+    }
+
+    public void setEndPos(int endPos) {
         this.endPos = endPos;
+    }
+
+    public void setMethodContent(String methodContent) {
         this.methodContent = methodContent;
+    }
+
+    public void setComment(String comment) {
         this.comment = comment;
+    }
+
+    public void setNode(MethodDeclaration node) {
         this.node = node;
     }
 
@@ -93,24 +116,6 @@ public class Method {
 
     public static boolean isSimilar(Method method1, Method method2) {
         return isSimilar(method1.methodContent, method2.methodContent);
-
-//        String lon = method1.methodContent.trim(), sht = method2.methodContent.trim();
-//        if (lon.length() == 0 || sht.length() == 0) return false;
-//
-//        if (lon.length() < sht.length()) {
-//            String temp = lon;
-//            lon = sht;
-//            sht = temp;
-//        }
-//        int start = 0, len = 0;
-//
-//        for (len = sht.length() - 1; len > 0; len --) {
-//            for (int i = 0; i + len < sht.length(); i++) {
-//                if (lon.contains(sht.substring(i, i + len)))
-//                    return len > 30;
-//            }
-//        }
-//        return false;
     }
 
     public static boolean isSimilar(String content1, String content2) {

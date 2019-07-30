@@ -180,7 +180,6 @@ public class FieldChange extends Modify {
                 if (method.getName().equals(methodName)) {
                     FieldChange result = FieldChange.match(method);
                     System.out.println(result != null);
-                    int a = 2;
                 }
             }
         }

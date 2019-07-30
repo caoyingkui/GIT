@@ -12,11 +12,13 @@ package fileDiff;
  */
 
 
+import java.io.Serializable;
+
 /**
  * Change用来记录一次commit中，某种信息的前后变化
  * @param <T>
  */
-public class Change <T> {
+public class Change <T> implements Serializable {
     //提交前
     public T OLD;
 

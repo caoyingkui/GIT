@@ -94,7 +94,6 @@ public class JavadocUpdate extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     JavadocUpdate result = JavadocUpdate.match(method);
-                    int a = 2;
                 }
             }
         }

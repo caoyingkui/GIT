@@ -4,6 +4,8 @@ import gumtreediff.actions.model.*;
 import gumtreediff.tree.ITree;
 import org.eclipse.jdt.core.dom.ASTNode;
 
+import java.io.Serializable;
+
 /**
  * Created by kvirus on 2019/6/5 20:48
  * Email @ caoyingkui@pku.edu.cn
@@ -14,7 +16,7 @@ import org.eclipse.jdt.core.dom.ASTNode;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class ActionHash {
+public class ActionHash implements Serializable {
     public static final int LOOSE = 1;
     public static final int MEDIUM = 2;
     public static final int STRICT = 3;
@@ -39,10 +41,12 @@ public class ActionHash {
     public boolean isSimilar(ActionHash hash, int level) {
         if (level == STRICT) {
             return typeHash == hash.typeHash &&
-                    rootHash == hash.rootHash &&
                     nodeHash == hash.nodeHash &&
-                    posHash == hash.posHash &&
-                    valueHash == hash.valueHash;
+                    //posHash == hash.posHash &&
+                    //rootHash == hash.rootHash &&
+                    valueHash == hash.valueHash ;
+                    //(nodeHash != 13150 || valueHash == hash.valueHash ) && // 如果是methodinvocation, 就必须要求方法名相同
+                    //&& valueHash == hash.valueHash;
         } else if (level == MEDIUM) {
             return typeHash == hash.typeHash &&
                     rootHash == hash.rootHash &&

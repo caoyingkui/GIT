@@ -117,7 +117,6 @@ public class ParameterInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ParameterInsert result = ParameterInsert.match(method);
-                    int a = 2;
                 }
             }
         }

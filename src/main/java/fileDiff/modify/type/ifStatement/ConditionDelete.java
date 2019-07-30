@@ -125,7 +125,7 @@ public class ConditionDelete extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     ConditionDelete result = ConditionDelete.match(method);
-                    int a = 2;
+
                 }
             }
         }

@@ -76,7 +76,6 @@ public class Lambda extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     Lambda result = Lambda.match(method);
-                    int a = 2;
                 }
             }
         }

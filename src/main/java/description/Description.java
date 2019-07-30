@@ -134,9 +134,6 @@ public class Description {
                 String content = issue.description;
                 List<String> tokens = StemTool.stem(content);
                 for (String token : new HashSet<String>(tokens)) {
-                    if (token.equals("version")) {
-                        int a = 2;
-                    }
                     count.put(token, count.getOrDefault(token, 0.0) + 1);
                 }
             }

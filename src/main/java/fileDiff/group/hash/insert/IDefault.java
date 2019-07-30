@@ -4,6 +4,7 @@ import ch.uzh.ifi.seal.changedistiller.model.classifiers.EntityType;
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 
@@ -23,7 +24,14 @@ public class IDefault extends InsertHash{
     public final int PARENT = 2;
 
     public IDefault(SourceCodeChange change) {
-        assert (change instanceof Insert || change instanceof Delete);
+        super(change);
+        if(change.getChangedEntity().getType().isStatement()) {
+            System.out.println("Default:" + change.getChangedEntity().getUniqueName());
+            System.out.println(change.getChangedEntity().getType());
+            System.out.println();
+        }
+
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move);
 
         hashes = new int[3];
         hashes[ACTION]      = typeHash(change);

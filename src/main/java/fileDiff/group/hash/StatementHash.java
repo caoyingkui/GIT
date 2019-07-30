@@ -11,16 +11,15 @@ import fileDiff.method.MethodDiff;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.dom.ASTNode;
 import org.eclipse.jdt.core.dom.ASTParser;
+import org.eclipse.jdt.core.dom.Block;
+import org.eclipse.jdt.core.dom.MethodDeclaration;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONPointer;
 import util.ReaderTool;
 import util.WriterTool;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileReader;
+import java.io.*;
 import java.util.*;
 
 /**
@@ -33,11 +32,13 @@ import java.util.*;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public abstract class StatementHash {
+public abstract class StatementHash implements Serializable {
 
     public static ASTParser parser;
     
     public static Map<Integer, Integer> codes;
+
+    public String content;
     
     static {
         parser = ASTParser.newParser(9);
@@ -171,6 +172,7 @@ public abstract class StatementHash {
     }
     
     public boolean equals(StatementHash hash) {
+        if (this instanceof IDefault || hash instanceof IDefault) return false;
         try {
             return hashes[0] == hash.hashes[0] && hashes[1] == hash.hashes[1];
         } catch (Exception e) {
@@ -234,34 +236,53 @@ public abstract class StatementHash {
         return 0;
     }
 
-    public static StatementHash getInstance(SourceCodeChange change) {
-        if (change instanceof Insert || change instanceof Delete) {
+    public static Block getBlock(SourceCodeChange change) {
+        String statement = change.getChangedEntity().getUniqueName();
+        parser.setKind(ASTParser.K_STATEMENTS);
+        parser.setSource(statement.toCharArray());
+        Map options = JavaCore.getOptions();
+        JavaCore.setComplianceOptions(JavaCore.VERSION_1_5, options);
+        parser.setCompilerOptions(options);
+        Block block = (Block)parser.createAST(null);
+        return block;
+    }
+
+    public static StatementHash getInstance(SourceCodeChange change, MethodDeclaration newDeclaration, MethodDeclaration oldDeclaration) {
+        if (change instanceof Insert || change instanceof Delete || change instanceof Move) {
             EntityType type = change.getChangedEntity().getType();
+            if (type == JavaEntityType.ASSERT_STATEMENT)        return new IAssignment(change);
             if (type == JavaEntityType.ASSIGNMENT)              return new IAssignment(change);
             if (type == JavaEntityType.BREAK_STATEMENT)         return new IBreak(change);
             if (type == JavaEntityType.CATCH_CLAUSE)            return new ICatch(change);
+            if (type == JavaEntityType.CLASS_INSTANCE_CREATION) return new IClassInstanceCreation(change);
             if (type == JavaEntityType.CONTINUE_STATEMENT)      return new IContinue(change);
             if (type == JavaEntityType.VARIABLE_DECLARATION_STATEMENT) return new IDeclaration(change);
+            if (type == JavaEntityType.DO_STATEMENT)            return new IDo(change);
             if (type == JavaEntityType.FOR_STATEMENT)           return new IFor(change);
+            if (type == JavaEntityType.FOREACH_STATEMENT)       return new IForeach(change);
             if (type == JavaEntityType.IF_STATEMENT ||
                     type == JavaEntityType.ELSE_STATEMENT)      return new IIf(change);
-            if (type == JavaEntityType.METHOD_INVOCATION)       return new IMethodInvocation(change);
+            if (type == JavaEntityType.LABELED_STATEMENT)       return new ILabelStatement(change);
+            if (type == JavaEntityType.METHOD_INVOCATION  ||
+                    type == JavaEntityType.CONSTRUCTOR_INVOCATION)       return new IMethodInvocation(change);
+            if (type == JavaEntityType.PARAMETER)               return new IParameter(change);
             if (type == JavaEntityType.POSTFIX_EXPRESSION)      return new IPostfixExpression(change);
-            if (type == JavaEntityType.RETURN_STATEMENT)        return new IReturn(change);
+            if (type == JavaEntityType.PREFIX_EXPRESSION)       return new IPrefixExpression(change);
+            if (type == JavaEntityType.RETURN_STATEMENT)        return new IReturn(change, newDeclaration, oldDeclaration);
             if (type == JavaEntityType.SWITCH_CASE)             return new ISwitchCase(change);
             if (type == JavaEntityType.SWITCH_STATEMENT)        return new ISwitchStatement(change);
             if (type == JavaEntityType.SYNCHRONIZED_STATEMENT)  return new ISynchronize(change);
             if (type == JavaEntityType.THROW_STATEMENT)         return new IThrow(change);
             if (type == JavaEntityType.TRY_STATEMENT)           return new ITry(change);
             if (type == JavaEntityType.WHILE_STATEMENT)         return new IWhile(change);
+            if (type == JavaEntityType.PARAMETER)               return new IParameter(change);
         } else if (change instanceof Update) {
             return new UUpdate(change);
         } else if (change instanceof Move) {
             return new MMove(change);
         }
 
-        assert 1 == 2;
-        return null;
+        return new IDefault(change);
 
     }
 
@@ -270,7 +291,6 @@ public abstract class StatementHash {
 
         String json = ReaderTool.read("C:\\Users\\oliver\\Desktop\\json1.json");
         JSONObject o = new JSONObject(json);
-        int a = 2;
         int count = 0;
         Set<String> files = new HashSet<>();
         Set<String> commit = new HashSet<>();
@@ -295,62 +315,5 @@ public abstract class StatementHash {
     }
 
     public static void main(String[] args) {
-        Set<String> types = new HashSet<>();
-        Map<String, Change<String>> methodList = new HashMap<>();
-        int count = 0;
-        for (File file: new File("LASE/data").listFiles()) {
-            System.out.println(file.getAbsolutePath());
-            if (file.getName().contains("lase_evaluation.json")) continue;
-            //if (file.getName().contains("139329_2.json")) continue;
-
-            JSONObject patch = new JSONObject(ReaderTool.read(file.getAbsolutePath()));
-            JSONArray methods = patch.getJSONArray("methods");
-            for (int i = 0; i < methods.length(); i++) {
-                List<SourceCodeChange> changes = MethodDiff.getChanges(
-                        methods.getJSONObject(i).getString("newContent"),
-                        methods.getJSONObject(i).getString("oldContent"));
-                methodList.put(patch.getString("patch") + "_" + i, new Change<String>(methods.getJSONObject(i).getString("newContent"), methods.getJSONObject(i).getString("oldContent")));
-                for (SourceCodeChange change: changes) {
-                    types.add(change.getChangedEntity().getType().toString());
-                }
-
-
-            }
-            count ++;
-        }
-
-        List<String> ids = new ArrayList<String>(methodList.keySet());
-        Collections.sort(ids);
-//        //ids.removeIf(id -> {
-//            return id.startsWith("103863_") || id.startsWith("114007_")
-//                    || id.startsWith("114007_") || id.startsWith("129314_") || id.startsWith("134091_")
-//                    || id.startsWith("139329_3") || id.startsWith("76182_") || id.startsWith("76391_")
-//                    || id.startsWith("77194_") || id.startsWith("86079_1_") || id.startsWith("89785_")
-//                    || id.startsWith("91937_") || id.startsWith("95116_") || id.startsWith("97981_");
-//
-//
-//        });
-
-        //StringBuilder result = new StringBuilder();
-        for (String st1: ids) {
-            //result.append(st1).append(":\n");
-            //result.append("OLD\n").append(methodList.get(st1).OLD).append("\n");
-            //result.append("NEW\n").append(methodList.get(st1).NEW).append("\n\n");
-
-            System.out.print(st1 + ":");
-            for (String st2: ids) {
-                if (st1.equals(st2)) continue;
-                try {
-                    if (MethodDiff.isSimilar(methodList.get(st1), methodList.get(st2)))
-                        System.out.print(" " + st2);
-                } catch (Exception e) {
-                    System.out.println("\nerror: " + st1 + " " + st2 );
-                    continue;
-                }
-            }
-            System.out.println();
-        }
-
-        //WriterTool.write("LASE/code.txt", result.toString());
     }
 }

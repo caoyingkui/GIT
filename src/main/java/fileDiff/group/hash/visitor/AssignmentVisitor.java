@@ -41,6 +41,8 @@ public class AssignmentVisitor extends ASTVisitor {
             if (right instanceof MethodInvocation ||
                 right instanceof ClassInstanceCreation) {
                 right.accept(this);
+            } else {
+                optionalName = right.toString();
             }
             return false;
         } else {
@@ -68,7 +70,6 @@ public class AssignmentVisitor extends ASTVisitor {
         AssignmentVisitor v = new AssignmentVisitor();
         block.accept(v);
 
-        int a = 2;
     }
 
 }

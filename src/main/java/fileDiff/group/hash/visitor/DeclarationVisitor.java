@@ -26,9 +26,15 @@ public class DeclarationVisitor extends ASTVisitor {
         VariableDeclarationFragment f = (VariableDeclarationFragment)(node.fragments().get(0));
 
         variableName = f.getName().toString();
+        Expression expression = f.getInitializer();
 
-        init = StatementHash.getCode(f.getInitializer());
-
+        if(expression != null && expression instanceof MethodInvocation) {
+            init = ((MethodInvocation) expression).getName().toString().hashCode();
+        } else if (expression == null) {
+            init = 0;
+        } else {
+            init = expression.toString().hashCode();
+        }
         return true;
     }
 }

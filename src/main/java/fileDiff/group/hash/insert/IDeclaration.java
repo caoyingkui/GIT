@@ -3,6 +3,7 @@ package fileDiff.group.hash.insert;
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 import fileDiff.group.hash.visitor.DeclarationVisitor;
@@ -10,6 +11,7 @@ import org.eclipse.jdt.core.dom.ASTNode;
 import org.eclipse.jdt.core.dom.ASTParser;
 import org.eclipse.jdt.core.dom.ASTVisitor;
 import org.eclipse.jdt.core.dom.Block;
+import util.CompileTool;
 
 /**
  * Created by kvirus on 2019/6/16 8:19
@@ -33,7 +35,8 @@ public class IDeclaration extends InsertHash {
 
 
     public IDeclaration(SourceCodeChange change) {
-        assert (change instanceof Insert || change instanceof Delete) &&
+        super(change);
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move) &&
                 change.getChangedEntity().getType() == JavaEntityType.VARIABLE_DECLARATION_STATEMENT;
 
         //Insert insert = (Insert) change;
@@ -56,12 +59,12 @@ public class IDeclaration extends InsertHash {
 
     private DeclarationVisitor getVisitor(SourceCodeChange insert) {
         String code = insert.getChangedEntity().getUniqueName();
-        parser.setKind(ASTParser.K_STATEMENTS);
-        parser.setSource(code.toCharArray());
-        Block block = (Block) parser.createAST(null);
+        Block block = (Block) CompileTool.getBlock(code);
 
         DeclarationVisitor visitor = new DeclarationVisitor();
-        block.accept(visitor);
+        if (block != null) {
+            block.accept(visitor);
+        }
 
         return visitor;
     }
@@ -78,8 +81,8 @@ public class IDeclaration extends InsertHash {
                 if (de.hashes[i] != hashes[i]) return false;
             return true;
         } else {
-            return hashes[DATATYPE] == de.hashes[DATATYPE] ||
-                    hashes[VARIABLE] == de.hashes[VARIABLE];
+            return (hashes[DATATYPE] == de.hashes[DATATYPE] && !IReturn.basicTypes.contains(hashes[DATATYPE]) ||
+                    hashes[VARIABLE] == de.hashes[VARIABLE] || hashes[INIT] == de.hashes[INIT]) ;
         }
     }
 }

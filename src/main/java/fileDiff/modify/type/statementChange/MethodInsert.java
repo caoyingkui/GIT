@@ -128,7 +128,6 @@ public class MethodInsert extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     MethodInsert result = MethodInsert.match(method);
-                    int a = 2;
                 }
             }
         }

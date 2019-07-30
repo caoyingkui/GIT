@@ -77,7 +77,6 @@ public class Rename extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     Rename result = Rename.match(method);
-                    int a = 2;
                 }
             }
         }

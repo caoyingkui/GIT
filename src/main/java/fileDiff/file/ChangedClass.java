@@ -27,6 +27,7 @@ import javafx.util.Pair;
 import javassist.runtime.Desc;
 
 import javax.validation.constraints.NotNull;
+import java.io.Serializable;
 import java.util.*;
 
 import static ch.uzh.ifi.seal.changedistiller.model.classifiers.ChangeType.*;
@@ -41,7 +42,7 @@ import static ch.uzh.ifi.seal.changedistiller.model.classifiers.ChangeType.*;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class ChangedClass extends FileDiff implements Update{
+public class ChangedClass extends FileDiff implements Update {
     public Change<String> name;
 
     public Change<String> path;
@@ -212,7 +213,6 @@ public class ChangedClass extends FileDiff implements Update{
         });
     }
 
-    @Override
     public void methodDiff() {
 
         distiller = ChangeDistiller.createFileDistiller(ChangeDistiller.Language.JAVA);
@@ -221,8 +221,9 @@ public class ChangedClass extends FileDiff implements Update{
         sourceCodeChanges = distiller.getSourceCodeChanges();
 
         Map<String, Method> methodsInNew = new HashMap<>();
-        for (Method method: parser.NEW.getMethods()) methodsInNew.put(method.fullName.replace(":", "."), method);
+        for (Method method: parser.NEW.getMethods()) methodsInNew.put(method.fullName, method);
         List<Method> methodsInOld = parser.OLD.getMethods();
+
 
         class Relation {
             public Method newMethod = null;
@@ -237,44 +238,47 @@ public class ChangedClass extends FileDiff implements Update{
             SourceCodeChange change = sourceCodeChanges.get(i);
             Method newMethod = null, oldMethod = null;
             if (change.getRootEntity().getType().isMethod()) {
-                String uniqueName = change.getRootEntity().getUniqueName().replaceAll(" ", "");
-                newMethod = methodsInNew.getOrDefault(uniqueName, null);
-                if (newMethod == null) newMethod = methodsInNew.getOrDefault(uniqueName, null);
-                if (change instanceof Insert) {
-                    if (change.getChangeType() == PARAMETER_INSERT) {
-                        try {
+                try {
+                    String uniqueName = change.getRootEntity().getUniqueName().replaceAll(" ", "");
+                    newMethod = methodsInNew.getOrDefault(uniqueName, null);
+                    if (change instanceof Insert) {
+                        if (change.getChangeType() == PARAMETER_INSERT) {
                             oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getParentEntity().getStartPosition() + 2));
-                        } catch (Exception e) {
-                            int a = 2;
-                        }
-                    } else {
-                        for (Method method: methodsInOld) {
-                            if (method.fullName.equals(uniqueName)) {
-                                oldMethod = method;
-                                break;
+                        } else {
+                            for (Method method : methodsInOld) {
+                                if (method.fullName.equals(uniqueName)) {
+                                    oldMethod = method;
+                                    break;
+                                }
                             }
-
                         }
+                    } else if (change instanceof ch.uzh.ifi.seal.changedistiller.model.entities.Update) {
+                        oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
+                    } else if (change instanceof Move) {
+                        oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
+                    } else if (change instanceof Delete) {
+                        oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
                     }
-                } else if (change instanceof ch.uzh.ifi.seal.changedistiller.model.entities.Update) {
-                    //newMethod = methodsInNew.get(uniqueName);
-                    oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
-                } else if (change instanceof Move) {
-                    //newMethod = methodsInNew.get(uniqueName);
-                    oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
-                } else if (change instanceof Delete) {
-                    if (change.getChangeType() == PARAMETER_DELETE) {
-                        int a = 2;
-                    }
-                    //newMethod = methodsInNew.getOrDefault(uniqueName, null);
-                    oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
+                } catch (Exception e) {
+                    System.out.println("Error from ChangedClass");
+                    continue;
                 }
+                if (newMethod == null && oldMethod == null)
+                    continue;
             } else if (change.getChangeType() == ADDITIONAL_FUNCTIONALITY) {
                 newMethod = methodsInNew.get(change.getChangedEntity().getUniqueName().replaceAll(" ", ""));
             } else if (change.getChangeType() == REMOVED_FUNCTIONALITY) {
                 oldMethod = methodsInOld.get(parser.OLD.getMethodAt(change.getChangedEntity().getStartPosition()));
             } else {
                 continue;
+            }
+
+            if (newMethod == null && oldMethod == null) {
+                String uniqueName = change.getChangedEntity().getUniqueName();
+
+                //编译器自动添加的构造函数
+                if (Character.isUpperCase(uniqueName.charAt(uniqueName.lastIndexOf(".") + 1)))
+                    continue;
             }
 
             boolean s = false;

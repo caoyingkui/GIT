@@ -128,7 +128,6 @@ public class NewClassImport extends Modify {
             for (MethodDiff method: c.getMethods()) {
                 if (method.getName().equals(methodName)) {
                     NewClassImport result = NewClassImport.match(method);
-                    int a = 2;
                 }
             }
         }

@@ -3,6 +3,7 @@ package fileDiff.group.hash.insert;
 import ch.uzh.ifi.seal.changedistiller.model.classifiers.java.JavaEntityType;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Delete;
 import ch.uzh.ifi.seal.changedistiller.model.entities.Insert;
+import ch.uzh.ifi.seal.changedistiller.model.entities.Move;
 import ch.uzh.ifi.seal.changedistiller.model.entities.SourceCodeChange;
 import fileDiff.group.hash.StatementHash;
 import org.eclipse.jdt.core.dom.ASTNode;
@@ -23,8 +24,8 @@ public class ITry extends InsertHash{
     public final int PARENT     = 2;
 
     public ITry(SourceCodeChange change) {
-
-        assert (change instanceof Insert || change instanceof Delete) &&
+        super(change);
+        assert (change instanceof Insert || change instanceof Delete || change instanceof Move) &&
                 change.getChangedEntity().getType() == JavaEntityType.TRY_STATEMENT;
 
         hashes = new int[3];

@@ -31,6 +31,7 @@ import util.SetTool;
 import util.StemTool;
 
 import javax.validation.constraints.NotNull;
+import java.io.*;
 import java.util.*;
 
 /**
@@ -43,13 +44,19 @@ import java.util.*;
  * |  **              **         **  **
  * |   *******        **         **     **
  */
-public class ChangedMethod extends MethodDiff implements FieldUpdate{
-    public DiffType type;
-    public Change<String> name;
-    public Change<String> signature;
-    public Change<String> fullName;
-    public Change<String> content;
-    public Change<String> comment;
+public class ChangedMethod extends MethodDiff implements FieldUpdate, Externalizable {
+
+    //这个只做序列化使用，无其他用处
+    private String info = "";
+
+    public DiffType                 type;
+    public Change<String>           name;
+    public Change<String>           signature;
+    public Change<String>           fullName;
+    public Change<Integer>          startLine;
+    public Change<Integer>          endLine;
+    public Change<String>           content;
+    public Change<String>           comment;
     public Change<MethodDeclaration> node;
 
     //tokens记录的是一个方法前后删除、增加的token
@@ -62,15 +69,19 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
     @NotNull
     public List<SourceCodeChange> sourceCodeChanges = new ArrayList<>();
 
+    public ChangedMethod() {}
+
     public ChangedMethod(Method newMethod, Method oldMethod, FileDiff file, String commitId) {
         this.commitId = commitId;
-        name = new Change<>(newMethod.name, oldMethod.name);
-        fullName = new Change<>(newMethod.fullName, oldMethod.fullName);
-        signature = new Change<>(getSignature(newMethod.fullName), getSignature(oldMethod.fullName));
-        content = new Change<>(newMethod.methodContent, oldMethod.methodContent);
-        comment = new Change<>(newMethod.comment, oldMethod.comment);
-        node = new Change<>(newMethod.node, oldMethod.node);
-        this.file = file;
+        name        = new Change<>(newMethod.name, oldMethod.name);
+        fullName    = new Change<>(newMethod.fullName, oldMethod.fullName);
+        signature   = new Change<>(getSignature(newMethod.fullName), getSignature(oldMethod.fullName));
+        startLine   = new Change<>(newMethod.startLine, oldMethod.startLine);
+        endLine     = new Change<>(newMethod.endLine, oldMethod.endLine);
+        content     = new Change<>(newMethod.methodContent, oldMethod.methodContent);
+        comment     = new Change<>(newMethod.comment, oldMethod.comment);
+        node        = new Change<>(newMethod.node, oldMethod.node);
+        this.file   = file;
 
         getType();
     }
@@ -131,9 +142,6 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
      * 提取两段代码中差异的token
      */
     protected void extractChangedTokens() {
-        if (name.OLD.equals("assignClassNormalizedList")) {
-            int a = 2;
-        }
         HashSet<String> newTokens = new HashSet<>();
         HashSet<String> oldTokens = new HashSet<>();
         changedSections.stream().forEach( section -> {
@@ -362,4 +370,17 @@ public class ChangedMethod extends MethodDiff implements FieldUpdate{
         }
     }
 
+
+    @Override
+    public void writeExternal(ObjectOutput out) throws IOException {
+        out.writeObject(content);
+        this.info = file.commitId + "|" + fullName.OLD + "|" + fullName.NEW;
+        out.writeObject(info);
+    }
+
+    @Override
+    public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException {
+        this.content = (Change<String>)in.readObject();
+        this.info = (String) in.readObject();
+    }
 }
